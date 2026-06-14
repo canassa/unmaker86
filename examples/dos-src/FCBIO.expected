@@ -1,0 +1,28 @@
+exit_code: 0
+--- output ---
+create al=0
+seqwrite rec 0 al=0
+seqwrite rec 1 al=0
+seqwrite rec 2 al=0
+filesize after writes: 96
+close al=0
+open al=0
+open filesize: 96
+seqread rec 0 al=0 [record-0-payload]
+seqread rec 1 al=0 [record-1-payload]
+seqread rec 2 al=0 [record-2-payload]
+seqread past-eof al=1
+random field after set(rec1): 1
+randread al=0 [record-1-payload]
+randwrite al=0
+randread after rewrite al=0 [REWRITTEN-REC-1]
+close2 al=0
+getsize al=0 records=3
+found: FCBDATA.DAT size=96
+found: FCBONE.DAT size=0
+found: FCBTWO.DAT size=0
+find count=3
+rename al=0
+delete-wild al=0
+find-after-delete al=255
+done

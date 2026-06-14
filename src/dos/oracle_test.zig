@@ -154,6 +154,26 @@ const PASSING = [_]Program{
     // — NO timestamps); proven deterministic by a triple-mint byte-identical diff.
     // The created files are all removed before exit so the corpus stays clean.
     .{ .exe = "HANDLES.EXE" },
+    // FCB (File Control Block) legacy file API band (band 14): INT 21h AH=0F-24,
+    // the pre-handle interface. FCBIO.EXE builds a 37-byte FCB in its own memory,
+    // points DS:DX at it, and drives AH=16 create + AH=15 sequential write of
+    // fixed records, AH=10 close, AH=0F open + AH=14 sequential read-back, AH=24
+    // set-random-record + AH=21 random read, AH=22 random write, AH=23 get
+    // file-size-in-records, AH=11/12 find-first/next over an FCB '?'-wildcard,
+    // AH=17 rename, and AH=13 wildcard delete. The FCB maps onto the SAME SFT/VFS
+    // machinery as the handle calls: an FCB-opened file gets a real SFT slot
+    // (refcounted) whose index is stored in the FCB's file_handle byte, exactly
+    // how dosbox-x passes the SFT index to DOS_ReadFile/WriteFile in fcb mode
+    // (dos_files.cpp DOS_FCB*). Record I/O moves bytes through the current DTA
+    // (AH=1A) at offset recno*rec_size. Only oracle-able values are printed
+    // (record CONTENT, byte/record COUNTS, file SIZE, file-size-in-records, found
+    // SIZE, AL return codes); the FCB date/time words (+0x14/+0x16) and the find-
+    // result FCB's date/time (+0x17/+0x19) are EXCLUDED — dosbox-x derives them
+    // from the host clock (DOS_FCBWrite: DOS_PackDate(dos.date)+BIOS_TIMER, and
+    // SaveFindResult's SetResult), which is non-deterministic and not oracle-able.
+    // Proven deterministic by a triple-mint byte-identical diff; every created
+    // file is removed before exit so the committed corpus stays byte-identical.
+    .{ .exe = "FCBIO.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented

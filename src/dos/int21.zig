@@ -12,6 +12,7 @@ const psp_mod = @import("psp.zig");
 const dta_mod = @import("dta.zig");
 const sft_mod = @import("sft.zig");
 const mcb_mod = @import("mcb.zig");
+const fcb_mod = @import("fcb.zig");
 
 const EAX = @intFromEnum(Reg32.eax);
 const EBX = @intFromEnum(Reg32.ebx);
@@ -22,6 +23,7 @@ pub fn Int21(comptime Cpu: type) type {
     return struct {
         const Dos = @import("dos.zig").Dos(Cpu);
         const Bridge = @import("bridge").Bridge(Cpu);
+        const Fcb = fcb_mod.Fcb(Cpu);
 
         pub fn service(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
             const ah = cpu.st.getReg8(4);
@@ -41,6 +43,21 @@ pub fn Int21(comptime Cpu: type) type {
                     cpu.st.setReg16(ECX, 0); // CX
                 },
                 0x31 => dos.unsupported(cpu, br, 0x21), // TSR deferred (D11)
+
+                // ---- FCB file API (legacy pre-handle interface, AH=0F-24) ----
+                0x0F => fcbOpen(dos, cpu, br),
+                0x10 => fcbClose(dos, cpu, br),
+                0x11 => fcbFindFirst(dos, cpu, br),
+                0x12 => fcbFindNext(dos, cpu, br),
+                0x13 => fcbDelete(dos, cpu, br),
+                0x14 => fcbSeqRead(dos, cpu, br),
+                0x15 => fcbSeqWrite(dos, cpu, br),
+                0x16 => fcbCreate(dos, cpu, br),
+                0x17 => fcbRename(dos, cpu, br),
+                0x21 => fcbRandomRead(dos, cpu, br),
+                0x22 => fcbRandomWrite(dos, cpu, br),
+                0x23 => fcbGetFileSize(dos, cpu, br),
+                0x24 => fcbSetRandomRecord(dos, cpu, br),
 
                 // ---- Char I/O ----
                 0x02 => { // output char in DL -> CON
@@ -1365,6 +1382,458 @@ pub fn Int21(comptime Cpu: type) type {
         fn exec(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
             const Loader = @import("loader.zig").Loader(Cpu);
             Loader.exec(dos, cpu, br);
+        }
+
+        // ===================================================================
+        // FCB file API (legacy pre-handle interface, AH=0F-24).
+        //
+        // Maps the FCB onto the SAME SFT/VFS machinery as the handle calls: an
+        // FCB-opened file gets a real SFT slot (refcounted, snapshot-consistent),
+        // and the slot index is stored directly in the FCB's file_handle byte —
+        // exactly how dosbox-x's FCB calls pass the SFT index to DOS_ReadFile/
+        // WriteFile in `fcb` mode (dos_files.cpp:1845 etc.). Sequential/random
+        // record I/O moves bytes through the CURRENT DTA (AH=1A), at offset
+        // recno*rec_size, per DOS_FCBRead/DOS_FCBWrite (dos_files.cpp:1917/1947).
+        // ===================================================================
+
+        /// The FCB view at DS:DX (detects the extended 0xFF prefix).
+        fn fcbAt(dos: *Dos, cpu: *Cpu) Fcb {
+            _ = dos;
+            const seg = cpu.st.selector[@intFromEnum(Seg.ds)];
+            const off = cpu.st.getReg16(EDX);
+            return Fcb.at(cpu, seg, off);
+        }
+
+        /// Resolve the FCB drive byte to a drive index (0='A'); byte 0 = default.
+        fn fcbDriveIdx(dos: *Dos, f: Fcb) u8 {
+            const d = f.driveByte();
+            return if (d == 0) dos.current_drive else d - 1;
+        }
+
+        /// Build the DOS-relative "NAME.EXT" path from an FCB's 11-byte name into
+        /// `out` (trailing spaces trimmed, the dot dropped when the ext is blank),
+        /// matching DOS_FCB::GetName + DOS_MakeName trimming. Returns the slice.
+        fn fcbDosName(f: Fcb, out: []u8) []u8 {
+            var nm: [11]u8 = undefined;
+            f.readName(&nm);
+            var n: usize = 0;
+            var i: usize = 0;
+            while (i < 8 and nm[i] != ' ') : (i += 1) {
+                out[n] = nm[i];
+                n += 1;
+            }
+            // Extension (only if any non-space char present).
+            var ext_len: usize = 0;
+            while (ext_len < 3 and nm[8 + ext_len] != ' ') ext_len += 1;
+            if (ext_len > 0) {
+                out[n] = '.';
+                n += 1;
+                i = 0;
+                while (i < ext_len) : (i += 1) {
+                    out[n] = nm[8 + i];
+                    n += 1;
+                }
+            }
+            return out[0..n];
+        }
+
+        /// True if the FCB's 11-byte name contains a wildcard ('?' — '*' is already
+        /// expanded to '?' by AH=29/the program). Mirrors strpbrk(name,"*?").
+        fn fcbHasWildcard(f: Fcb) bool {
+            var nm: [11]u8 = undefined;
+            f.readName(&nm);
+            for (nm) |c| if (c == '?' or c == '*') return true;
+            return false;
+        }
+
+        /// AH=16 FCB Create (dos_files.cpp:1831 DOS_FCBCreate). Create/truncate the
+        /// named file, allocate an SFT slot, and seed the FCB open fields (drive,
+        /// SFT index, cur_block=0, rec_size=128, filesize, date/time) exactly like
+        /// DOS_FCB::FileOpen (dos_classes.cpp:644). AL=0 on success, 0xFF on error.
+        fn fcbCreate(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            const f = fcbAt(dos, cpu);
+            const drive = fcbDriveIdx(dos, f);
+            const dp = dos.drivePtr(drive) orelse return fcbFail(cpu);
+            var nbuf: [16]u8 = undefined;
+            const dos_name = fcbDosName(f, &nbuf);
+            const hf = dp.create(dos_name) catch return fcbFail(cpu);
+            fcbFinishOpen(dos, cpu, f, hf, drive, dos_name) catch return fcbFail(cpu);
+            cpu.st.setReg8(0, 0x00);
+            br.setGuestCF(false);
+        }
+
+        /// AH=0F FCB Open (dos_files.cpp:1849 DOS_FCBOpen). Open the named file
+        /// read/write. A wildcard name is first resolved via FCB find-first to a
+        /// concrete name (dosbox-x:1855). AL=0 on success, 0xFF on error.
+        fn fcbOpen(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            const f = fcbAt(dos, cpu);
+            const drive = fcbDriveIdx(dos, f);
+            const dp = dos.drivePtr(drive) orelse return fcbFail(cpu);
+
+            // Resolve a wildcard open to the first matching name (dosbox-x:1855).
+            if (fcbHasWildcard(f)) {
+                var pat: [11]u8 = undefined;
+                f.readName(&pat);
+                var found: [256]vfs.FoundEntry = undefined;
+                const cnt = dp.enumerate("", &pat, &found) catch return fcbFail(cpu);
+                if (cnt == 0) return fcbFail(cpu);
+                var nm11: [11]u8 = undefined;
+                found[0].name.fcb(&nm11);
+                f.writeName(&nm11);
+            }
+
+            var nbuf: [16]u8 = undefined;
+            const dos_name = fcbDosName(f, &nbuf);
+            const hf = dp.open(dos_name, .read_write) catch return fcbFail(cpu);
+            fcbFinishOpen(dos, cpu, f, hf, drive, dos_name) catch return fcbFail(cpu);
+            cpu.st.setReg8(0, 0x00);
+            br.setGuestCF(false);
+        }
+
+        /// Common open tail: allocate an SFT slot for `hf`, store its index in the
+        /// FCB, and fill the FCB open fields (DOS_FCB::FileOpen, dos_classes.cpp:644).
+        fn fcbFinishOpen(dos: *Dos, cpu: *Cpu, f: Fcb, hf: vfs.HostFile, drive: u8, dos_name: []const u8) !void {
+            _ = cpu;
+            const slot = dos.sft.allocSlot() orelse {
+                dos.drivePtr(drive).?.close(hf);
+                return error.NoSlot;
+            };
+            const e = dos.sft.get(slot);
+            e.* = .{ .in_use = true, .ref = .{ .file = hf }, .position = 0, .mode = .read_write, .refcount = 1, .drive = drive };
+            e.setPath(dos_name);
+            e.f_time = clock.fileTime();
+            e.f_date = clock.fileDate();
+            const sz: u32 = if (dos.drivePtr(drive).?.size(hf)) |s| @intCast(@min(s, std.math.maxInt(u32))) else |_| 0;
+            e.snap_len = sz;
+
+            f.setDriveByte(drive + 1); // FileOpen sets drive = GetDrive()+1
+            f.setFileHandle(slot);
+            f.setCurBlock(0);
+            f.setRecSize(fcb_mod.DEFAULT_REC_SIZE);
+            f.setFileSize(sz);
+            f.setDate(clock.fileDate());
+            f.setTime(clock.fileTime());
+        }
+
+        /// AH=10 FCB Close (dos_files.cpp:1887 DOS_FCBClose). Mark the FCB's handle
+        /// closed (0xFF) and release the SFT slot (refcount-aware). AL=0 / 0xFF.
+        fn fcbClose(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            const f = fcbAt(dos, cpu);
+            const slot = f.fileHandle();
+            if (slot == fcb_mod.HANDLE_CLOSED or slot >= sft_mod.SFT_MAX) return fcbFail(cpu);
+            const e = dos.sft.get(slot);
+            if (!e.in_use) return fcbFail(cpu);
+            f.setFileHandle(fcb_mod.HANDLE_CLOSED); // FileClose sets handle = 0xff
+            if (e.refcount > 1) {
+                e.refcount -= 1;
+            } else {
+                if (e.ref == .file) {
+                    if (dos.drivePtr(e.drive)) |d| d.close(e.ref.file);
+                    dos.sft.freeSlot(slot);
+                }
+            }
+            cpu.st.setReg8(0, 0x00);
+            br.setGuestCF(false);
+        }
+
+        /// Resolve an FCB's SFT entry, re-opening on demand if the handle is closed
+        /// but a rec_size is set — mirrors DOS_FCBRead/Write's "Reopened closed FCB"
+        /// path (dos_files.cpp:1921). Returns null if it cannot be resolved.
+        fn fcbSftEntry(dos: *Dos, cpu: *Cpu, f: Fcb) ?*sft_mod.SftEntry {
+            var slot = f.fileHandle();
+            if (slot == fcb_mod.HANDLE_CLOSED and f.recSize() != 0) {
+                // Re-open (dosbox-x DOS_FCBOpen on a closed-but-active FCB).
+                const drive = fcbDriveIdx(dos, f);
+                const dp = dos.drivePtr(drive) orelse return null;
+                var nbuf: [16]u8 = undefined;
+                const dos_name = fcbDosName(f, &nbuf);
+                const hf = dp.open(dos_name, .read_write) catch return null;
+                fcbFinishOpen(dos, cpu, f, hf, drive, dos_name) catch return null;
+                slot = f.fileHandle();
+            }
+            if (slot >= sft_mod.SFT_MAX) return null;
+            const e = dos.sft.get(slot);
+            if (!e.in_use or e.ref != .file) return null;
+            return e;
+        }
+
+        /// FCB record I/O default: a rec_size of 0 defaults to 128 and is written
+        /// back into the FCB (dos_files.cpp:1926).
+        fn fcbRecSize(f: Fcb) u16 {
+            var rs = f.recSize();
+            if (rs == 0) {
+                rs = fcb_mod.DEFAULT_REC_SIZE;
+                f.setRecSize(rs);
+            }
+            return rs;
+        }
+
+        /// Read one record at (cur_block*128 + cur_rec)*rec_size from the file into
+        /// the DTA at recno*rec_size, advancing cur_block/cur_rec. Returns the FCB
+        /// status: 0 = ok, 1 = no data (EOF), 3 = partial (zero-padded). Shared by
+        /// AH=14 (recno=0) and AH=21/27 (random). Mirrors DOS_FCBRead.
+        fn fcbReadRecord(dos: *Dos, cpu: *Cpu, f: Fcb, recno: u16) u8 {
+            const e = fcbSftEntry(dos, cpu, f) orelse return 1;
+            const rs = fcbRecSize(f);
+            const cur_block = f.curBlock();
+            const cur_rec = f.curRec();
+            const pos: u64 = (@as(u64, cur_block) * 128 + cur_rec) * rs;
+            const drive = dos.drivePtr(e.drive) orelse return 1;
+            var scratch: [256]u8 = undefined;
+            const rbuf = if (rs <= scratch.len) scratch[0..rs] else return 1;
+            const n = drive.readAt(e.ref.file, pos, rbuf) catch return 1;
+            if (n == 0) return 1; // FCB_READ_NODATA
+            // Zero-pad a short final record to rec_size (dos_files.cpp:1936).
+            if (n < rs) {
+                var z: usize = n;
+                while (z < rs) : (z += 1) rbuf[z] = 0;
+            }
+            // Write the record into the DTA at recno*rec_size.
+            const dta_phys = (@as(u32, dos.dta_seg) << 4) + dos.dta_off + @as(u32, recno) * rs;
+            cpu.bus.writeGuestBlock(dta_phys, rbuf);
+            advanceRecord(f);
+            return if (n == rs) 0 else 3; // SUCCESS / READ_PARTIAL
+        }
+
+        /// Write one record from the DTA (at recno*rec_size) to the file at
+        /// (cur_block*128 + cur_rec)*rec_size, growing filesize and advancing the
+        /// record pointer. Returns 0 = ok, 1 = write error. Mirrors DOS_FCBWrite.
+        /// The date/time it stamps come from the deterministic clock (NOT host) —
+        /// dosbox-x uses the host date + BIOS timer here, which is why the FCB
+        /// date/time words are excluded from the oracle (band 14).
+        fn fcbWriteRecord(dos: *Dos, cpu: *Cpu, f: Fcb, recno: u16) u8 {
+            const e = fcbSftEntry(dos, cpu, f) orelse return 1;
+            const rs = fcbRecSize(f);
+            const cur_block = f.curBlock();
+            const cur_rec = f.curRec();
+            const pos: u64 = (@as(u64, cur_block) * 128 + cur_rec) * rs;
+            const drive = dos.drivePtr(e.drive) orelse return 1;
+            var scratch: [256]u8 = undefined;
+            const wbuf = if (rs <= scratch.len) scratch[0..rs] else return 1;
+            const dta_phys = (@as(u32, dos.dta_seg) << 4) + dos.dta_off + @as(u32, recno) * rs;
+            cpu.bus.readGuestBlock(dta_phys, wbuf);
+            const n = drive.writeAt(e.ref.file, pos, wbuf) catch return 1;
+            // Grow filesize if we wrote past the old end (dos_files.cpp:1968).
+            var size = f.fileSize();
+            if (pos + n > size) size = @intCast(pos + n);
+            f.setFileSize(size);
+            // Deterministic date/time (D13) — see the doc comment above.
+            f.setDate(clock.fileDate());
+            f.setTime(clock.fileTime());
+            e.f_date = clock.fileDate();
+            e.f_time = clock.fileTime();
+            advanceRecord(f);
+            return 0; // FCB_SUCCESS
+        }
+
+        /// Advance cur_rec, rolling into the next block at 128 (dos_files.cpp:1941).
+        fn advanceRecord(f: Fcb) void {
+            var cur_block = f.curBlock();
+            var cur_rec = f.curRec();
+            cur_rec +%= 1;
+            if (cur_rec > 127) {
+                cur_block +%= 1;
+                cur_rec = 0;
+            }
+            f.setCurBlock(cur_block);
+            f.setCurRec(cur_rec);
+        }
+
+        /// AH=14 Sequential Read (dos.cpp:1424). recno=0.
+        fn fcbSeqRead(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            _ = br;
+            const f = fcbAt(dos, cpu);
+            cpu.st.setReg8(0, fcbReadRecord(dos, cpu, f, 0));
+        }
+
+        /// AH=15 Sequential Write (dos.cpp:1428). recno=0.
+        fn fcbSeqWrite(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            _ = br;
+            const f = fcbAt(dos, cpu);
+            cpu.st.setReg8(0, fcbWriteRecord(dos, cpu, f, 0));
+        }
+
+        /// AH=24 Set Random Record (dos.cpp:1481 DOS_FCBSetRandomRecord): random =
+        /// cur_block*128 + cur_rec.
+        fn fcbSetRandomRecord(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            _ = br;
+            const f = fcbAt(dos, cpu);
+            f.setRandom(@as(u32, f.curBlock()) * 128 + f.curRec());
+        }
+
+        /// AH=21 Random Read (dos.cpp:1463 -> DOS_FCBRandomRead restore=true).
+        /// Sets cur_block/cur_rec from the random field, reads ONE record into the
+        /// DTA, then restores the original cur_block/cur_rec (the random field is
+        /// NOT advanced for the single-record call). AL = the FCB status.
+        fn fcbRandomRead(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            _ = br;
+            const f = fcbAt(dos, cpu);
+            const rnd = f.random();
+            f.setCurBlock(@intCast(rnd / 128));
+            f.setCurRec(@intCast(rnd & 127));
+            const old_block = f.curBlock();
+            const old_rec = f.curRec();
+            const status = fcbReadRecord(dos, cpu, f, 0);
+            // restore=true: restore the record pointer (dos_files.cpp:2038).
+            f.setCurBlock(old_block);
+            f.setCurRec(old_rec);
+            cpu.st.setReg8(0, status);
+        }
+
+        /// AH=22 Random Write (dos.cpp:1470 -> DOS_FCBRandomWrite restore=true).
+        /// As AH=21 but writes the DTA record to the file at the random record.
+        fn fcbRandomWrite(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            _ = br;
+            const f = fcbAt(dos, cpu);
+            const rnd = f.random();
+            f.setCurBlock(@intCast(rnd / 128));
+            f.setCurRec(@intCast(rnd & 127));
+            const old_block = f.curBlock();
+            const old_rec = f.curRec();
+            const status = fcbWriteRecord(dos, cpu, f, 0);
+            f.setCurBlock(old_block);
+            f.setCurRec(old_rec);
+            cpu.st.setReg8(0, status);
+        }
+
+        /// AH=23 Get File Size (dos.cpp:1477 -> DOS_FCBGetFileSize). Opens the
+        /// named file, seeks to end, sets the FCB random field to the file size in
+        /// records (rounded up by rec_size), and closes. AL=0 / 0xFF.
+        fn fcbGetFileSize(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            _ = br;
+            const f = fcbAt(dos, cpu);
+            const drive = fcbDriveIdx(dos, f);
+            const dp = dos.drivePtr(drive) orelse return fcbFail(cpu);
+            var nbuf: [16]u8 = undefined;
+            const dos_name = fcbDosName(f, &nbuf);
+            const hf = dp.open(dos_name, .read_only) catch return fcbFail(cpu);
+            const size: u32 = if (dp.size(hf)) |s| @intCast(@min(s, std.math.maxInt(u32))) else |_| 0;
+            dp.close(hf);
+            var rs = f.recSize();
+            if (rs == 0) rs = fcb_mod.DEFAULT_REC_SIZE; // default if missing (dosbox:2086)
+            var records: u32 = size / rs;
+            if (size % rs != 0) records += 1;
+            f.setRandom(records);
+            cpu.st.setReg8(0, 0x00);
+        }
+
+        /// AH=11 FCB Find First (dos.cpp:1409 -> DOS_FCBFindFirst). Enumerate the
+        /// drive root for the FCB's wildcard name and write the first match's
+        /// 32-byte found-FCB into the DTA (DOS_FCB SetName/SetResult layout). AL=0
+        /// on a match, 0xFF when none. Find state (drive/pattern/index) is kept
+        /// host-side on the Dos ctx (one FCB search active at a time, like the
+        /// dosbox-x tempdta convention).
+        fn fcbFindFirst(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            _ = br;
+            const f = fcbAt(dos, cpu);
+            const drive = fcbDriveIdx(dos, f);
+            const dp = dos.drivePtr(drive) orelse return fcbFail(cpu);
+            var pat: [11]u8 = undefined;
+            f.readName(&pat);
+            var found: [256]vfs.FoundEntry = undefined;
+            const cnt = dp.enumerate("", &pat, &found) catch return fcbFail(cpu);
+            if (cnt == 0) return fcbFail(cpu);
+            dos.fcb_search_drive = drive;
+            dos.fcb_search_pat = pat;
+            dos.fcb_search_idx = 1;
+            dos.fcb_search_ext = f.extended;
+            writeFoundFcb(dos, cpu, found[0], drive, f.extended);
+            cpu.st.setReg8(0, 0x00);
+        }
+
+        /// AH=12 FCB Find Next (dos.cpp:1414 -> DOS_FCBFindNext). Continue the
+        /// active FCB search; write the next match's found-FCB to the DTA. AL=0/0xFF.
+        fn fcbFindNext(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            _ = br;
+            const drive = dos.fcb_search_drive;
+            const dp = dos.drivePtr(drive) orelse return fcbFail(cpu);
+            var found: [256]vfs.FoundEntry = undefined;
+            const cnt = dp.enumerate("", &dos.fcb_search_pat, &found) catch return fcbFail(cpu);
+            const idx = dos.fcb_search_idx;
+            if (idx >= cnt) return fcbFail(cpu);
+            dos.fcb_search_idx = idx + 1;
+            writeFoundFcb(dos, cpu, found[idx], drive, dos.fcb_search_ext);
+            cpu.st.setReg8(0, 0x00);
+        }
+
+        /// Write a 32-byte found-FCB into the DTA per DOS_FCB SaveFindResult
+        /// (dos_files.cpp:1809) + SetResult (dos_classes.cpp:699): for an extended
+        /// search FCB the block starts with the 7-byte 0xFF prefix (attr at +6).
+        /// At the FCB base: drive (+0), name (+1..8), ext (+9..11), attr (+0x0C),
+        /// time (+0x17), date (+0x19), size (+0x1D). Date/time are deterministic
+        /// (D13) and excluded from the oracle (host-derived in dosbox-x).
+        fn writeFoundFcb(dos: *Dos, cpu: *Cpu, fe: vfs.FoundEntry, drive: u8, extended: bool) void {
+            const dta_base = (@as(u32, dos.dta_seg) << 4) + dos.dta_off;
+            var base = dta_base;
+            if (extended) {
+                // Extended found-FCB: 0xFF flag, 5 reserved zero bytes, attr at +6.
+                cpu.bus.writePhys8(dta_base, 0xFF);
+                var z: u16 = 1;
+                while (z < 6) : (z += 1) cpu.bus.writePhys8(dta_base + z, 0);
+                cpu.bus.writePhys8(dta_base + 6, fe.attr);
+                base = dta_base + 7;
+            }
+            cpu.bus.writePhys8(base + fcb_mod.FCB_DRIVE, drive + 1);
+            var nm11: [11]u8 = undefined;
+            fe.name.fcb(&nm11);
+            var i: u16 = 0;
+            while (i < 8) : (i += 1) cpu.bus.writePhys8(base + fcb_mod.FCB_NAME + i, nm11[i]);
+            i = 0;
+            while (i < 3) : (i += 1) cpu.bus.writePhys8(base + fcb_mod.FCB_EXT + i, nm11[8 + i]);
+            // SetResult writes attr/time/date/size at the documented find offsets.
+            cpu.bus.writePhys8(base + 0x0C, fe.attr);
+            cpu.bus.writePhys16(base + 0x17, clock.fileTime());
+            cpu.bus.writePhys16(base + 0x19, clock.fileDate());
+            cpu.bus.writePhys32(base + 0x1D, fe.size);
+        }
+
+        /// AH=13 FCB Delete File (dos.cpp:1419 -> DOS_FCBDeleteFile). Honors
+        /// wildcards: find-first/next over the pattern and unlink each match;
+        /// AL=0 if at least one file was deleted, else 0xFF (dos_files.cpp:2143).
+        fn fcbDelete(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            _ = br;
+            const f = fcbAt(dos, cpu);
+            const drive = fcbDriveIdx(dos, f);
+            const dp = dos.drivePtr(drive) orelse return fcbFail(cpu);
+            var pat: [11]u8 = undefined;
+            f.readName(&pat);
+            var found: [256]vfs.FoundEntry = undefined;
+            const cnt = dp.enumerate("", &pat, &found) catch return fcbFail(cpu);
+            var deleted: bool = false;
+            var i: usize = 0;
+            while (i < cnt) : (i += 1) {
+                var nbuf: [13]u8 = undefined;
+                const disp = found[i].name.display(&nbuf);
+                if (dp.unlink(disp)) {
+                    deleted = true;
+                } else |_| {}
+            }
+            cpu.st.setReg8(0, if (deleted) 0x00 else 0xFF);
+        }
+
+        /// AH=17 FCB Rename (dos.cpp:1437 -> DOS_FCBRenameFile). The OLD FCB is at
+        /// DS:DX; the NEW name is a second FCB at base+0x10 (dos_files.cpp:2159).
+        /// AL=0 on success, 0xFF on error. (Wildcards in rename are not exercised
+        /// by the corpus; a literal old->new rename is implemented faithfully.)
+        fn fcbRename(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            _ = br;
+            const fold = fcbAt(dos, cpu);
+            const drive = fcbDriveIdx(dos, fold);
+            const dp = dos.drivePtr(drive) orelse return fcbFail(cpu);
+            // The NEW FCB sits 0x10 past the OLD FCB's base (dos_files.cpp:2159).
+            const fnew = Fcb{ .cpu = cpu, .base = fold.base + 0x10, .extended = false, .attr_phys = 0 };
+            var ob: [16]u8 = undefined;
+            var nb: [16]u8 = undefined;
+            const old_name = fcbDosName(fold, &ob);
+            const new_name = fcbDosName(fnew, &nb);
+            dp.rename(old_name, new_name) catch return fcbFail(cpu);
+            cpu.st.setReg8(0, 0x00);
+        }
+
+        /// FCB error return: AL=0xFF (dos.cpp:1397). FCB calls signal failure in AL,
+        /// NOT via CF — they never set the carry flag.
+        fn fcbFail(cpu: *Cpu) void {
+            cpu.st.setReg8(0, 0xFF);
         }
 
         fn vfsErrToDos(e: vfs.VfsError) u16 {

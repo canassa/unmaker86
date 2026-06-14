@@ -98,6 +98,15 @@ pub fn Dos(comptime Cpu: type) type {
         search_dir: [64]u8 = @splat(0),
         search_dir_len: u8 = 0,
 
+        // The active FCB find-first/find-next search state (INT 21h AH=11/12).
+        // The FCB find record lives in the DTA (too small for a full path), so the
+        // search drive/pattern/index are kept host-side; one FCB search is active
+        // at a time (the dosbox-x tempdta convention, dos_files.cpp:1898).
+        fcb_search_drive: u8 = 0,
+        fcb_search_pat: [11]u8 = @splat(' '),
+        fcb_search_idx: usize = 0,
+        fcb_search_ext: bool = false,
+
         // ---- Host-side state ----
         sft: Sft = .{},
         dev_table: DeviceTable = .{},
@@ -124,6 +133,10 @@ pub fn Dos(comptime Cpu: type) type {
             self.cwd_len = @splat(0);
             self.search_dir = @splat(0);
             self.search_dir_len = 0;
+            self.fcb_search_drive = 0;
+            self.fcb_search_pat = @splat(' ');
+            self.fcb_search_idx = 0;
+            self.fcb_search_ext = false;
             self.sft.reset();
             self.dev_table.reset();
             self.drives = @splat(null);
