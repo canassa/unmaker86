@@ -1,0 +1,6 @@
+exit_code: 0
+--- output ---
+status[0]=FF
+status[1]=FF
+status[2]=FF
+chars: 80 81 82

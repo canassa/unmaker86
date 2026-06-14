@@ -58,6 +58,13 @@ const PASSING = [_]Program{
     .{ .exe = "FARHEAP.EXE" },
     .{ .exe = "DOSERR.EXE" },
     .{ .exe = "VECTORS.EXE" },
+    // Console/stdin INPUT band (scripted stdin via "<STEM>.in"): AH=0A buffered
+    // line, AH=01/08 char read+echo, AH=0B status + AH=0C flush/read, CRT
+    // scanf/fgets (AH=3F on handle 0). Goldens minted with dosbox-x `< IN.TXT`.
+    .{ .exe = "READLINE.EXE" },
+    .{ .exe = "GETCH.EXE" },
+    .{ .exe = "STDSTAT.EXE" },
+    .{ .exe = "CSCANF.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented
@@ -105,6 +112,17 @@ fn runOnZdos(alloc: std.mem.Allocator, dir: std.Io.Dir, io: std.Io, exe: []const
     m.dos.current_drive = 2;
 
     try m.bootProgram(2, exe, args);
+
+    // Console-INPUT programs carry a "<STEM>.in" sidecar holding the EXACT bytes
+    // dosbox-x fed to handle 0 via `prog < IN.TXT`. Preload them as the machine's
+    // scripted stdin so the run is apples-to-apples with the golden. `loadInput`
+    // marks the CON seam as REDIRECTED (status always ready, no AH=0C flush —
+    // matching a dosbox-x redirected LocalFile).
+    if (try readSidecar(alloc, dir, io, exe, ".in")) |in_bytes| {
+        defer alloc.free(in_bytes);
+        m.dos.dev_table.con.loadInput(in_bytes);
+    }
+
     _ = m.runUntil(struct {
         fn done(mm: *Machine) bool {
             return mm.cpu.st.halted or mm.dos.terminated;
@@ -117,11 +135,19 @@ fn runOnZdos(alloc: std.mem.Allocator, dir: std.Io.Dir, io: std.Io, exe: []const
 
 /// Read a corpus golden file from the examples dir.
 fn readGolden(alloc: std.mem.Allocator, dir: std.Io.Dir, io: std.Io, exe: []const u8) ![]u8 {
-    // "FOO.EXE" -> "FOO.expected"
+    return (try readSidecar(alloc, dir, io, exe, ".expected")) orelse error.FileNotFound;
+}
+
+/// Read a "<STEM><ext>" sidecar next to the EXE (e.g. ".expected", ".in").
+/// Returns null if the file does not exist; caller frees the returned bytes.
+fn readSidecar(alloc: std.mem.Allocator, dir: std.Io.Dir, io: std.Io, exe: []const u8, ext: []const u8) !?[]u8 {
     const dot = std.mem.lastIndexOfScalar(u8, exe, '.').?;
     var name_buf: [64]u8 = undefined;
-    const name = try std.fmt.bufPrint(&name_buf, "{s}.expected", .{exe[0..dot]});
-    var f = try dir.openFile(io, name, .{});
+    const name = try std.fmt.bufPrint(&name_buf, "{s}{s}", .{ exe[0..dot], ext });
+    var f = dir.openFile(io, name, .{}) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        else => return e,
+    };
     defer f.close(io);
     var rbuf: [64]u8 = undefined;
     var reader = f.reader(io, &rbuf);

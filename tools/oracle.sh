@@ -50,6 +50,24 @@ LOG="$(mktemp)"
 ARGS=""
 [ -f "$WORK/$STEM.args" ] && ARGS="$(tr -d '\r\n' < "$WORK/$STEM.args")"
 
+# A console-INPUT corpus program reads from stdin (DOS handle 0). Its golden
+# depends on EXACTLY which bytes the keyboard/stdin produces, so those bytes are
+# committed in a sidecar "<STEM>.in" next to the EXE. When present, the oracle
+# runs the program under dosbox-x with stdin REDIRECTED from that file
+# (`PROG.EXE < IN.TXT > OUT.TXT`): DOS handle 0 then reads the file's bytes
+# verbatim (a redirected localFile, GetInformation()==0 => never reports
+# not-ready/EOF via bit 6 — see drive_local.cpp LocalFile::GetInformation). The
+# zdos harness preloads the IDENTICAL bytes as the machine's scripted stdin, so
+# the run is apples-to-apples. We copy the sidecar to IN.TXT on the mounted C:
+# (8.3 name) so the dosbox-x shell can open it for redirection.
+REDIR_IN=""
+IN_TXT="$WORK/IN.TXT"
+rm -f "$IN_TXT"
+if [ -f "$WORK/$STEM.in" ]; then
+    cp "$WORK/$STEM.in" "$IN_TXT"
+    REDIR_IN="< IN.TXT"
+fi
+
 rm -f "$OUT" "$CODE"
 
 # Build the ERRORLEVEL probe ladder. `if errorlevel N` is true iff code >= N.
@@ -84,7 +102,7 @@ done
       -set "parallel1=disabled" \
       -c "mount c $WORK" \
       -c "c:" \
-      -c "$NAME $ARGS > OUT.TXT" \
+      -c "$NAME $ARGS $REDIR_IN > OUT.TXT" \
       "${PROBE_CMDS[@]}" \
       -c "exit" > "$LOG" 2>&1 || true
 )
@@ -115,6 +133,6 @@ fi
     sed 's/\x1a$//' "$OUT"
 } > "$EXPECTED"
 
-rm -f "$OUT" "$CODE"
+rm -f "$OUT" "$CODE" "$IN_TXT"
 
 echo "minted golden: $EXPECTED  (exit_code=$RET, $(wc -c < "$EXPECTED") bytes)"

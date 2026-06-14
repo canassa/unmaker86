@@ -49,14 +49,15 @@ pub fn Int21(comptime Cpu: type) type {
                 0x06 => { // direct console I/O (DL=0xFF -> input, else output)
                     const dl = cpu.st.getReg8(2);
                     if (dl == 0xFF) {
-                        var b: [1]u8 = undefined;
-                        const n = dos.dev_table.con.read(&b);
-                        if (n == 1) {
-                            cpu.st.setReg8(0, b[0]);
-                            br.setGuestZF(false);
-                        } else {
+                        // dos.cpp:516 — if STDIN not ready: AL=0, ZF=1, done.
+                        if (!dos.dev_table.con.stdinReady()) {
                             cpu.st.setReg8(0, 0);
                             br.setGuestZF(true);
+                        } else {
+                            var b: [1]u8 = undefined;
+                            const n = dos.dev_table.con.read(&b);
+                            cpu.st.setReg8(0, if (n == 1) b[0] else 0);
+                            br.setGuestZF(false);
                         }
                     } else {
                         dos.dev_table.con.writeByte(dl);
@@ -75,6 +76,11 @@ pub fn Int21(comptime Cpu: type) type {
                     cpu.st.setReg8(0, c);
                     dos.dev_table.con.writeByte(c);
                 },
+                0x0A => bufferedInput(dos, cpu, br),
+                0x0B => { // get STDIN status -> AL = 0xFF ready / 0x00 not ready
+                    cpu.st.setReg8(0, if (dos.dev_table.con.stdinReady()) 0xFF else 0x00);
+                },
+                0x0C => flushAndRead(dos, cpu, br),
 
                 // ---- DTA + date/time ----
                 0x1A => { // set DTA = DS:DX
@@ -187,6 +193,71 @@ pub fn Int21(comptime Cpu: type) type {
                 off +%= 1;
             }
             cpu.st.setReg8(0, '$'); // AL = last char (DOS quirk)
+        }
+
+        /// AH=0A Buffered Input (dos.cpp:1247). DS:DX -> {max-len, count, chars...}.
+        /// Read STDIN until CR (13), echoing to STDOUT; skip LF (10); handle
+        /// backspace (8) non-destructively; bell (7) when the buffer is full and
+        /// the byte is not CR. The CR is echoed AND stored, then `count` (byte 1)
+        /// is set to the number of chars BEFORE the CR. `free` (max-len) of 0 is a
+        /// no-op. On redirected EOF dosbox-x E_Exits (crash) — we instead stop
+        /// deterministically (programs in this band are scripted to end with CR
+        /// before EOF, so this path is not exercised by the corpus).
+        fn bufferedInput(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            _ = br;
+            const con = &dos.dev_table.con;
+            const seg = cpu.st.selector[@intFromEnum(Seg.ds)];
+            const data = (@as(u32, seg) << 4) + cpu.st.getReg16(EDX);
+            var free = cpu.bus.readPhys8(data);
+            if (free == 0) return;
+            free -= 1;
+            var read: u8 = 0;
+            while (true) {
+                var b: [1]u8 = undefined;
+                if (con.read(&b) == 0) break; // EOF (dosbox E_Exits; we stop)
+                const c = b[0];
+                if (c == 10) continue; // LF: ignored
+                if (c == 8) { // backspace: non-destructive erase if anything stored
+                    if (read > 0) {
+                        con.writeByte(8);
+                        con.writeByte(' ');
+                        con.writeByte(8);
+                        read -= 1;
+                    }
+                    continue;
+                }
+                if (read == free and c != 13) { // buffer full, not CR: bell
+                    con.writeByte(7);
+                    continue;
+                }
+                con.writeByte(c);
+                cpu.bus.writePhys8(data + 2 + read, c);
+                if (c == 13) break;
+                read += 1;
+            }
+            cpu.bus.writePhys8(data + 1, read);
+        }
+
+        /// AH=0C Flush Buffer and read STDIN (dos.cpp:1350). Flush pending STDIN
+        /// ONLY if handle 0 is the CON device (an interactive console); a
+        /// redirected stdin (LocalFile) is not named CON, so no flush. Then, if AL
+        /// is one of {01,06,07,08,0A}, re-dispatch INT 21h with AH=AL; otherwise
+        /// AL=0. (We model handle 0 as the CON device in either mode; `isFlushable`
+        /// captures the redirected vs interactive distinction.)
+        fn flushAndRead(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            const con = &dos.dev_table.con;
+            if (con.isFlushable()) {
+                var b: [1]u8 = undefined;
+                while (con.stdinReady() and con.read(&b) != 0) {}
+            }
+            const al = cpu.st.getReg8(0);
+            switch (al) {
+                0x01, 0x06, 0x07, 0x08, 0x0A => {
+                    cpu.st.setReg8(4, al); // AH = AL
+                    service(dos, cpu, br); // re-dispatch
+                },
+                else => cpu.st.setReg8(0, 0),
+            }
         }
 
         // ===================================================================

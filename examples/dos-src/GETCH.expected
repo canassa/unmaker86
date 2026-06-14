@@ -1,0 +1,6 @@
+exit_code: 0
+--- output ---
+xyno-echo: 97 98 99
+count=3
+echo:
+done

@@ -23,10 +23,17 @@ pub const CharDevice = struct {
     out_len: usize = 0,
 
     /// Scripted CON input (keyboard seam) — deterministic external input. Tests
-    /// preload this; reads consume from `in_pos`.
+    /// preload this; reads consume from `in_pos`. When `redirected` is set, this
+    /// CON's STDIN seam models a REDIRECTED stdin (DOS `prog < file`): in dosbox-x
+    /// the handle-0 object is then a `LocalFile`, not the CON device, so
+    /// `LocalFile::GetInformation()==0` (drive_local.cpp) — bit 6 (EOF/not-ready)
+    /// is NEVER set, hence AH=0B STDIN-status is always "ready" (0xFF) and AH=0C
+    /// does NOT flush (its flush is gated on the handle being named "CON").
+    /// zdos preloads `.in` bytes via `loadInput`, which sets `redirected=true`.
     in_buf: [256]u8 = @splat(0),
     in_len: usize = 0,
     in_pos: usize = 0,
+    redirected: bool = false,
 
     pub fn init(id: DeviceId, name: []const u8) CharDevice {
         var d: CharDevice = .{ .id = id, .name = @splat(' ') };
@@ -38,6 +45,16 @@ pub const CharDevice = struct {
     /// The device-info word (AH=44 AL=00): bit 7 set (it IS a device). CON sets
     /// the stdin/stdout bits (bit 0/1) and the "special CON" bit (bit 4).
     pub fn infoWord(self: *const CharDevice) u16 {
+        // Under REDIRECTION (the oracle mints with `prog < IN.TXT > OUT.TXT`),
+        // dosbox-x backs handles 0/1/2 with LocalFiles, whose GetInformation()==0
+        // (drive_local.cpp: bit 7 CLEAR = NOT a device, drive bits = 0). The
+        // Borland CRT then treats stdout as a file -> FULLY buffered (flushed at
+        // exit), so direct INT-21h console writes (AH=01/02/06/0A echo) appear
+        // BEFORE the at-exit printf flush. zdos must report the SAME "this is a
+        // redirected file" so the CRT buffers identically and the byte ORDER
+        // matches the golden. (Without this, CON reports a device -> line-buffered
+        // -> interleaved order diverges; see GETCH.)
+        if (self.id == .con and self.redirected) return 0x0000;
         return switch (self.id) {
             .con => 0x80D3, // device + stdin + stdout + special + EOF-on-input bits
             .aux => 0x80C0,
@@ -94,6 +111,29 @@ pub const CharDevice = struct {
         @memcpy(self.in_buf[0..n], bytes[0..n]);
         self.in_len = n;
         self.in_pos = 0;
+        self.redirected = true;
+    }
+
+    /// True if more scripted input remains (not yet at EOF).
+    pub fn hasInput(self: *const CharDevice) bool {
+        return self.in_pos < self.in_len;
+    }
+
+    /// DOS STDIN status (AH=0B / GetSTDINStatus): "is a key/byte ready?".
+    /// Under REDIRECTED stdin, dosbox-x's handle-0 is a LocalFile whose
+    /// GetInformation()==0, so bit 6 is never set and status is ALWAYS ready —
+    /// even past EOF (a redirected status poll keeps returning 0xFF; the program
+    /// then learns EOF only from a 0-byte read). Without redirection (interactive
+    /// CON, no scripted input) we report not-ready (no keystrokes pending).
+    pub fn stdinReady(self: *const CharDevice) bool {
+        if (self.redirected) return true;
+        return self.in_pos < self.in_len;
+    }
+
+    /// AH=0C flush-buffer gate: dosbox-x flushes STDIN only when the handle is
+    /// named "CON". A redirected stdin (LocalFile) is NOT named CON, so no flush.
+    pub fn isFlushable(self: *const CharDevice) bool {
+        return self.id == .con and !self.redirected;
     }
 };
 

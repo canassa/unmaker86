@@ -1,0 +1,5 @@
+exit_code: 0
+--- output ---
+hello world
+count=11
+line=[hello world]

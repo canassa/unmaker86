@@ -22,5 +22,6 @@ examples/dos-src/*.OBJ
 examples/dos-src/BUILD.LOG
 examples/dos-src/OUT.TXT
 examples/dos-src/CODE.TXT
+examples/dos-src/IN.TXT
 examples/dos-src/SCRATCH.DAT
 examples/dos-src/LV.TXT
