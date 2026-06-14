@@ -60,5 +60,10 @@ int main(void)
     rc = _dos_getftime(handle, &gotdate, &gottime);
     printf("getftime(closed) rc=%d errno=%d\n", rc != 0, errno);
 
+    /* Self-clean: remove the scratch file so the corpus dir is byte-identical
+     * before and after the run (other find-first/dir-listing goldens depend on
+     * the committed directory state being unchanged). */
+    remove("FDATE.DAT");
+
     return 0;
 }
