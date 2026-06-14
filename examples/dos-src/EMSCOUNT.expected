@@ -1,5 +1,5 @@
 exit_code: 0
 --- output ---
-base=0001 after=0003
+base=0000 after=0002
 h1pages=0003 h2pages=0005
-entries=0003 sumpages=0020
+entries=0002 sumpages=0008

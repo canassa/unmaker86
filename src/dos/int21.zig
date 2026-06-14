@@ -170,11 +170,39 @@ pub fn Int21(comptime Cpu: type) type {
         /// INT 2Fh multiplex (D18): default faithful "not installed". A program
         /// that probes (AX=xx00 -> AL=0 means "ok to install / not present") gets
         /// AL=0; we flag unhandled probes structurally without faking "installed".
+        ///
+        /// The XMS install-check pair (AX=4300 / AX=4310) is handled EXPLICITLY:
+        /// zdos defers XMS (extended memory) entirely — BaK and our target class
+        /// are plain real-mode with EMS via INT 67h, no XMS/DPMI/extender (see
+        /// plans/dos-coverage-gaps.md §4). The FAITHFUL answer is therefore "no
+        /// XMS driver resident", NOT a fake "installed". This mirrors dosbox-x
+        /// with `xms=false`: its XMS multiplex handler (xms.cpp multiplex_xms,
+        /// registered only when the `xms` config bool is true) is then absent, so
+        /// AX=4300/4310 fall through INT2F_Handler (dos_misc.cpp:96) which logs
+        /// "Unhandled" and returns WITHOUT touching registers — leaving AL = the
+        /// low byte the caller loaded (0x00 for AX=4300), i.e. AL != 0x80 = "not
+        /// installed". An XMS-aware program checks AL==0x80 and only issues
+        /// AX=4310 (get entry point) when it is; on "not installed" it falls back
+        /// to EMS/conventional memory and never calls 4310.
         pub fn handle2f(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
-            // AL=0 (not installed / available) is the faithful default.
-            cpu.st.setReg8(0, 0);
             _ = br;
             _ = dos;
+            const ax = cpu.st.getReg16(EAX);
+            switch (ax) {
+                // XMS install check: AL != 0x80 => no XMS driver. dosbox-x with
+                // xms=false leaves registers untouched (AL stays 0x00). We set AL
+                // explicitly to make the "not installed" contract unmistakable;
+                // we do NOT touch ES:BX (no entry point to advertise).
+                0x4300 => cpu.st.setReg8(0, 0x00),
+                // XMS get entry point: a correct program never reaches here after
+                // a "not installed" 4300. Stay faithful to dosbox-x (xms=false):
+                // leave ALL registers unchanged — do not synthesize a bogus
+                // seg:offset that would point at a non-existent XMS driver.
+                0x4310 => {},
+                // All other multiplex calls: AL=0 ("not installed / available to
+                // install") is the faithful default for an unclaimed AX.
+                else => cpu.st.setReg8(0, 0),
+            }
         }
 
         // ===================================================================

@@ -58,6 +58,12 @@ const PASSING = [_]Program{
     .{ .exe = "FARHEAP.EXE" },
     .{ .exe = "DOSERR.EXE" },
     .{ .exe = "VECTORS.EXE" },
+    // XMS install-probe band (band 8): the canonical XMS install-check handshake
+    // via INT 2Fh AX=4300. zdos defers XMS, so the faithful answer is "not
+    // installed" (AL != 0x80); the program then falls back to EMS. The golden was
+    // minted with the oracle pinned to xms=false (see tools/oracle.sh), matching
+    // zdos's deferred-XMS scope.
+    .{ .exe = "XMSPROBE.EXE" },
     // Child-process EXEC band: SPAWN.EXE launches CHILD.EXE via INT 21h AH=4B
     // AL=00 (load-and-execute, P_WAIT), captures its return code, and resumes —
     // the full EXEC / DOS_Terminate unwind. The golden interleaves parent+child

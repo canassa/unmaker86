@@ -3,4 +3,4 @@ exit_code: 0
 version=40
 status=00
 frame=E000
-free=03A4 total=03A4
+free=03BC total=03BC

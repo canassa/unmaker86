@@ -20,23 +20,32 @@ pub const FRAME_LEN: u32 = FRAME_PAGES * PAGE_SIZE; // 64 KiB
 
 pub const EMS_HANDLES: u8 = 64; // provisional / comptime-asserted cap
 
-/// Reported total/free EMS pages — MATCHED to the dosbox-x oracle, which reports
-/// BX=free=DX=total=0x03A4 (932 pages, ~14.5 MiB) on a default-memsize machine
-/// (`get_total_pages()` = MEM_TotalPages()/4, `get_free_pages()` = MEM_FreeTotal()/4,
-/// ems.cpp:93/98). dosbox-x's free count does NOT subtract the OS/system handle's
-/// pages from this report, so we mirror that: REPORTED_PAGES is the floor, and
-/// AH=42 free = REPORTED_PAGES - (user-allocated pages). The system handle (h0)
-/// lives in the backing store but is excluded from the reported free accounting.
-pub const REPORTED_PAGES: u16 = 0x03A4;
+/// Reported total/free EMS pages — MATCHED to the dosbox-x oracle, pinned to
+/// EMS *board mode* (the canonical reference config, see below).
+///
+/// EMS BOARD MODE — why 0x3BC and no system handle:
+///   The canonical oracle (tools/oracle.sh) pins `xms=false` to match zdos's
+///   deferred-XMS scope (band 8). dosbox-x, when XMS is disabled and ems=true,
+///   DOWNGRADES the default EMS_MIXED mode to EMS_BOARD (ems.cpp:1845-1849:
+///   "EMS changed to board mode ... because XMS is not enabled"). Board mode is
+///   a pure hardware-EMS-board model: NO VCPI, NO EMM386/V86, and — critically —
+///   it does NOT allocate the OS-dedicated system handle (the system-handle
+///   alloc lives only in the non-board `else` branch, ems.cpp:1949-1950). This
+///   is EXACTLY zdos's BaK-target model ("EMS via a host INT 67h handler, no
+///   EMM386/V86" — CLAUDE.md), so board mode is the faithful match, not a
+///   compromise.
+///
+///   Consequences vs the old xms=true (EMS_MIXED) goldens:
+///     - No 24-page system handle (handle 0). Active handle count starts at 0
+///       (EMSCOUNT base=0000), and the AH=4D array omits it (sumpages drops 24).
+///     - Those 24 pages return to the pool: reported total/free rises
+///       0x03A4 -> 0x03BC (EMSINFO free=total=03BC). 0x3BC - 0x3A4 = 24.
+///   AH=42 free = REPORTED_PAGES - (user-allocated pages).
+pub const REPORTED_PAGES: u16 = 0x03BC;
 
-/// dosbox-x allocates an OS-dedicated system handle (handle 0) of 24 pages at
-/// EMS init (`EMM_AllocateSystemHandle(24)`, ems.cpp:1481). It is NEVER freed and
-/// shows up in the AH=4B handle count and the AH=4D all-handles array.
-pub const SYSTEM_HANDLE_PAGES: u16 = 24;
-
-/// Physical backing store, in 16 KiB pages. Sized to hold the system handle plus
-/// a generous margin of user pages (the reported total 0x3A4 is virtual; only
-/// pages a program actually maps need real backing). 128 pages = 2 MiB.
+/// Physical backing store, in 16 KiB pages. Sized for a generous margin of user
+/// pages (the reported total 0x3BC is virtual; only pages a program actually
+/// maps need real backing). 128 pages = 2 MiB.
 pub const BACKING_PAGES: u16 = 128;
 
 pub const EMM_VERSION: u8 = 0x40; // LIM EMS 4.0 (dosbox-x AH=46 returns AL=0x40)
@@ -65,8 +74,9 @@ pub fn Ems(comptime Cpu: type) type {
         frame_map: [FRAME_PAGES]?u16 = @splat(null),
         /// Next free logical page (simple bump allocator over the backing store).
         next_page: u16 = 0,
-        /// Pages allocated to USER handles (excludes the system handle), used for
-        /// the AH=42 free-page report so it matches dosbox-x's accounting.
+        /// Pages allocated to user handles, used for the AH=42 free-page report
+        /// so it matches dosbox-x's accounting (board mode: all handles are user
+        /// handles).
         user_pages: u16 = 0,
         installed: bool = false,
 
@@ -77,15 +87,10 @@ pub fn Ems(comptime Cpu: type) type {
             self.frame_map = @splat(null);
             self.next_page = 0;
             self.user_pages = 0;
-            // dosbox-x allocates the OS system handle (handle 0, 24 pages) at EMS
-            // init (ems.cpp:1481). It is never freed; it occupies the backing
-            // store but does NOT count against the reported free pages.
-            self.handles[0] = .{
-                .active = true,
-                .pages = SYSTEM_HANDLE_PAGES,
-                .base_page = 0,
-            };
-            self.next_page = SYSTEM_HANDLE_PAGES;
+            // EMS BOARD MODE (canonical oracle pins xms=false -> dosbox-x EMS
+            // board mode, ems.cpp:1845): NO OS system handle is allocated. All
+            // handles 0..N are user handles, the bump allocator starts at page 0,
+            // and the active handle count starts at 0. See REPORTED_PAGES above.
         }
 
         /// The MMIO MemHandler the machine registers at the page-frame window.
@@ -194,9 +199,9 @@ pub fn Ems(comptime Cpu: type) type {
                 cpu.st.setReg8(4, 0x88); // backing exhausted
                 return;
             }
-            // User handles start at index 1 (handle 0 = OS system handle,
-            // ems.cpp:273).
-            var h: u8 = 1;
+            // Board mode: no reserved system handle, so user handles start at
+            // index 0 (dosbox-x board mode assigns from handle 0 up).
+            var h: u8 = 0;
             while (h < EMS_HANDLES) : (h += 1) {
                 if (!self.handles[h].active) {
                     self.handles[h] = .{ .active = true, .pages = want, .base_page = self.next_page };
@@ -240,8 +245,9 @@ pub fn Ems(comptime Cpu: type) type {
         fn freeHandle(self: *Self, cpu: *Cpu) void {
             const Reg32 = @import("cpu").state.Reg32;
             const handle = cpu.st.getReg16(@intFromEnum(Reg32.edx));
-            if (handle == 0 or handle >= EMS_HANDLES or !self.handles[handle].active) {
-                // Handle 0 (system) is never deallocated (ems.cpp:438-439).
+            if (handle >= EMS_HANDLES or !self.handles[handle].active) {
+                // Board mode: no reserved system handle — handle 0 is a normal
+                // user handle and may be freed like any other.
                 cpu.st.setReg8(4, 0x83);
                 return;
             }
@@ -298,8 +304,8 @@ pub fn Ems(comptime Cpu: type) type {
         }
 
         // -------------------------------------------------------------------
-        // AH=4B — get active handle count (ems.cpp:813). Counts every active
-        // handle INCLUDING the OS system handle 0.
+        // AH=4B — get active handle count (ems.cpp:813). Board mode: counts the
+        // active user handles only (no OS system handle exists).
         // -------------------------------------------------------------------
         fn getHandleCount(self: *Self, cpu: *Cpu) void {
             const Reg32 = @import("cpu").state.Reg32;
@@ -324,7 +330,8 @@ pub fn Ems(comptime Cpu: type) type {
         }
 
         // AH=4D — pages for all handles -> ES:DI array of {handle:u16, pages:u16},
-        // BX = entry count (ems.cpp:823/493). Walks ALL handles incl. system 0.
+        // BX = entry count (ems.cpp:823/493). Board mode: walks the active user
+        // handles only (no system handle exists).
         fn getPagesAllHandles(self: *Self, dos: *Dos, cpu: *Cpu, br: *Bridge) void {
             _ = dos;
             _ = br;

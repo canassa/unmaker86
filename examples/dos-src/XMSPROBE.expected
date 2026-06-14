@@ -1,0 +1,6 @@
+exit_code: 0
+--- output ---
+XMS install check: AL=00
+XMS not installed
+fallback: EMS available
+done

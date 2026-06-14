@@ -27,6 +27,31 @@
 # list mirror tools/bcc.sh (the proven c-recon recipe): no display, no audio,
 # runs the autoexec and exits. The program's directory mounts as C:.
 #
+# CANONICAL ORACLE SCOPE — xms / ems pinning (determinism vs zdos's scope):
+#   xms=false  — PINNED. dosbox-x defaults xms=true (dosbox.cpp:4619), which
+#     installs the XMS multiplex handler so INT 2Fh AX=4300 returns AL=0x80
+#     ("XMS present"). zdos DEFERS XMS entirely (plans/dos-coverage-gaps.md §4:
+#     our target class is plain real-mode + EMS, no XMS/DPMI/extender), so the
+#     faithful answer is "not installed" (AL!=0x80). Pinning xms=false makes the
+#     reference oracle match zdos's deferred-XMS scope: with it off, dosbox-x's
+#     multiplex_xms is never registered (xms.cpp:771) and AX=4300/4310 fall
+#     through INT2F_Handler untouched (AL=0x00) — exactly zdos's answer.
+#   ems  — NOT pinned (left at dosbox-x's default "true", dosbox.cpp:4829). zdos
+#     IMPLEMENTS EMS (INT 67h AH=40-48, ems.zig). NOTE: turning xms OFF has a
+#     deliberate side effect on EMS — with xms=false and ems=true, dosbox-x
+#     DOWNGRADES its EMS from "mixed" mode to BOARD mode (ems.cpp:1845: "EMS
+#     changed to board mode ... because XMS is not enabled"). Board mode is a
+#     pure hardware-EMS-board model with NO VCPI and NO OS system handle — which
+#     is EXACTLY zdos's BaK-target scope ("EMS via a host INT 67h handler, no
+#     EMM386/V86", CLAUDE.md). So board mode is the CORRECT canonical reference,
+#     not a regression. Consequence on the re-minted goldens:
+#       EMSINFO  free=total 03A4 -> 03BC  (+24 pages freed by dropping the
+#                                          system handle)
+#       EMSCOUNT base 0001->0000, sumpages 0020->0008 (no system handle counted)
+#     EMSMAP/EMSSAVE/MEMALLOC/FARHEAP are UNCHANGED (they don't depend on the
+#     system handle or the EMS total). zdos's ems.zig is matched to board mode
+#     (REPORTED_PAGES=0x3BC, no system handle) so it reproduces these goldens.
+#
 # Disk-fill hazard: a runaway program could fill the host disk via the redirect.
 # We bound it with `ulimit -f` (max file size, 512-byte blocks) and `timeout`.
 set -e
@@ -91,6 +116,7 @@ done
       -set "core=dynamic_x86" \
       -set "cycles=max" \
       -set "cputype=pentium_mmx" \
+      -set "xms=false" \
       -set "pcspeaker=false" \
       -set "voodoo=false" \
       -set "scaler=none" \
