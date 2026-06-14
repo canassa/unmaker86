@@ -1,0 +1,5 @@
+exit_code: 0
+--- output ---
+before: C3 C4 C5 C6
+after: 5A 5B 5C 5D
+mapsize=10

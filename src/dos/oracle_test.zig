@@ -50,6 +50,10 @@ const PASSING = [_]Program{
     .{ .exe = "COUNTRY.EXE" },
     .{ .exe = "DIRLIST.EXE" },
     .{ .exe = "DISKFREE.EXE" },
+    .{ .exe = "EMSINFO.EXE" },
+    .{ .exe = "EMSMAP.EXE" },
+    .{ .exe = "EMSCOUNT.EXE" },
+    .{ .exe = "EMSSAVE.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented

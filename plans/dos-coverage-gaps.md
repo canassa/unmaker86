@@ -192,19 +192,19 @@ notable gap (§4).
 
 | AH | Description | `ems.cpp` | Status |
 |----|-------------|-----------|--------|
-| 40 | Get status | 782 | **PLAN** (ems.zig, Phase 7) |
-| 41 | Get page-frame segment | 785 | **PLAN** |
-| 42 | Get number of pages (total/free) | 789 | **PLAN** |
-| 43 | Allocate handle + pages | 794 | **PLAN** |
-| 44 | Map expanded page | 797 | **PLAN** |
-| 45 | Release handle + free pages | 800 | **PLAN** |
-| 46 | Get EMM version | 803 | **PLAN** |
-| 47 | Save page map | 807 | **PLAN** |
-| 48 | Restore page map | 810 | **PLAN** |
-| 4B | Get handle count | 813 | **GAP** (LIM 3.2 — Tier 2) |
-| 4C | Get pages for one handle | 818 | **GAP** (Tier 2) |
-| 4D | Get pages for all handles | 823 | **GAP** (Tier 2) |
-| 4E | Save/restore page map (00/01/02/03) | 826 | **GAP** (Tier 2 — context switch) |
+| 40 | Get status | 782 | **IMPL** (ems.zig; oracle band EMSINFO) |
+| 41 | Get page-frame segment | 785 | **IMPL** (ems.zig FRAME_SEG=0xE000; EMSINFO) |
+| 42 | Get number of pages (total/free) | 789 | **IMPL** (ems.zig; total/free=0x3A4 per dosbox-x; EMSINFO) |
+| 43 | Allocate handle + pages | 794 | **IMPL** (ems.zig `allocHandle`; EMSMAP/EMSCOUNT) |
+| 44 | Map expanded page | 797 | **IMPL** (ems.zig `mapPage`; EMSMAP) |
+| 45 | Release handle + free pages | 800 | **IMPL** (ems.zig `freeHandle`; EMSMAP) |
+| 46 | Get EMM version | 803 | **IMPL** (ems.zig; AL=0x40 = LIM 4.0 per dosbox-x; EMSINFO) |
+| 47 | Save page map | 807 | **IMPL** (ems.zig `savePageMap`, per-handle) |
+| 48 | Restore page map | 810 | **IMPL** (ems.zig `restorePageMap`, per-handle) |
+| 4B | Get handle count | 813 | **IMPL** (ems.zig `getHandleCount`; oracle band EMSCOUNT) |
+| 4C | Get pages for one handle | 818 | **IMPL** (ems.zig `getPagesForHandle`; EMSCOUNT) |
+| 4D | Get pages for all handles | 823 | **IMPL** (ems.zig `getPagesAllHandles`; EMSCOUNT) |
+| 4E | Save/restore page map (00/01/02/03) | 826 | **IMPL** (ems.zig `savRestPageMap`; oracle band EMSSAVE) |
 | 4F | Save/restore partial page map | 851 | **GAP** (Tier 3) |
 | 50 | Map/unmap multiple pages (LIM 4.0) | 854 | **GAP** (Tier 2 — LIM 4.0 programs) |
 | 51 | Reallocate pages | 881 | **GAP** (Tier 2) |

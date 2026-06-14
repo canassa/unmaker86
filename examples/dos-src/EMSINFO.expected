@@ -1,0 +1,6 @@
+exit_code: 0
+--- output ---
+version=40
+status=00
+frame=E000
+free=03A4 total=03A4

@@ -198,3 +198,72 @@ PASSING (permanent regressions): all five corpus programs.
 This worklist is empirical: it is exactly what real compiler-built programs need
 that zdos lacks, surfaced by an external oracle rather than by self-authored
 fixtures.
+
+---
+
+## EMS band (LIM Expanded Memory, INT 67h) — all PASS
+
+Four real BC++ 3.1 programs (direct INT 67h via `int86`/`int86x`, no EMS
+library) added to the corpus, goldens minted from dosbox-x:
+
+- **EMSINFO** — presence probe (open `EMMXXXX0` via AH=3D + IOCTL device-bit
+  check) then AH=46 version / AH=40 status / AH=41 page-frame seg / AH=42 page
+  count. Golden: `version=40 status=00 frame=E000 free=03A4 total=03A4`.
+- **EMSMAP** — the core correctness proof: alloc 4 pages (AH=43), map logical
+  page 0 → slot 0, write pattern A; map page 1, write pattern B; map page 0
+  back and read pattern A again, then page 1 back. Proves logical pages persist
+  across remap. Free (AH=45). Golden read-backs `11..18` / `A0..A7`.
+- **EMSCOUNT** — AH=4B handle count / AH=4C pages-per-handle / AH=4D
+  all-handles array. Allocates two handles (3 + 5 pages). Golden:
+  `base=0001 after=0003`, `h1pages=0003 h2pages=0005`,
+  `entries=0003 sumpages=0020`.
+- **EMSSAVE** — AH=4E save/restore page map (AL=03 size, AL=00 save, AL=01
+  restore). Maps page 0, saves, remaps to page 1, restores, reads page 0 back.
+  Golden: `before: C3 C4 C5 C6`, `after: 5A 5B 5C 5D`, `mapsize=10`. Minted
+  TWICE — byte-identical, golden is stable/deterministic.
+
+### zdos EMS fixes to match the dosbox-x oracle (all cited to `ems.cpp`)
+
+1. **AH=46 version 0x32 → 0x40.** dosbox-x reports LIM EMS **4.0**
+   (`EMM_VERSION 0x40`, ems.cpp:32/805). zdos returned 0x32 (3.2). Fixed.
+2. **AH=42 page count 64 → 0x03A4.** dosbox-x reports free=total=0x03A4 on a
+   default-memsize machine (`get_total_pages`/`get_free_pages`, ems.cpp:93/98).
+   zdos now reports `REPORTED_PAGES=0x03A4` total, free = total − user-allocated
+   pages. (dosbox-x's free does NOT subtract the OS system handle; mirrored.)
+3. **OS system handle (handle 0, 24 pages) created at EMS init**
+   (`EMM_AllocateSystemHandle(24)`, ems.cpp:1481). Never freed (ems.cpp:438).
+   This makes AH=4B base count = 1 and the AH=4D array carry handle 0 with 24
+   pages (24+3+5 = 0x20 sum). User handles now start at index 1 (ems.cpp:273).
+4. **AH=4B/4C/4D implemented** (ems.cpp:813/818/823/493): handle count over all
+   active handles; pages for one handle; the {handle:u16,pages:u16} array to
+   ES:DI with BX = entry count.
+5. **AH=4E implemented** (ems.cpp:826): AL=03 array-size (16 bytes = 4 phys ×
+   {handle,page}), AL=00 save to ES:DI, AL=01 restore from DS:SI, AL=02
+   save+restore. Frame map serialized as {handle,page} per slot (NULL=0xFFFF).
+6. **AH=47/48 now real per-handle save/restore** (were no-op accepts):
+   ems.cpp:448/477, with EMM_PAGE_MAP_SAVED (0x8D) / EMM_NO_SAVED (0x8E) errors.
+7. **AH=43 zero-page rejection (0x89)** + free-count check vs REPORTED_PAGES;
+   **AH=45 refuses handle 0** (ems.cpp:266/438).
+
+### Page-frame-segment parity
+
+zdos's `FRAME_SEG = 0xE000` already matched dosbox-x's `EMM_PAGEFRAME 0xE000`
+(ems.cpp:26) — EMSINFO's `frame=E000` golden passes with no change.
+
+### Status
+
+Full corpus now **16 programs** (12 prior + 4 EMS), all PASSING in
+`zig build test-oracle` (exit 0). Full `zig build test` green (exit 0).
+No regressions. The EMS MMIO page-frame device (`src/dos/ems.zig`,
+bus-registered in `src/machine/machine.zig`) was the only module touched on the
+EMS side — no `src/bus/` edit was needed (the bus side is an ordinary MMIO
+device whose handler is owned by the EMS manager).
+
+### Next uncovered DOS area
+
+Highest-value remaining gap (per `dos-coverage-gaps.md` Tier 1): **INT 2Fh
+AX=4300/4310 (XMS install-check + entry point)** — XMS itself is a deliberate
+DEFER, but the probe must answer "not installed" (AL≠0x80) cleanly so XMS-aware
+programs fall back to EMS/conventional, rather than hitting the structural
+`unsupported` stop. After that, **AH=34 InDOS / the SDA structure** (Tier 2) and
+**EMS LIM 4.0 AH=50/57** (multi-page map / region move) if a trace needs them.
