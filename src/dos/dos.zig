@@ -82,6 +82,21 @@ pub fn Dos(comptime Cpu: type) type {
         strategy: mcb_mod.Strategy = .first_fit,
         ret_code: u16 = 0, // last AH=4C/00 exit code (for AH=4D)
         ret_type: u8 = 0, // 0=normal exit, 1=Ctrl-C, 2=critical, 3=TSR
+        last_error: u16 = 0, // last DOS error code (for AH=59 extended error)
+        breakcheck: bool = false, // Ctrl-Break extended checking flag (AH=33)
+        sysvars_seg: u16 = 0, // segment of the List-of-Lists / SysVars (AH=52)
+
+        // Per-drive current directory (D8b), DOS-relative to the drive root (no
+        // leading backslash, '\' separators). Empty = the root. A fixed inline
+        // buffer per drive (no heap; deterministic).
+        cwd: [26][64]u8 = @splat(@splat(0)),
+        cwd_len: [26]u8 = @splat(0),
+
+        // The active find-first/find-next search directory (DOS-relative). Only
+        // one DTA search is active at a time by convention; the DTA reserved area
+        // is too small for a full subdir path, so we keep it host-side (D8b).
+        search_dir: [64]u8 = @splat(0),
+        search_dir_len: u8 = 0,
 
         // ---- Host-side state ----
         sft: Sft = .{},
@@ -102,6 +117,13 @@ pub fn Dos(comptime Cpu: type) type {
             self.strategy = .first_fit;
             self.ret_code = 0;
             self.ret_type = 0;
+            self.last_error = 0;
+            self.breakcheck = false;
+            self.sysvars_seg = 0;
+            self.cwd = @splat(@splat(0));
+            self.cwd_len = @splat(0);
+            self.search_dir = @splat(0);
+            self.search_dir_len = 0;
             self.sft.reset();
             self.dev_table.reset();
             self.drives = @splat(null);
@@ -207,6 +229,18 @@ pub fn Dos(comptime Cpu: type) type {
             self.arena_first_mcb = arena_start_seg;
             self.mcb().initArena(arena_paras - 1);
 
+            // The List-of-Lists / SysVars block (AH=52, D20). Placed in the low
+            // DOS data area at a fixed segment; the documented LoL pointer (BX) is
+            // `sysvars_lol_off` into the block, and [block:LoL-2] is the first-MCB
+            // segment — the REAL arena anchor (D9), not a faked pointer.
+            self.sysvars_seg = 0x0070;
+            const lol = Int21.sysvars_lol_off;
+            // Zero the SysVars block region first (deterministic).
+            var z: u16 = 0;
+            while (z < 64) : (z += 1) self.cpu.bus.writePhys8((@as(u32, self.sysvars_seg) << 4) + z, 0);
+            // First-MCB segment anchor at [block:LoL-2].
+            self.cpu.bus.writePhys16((@as(u32, self.sysvars_seg) << 4) + lol - 2, self.arena_first_mcb);
+
             // Standard handles 0-4 -> CON/CON/CON/AUX/PRN (D17).
             self.sft.openDeviceAt(0, &self.dev_table.con, .read_only); // stdin
             self.sft.openDeviceAt(1, &self.dev_table.con, .write_only); // stdout
@@ -246,10 +280,35 @@ pub fn Dos(comptime Cpu: type) type {
 
         /// A faithful DOS error return (rule a): CF=1, AX=error code. Used ONLY
         /// where real DOS itself sets an error (e.g. open a missing file -> AX=2).
+        /// Records the code as `last_error` (the `dos.errorcode` AH=59 returns).
         pub fn dosError(self: *Self, cpu: *Cpu, br: *Bridge, code: u16) void {
-            _ = self;
+            self.last_error = code;
             cpu.st.setReg16(0, code);
             br.setGuestCF(true);
+        }
+
+        /// The per-drive current directory (DOS-relative, no leading '\'). Empty
+        /// = the root. `drive` is 0='A'.
+        pub fn cwdOf(self: *Self, drive: u8) []const u8 {
+            if (drive >= 26) return "";
+            return self.cwd[drive][0..self.cwd_len[drive]];
+        }
+        pub fn setCwd(self: *Self, drive: u8, path: []const u8) bool {
+            if (drive >= 26) return false;
+            if (path.len > self.cwd[drive].len) return false;
+            @memcpy(self.cwd[drive][0..path.len], path);
+            self.cwd_len[drive] = @intCast(path.len);
+            return true;
+        }
+
+        pub fn searchDir(self: *Self) []const u8 {
+            return self.search_dir[0..self.search_dir_len];
+        }
+        pub fn setSearchDir(self: *Self, path: []const u8) bool {
+            if (path.len > self.search_dir.len) return false;
+            @memcpy(self.search_dir[0..path.len], path);
+            self.search_dir_len = @intCast(path.len);
+            return true;
         }
 
         // -------------------------------------------------------------------
@@ -279,5 +338,6 @@ pub fn Dos(comptime Cpu: type) type {
         pub const ERR_NOT_ENOUGH_MEM: u16 = 8;
         pub const ERR_INVALID_FUNC: u16 = 1;
         pub const ERR_NO_MORE_FILES: u16 = 18;
+        pub const ERR_INVALID_DRIVE: u16 = 15;
     };
 }

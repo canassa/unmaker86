@@ -53,9 +53,15 @@ the oracle and the zdos harness pass the IDENTICAL argv.
 |---------------|------------------------------------------------------------------|------------|
 | `HELLO.EXE`   | printf → CON; CRT startup (AH=30/4A memory-sizing)               | **PASS**   |
 | `MALLOC.EXE`  | malloc/free 32 KB in chunks → CRT far heap on AH=48/4A           | **PASS**   |
-| `FILEIO.EXE`  | fopen/fwrite/fseek/fread/fclose → AH=43/3D/40/3E/3C VFS          | **DIVERGE**|
-| `ARGENV.EXE`  | argc/argv (PSP cmdtail) + getenv (PSP environment block)         | **DIVERGE**|
-| `SUBDIR.EXE`  | fopen("SUB\\DATA.TXT") → subdirectory path resolution           | **DIVERGE**|
+| `FILEIO.EXE`  | fopen/fwrite/fseek/fread/fclose → AH=43/3D/40/3E/3C VFS          | **PASS**   |
+| `ARGENV.EXE`  | argc/argv (PSP cmdtail) + getenv (PSP environment block)         | **PASS**   |
+| `SUBDIR.EXE`  | fopen("SUB\\DATA.TXT") → subdirectory path resolution           | **PASS**   |
+
+**SECOND PASS COMPLETE: all five corpus programs now reproduce the dosbox-x
+goldens byte-for-byte (`zig build test-oracle` green; all five in `PASSING`,
+`DIVERGING` empty).** The three fixes (below) are real DOS-semantics
+implementations, not match-forcing tweaks. The remainder of this file is the
+historical worklist that drove the fixes.
 
 All five are real Borland C++ 3.1 `.EXE`s, compiled with `tools/bcc.sh` and
 committed (small) alongside their `.expected` goldens; the 35 MB toolchain stays
@@ -165,7 +171,29 @@ PATH), but argv[0] fidelity matters for any program that prints its own name.
 3. **Environment block: real argv[0] path + a deterministic populated env** —
    argv[0] fidelity + a pinned reproducible env policy.
 
-PASSING (permanent regressions): `HELLO.EXE`, `MALLOC.EXE`.
+## RESOLUTION (second pass — all PASS)
+
+1. **AH=43 AL=00 — FIXED** (`int21.zig fn getSetAttr`). Now resolves the path
+   through the VFS and `stat`s it: returns CF=1/AX=2 when absent, the real
+   attribute bits + CF=0 when present (`dos.cpp:1106`). FILEIO's `fopen("wb")`
+   existence probe now correctly takes the create path.
+2. **Subdirectory path resolution — IMPLEMENTED** (`vfs.zig`, `int21.zig fn
+   resolve`). The VFS now walks multi-component DOS paths against the host tree
+   (fast statFile path for identical names; deterministic sorted-iteration munge
+   fallback for intermediate dirs). `int21.zig resolve` returns the full
+   DOS-relative path (drive-prefix-stripped, CWD-joined when relative) instead of
+   only the final component. AH=3B chdir / AH=39 mkdir / AH=3A rmdir / AH=47
+   get-cwd now back this. SUBDIR resolves `SUB\DATA.TXT` correctly.
+3. **Environment block + argv[0] — IMPLEMENTED** (`loader.zig fn buildEnv` +
+   `canonicalProgPath`). The env block now carries dosbox-x's EXACT pinned env
+   (`COMSPEC`, `PATH`, `PROMPT`, in that order — captured from `dosbox-x` `SET`,
+   never the host process env), the 0x0001 word, then the canonical `C:\<EXE>`
+   path so the CRT derives the real argv[0]. Matching dosbox-x's env exactly was
+   also necessary for MALLOC: the Borland near-heap geometry (the `environ[]`
+   array size) is env-dependent, and a divergent env shifted it enough to clobber
+   2 heap bytes; the exact env restores byte-parity (32768 verified).
+
+PASSING (permanent regressions): all five corpus programs.
 
 This worklist is empirical: it is exactly what real compiler-built programs need
 that zdos lacks, surfaced by an external oracle rather than by self-authored

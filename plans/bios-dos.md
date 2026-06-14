@@ -509,8 +509,10 @@ Do **not** write code or touch other files while working from this plan; it is t
       copy time). **Flag: this is an addition to `src/bus/` — call it out to the user; it is the only
       bus edit this module needs.**
 
-- [ ] **D20 — Promote the real-CRT-baseline INT 21h functions into scope, pinned to `dos.cpp`. NEW
-      (the concrete function list behind D8a + the AH=43 fidelity fix).** Each is a CRT-startup/runtime
+- [x] **D20 — Promote the real-CRT-baseline INT 21h functions into scope, pinned to `dos.cpp`. NEW
+      (the concrete function list behind D8a + the AH=43 fidelity fix).** DONE: AH=43 AL=00 existence
+      check fixed; AH=33/29/59/52 added; AH=44 AL=01/06/07 added; AH=45/46 dup/dup2 added (SFT refcount);
+      AH=3B/39/3A/47 promoted to real path support. Each is a CRT-startup/runtime
       call the oracle proved real programs make; semantics pinned to `references/dosbox-staging/src/dos/
       dos.cpp`:
   - **AH=43 AL=00 (get file attributes) — FIX, do not stub (FILEIO divergence, HIGHEST PRIORITY).** The
@@ -564,10 +566,10 @@ Do **not** write code or touch other files while working from this plan; it is t
     listed as permanent regressions (`PASSING`); the known-divergent ones are an asserted worklist
     (`DIVERGING`, each asserted to STILL diverge so a fix promotes it loudly — never tweak zdos to force a
     match; the divergence is the deliverable).
-  - **The acceptance ladder (the v1 gate):** `HELLO ✅ → MALLOC ✅ → FILEIO → ARGENV → SUBDIR → (extend
-    the corpus) → **BaK boots**`. HELLO/MALLOC are passing regressions; FILEIO/ARGENV/SUBDIR are the live
-    second-pass worklist; BaK booting (matching a dosbox-x BaK golden, or the documented BaK boot
-    sequence) is the v1 gate.
+  - **The acceptance ladder (the v1 gate):** `HELLO ✅ → MALLOC ✅ → FILEIO ✅ → ARGENV ✅ → SUBDIR ✅ →
+    (extend the corpus) → **BaK boots**`. All FIVE current corpus programs are now passing regressions
+    (`test-oracle` green; `DIVERGING` empty). BaK booting (matching a dosbox-x BaK golden, or the
+    documented BaK boot sequence) is the remaining v1 gate.
   - **Hand-assembled fixtures keep ONE job:** **cycle-exact determinism** testing (the run-twice-byte-
     identical-including-cycle-position regressions, Phase 8) — zdos's *separate* guarantee that dosbox-x
     cannot make. They are **never** the sufficiency gate. **Rationale:** sufficiency must be measured
@@ -872,14 +874,15 @@ unsupported subfunctions flag (D11). (Per-function fixtures still exist for cycl
         DOS version** → reads the **PSP version bytes** (5.0: AL=5, AH=0), returns **BH=OEM=0xFF**,
         **BL:CX = serial = 0**; AH=4D get return code. **AH=31 TSR — DEFERRED-BY-DEFAULT** (D11 flag);
         pull in only on trace evidence.
-  - [ ] **CRT-startup additions (D8a/D20) — required to START any real program:** **AH=33** extended
+  - [x] **CRT-startup additions (D8a/D20) — required to START any real program:** **AH=33** extended
         break-checking (AL=00/01/02 get/set/get+set the deterministic `breakcheck` flag, AL=05 boot-drive
         DL=3, AL=06 true-version, `dos.cpp:881-910`); **AH=29** parse-filename-into-FCB (DS:SI → ES:DI per
         the AL bits, returns AL=0/1/0xFF, `dos.cpp:743`); **AH=59** get-extended-error (return the
         deterministic `last_error` in AX + class/action/locus bytes, `dos.cpp:1337`); **AH=52** Get List
         of Lists / SysVars (ES:BX → a byte-accurate SysVars table with a **real first-MCB anchor**, D9 —
         not a faked pointer, `dos.cpp:1256`). Maintain `last_error` on the Dos ctx, set by every D11a
-        error path.
+        error path. DONE — `last_error` set by `dos.dosError`; SysVars block placed at seg 0x0070 with
+        the real arena MCB at [block:LoL-2].
   - [x] **Char I/O (minimal):** AH=02 output char, AH=06/07 direct console I/O, **AH=09 print $-string**
         (used by the loader test), AH=01/08 input char. (BaK uses VGA directly, but the loader/runtime
         may print.)
@@ -893,24 +896,25 @@ unsupported subfunctions flag (D11). (Per-function fixtures still exist for cycl
         `File.reader`/`writer`, D6/Phase 5) and guest memory at DS:DX for CX bytes **through
         `bus.writeGuestBlock`/`readGuestBlock` + a fixed stack scratch buffer (D19)**; **count from CX
         (guest input) → D5 cost `base + CX*per_byte`.**
-  - [ ] **AH=43 AL=00 existence check — FIX (D20/D11a, FILEIO divergence, HIGHEST PRIORITY).** Currently
-        `fn getSetAttr` returns `CX=0x20, CF=0` **unconditionally**, never consulting the VFS — which
-        makes the CRT's `fopen("wb")` open-for-write instead of create, so `fopen` fails. Resolve the path
-        through the VFS: **CF=1, AX=2 (file-not-found) when absent**; real attribute bits + CF=0 when
-        present (`dos.cpp:1106-1120`). AL=01 set-attr stays as is.
-  - [ ] **AH=44 IOCTL `AL=01/06/07` — ADD (D20).** AL=00 (get device info, device bit 7) exists; add
-        AL=01 (set device info), AL=06 (get input status → AL=0xFF/0x00), AL=07 (get output status),
+  - [x] **AH=43 AL=00 existence check — FIX (D20/D11a, FILEIO divergence, HIGHEST PRIORITY).** DONE:
+        `fn getSetAttr` now resolves the path through the VFS and `stat`s it — **CF=1, AX=2 when absent**;
+        real attribute bits + CF=0 when present (`dos.cpp:1106-1120`). AL=01 set-attr now also errors when
+        the file is absent (faithful).
+  - [x] **AH=44 IOCTL `AL=01/06/07` — ADD (D20).** DONE: AL=01 (set device info, accepted), AL=06 (get
+        input status → device 0xFF, file 0xFF unless at EOF → 0x00), AL=07 (get output status → 0xFF),
         routed through the SFT `{device,file}` union (D17). `DOS_IOCTL`, `dos.cpp:1138`.
-  - [ ] **AH=45 dup / AH=46 dup2 — ADD (D20, was DEFERRED).** AH=45 allocates a new JFT slot aliasing the
-        same SFT entry (new handle in AX); AH=46 forces CX to alias BX. Add an SFT **reference count** so
-        the entry closes only on the last handle. `dos.cpp:1146-1162`. CRTs dup for stdio redirection.
+  - [x] **AH=45 dup / AH=46 dup2 — ADD (D20, was DEFERRED).** DONE: AH=45 allocates a new JFT slot
+        aliasing the same SFT entry (new handle in AX); AH=46 forces CX to alias BX (closing CX's prior
+        target first). The SFT `refcount` is now honored on close so the entry closes only on the last
+        handle. `dos.cpp:1146-1162`.
   - [x] **Directory search:** **AH=4E find-first, 4F find-next** (wildcards `*`/`?`; writes the DTA
-        record; uses the VFS `findFirst`/`findNext` over the host dir with 8.3 munging, D10).
-  - [ ] **Directory navigation — PROMOTE to real path support (D8b, SUBDIR divergence).** **AH=47
-        get-cwd** (write the current dir string at DS:SI, `dos.cpp:1163`), **AH=3B chdir** (was a no-op
-        success — make it validate + set the per-drive current dir against the VFS, `dos.cpp:1007`),
-        **AH=39 mkdir / AH=3A rmdir** (were DEFERRED — implement against the VFS, `dos.cpp:986/996`).
-        These back the multi-component path resolution the corpus + BaK need.
+        record; uses the VFS `findFirst`/`findNext` over the host dir with 8.3 munging, D10; now resolves
+        the directory portion of the pattern via the D8b walker).
+  - [x] **Directory navigation — PROMOTE to real path support (D8b, SUBDIR divergence).** DONE: **AH=47
+        get-cwd** writes the per-drive current dir at DS:SI (`dos.cpp:1163`); **AH=3B chdir** validates the
+        target against the VFS (`dirExists`) + sets the per-drive CWD (`dos.cpp:1007`); **AH=39 mkdir /
+        AH=3A rmdir** implemented against the VFS (`dos.cpp:986/996`). The VFS walks multi-component paths
+        (`SUB\DATA.TXT`, `C:\A\B\C`).
   - [x] **DTA + date/time + misc:** AH=1A set DTA, AH=2F get DTA; **AH=2A get date, 2C get time** (from
         the BDA tick + emulated epoch, D13 — NOT host clock), AH=2B/2D set date/time (update the
         emulated state); **AH=57 get/set file date-time** → from the deterministic source, NOT host
@@ -1024,17 +1028,16 @@ determinism only.
         with only `minsize` paragraphs, `memtop - DGROUP` was smaller than the required stack+heap and
         the CRT `abort()`ed (exit 3) before `main`. `loadExe` now follows the real `min/max/maxfree`
         rule; covered by `borland_test.zig` running the real `examples/dos-src/HELLO.EXE`.
-  - [ ] **Build a REAL environment block — FIX (ARGENV divergence, D20).** The first pass wrote an EMPTY
-        env (just the double-null + `0x0001` + a `"PROGRAM.EXE"` **placeholder** path) — so `getenv("PATH")`
-        returned null and **`argv[0]` was `C:\PROGRAM.EXE` instead of the real EXE name**
-        (`plans/dos-oracle-report.md` §3; reference `MakeEnv`, `dos_execute.cpp`). Fix both:
-    - [ ] alloc an env MCB (**owner = the new PSP**); **inherit/populate** the parent's env (or, for the
-          root/initial load, a **pinned deterministic env** — a fixed `PATH`/`COMSPEC` constant, NOT the
-          host environment, a determinism requirement: never read `getenv` from the host);
-    - [ ] terminate the var list with the double-null, then write the **`0x0001` word + the program's
-          CANONICAL path** (the real `C:\<EXE name>`, not a placeholder) so the CRT derives the correct
-          `argv[0]` from it;
-    - [ ] set **PSP[0x2C] = envseg**.
+  - [x] **Build a REAL environment block — FIX (ARGENV divergence, D20).** DONE
+        (`loader.zig fn buildEnv` + `canonicalProgPath`). Reference `MakeEnv`, `dos_execute.cpp`.
+    - [x] alloc an env MCB (**owner = the new PSP**); populate a **pinned deterministic env** — the EXACT
+          dosbox-x default set captured from `dosbox-x` `SET`: `COMSPEC=Z:\COMMAND.COM`,
+          `PATH=Z:\;Z:\SYSTEM;Z:\BIN;Z:\DOS;Z:\4DOS;Z:\DEBUG;Z:\TEXTUTIL`, `PROMPT=$P$G` (in that order),
+          NEVER the host environment (determinism). Matching dosbox-x's env exactly is also required for
+          MALLOC byte-parity (the Borland near-heap geometry is env-size-dependent);
+    - [x] terminate the var list with the double-null, then write the **`0x0001` word + the program's
+          CANONICAL path** (the real `C:\<EXE name>`) so the CRT derives the correct `argv[0]`;
+    - [x] set **PSP[0x2C] = envseg** (via `buildPsp`).
   - [x] **Build the PSP** (Phase 4) at the allocation base; set parent, environment (envseg above),
         command-tail, the **0x34→0x18 file-table far pointer + max_files=20 at 0x32** (D9), the **FCBs at
         0x5C/0x6C** parsed from the EXEC param block (for the initial BaK load synthesize a default-drive

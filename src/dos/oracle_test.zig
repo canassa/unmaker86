@@ -40,6 +40,9 @@ const Program = struct {
 const PASSING = [_]Program{
     .{ .exe = "HELLO.EXE" },
     .{ .exe = "MALLOC.EXE" },
+    .{ .exe = "FILEIO.EXE" },
+    .{ .exe = "ARGENV.EXE", .args = "alpha beta gamma" },
+    .{ .exe = "SUBDIR.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented
@@ -48,11 +51,7 @@ const PASSING = [_]Program{
 /// deliverable; each is asserted to STILL diverge (a NOT-equal check) so that if
 /// zdos is later fixed, this test fails loudly and the program is promoted to
 /// PASSING.
-const DIVERGING = [_]Program{
-    .{ .exe = "FILEIO.EXE" },
-    .{ .exe = "ARGENV.EXE", .args = "alpha beta gamma" },
-    .{ .exe = "SUBDIR.EXE" },
-};
+const DIVERGING = [_]Program{};
 
 const Golden = struct { exit_code: u16, output: []const u8 };
 

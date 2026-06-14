@@ -78,10 +78,15 @@ pub fn Loader(comptime Cpu: type) type {
             const got = drive.readAt(hf, 0, &magic) catch return error.IoFailed;
             const sig: u16 = if (got >= 2) (@as(u16, magic[0]) | (@as(u16, magic[1]) << 8)) else 0;
 
+            // The canonical DOS program path (C:\<NAME>) the env block ends with —
+            // the CRT derives argv[0] from it (dos_execute.cpp MakeEnv).
+            var path_buf: [MAX_PROG_PATH]u8 = undefined;
+            const prog_path = canonicalProgPath(drive_idx, host_name, &path_buf);
+
             if (sig == MZ_MAGIC1 or sig == MZ_MAGIC2) {
-                return loadExe(dos, cpu, drive, hf, fsize, cmdtail, mode);
+                return loadExe(dos, cpu, drive, hf, fsize, cmdtail, mode, prog_path);
             }
-            return loadCom(dos, cpu, drive, hf, fsize, cmdtail, mode);
+            return loadCom(dos, cpu, drive, hf, fsize, cmdtail, mode, prog_path);
         }
 
         // ----------------------------------------------------------------
@@ -95,6 +100,7 @@ pub fn Loader(comptime Cpu: type) type {
             fsize: u64,
             cmdtail: []const u8,
             mode: LoadMode,
+            prog_path: []const u8,
         ) LoadError!Result {
             var hdr_bytes: [28]u8 = undefined;
             const n = drive.readAt(hf, 0, &hdr_bytes) catch return error.IoFailed;
@@ -123,7 +129,7 @@ pub fn Loader(comptime Cpu: type) type {
             else
                 0xFFFF;
 
-            const env_seg = buildEnv(dos, cpu, host_path_placeholder) orelse return error.NoMemory;
+            const env_seg = buildEnv(dos, cpu, prog_path) orelse return error.NoMemory;
 
             const maxfree = dos.mcb().largestFree();
             if (maxfree < minsize) {
@@ -191,10 +197,11 @@ pub fn Loader(comptime Cpu: type) type {
             fsize: u64,
             cmdtail: []const u8,
             mode: LoadMode,
+            prog_path: []const u8,
         ) LoadError!Result {
             if (fsize > 0xFE00) return error.BadImage; // COM max ~64KB - PSP - stack
 
-            const env_seg = buildEnv(dos, cpu, host_path_placeholder) orelse return error.NoMemory;
+            const env_seg = buildEnv(dos, cpu, prog_path) orelse return error.NoMemory;
             // COM grabs the largest free block.
             const largest = dos.mcb().largestFree();
             if (largest < 17) {
@@ -230,7 +237,36 @@ pub fn Loader(comptime Cpu: type) type {
         // ----------------------------------------------------------------
         // Shared helpers
         // ----------------------------------------------------------------
-        const host_path_placeholder = "C:\\PROGRAM.EXE";
+        const MAX_PROG_PATH = 80;
+
+        /// The pinned, DETERMINISTIC environment the child inherits (D13). dosbox-x
+        /// seeds these on its Z: utility drive; we replicate the exact strings so a
+        /// program reading PATH/COMSPEC sees stable values WITHOUT ever touching the
+        /// host environment (never the host process env). Each entry is NUL-terminated; the
+        /// block ends with a double-NUL, then the 0x0001 word + program path.
+        const pinned_env = [_][]const u8{
+            "COMSPEC=Z:\\COMMAND.COM",
+            "PATH=Z:\\;Z:\\SYSTEM;Z:\\BIN;Z:\\DOS;Z:\\4DOS;Z:\\DEBUG;Z:\\TEXTUTIL",
+            "PROMPT=$P$G",
+        };
+
+        /// Build the canonical DOS path `<DRIVE>:\<HOSTNAME>` (uppercased) into
+        /// `buf` so the env block's trailing program-path yields a real argv[0].
+        fn canonicalProgPath(drive_idx: u8, host_name: []const u8, buf: []u8) []const u8 {
+            var i: usize = 0;
+            buf[i] = 'A' + drive_idx;
+            i += 1;
+            buf[i] = ':';
+            i += 1;
+            buf[i] = '\\';
+            i += 1;
+            for (host_name) |c| {
+                if (i >= buf.len - 1) break;
+                buf[i] = if (c >= 'a' and c <= 'z') c - 32 else c;
+                i += 1;
+            }
+            return buf[0..i];
+        }
 
         fn setupRun(cpu: *Cpu, res: Result) void {
             cpu.loadSegment(.cs, res.cs);
@@ -260,20 +296,30 @@ pub fn Loader(comptime Cpu: type) type {
             while (h < 5) : (h += 1) p.jftSet(h, @intCast(h));
         }
 
-        /// Build a minimal environment block (D6 EXEC step): one MCB-allocated
-        /// paragraph block ending `0x00 0x00 0x01 0x00 <program path> 0x00`.
+        /// Build the environment block (D6 EXEC step, dos_execute.cpp MakeEnv): the
+        /// pinned env vars (each NUL-terminated), a double-NUL terminator, the
+        /// 0x0001 word, then the canonical program path NUL-terminated (so the CRT
+        /// derives the real argv[0]). MCB-allocated; deterministic (D13).
         fn buildEnv(dos: *Dos, cpu: *Cpu, prog_path: []const u8) ?u16 {
-            const env_size = 16 + prog_path.len + 4; // a tiny default
-            const paras: u16 = @intCast((env_size + 15) / 16 + 1);
+            var env_bytes: usize = 0;
+            for (pinned_env) |v| env_bytes += v.len + 1; // var + NUL
+            env_bytes += 1; // the closing NUL of the double-NUL
+            env_bytes += 2; // the 0x0001 word
+            env_bytes += prog_path.len + 1; // program path + NUL
+            const paras: u16 = @intCast((env_bytes + 15) / 16 + 1);
             const seg = dos.mcb().alloc(paras, dos.current_psp) orelse return null;
             var off: u32 = (@as(u32, seg) << 4);
-            // Empty environment: just the double-null terminator.
-            cpu.bus.writePhys8(off, 0);
+            for (pinned_env) |v| {
+                for (v) |c| {
+                    cpu.bus.writePhys8(off, c);
+                    off += 1;
+                }
+                cpu.bus.writePhys8(off, 0); // NUL after each var
+                off += 1;
+            }
+            cpu.bus.writePhys8(off, 0); // the second NUL of the double-NUL
             off += 1;
-            cpu.bus.writePhys8(off, 0);
-            off += 1;
-            // Trailing 0x0001 word + the program path string (the env terminator).
-            cpu.bus.writePhys16(off, 0x0001);
+            cpu.bus.writePhys16(off, 0x0001); // entry-count word
             off += 2;
             for (prog_path) |c| {
                 cpu.bus.writePhys8(off, c);
