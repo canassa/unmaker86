@@ -1,0 +1,7 @@
+exit_code: 0
+--- output ---
+start: coreleft>0 = 1
+after a(4096): dropped>=blk = 1
+after b(4096): dropped>=2blk = 1
+after free a: recovered = 0
+after free b: back to start = 1

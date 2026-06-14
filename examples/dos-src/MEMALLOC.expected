@@ -1,0 +1,10 @@
+exit_code: 0
+--- output ---
+alloc A: 16 paras ok
+alloc B: 32 paras ok
+grow A->48: fail max=16
+shrink B->8: ok
+freed A,B
+huge alloc failed ax=0008
+alloc largest ok
+largest+1 alloc cf=1

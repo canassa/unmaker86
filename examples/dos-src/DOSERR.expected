@@ -1,0 +1,7 @@
+exit_code: 0
+--- output ---
+open failed ax=0002
+ext_error=0002
+class=08
+action=01
+locus=00

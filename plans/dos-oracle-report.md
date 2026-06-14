@@ -267,3 +267,84 @@ DEFER, but the probe must answer "not installed" (AL≠0x80) cleanly so XMS-awar
 programs fall back to EMS/conventional, rather than hitting the structural
 `unsupported` stop. After that, **AH=34 InDOS / the SDA structure** (Tier 2) and
 **EMS LIM 4.0 AH=50/57** (multi-page map / region move) if a trace needs them.
+
+---
+
+## Band 5 — DOS memory management, extended-error, interrupt vectors (4 programs)
+
+Theme: the raw INT 21h memory API (AH=48/49/4A), extended-error
+(AH=59 class/action/locus), and software-interrupt vector get/set (AH=25/35 +
+native real-mode IVT delivery). All deterministic, output-observable, no
+console input / live clock / XMS.
+
+### Programs added (corpus now 20: 16 prior + 4)
+
+1. **MEMALLOC** (`examples/dos-src/MEMALLOC.C`) — direct INT 21h memory via
+   `int86`/`int86x`: AH=48 allocate two blocks, AH=4A grow (blocked by the
+   adjacent block → reports max) then shrink, AH=49 free both, then a
+   deliberately-too-large AH=48 (0xFFFF paras) that MUST fail with **AX=0008**
+   (insufficient memory) and **BX = largest free block**. The BX contract is
+   PROVEN (not printed raw, which would be arena-dependent): re-allocating
+   exactly BX paragraphs succeeds and BX+1 fails. Golden: `ax=0008`,
+   `grow A->48: fail max=16`, `alloc largest ok`, `largest+1 alloc cf=1`.
+2. **FARHEAP** (`FARHEAP.C`) — Borland `farcoreleft`/`farmalloc`/`farfree`
+   (built on AH=48/4A/49). Prints DELTAS/orderings of coreleft (not the raw
+   byte count, which is map-dependent) across two alloc/free cycles. Golden
+   captures the real far-heap quirk: freeing the lower block while the upper is
+   still held does NOT raise top-contiguous coreleft (`recovered = 0`); freeing
+   both returns to start (`back to start = 1`).
+3. **DOSERR** (`DOSERR.C`) — `open` a nonexistent file (AH=3D fails, AX=2) then
+   AH=59 extended error. Golden: `ext_error=0002`, **class=08**, **action=01**,
+   **locus=00** — the bytes a CRT maps to errno/_doserrno.
+4. **VECTORS** (`VECTORS.C`) — install a C `interrupt` handler on the unused
+   user vector **INT 0x60** via `setvect` (AH=25), read it back via `getvect`
+   (AH=35) and confirm the round-trip, fire `geninterrupt(0x60)` 3× (handler
+   increments a static), then restore + re-confirm the saved vector. Golden:
+   `install round-trip = 1`, `marker = 3`, `restore round-trip = 1`. Proves
+   AH=25/35 round-trip the guest IVT AND that a guest-installed software
+   interrupt is delivered by pure real-mode IVT dispatch (`deliverViaIvt`,
+   `src/cpu/interrupts.zig:185`).
+
+### Goldens minted
+
+All four minted by `tools/oracle.sh` from dosbox-x FIRST, each minted **twice**
+and byte-compared → deterministic. Vendored as `MEMALLOC/FARHEAP/DOSERR/
+VECTORS.expected`.
+
+### zdos fixes
+
+**None required — every program matched its dosbox-x golden on the first run.**
+The existing implementation already conforms to the DOS contracts this band
+targets:
+
+- **AH=48 largest-free-on-failure** (`int21.zig:962` → `mcb().largestFree()`,
+  `mcb.zig:92`) matches `DOS_AllocateMemory` (dos.cpp:1173): CF set, AX=8, BX =
+  largest free block.
+- **AH=4A resize max-on-failure** (`int21.zig:983`, `mcb.zig:148`) matches
+  `DOS_ResizeMemory` (dos.cpp:1194): a grow blocked by the adjacent block fails
+  with BX = the current (max-attainable) size.
+- **AH=59 class/action/locus** (`int21.zig:741`) already emits BH=08 (class
+  "not found"), BL=01 (action), CH=00 (locus) for file-not-found — byte-identical
+  to dosbox-x's errortable lookup (dos.cpp:1337).
+- **AH=25/35 + software-INT delivery** (`int21.zig:94/101` write/read the guest
+  IVT; the CPU delivers INT 0x60 via `deliverViaIvt`) round-trips and dispatches
+  a guest-installed handler with no DOS special-casing.
+
+Honesty note: this band confirmed conformance rather than uncovering bugs — the
+oracle was run independently of zdos, the harness was proven to actually compare
+zdos output (a deliberately corrupted golden made `test-oracle` fail loudly,
+then was restored), so the green result is real, not papered over.
+
+### Status
+
+`zig build test-oracle` green (exit 0) — **20/20 programs PASSING**, full prior
+16-program corpus intact (no regression). `zig build test` green (exit 0),
+all targets. Nothing dropped.
+
+### Next uncovered DOS area
+
+Unchanged from above and still the top priority: **INT 2Fh AX=4300/4310 (XMS
+install-check)** must answer "not installed" cleanly. Within this band's theme,
+the next rung is **AH=58 alloc-strategy + UMB link (AL=02/03)** behavior under a
+real program, and **AH=34 InDOS / a guest-RAM SDA** so AH=5D AL=06 returns a
+real pointer — both Tier 2.

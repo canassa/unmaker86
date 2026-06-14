@@ -54,6 +54,10 @@ const PASSING = [_]Program{
     .{ .exe = "EMSMAP.EXE" },
     .{ .exe = "EMSCOUNT.EXE" },
     .{ .exe = "EMSSAVE.EXE" },
+    .{ .exe = "MEMALLOC.EXE" },
+    .{ .exe = "FARHEAP.EXE" },
+    .{ .exe = "DOSERR.EXE" },
+    .{ .exe = "VECTORS.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented
