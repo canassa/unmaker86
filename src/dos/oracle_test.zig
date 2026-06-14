@@ -54,6 +54,22 @@ const PASSING = [_]Program{
     .{ .exe = "EMSMAP.EXE" },
     .{ .exe = "EMSCOUNT.EXE" },
     .{ .exe = "EMSSAVE.EXE" },
+    // Deep EMS handle/page-query + page-map save/restore re-entrancy band
+    // (band 15): INT 67h AH=4B/4C/4D (handle count, pages-per-handle,
+    // all-handle {handle,pages} array) plus AH=4E AL=03/00/01 (page-map size,
+    // save, restore). EMSPAGE.EXE allocates two handles (3 + 5 pages), reads
+    // every count/page query back, maps two distinct logical pages into two
+    // frame slots, writes markers, AH=4E SAVEs the live two-slot map, remaps to
+    // OTHER logical pages and overwrites the windows (proving they changed),
+    // then AH=4E RESTOREs and confirms the ORIGINAL markers reappear through the
+    // frame window — the re-entrancy primitive an EMS-using ISR relies on. Board
+    // mode (oracle xms=false -> EMS_BOARD): no OS system handle, so the count is
+    // 2 and the handles are 0/1. All printed values are oracle-able (counts,
+    // page totals, the mapsize, and the marker bytes read back through mapped
+    // pages — content is deterministic given the bump allocator + zero-init
+    // backing). Proven deterministic by a triple-mint byte-identical diff. The
+    // program creates no files, so the corpus stays byte-identical.
+    .{ .exe = "EMSPAGE.EXE" },
     .{ .exe = "MEMALLOC.EXE" },
     .{ .exe = "FARHEAP.EXE" },
     .{ .exe = "DOSERR.EXE" },

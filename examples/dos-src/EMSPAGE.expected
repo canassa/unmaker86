@@ -1,0 +1,8 @@
+exit_code: 0
+--- output ---
+count=0002 p1=0003 p2=0005
+entries=0002 sumpages=0008 mapsize=10
+orig: 5A 5B 5C 5D B2 B3 B4 B5
+remap: 10 11 12 13 90 91 92 93
+restd: 5A 5B 5C 5D B2 B3 B4 B5
+final=0000
