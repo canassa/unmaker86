@@ -70,6 +70,27 @@ const PASSING = [_]Program{
     // backing). Proven deterministic by a triple-mint byte-identical diff. The
     // program creates no files, so the corpus stays byte-identical.
     .{ .exe = "EMSPAGE.EXE" },
+    // LIM EMS 4.0 extensions band (band 16): INT 67h AH=50 (map/unmap multiple
+    // pages — AL=00 by logical/physical page number AND AL=01 by logical/segment,
+    // ems.cpp:1049), AH=51 (reallocate pages — grow + shrink, ems.cpp:1076),
+    // AH=47/48 (per-handle save/restore page map — focused coverage), and the
+    // AH=53/54 handle-name surface (set/get name, search-by-name, enumerate;
+    // ems.cpp:805/766). EMSLIM.EXE allocates two handles (4 + 2 pages), bulk-maps
+    // all four of H1's pages into the four frame slots in ONE AH=50 AL=00 call,
+    // writes/reads-back a distinct byte per window, AH=47-saves then remaps then
+    // AH=48-restores (window byte returns), bulk-UNMAPs two slots via the 0xFFFF
+    // sentinel then bulk-maps H2 by SEGMENT (AH=50 AL=01), GROWs H2 2->5 (free
+    // pool -3, kept pages still readable) and SHRINKs 5->1 (free pool +4),
+    // set/get a handle name ("KRONDOR"), searches for it (returns the handle),
+    // and enumerates all names (count). Board mode (oracle xms=false): the first
+    // user handle is 1, not 0 — dosbox EMM_AllocateMemory scans from handle 1
+    // (ems.cpp:425), handle 0 is the reserved system slot; zdos was fixed to
+    // match (search returns found=0001). All printed values are oracle-able
+    // (return codes, free-page deltas off the deterministic REPORTED total, the
+    // bytes read back through mapped windows, and the program-supplied name);
+    // proven deterministic by a triple-mint byte-identical diff. The program
+    // creates no files, so the corpus stays byte-identical.
+    .{ .exe = "EMSLIM.EXE" },
     .{ .exe = "MEMALLOC.EXE" },
     .{ .exe = "FARHEAP.EXE" },
     .{ .exe = "DOSERR.EXE" },

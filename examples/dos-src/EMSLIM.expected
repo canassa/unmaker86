@@ -1,0 +1,16 @@
+exit_code: 0
+--- output ---
+free0=03BC free1=03B6 drop=0006
+bulk: A0 B1 C2 D3
+remap0=D3
+restd0=A0
+seg: 22 33
+grown pages=0005
+free2=03B3 growdrop=0003
+kept: 22 33
+shrunk pages=0001
+freeS=03B7 rise=0004
+name=KRONDOR
+search rc=00 found=0001 (h1=0001)
+enum count=0002
+freeF=03BC (free0=03BC)
