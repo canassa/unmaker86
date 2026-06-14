@@ -181,6 +181,20 @@ pub fn CpuWith(comptime Bus: type, comptime opts: Options) type {
             return interrupts.step(self);
         }
 
+        /// Fast-forward the idle (HLT) cycle ledger to an absolute cycle target.
+        ///
+        /// The CPU is the SOLE writer of `st.cycles` (the determinism ledger); the
+        /// machine must NEVER poke `st.cycles` directly. On a `.halted` stop the
+        /// machine computes the next scheduled event cycle (a pure function of the
+        /// deterministic event schedule — never host time) and calls this so the
+        /// idle span is charged through the CPU. `to_cycle` must be >= the current
+        /// ledger (idle never rewinds time); a target at-or-before now is a no-op.
+        /// This closes the cpu.md-deferred D11 HLT/idle-accounting boundary.
+        pub fn fastForwardIdle(self: *Self, to_cycle: u64) void {
+            std.debug.assert(self.st.halted); // only valid while halted (idle)
+            if (to_cycle > self.st.cycles) self.st.cycles = to_cycle;
+        }
+
         /// Thin wrapper: run at least `n` cycles (loops step()).
         pub fn runCycles(self: *Self, n: u64) StopReason {
             const target = self.st.cycles + n;

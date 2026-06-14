@@ -1,0 +1,1055 @@
+# zdos BIOS + DOS module — implementation plan (`src/bios/` + `src/dos/`): the callback-trampoline bridge, the host-serviced BIOS, the emulated DOS kernel, and the EXE/COM loader
+
+This is the literal, ordered build plan for the two **host-serviced** modules where zdos's
+reason-for-existing lives: the **callback-trampoline guest↔host bridge**, the **BIOS** (IVT/BDA/POST
++ INT 10h/16h/1Ah/08h/11h/12h/13h/15h), the **emulated DOS kernel** (INT 21h dispatch, PSP/MCB/DTA/SFT,
+host-FS-redirection VFS), the **EXE/COM loader** (the path that actually starts Betrayal at Krondor),
+and the **EMS INT 67h service** — in **Zig 0.16**. These are `src/dos/` and `src/bios/` in the module
+graph: they sit **above** the machine (they import `cpu`, `bus`, `machine`, `devices`) and **nothing
+imports them except `src/api/`**. The **callback-bridge primitive** is NOT in either of them — it is a
+**shared leaf** (`src/abi/` alongside `bus_contract.zig`, or a new `src/bridge/` peer) that BOTH
+`src/bios/` and `src/dos/` import while **neither imports the other** (D12 reversed / D16). The
+`Services` aggregate (the CPU's `CallbackSink`) lives at the machine layer and holds `*Bios` + `*Dos` +
+the bridge + a `*Cpu` back-pointer.
+
+**This is the whole point of zdos.** DOS/BIOS are **host-serviced** (API-style, Spice86 lineage):
+a guest `INT 21h` does not run real MS-DOS instructions — it traps to a host Zig handler that
+reads/writes guest registers + memory. That gives full introspection (the reason DOSBox can't be
+debugged the way zdos can). **BUT** the prime directive — *no holes in the cycle ledger* — means
+**every host-serviced trap MUST charge a fixed, deterministic synthetic cycle cost**. This is the
+exact hole that makes Spice86 non-reproducible (its cycle count smears 346k–3.6M cycles across a trap
+because the trap consumes zero ledger cycles); **closing that hole is the entire differentiator of
+this module.** The synthetic-cycle-cost contract (DECISION D5 below) is therefore **first-class**,
+not an afterthought.
+
+**The ground rule is especially load-bearing here.** This is a huge API surface. An INT 21h
+subfunction or BIOS service we cannot support faithfully **must be flagged / surfaced** (a structural
+"unsupported DOS service" signal the API server sees), **never silently faked** to "appear to work."
+Faking DOS is the precise failure mode (`CLAUDE.md` §"Ground rule") this project exists to escape. The
+scope below is **curated to what BaK needs**; everything else is explicitly **deferred and flagged**,
+not padded in.
+
+**Read before starting (source of truth — do not work from memory):**
+- `CLAUDE.md` — the charter. **Host-serviced DOS/BIOS** (Spice86 lineage) **+ the prime directive (no
+  holes in the cycle ledger)** = every host-serviced trap charges a fixed synthetic cost. The **ground
+  rule** (no fakes/stubs; flag, don't bypass). The **First target: Betrayal at Krondor** (real-mode
+  386, loads via INT 21h file calls, needs **EMS via a host INT 67h handler** — no EMM386/V86; EMS
+  backing/MMIO is a bus device per B8, but the **INT 67h service** lives here).
+- **`src/cpu/interrupts.zig` — read the ACTUAL code** (verified against the file): `step()` snapshots
+  `instr_start_eip`, runs `dispatch.executeOne`, then `serviceInterrupts()` (interrupts.zig:46-87);
+  the real-mode IVT delivery `deliverViaIvt` pushes FLAGS/CS/IP and clears IF/TF (interrupts.zig:185-209);
+  `pushWord`/`popWord` use SP (16-bit real-mode stack, interrupts.zig:212-225); `VEC_UD = 6` and the
+  `#UD` path (interrupts.zig:29); `deliverInterrupt`/`deliverException` charge `cycles.interrupt_delivery`/
+  `cycles.fault_delivery` (interrupts.zig:140,175). **The callback opcode is a trapped illegal
+  instruction surfaced through this path** (see D1/D2).
+- **`src/cpu/cpu.zig` — the CPU surface a handler uses** (verified): `CpuWith(Bus, opts)` (cpu.zig:60),
+  `Cpu.init(bus, pic, sched)` (cpu.zig:81), `step()` → `interrupts.step()` (cpu.zig:180), the
+  inspect/patch surface `readReg32`/`writeReg32`/`readSegSelector`/`readFlags`/`patchEip`/
+  `readLogical8`/`patchLogical8`/`readPhysical8`/`patchPhysical8` (cpu.zig:220-251), `loadSegment`
+  (cpu.zig:156), `segRead*/segWrite*` (cpu.zig:128-151), `St`/`State` register helpers
+  `getReg16/32`/`setReg16/32`/`selector[]`/`seg_base[]`/`eflags`. **A DOS/BIOS handler mutates `cpu.st`
+  and reads/writes `cpu.bus`.**
+- `src/machine/` and **`plans/machine.md`** — the run loop (`Machine.step()` burst model, M-D5), the
+  `machine.StopReason` superset `{ normal, breakpoint, halted_forever, shutdown, cycles_reached }`
+  (M-D13), `Machine` owns the `Bus`/`Pic`/`Pit`/scheduler and instantiates `CpuWith`, the **push
+  registration** model (M-D1), the BIOS-POST stand-ins `programDefaultPic()`/`programDefaultTimer()`/
+  `enableA20()` (M-D9 — **this module's real BIOS replaces/extends them**), and the
+  `DeviceCtx{pic, sched}` device-wiring pattern flagged in machine.md §"Out of scope".
+- **`src/bus/bus.zig` + `plans/bus.md`** — `loadRom(phys, bytes)` (the BIOS ROM region at 0xF0000,
+  Phase 3), the standard ROM regions installed `.rom` at init, `mapMmio(frame_phys, len, handler)` for
+  the **EMS MMIO seam** (B8 — EMS is an ordinary MMIO device; the INT 67h *service* + backing store
+  live HERE), `setA20`, the snapshot model (B12 — handlers by stable ID). The IVT/BDA/PSP/MCB all live
+  in guest **RAM** (conventional memory), not in special bus state.
+- `src/abi/bus_contract.zig` — the comptime contracts; this module adds **no new CPU contract** (it
+  hangs off the existing illegal-opcode/`#UD` surface — see D2).
+- `plans/cpu.md` — Phase 5 (real-mode IVT delivery, `#UD` gating, the positive 386-valid opcode
+  allowlist), the cycle ledger (Phase 7, `cycles.interrupt_delivery`/`fault_delivery`), D11 HLT.
+- The architecture studies — **all three converge on this exact design**: `plans/dosbox-x.md` §6
+  (emulated DOS kernel) + §7 (callback bridge `0xFE 0x38 <id>`, `CALLBACK_RunRealInt`),
+  `plans/dosbox-staging.md` §6-7 (the callback mechanism is "the architecture"; CB_SEG=0xF000,
+  CB_SOFFSET=0x1000, CB_SIZE, `0xfe 0x38`), `plans/spice86.md` §7 (IVT install, the F000 stub +
+  callback opcode, `IndexBasedDispatcher`, BDA at 0040:0000, the per-AH dispatch). **`plans/dosbox-test-suite.md`**
+  — the 8.3-name-munging (`DOS_MakeName`/`DTAExtendName`) + MCB layout tests are a **behavioral spec to
+  re-derive from, NOT copy** (DOSBox is GPL).
+- Reference sources (algorithmic detail — re-derive, do not copy GPL behavior):
+  `references/dosbox-staging/src/cpu/callback.cpp` (`callback_setup_extra` emits `0xfe 0x38 <id>`
+  callback.cpp:199-200; the return-sequence builders `CB_IRET`/`CB_RETF`/`CB_IRET_STI` callback.cpp:209-264;
+  `CALLBACK_RunRealInt` callback.cpp:106-114 — re-entrancy; `CALLBACK_SCF/SZF/SIF` patch the FLAGS image
+  on the guest stack callback.cpp:116-135), `src/cpu/callback.h` (CB_SEG=0xF000, CB_SOFFSET=0x1000,
+  CB_SIZE=32, CB_MAX=128), `src/dos/dos.cpp` (the `DOS_21Handler` AH switch), `src/dos/dos_execute.cpp`
+  (`struct EXE_Header` line 27, MAGIC1=0x5a4d line 47, the COM-vs-EXE branch line 332, relocation +
+  `SetupPSP`/`MakeEnv`), `src/dos/dos_memory.cpp` (MCB chain), `src/dos/dos_files.cpp`/`drive_local.cpp`
+  (the `DOS_Drive` VFS + 8.3); `references/spice86/.../Emulator/OperatingSystem/` (`Dos.cs`,
+  `DosFileManager.cs`, `DosMemoryManager.cs`, `DosProcessManager.cs`, `DosProgramLoader.cs`, the PSP/MCB
+  structs) + `.../InterruptHandlers/` (callback + BIOS).
+- **Zig 0.16 host I/O — verified, IMPORTANT (the API churned):** file I/O is **`std.Io.Dir` /
+  `std.Io.File`** (NOT `std.fs.File`). `Dir.openFile(io, sub_path, opts)` (`Io/Dir.zig:577`),
+  `Dir.createFile` (:638), `Dir.deleteFile` (:1004), `Dir.rename` (:1093), `Dir.iterate()` (:211).
+  Every call takes an **`io: Io`** handle. Read/write/seek go through `File.reader(io, buf)` /
+  `File.writer(io, buf)` then `Reader.seekTo`/`seekBy`/`getSize` (`Io/File/Reader.zig:115,134,164`),
+  `Writer.seekTo` (`Io/File/Writer.zig:197`). **Grep `references/zig/lib/std/Io/` for exact signatures
+  — do not write from memory.** This `io: Io` indirection is the seam where determinism is enforced
+  (D6): host file *content* is fixed external input; its *timing* never touches the ledger.
+
+**Notation:** every actionable step is a `[ ]` checkbox. The **DECISIONS** block records each design
+choice (D1…D19) with a **recommendation + rationale** per the ground rule (flag, don't silently
+decide). Items marked **(determinism-critical)** are part of the reproducibility surface and must be
+exact — the bridge's synthetic-cost charging and the no-host-time file/clock contract especially.
+Do **not** write code or touch other files while working from this plan; it is the spec.
+
+> **Proportionality note.** Be thorough on **the callback-trampoline bridge (Phase 0)** and **the
+> synthetic-cycle-cost / determinism contract (D5, Phase 1)** — they are the foundation everything
+> hangs off and the literal differentiator. Curate the INT 21h / BIOS service set to **what BaK
+> needs**; flag the rest deferred. Do not pad the per-subfunction minutiae of services BaK never calls.
+
+---
+
+## DECISIONS (recommendation + rationale per the ground rule — flag, don't silently decide)
+
+- [x] **D1 — Callback opcode: reuse DOSBox's `0xFE 0x38 <id8>` (GRP4 reg=7, an illegal/undefined 386
+      encoding) as the guest↔host trap. RECOMMENDED.** Weighing:
+  - *Option A — a brand-new bespoke opcode* (e.g. an unused single byte). Rejected: every unused byte
+    on the 386 is either a documented #UD or risks colliding with a real (even undocumented-but-valid)
+    386 instruction; cpu.md M3 already pins a **positive allowlist of 386-valid opcodes** (`0xD6 SALC`,
+    `0xF1 ICEBP`, the `0x82` alias) and #UDs everything else — a bespoke byte would have to be carved
+    out of that allowlist.
+  - *Option B (RECOMMENDED) — `0xFE /7` (`0xFE 0x38`)*, exactly what dosbox-staging
+    (`callback.cpp:199-200`) and dosbox-x emit. `0xFE` is GRP4; reg fields 0/1 are INC/DEC r/m8, reg
+    2-7 are **reserved → #UD on a real 386**. `0xFE 0x38` is mod=00 reg=7 rm=000. The CPU already
+    raises `#UD` (VEC_UD=6) for this encoding via the Grp4 default arm (cpu.md Phase 2 "#UD default
+    arm" + Phase 4b Grp4/5). **The id byte follows the opcode** (`0xFE 0x38 <id>`); the handler reads
+    it from the stub. **Rationale:** it is a *known-illegal* encoding (so it can never alias a real
+    386 instruction — the allowlist already rejects it), the three reference emulators converge on it
+    (proven design), and it requires **no new CPU contract** — only a hook on the existing `#UD`/Grp4
+    path (D2). Flag: the id is a **separate immediate byte after `0xFE 0x38`**, so the stub is **3 bytes
+    with a 1-byte id**. **This is a *deliberate* divergence from DOSBox** (which uses a 4-byte stub with a
+    **2-byte** id, `CB_SIZE=32`, `CB_MAX=128`): zdos's 128 callback ids fit in a single byte, so a 1-byte
+    id suffices. **Do not claim the stub "mirrors DOSBox byte-for-byte" and do NOT inherit DOSBox's
+    `CB_SIZE=32` offset math** — define zdos's own `CB_SLOT_SIZE` (stub bytes + the per-id return tail;
+    see D4). The `/7` arm `fetch8`s the id itself; document this so the decoder hook reads the id without
+    re-decoding.
+
+- [x] **D2 — How the CPU surfaces the trapped callback to the host: a comptime `CallbackSink` hook on
+      the CPU, invoked from the Grp4-`/7` decode arm, NOT a `StopReason` round-trip through the machine
+      run loop. RECOMMENDED (determinism-critical).** Weighing the two shapes the prompt raises:
+  - *Option A — a distinct `StopReason.callback{id}`:* the CPU's `step()` returns "I hit a callback id
+    N"; the machine loop dispatches to `handlers[N]`. This is the DOSBox `Normal_Loop` shape
+    (`dosbox.cpp` returns the id, the loop calls `Callback_Handlers[ret]()`). **Problem for zdos:** it
+    forces every host-serviced trap through the machine's outer loop, which complicates **re-entrancy**
+    (D3 — a host handler that itself runs a guest INT must re-enter the loop) and spreads dispatch
+    across two modules. It also can't be used while the CPU is mid-burst (cpu.zig `runCycles` loops
+    `step()` and only checks `.shutdown`).
+  - *Option B (RECOMMENDED) — a comptime hook* `CallbackSink` added to the CPU's `Options` (alongside
+    `Pic`/`Scheduler`), with one method **`dispatchCallback(self: *Sink, id: u8) void`**. **The contract
+    must NOT name `*Cpu`:** `src/abi/bus_contract.zig` is a *shared leaf* that BOTH `src/cpu/` and
+    `src/bus/` import — it cannot reference the CPU type without inverting the module graph. So the
+    `Sink` **holds its own `*Cpu`** (set at wire time by the machine, exactly as the `Services` aggregate
+    is constructed with the CPU pointer), and `assertCallbackSinkContract(comptime Sink)` verifies only
+    `fn (*Sink, u8) void` — no CPU type in the signature. When the Grp4 decode arm sees reg=7, it reads
+    the id byte and calls `cpu.cb.dispatchCallback(id)` **synchronously, inline in `executeOne`**; EIP is
+    advanced past the 3-byte stub **after the call returns and only if CS:IP was not changed** (see
+    D1/Phase 0b). The host handler runs, mutates `cpu.st` + `cpu.bus` (through the `*Cpu` the sink holds),
+    and returns; the stub's *next* byte is the `IRET`/`RETF` tail (D4) which the CPU executes normally to
+    resume the guest. **Rationale:** (1) the handler runs **inside the CPU step**, so re-entrancy (D3) is
+    "the handler drives the machine step in a loop" — no machine-loop gymnastics; (2) dispatch is one
+    comptime-inlined call with **zero runtime vtable** on a path that's already rare (a trap), matching
+    the project's comptime-Bus doctrine; (3) it keeps `bus_contract.zig` a true leaf (no CPU type leak),
+    so the module graph stays acyclic exactly like `assertBusContract`. Flag: the DOS/BIOS facade is
+    wired into `CpuWith(Bus, .{ .Pic, .Scheduler, .CallbackSink })`; the machine constructs it and sets
+    its `*Cpu` back-pointer. The default is a `NullCallbackSink` that **raises #UD** (so a callback opcode
+    with no registered sink faithfully faults — ground rule, never a silent NOP; this path must NOT
+    pre-advance EIP so the existing `interrupts.zig` fault rollback stays correct). **This is the one CPU
+    edit this module requires; flag it for the user — it touches `src/cpu/` (the Grp4 `/7` arm + `Options`).**
+
+- [x] **D3 — Re-entrancy (`CALLBACK_RunRealInt` equivalent): host code issues a guest INT by running a
+      real `INT n` through a ROM trampoline and driving the MACHINE step until a stop callback fires.
+      REWRITTEN — this is the #1 correctness fix.** The loader and any host code that must issue a guest
+      INT (the EXEC path AH=4B reusing the file-open service, or the BIOS calling INT 10h internally)
+      needs the `CALLBACK_RunRealInt` trick (`callback.cpp:106-114,677-685`). **The prior "set CS:IP =
+      IVT[intnum] + push a hand-rolled far-return frame" was WRONG:** an INT handler ends in **IRET**
+      (popping FLAGS/CS/IP), not RETF, so a hand-built RETF/far-return frame is the wrong shape and the
+      flags would not unwind. **Correct zdos shape — execute a real `INT n` via a trampoline:**
+  - Build a small **trampoline in the BIOS ROM region**: the two bytes `CD nn` (`INT n`) followed by the
+    reserved **stop-callback opcode** (`0xFE 0x38 <stop_id>`), i.e. `INT n; <stop-callback>`. (Mirror
+    DOSBox planting `CB_INT*`/`call_stop` in the callback area.)
+  - `bridge.runGuestInt(intnum) void`: (1) save `cpu.st` CS:IP/SP (and the re-entry-seam scratch, below);
+    (2) point CS:IP at the trampoline; (3) **drive the re-entry loop through the MACHINE step primitive**
+    (the one that calls `fireDue` + honors `nextEventCycle`), **NOT raw `cpu.step()`** — so PIT/IRQ
+    events fire during re-entry and the BDA tick stays cycle-deterministic; (4) the real `INT n` the CPU
+    executes builds its **own IRET frame (FLAGS/CS/IP)** and dispatches through the IVT exactly as the
+    guest would; (5) when the guest handler `IRET`s, it lands on the trampoline's stop callback, whose
+    handler sets `reentry_done = true`; the loop exits; (6) restore CS:IP/SP and the seam scratch.
+  - **Machine/bridge wiring:** the bridge sits *below* the machine, so the bridge cannot call the machine
+    step by importing it (that would invert the graph). The **machine must supply the step/`fireDue`
+    primitive to the bridge** (a function pointer / small stepping interface injected at wire time), OR
+    the machine owns `runGuestInt` and the bridge exposes the save/restore + trampoline primitives it
+    calls. State the chosen wiring in Phase 0d. Either way the re-entry loop honors the event schedule.
+  - **Save/restore the re-entry seam (`cpu.dec` + `cpu.instr_start_eip`):** a nested step runs
+    `cpu.dec.reset()` and overwrites `instr_start_eip`, clobbering per-instruction decode scratch the
+    outer `executeOne` still needs after `runGuestInt` returns. Snapshot both around the re-entry and
+    restore them.
+  - **Determinism (critical):** the re-entrant steps run real guest instructions and charge their
+    **real** cycle costs through the normal ledger — there is **no separate timing path**; only the leaf
+    host services charge synthetic cost (D5). **Rationale:** mirrors the proven `CALLBACK_RunRealInt`
+    design byte-for-byte in *shape* (real INT, IRET unwind, stop callback), keeps re-entrancy on the
+    deterministic machine step, and keeps the cycle ledger whole across re-entry. Flag: the reserved
+    stop-callback id and its trampoline are allocated at BIOS init (Phase 0d/Phase 2).
+
+- [x] **D4 — Callback stub layout + return semantics: a fixed table of 3-byte trap stubs in the BIOS
+      ROM region at F000:CB_BASE, each followed by a per-id return tail (`IRET`/`RETF`/`IRET+STI`).
+      RECOMMENDED.** Mirror DOSBox's *placement* (CB_SEG=0xF000, CB_SOFFSET=0x1000, callback.h) but
+      **NOT its `CB_SIZE=32` / 2-byte-id offset math** — zdos uses a **3-byte stub with a 1-byte id**
+      (D1, a deliberate divergence: 128 ids fit a byte) and defines its own `CB_SLOT_SIZE`. zdos:
+      reserve a region in the BIOS ROM image (segment 0xF000) for **N callback slots**; each slot is
+      `0xFE 0x38 <id>` (3 bytes) followed by the return sequence chosen by the callback **type**
+      (`.iret` for hardware/software-INT handlers → `0xCF`; `.retf` for far-call services; `.iret_sti`
+      for IRQ handlers that re-enable interrupts; `.iret_eoi` for IRQ0/IRQ1 that send an EOI first — the
+      DOSBox `CB_IRQ0`/`CB_IRQ1` builders, callback.cpp). The IVT entry for a serviced vector points at
+      its slot's seg:offset. **The stub bytes are written into guest RAM via `bus.loadRom` (the BIOS
+      image)** so from the guest's view there is *real code* at the vector (faithfulness — a guest that
+      reads/copies its INT 21h vector sees a valid F000 pointer, as BaK's loader might). **The host sets
+      carry/zero/IF on return by patching the FLAGS image on the guest stack** (the `CALLBACK_SCF/SZF/SIF`
+      trick, callback.cpp:116-135 — `real_writew(SS, SP+4, ...)` because the IRET frame is
+      IP/CS/FLAGS) so `IRET` returns the right flags to the guest. **Rationale:** identical to all three
+      references; "real code at the vector" is the faithfulness property that makes the host-serviced
+      design indistinguishable from real DOS to the guest. **Re-derive the exact byte sequences from the
+      ISA, not by copying DOSBox's builder** (the bytes are ISA facts: `0xCF`=IRET, `0xCB`=RETF,
+      `0xFB`=STI; the GPL-licensed *builder code* is not copied).
+
+- [x] **D5 — The synthetic-cycle-cost contract (FIRST-CLASS — THE zdos differentiator): every callback
+      handler charges a FIXED, DOCUMENTED synthetic cycle cost (or a deterministic pure function of the
+      work), charged UNIFORMLY at the bridge with per-service overrides. DECIDED (determinism-critical).**
+      This is the literal closing of the Spice86 hole (`CLAUDE.md` §"Prime directive"): Spice86's trap
+      consumes **zero** ledger cycles, so frame N drifts; **zdos charges a deterministic synthetic cost
+      so the ledger has no hole across a trap.**
+  - **Where it is charged:** in the **bridge**, in `dispatchCallback` (D2), **before** invoking the
+    leaf handler: `cpu.st.cycles += cb_cost.base[id]` where `cb_cost` is a flat per-id table (the same
+    dispatch shape as cpu.md's `cycles.zig`). The handler may add a **deterministic, work-proportional
+    increment on top** via a documented formula (below). This is the "uniform + per-service override"
+    model the prompt asks for.
+  - **It MUST be a pure function** of (the service id, the guest-register inputs that define the work
+    size). **No host time, no host I/O latency, no host scheduling** may influence it (the whole point).
+    A file read of N bytes charges `cb_cost.file_read_base + N * cb_cost.per_byte` (a fixed formula),
+    **NOT** `f(host read duration)`. The N comes from the guest's CX/count register — a guest input,
+    not a host measurement.
+  - **The numbers are INTERIM / provisional-by-design**, exactly like cpu.md's flat cycle model (D6):
+    they are *fixed* (which satisfies the prime directive) but **not** claimed to be PRM-accurate real
+    DOS timings (real INT 21h cost varies by FAT/disk state we don't model). Documented as such in the
+    `cb_cost.zig` header. The honest figure to transcribe later (a fidelity-only pass) would be measured
+    DOS-on-386 service timings; not available offline, so per the ground rule it is **not invented** —
+    fixed interim costs are used and labeled.
+  - **Comptime totality (no silent default):** every allocated callback id must have a `cb_cost` entry;
+    a comptime/assert check (mirroring cpu.md's 0x400-key sweep) fails if an id has no cost. The
+    default/unsupported-service path (D11) charges a defined cost too.
+  - **Reconciliation with cpu.md + machine M-D7:** the CPU already charges `cycles.interrupt_delivery`
+    for the IVT delivery that *reaches* the stub (interrupts.zig:140/175). The **synthetic cost D5 adds
+    is the cost of the host SERVICE itself** (the guest work it stands in for), charged on top of the
+    delivery cost — together they make the trap's total ledger cost a fixed function with no hole. The
+    re-entrant guest work (D3) is charged normally and is separate. **Rationale:** `CLAUDE.md` hard
+    constraint #1; this is the single most important property of the module.
+
+- [x] **D6 — Deterministic host file I/O: host file CONTENT is fixed external input (replayed config,
+      not snapshot bytes); host file TIMING never touches the ledger. DECIDED (determinism-critical).**
+      The VFS (D8) reads/writes real host files, but:
+  - The **cycle cost is the synthetic D5 formula** (`base + N*per_byte`), never the real read duration.
+  - **No host wall clock** drives anything: INT 21h get-date/get-time (AH=2A-2C) and INT 1Ah read the
+    **emulated PIT/RTC tick** (`CLAUDE.md` #2), NOT `std.time` (D13). The Zig `io: Io` handle is the
+    seam; grep-enforce no `std.time` in the module.
+  - **Snapshot model:** open file handles are snapshotted by **stable SFT index + host path + current
+    file position** (D9/D14), NOT by host fd. On restore the VFS re-opens the path and seeks to the
+    saved position. **Host file content is NOT in the snapshot** — it is replayed external config (the
+    game's data files on disk). **Rationale:** `CLAUDE.md` #2/#3/#6; reproducibility requires the
+    *content* be a fixed input and the *timing* be synthetic.
+
+- [x] **D7 — Handler signature: `fn(ctx: *Service, cpu: *Cpu) void`, operating on `cpu.st` + `cpu.bus`
+      via the existing CPU surface; dispatch by AH inside each INT handler (the `IndexBasedDispatcher`
+      shape). RECOMMENDED.** Each callback id maps to one **interrupt-level** handler
+      (`int21Handler`, `int10Handler`, …); the handler reads `cpu.st.getReg8(AH)` and switches to a
+      per-AH subfunction. Handlers use the *existing* CPU accessors — `getReg16/32`/`setReg16/32`,
+      `selector[]`/`seg_base[]`, `eflags`, and for guest memory the segmented `readLogical8`/`segRead*`
+      or physical `readPhysical8`/`patchPhysical8` (cpu.zig:220-251). They set return carry/zero via the
+      D4 stack-FLAGS patch helper (`bridge.setGuestCF(cpu, bool)` etc.). **Rationale:** matches
+      spice86's `IndexBasedDispatcher` (AH = sub-function index) and dosbox's `DOS_21Handler` switch;
+      reuses the CPU's already-tested register/memory surface (no new memory path); the `*Service` ctx
+      carries the DOS/BIOS state (PSP/MCB/SFT/VFS, BDA). Flag: handlers must be **pure w.r.t. host
+      time/RNG/scheduling** (audit, Phase 9), and must read counts from guest registers so D5 costs stay
+      pure.
+
+- [x] **D8 — Host-FS VFS: a `DosDrive` abstraction with ONE backend for BaK — a `HostDirDrive` mapping
+      one host directory to one DOS drive letter; `std.Io.Dir`-based. RECOMMENDED (curated).** Weighing:
+      DOSBox has 6 drive backends (`localDrive`/`fatDrive`/`isoDrive`/…); spice86 has `DosDriveManager`
+      + path resolver. **BaK needs exactly one:** a real-mode game that loads its data files from a
+      directory. **zdos:** a `DosDrive` interface (the methods BaK exercises — `open`, `create`, `close`,
+      `read`, `write`, `seek`, `findFirst`, `findNext`, `unlink`, `getAttr`, `rename`) with a single
+      `HostDirDrive` backend over `std.Io.Dir` (verified API — Phase 5). A drive table `drives[26]`
+      (A:..Z:); BaK's install dir mounts as `C:`. **8.3 name munging** (D10) maps DOS 8.3 names ↔ host
+      filenames. **Rationale:** ground rule says don't build speculative breadth; BaK needs one host
+      directory mapped to one drive; the interface keeps the seam for `fatDrive`/CD later (flagged
+      deferred). FCB-based file API (CP/M legacy, INT 21h 0x0F-0x24) is **deferred-and-flagged** unless a
+      BaK trace shows it (handle-based 0x3C-0x42 is what 1993 games use).
+
+- [x] **D9 — PSP/MCB/DTA/SFT representation: thin typed "views" over guest RAM (the DOSBox `MemStruct`
+      model), NOT host-side mirror structs. RECOMMENDED.** The PSP (256 bytes), MCB chain (16-byte
+      headers in the arena), DTA (128 bytes), and the environment block are **real bytes in guest
+      conventional memory** — a guest program reads them at byte-accurate offsets (BaK's loader/runtime
+      inspects its PSP). zdos models each as a small Zig helper (`Psp`, `Mcb`, `Dta`) that reads/writes
+      fields at fixed offsets through `cpu.bus`/the segmented accessors — the `DOS_PSP`/`DOS_MCB`/`DOS_DTA`
+      pattern. **The SFT (system file table)** is the one piece that is **host-side state** (it holds the
+      Zig `File` handle objects, which cannot live in guest RAM): a fixed-size `sft: [N]SftEntry` array
+      on the `Service` ctx, indexed by a stable id; the **per-process JFT (job file table)** in the PSP
+      maps the guest's file *handle* (the small int it gets back) → SFT index (byte array at PSP offset
+      0x18, the classic 20-handle JFT). **Rationale:** byte-accurate guest-visible structures =
+      faithfulness (the guest sees real DOS structures); the SFT-on-host + JFT-in-PSP split is exactly
+      how real DOS + DOSBox/spice86 do it and is the only place a host object (the `File`) must live.
+      Snapshot: guest-RAM structures ride the bus snapshot; the SFT host handles are re-bound by
+      path+position (D6/D14).
+
+- [x] **D10 — 8.3 name munging: re-derive the canonicalization from the documented DOS rules + the
+      dosbox-test-suite behavioral spec; do NOT copy DOSBox's `DOS_MakeName`/`DTAExtendName` code (GPL).
+      DECIDED.** The behavior to reproduce (re-derived, with unit tests written from the spec, per
+      `plans/dosbox-test-suite.md`): uppercase; split name (≤8) + extension (≤3) on the last dot;
+      reject/translate characters illegal in 8.3; collapse a host long-name to a deterministic 8.3
+      short name when enumerating a directory (the `~1` tilde-numbering generation order must be
+      **deterministic** — a determinism concern, since iteration order of a host directory is not
+      guaranteed: sort entries before assigning `~N`). **Rationale:** the munging is a *specification*
+      (documented DOS 8.3 rules), not DOSBox-proprietary; copying GPL code is forbidden; the
+      determinism subtlety (stable `~N` assignment over an unordered host directory listing,
+      `CLAUDE.md` #5) must be handled explicitly — **sort `Dir.iterate()` output deterministically
+      before numbering.**
+
+- [x] **D11 — Unsupported INT 21h subfunction / BIOS service policy: FLAG + surface, never fake — but
+      faithfully (split into two faithful sub-rules). DECIDED + CORRECTED (ground rule, load-bearing).**
+      An AH (or AH/AL) we have not implemented does **not** silently return a fabricated success. The
+      policy splits:
+  - **(a) Functions with a defined DOS error path** set **CF=1 + AX=error code ONLY where DOS itself
+    does** (e.g. open a missing file → CF=1, AX=2). This is a *faithful* failure, not an invention — used
+    only for subfunctions that have a real DOS error return.
+  - **(b) The generic unknown-AH default** returns **AL=0 with carry CLEAR** — because that is what real
+    DOS actually does for an unknown AH (`dosbox dos.cpp:1610`: `reg_al = 0; break;`); real DOS does
+    **NOT** set CF for an unknown function. **Do not fabricate a CF=error here** — that would itself be a
+    fake. The "surface, never fake" goal is met **not** by a fabricated CF, but by **also raising the
+    structural `Service.unsupported{int, ah, al}` signal** the API server sees (a record + an optional
+    stop). So the *guest* sees faithful real-DOS behavior (AL=0, CF clear) while the *host/API* sees the
+    honest "we don't implement this" signal.
+  - A comptime/registration check lists exactly which subfunctions are implemented; the default arm of
+    each INT switch hits rule (b). Charges the D5 default cost. **Rationale:** `CLAUDE.md` ground rule —
+    faking DOS is the failure mode to escape; faithfulness means matching real DOS's *actual* unknown-AH
+    behavior (AL=0/CF clear), and the honesty requirement is satisfied by the out-of-band structural
+    signal, not by lying to the guest with a fake CF.
+
+- [x] **D12 — Module split: `src/bios/` (IVT/BDA/POST + BIOS INTs) and `src/dos/` (kernel + loader +
+      VFS + EMS service) as SEPARATE peer modules; the callback-bridge primitive is HOISTED into a
+      SHARED LEAF both import — NOT a dos→bios edge. REVERSED.** The prior decision routed `src/dos/` →
+      `src/bios/` so dos could reuse the bridge; **that edge is overturned.** Reasons: it makes `dos`
+      depend on the whole of `bios` just for the bridge primitive, and it is asymmetric (the BIOS INT
+      handlers and the DOS INT handlers both need the *same* bridge — there is no real "bios owns the
+      bridge" relationship; both are equal clients). **New shape — hoist the bridge primitive into a
+      shared leaf:** the callback primitive (callback allocation, stub/trampoline planting, `runGuestInt`,
+      the FLAGS-patch/`setGuestCF/ZF/IF` helpers, the `cb_cost` synthetic-cost table) moves into a
+      **shared leaf module** — `src/abi/` alongside `bus_contract.zig` (or a new `src/bridge/` peer that
+      sits below both `src/bios/` and `src/dos/`). **BOTH `src/bios/` and `src/dos/` import the bridge
+      leaf; NEITHER imports the other.** This matches the existing `assertBusContract`→`src/abi/` leaf
+      pattern (a leaf both cpu and bus import, neither importing the other), and the reference emulators
+      (DOSBox's `callback.cpp` is shared infrastructure under `src/cpu/`, not under `src/dos/`; spice86
+      keeps the callback machinery in `Common/`, not in the DOS layer). The **`Services` aggregate** that
+      is the CPU's `CallbackSink` (D2) **still lives at the machine layer**: the machine owns a `Services`
+      that holds the `*Bios` + `*Dos` state + the bridge instance + the `*Cpu` back-pointer, and is the
+      `CallbackSink` the CPU dispatches to. **Rationale:** keeps the graph acyclic with the bridge as a
+      true shared leaf (the same doctrine as `bus_contract.zig`); one `CallbackSink` facade keeps the
+      CPU's comptime surface single; removes the awkward dos→bios coupling. Flag: update the build wiring
+      — `bios_mod` and `dos_mod` both `addImport("bridge", ...)`; neither imports the other.
+
+- [x] **D13 — INT 21h get-time / INT 1Ah / get-date stay deterministic by reading the emulated
+      PIT/RTC, not the host clock. DECIDED (determinism-critical).** INT 21h AH=2A (get date), 2B (set
+      date), 2C (get time) and INT 1Ah (system time-of-day tick) derive their values from the **BDA tick
+      count at 0040:006C** (incremented by the INT 08h/IRQ0 handler, which the PIT drives at the
+      deterministic cycle, machine M-D6/M-D9) and a fixed **emulated epoch** (a pinned start date/time, a
+      project constant). **No `std.time` anywhere** (grep-enforced, Phase 9). **Rationale:** `CLAUDE.md`
+      #2 ("emulated time = f(cycle counter)"); a game that seeds RNG from the clock (some do) would be
+      non-reproducible otherwise — this is a direct determinism requirement. **CONFIRMED: the pinned
+      emulated epoch is `1993-01-01 00:00:00`** (a documented project constant in `timing.zig`).
+  - **Extends to ALL DOS-visible file/dir date-time fields (this is the Spice86 leak to avoid).**
+    The DTA find record's date/time (offsets 0x16/0x18), AH=57 get/set file date-time, directory-entry
+    timestamps, and any PSP/MCB date fields **come from a deterministic source** — the pinned
+    1993-01-01 epoch, the emulated BDA tick, or per-file replayed config — and **NEVER from host `stat`
+    mtime/ctime.** (Spice86's exact non-determinism leak is reading host file mtime here,
+    `DosFileManager.cs:1031`.) **Phase 9's grep is extended to ban `mtime`/`ctime`/stat-timestamp use in
+    `src/dos/`, not just `std.time`.**
+
+- [x] **D14 — Snapshot/restore of DOS+BIOS state from day one. DECIDED (`CLAUDE.md` #6).** The snapshot
+      set: **(in guest RAM, rides the bus snapshot B12)** the IVT, the BDA, every PSP, the MCB chain,
+      the current DTA, the environment blocks, the callback stubs (config, replayed); **(host-side on the
+      `Service` ctx, snapshotted explicitly)** the SFT (open files by **stable id + host path + file
+      position** — re-opened/re-sought on restore, D6/D9), the current-PSP segment, the current-drive,
+      the EMS handle/page-map state, the `next_seq`-style id counters. **Host file content is replayed
+      external config, NOT snapshot bytes.** On restore the machine re-binds callback ids → handlers
+      (like the bus re-binds handler ids) and the VFS re-opens SFT paths. **Rationale:** `CLAUDE.md` #6;
+      a populated DOS state (program loaded, files open, memory allocated) must round-trip
+      byte-identical with host handles re-bound by path+position.
+
+- [x] **D15 — EMS INT 67h service lives HERE (in `src/dos/`), driving the bus's EMS MMIO device (bus
+      B8). DECIDED.** The bus side is already planned: EMS is an ordinary MMIO device registered via
+      `mapMmio(frame_phys, 0x10000, ems_handler)`; the **EMS manager owns the backing store and remaps
+      by swapping which slice its MMIO handler points at** (bus B8). **This module supplies that manager
+      + the INT 67h handler** (LIM EMS: get-status, get-page-frame, get-page-count, allocate-handle,
+      map-page, free-handle — AH=40-4x). BaK needs EMS (`CLAUDE.md` First target: ~1 MB EMS). **Rationale:**
+      the INT 67h *service* is a host-serviced trap exactly like INT 21h (charges D5 cost, flags
+      unsupported subfunctions); the bus already owns the MMIO/backing seam, so this module owns only
+      the handle table + page-map logic + the INT 67h dispatch. Included in scope (not deferred) because
+      BaK requires it. Flag: the EMS backing block's deterministic zero-init is determinism-critical and
+      lives in this manager (bus B12 "device-side state").
+
+- [x] **D16 — The callback-bridge primitive lives in a SHARED LEAF (`src/abi/` or a new `src/bridge/`
+      peer), imported by both `src/bios/` and `src/dos/`. DECIDED.** (The concrete location chosen by
+      D12's reversal.) The leaf exports `allocCallback`/`plantStub`/`setRealVec`, `dispatchCallback`'s
+      cost-charge + handler-table contract, `runGuestInt`, `setGuestCF/ZF/IF`, and the `cb_cost` table.
+      It depends only on the CPU surface + the bus contract (already leaves), so it is itself a clean
+      leaf. **Rationale:** mirrors `bus_contract.zig` (a shared leaf both `cpu` and `bus` import); the
+      bridge is equally infrastructure for the BIOS and DOS handlers; keeps the graph acyclic with no
+      dos↔bios edge.
+
+- [x] **D17 — DOS character-device layer: `SftEntry` is a tagged union `{ device, file }`; standard
+      handles are pre-opened device objects; AH=3D resolves a device table BEFORE the drive VFS; EMS
+      registers `EMMXXXX0` as a device. DECIDED (critical — BaK's EMS probe + console depend on it).**
+      Real DOS treats CON/AUX/PRN/NUL and installable character devices as first-class objects opened by
+      name ahead of any file. zdos models this:
+  - `SftEntry = union(enum) { device: *DosCharDevice, file: HostFile }` — the SFT entry is either a host
+    file (the VFS `File`) or a character-device object. (Supersedes D9's `host_file: ?File` field shape.)
+  - **Pre-open handles 0–4 → CON / CON / CON / AUX / PRN** device objects (stdin/stdout/stderr/aux/prn).
+  - **AH=3D open resolves a device table** (CON, AUX, PRN, NUL, `EMMXXXX0`) by name **BEFORE** consulting
+    the drive VFS — opening `"CON"` returns a CON handle, not a file named CON. (DOSBox `dos_devices.cpp`.)
+  - **AH=44 AL=00 (get device info)** returns the **device bit (bit 7 set)** for a device handle; read/
+    write/seek on a device handle route to the device's methods (CON → keyboard/VGA seam; NUL → discard),
+    not the VFS.
+  - **EMS registers `EMMXXXX0` as a character device** — this is the documented EMS-presence probe a
+    program issues (`INT 21h AH=3D open "EMMXXXX0"`, then `AH=44` IOCTL); **without it BaK cannot detect
+    EMS** (`dosbox ems.cpp:1451`). **Rationale:** faithful DOS device semantics; the console + the EMS
+    detection path BaK needs both require the device dimension; ground rule — the EMS probe must succeed
+    truthfully, not be faked.
+
+- [x] **D18 — INT 33h mouse driver is OWNED HERE (a host-serviced trap), not deferred to the device
+      half. DECIDED (major — BaK needs it).** Like INT 16h keyboard, the mouse *driver* INT (33h) is a
+      host-serviced callback that reads raw motion/buttons from the mouse *device* via the same
+      scripted-input seam as the keyboard; only the mouse *device* itself is in `src/devices/`. The
+      callback + driver state lives here (Phase 3). **Rationale:** INT 33h is API-shaped (register-in/
+      register-out, no real driver code runs), exactly the host-serviced pattern; BaK is mouse-driven.
+      INT 2Fh multiplex defaults to faithful "not installed" / no-handler semantics (don't fault); which
+      AX probes BaK issues is trace-driven (a flagged stub is fine).
+
+- [x] **D19 — A bounded bus-side bulk copy (`writeGuestBlock`/`readGuestBlock`) is added to the bus.
+      DECIDED (perf — flagged as a bus addition).** The loader (image copy + relocations) and AH=3F/40
+      read/write are the warmest host-service paths; a per-byte `writePhys8` loop across them is wasteful.
+      Add `bus.writeGuestBlock(phys, []const u8)` / `bus.readGuestBlock(phys, []u8)` that do **one
+      A20/region check per span** and `@memcpy` into/out of `bus.ram`, with a per-byte fallback only on a
+      region-crossing span (the DOSBox `MEM_BlockWrite`/`MEM_BlockRead` shape). The loader + AH=3F/40 copy
+      through it via a **fixed stack scratch buffer** (no per-call heap, no per-byte loop on the warm
+      path). **Rationale:** the only host-service hot path; a bounded, region-checked block copy is both
+      faster and still a single deterministic operation (cost stays the synthetic D5 formula, not host
+      copy time). **Flag: this is an addition to `src/bus/` — call it out to the user; it is the only
+      bus edit this module needs.**
+
+---
+
+## Phase 0: The callback-trampoline bridge (FOUNDATIONAL — everything hangs off this)
+
+Goal: a working guest↔host bridge — a guest `INT n` reaches a host Zig handler, which mutates guest
+regs/memory and returns via `IRET`, charging a deterministic synthetic cost; plus the re-entrant
+`runGuestInt` so host code can drive a guest INT. **Done when** a round-trip test (guest `INT n` → host
+handler bumps AX → `IRET` → guest sees AX) passes, the re-entrancy test (host `runGuestInt` → a host
+handler runs → returns) passes, and both are byte-identical across two runs including the cycle ledger.
+
+### 0a. Module skeleton & build wiring (D12)
+
+- [ ] Create `src/bios/` and `src/dos/` file splits (one responsibility per file):
+  - [ ] `src/bios/bios.zig` — module root: the `Bios` struct (IVT/BDA/POST + BIOS INT handlers),
+        exposes `init`/`reset`/the callback-handler registration.
+  - [ ] **`src/bridge/bridge.zig` (or `src/abi/bridge.zig`) — the callback-trampoline primitive in a
+        SHARED LEAF (D12 reversed / D16):** callback allocation, stub + **`INT n; <stop-callback>`
+        trampoline** planting into the BIOS ROM image (D3), the `dispatchCallback` cost-charge +
+        handler-table contract the CPU's `CallbackSink` calls, `runGuestInt` (D3 re-entrancy, driven
+        through the machine step), `setGuestCF/ZF/IF` (D4 stack-FLAGS patch), `cb_cost` (D5
+        synthetic-cost table). **Imported by BOTH `src/bios/` and `src/dos/`; neither imports the other.**
+        Depends only on the CPU surface + the bus contract (already leaves).
+  - [ ] `src/bios/bda.zig` — the BIOS Data Area layout (0040:0000) field offsets + typed accessors.
+  - [ ] `src/bios/int10.zig`, `int16.zig`, `int1a.zig`, `int08.zig`, `int11_12.zig`, `int13.zig`,
+        `int15.zig` — the BIOS service handlers (Phase 3).
+  - [ ] `src/dos/dos.zig` — module root: the `Dos` struct (kernel state: PSP chain, MCB, DTA, SFT,
+        drives, version), the INT 21h dispatch.
+  - [ ] `src/dos/int21.zig` — the AH switch (Phase 4); `src/dos/psp.zig`, `mcb.zig`, `dta.zig`,
+        `sft.zig` — the guest-RAM-view structures + the host SFT (D9).
+  - [ ] `src/dos/vfs.zig` (the `DosDrive` interface + `HostDirDrive`, D8), `src/dos/devices.zig` (the
+        `DosCharDevice` table — CON/AUX/PRN/NUL/`EMMXXXX0`, D17), `src/dos/name83.zig` (8.3 munging, D10),
+        `src/dos/loader.zig` (EXE/COM loader, Phase 6), `src/dos/int33.zig` (INT 33h mouse driver, D18,
+        Phase 3), `src/dos/ems.zig` (INT 67h + the EMS manager/MMIO handler + the `EMMXXXX0` device,
+        D15/D17/Phase 7).
+  - [ ] `src/machine/services.zig` — the `Services` aggregate that is the CPU's `CallbackSink` (D2/D12/
+        D16): holds `*Bios` + `*Dos` + the bridge instance + a `*Cpu` back-pointer; `dispatchCallback(id)`
+        charges D5 cost then routes id → the right handler. (Lives at the machine layer, NOT in `bios`.)
+  - [ ] Test roots: `src/bridge/bridge_test.zig` (the shared leaf, D16), `src/bios/bios_test.zig`,
+        `src/dos/dos_test.zig`,
+        `src/dos/int21_test.zig`, `src/dos/loader_test.zig`, `src/dos/name83_test.zig`, and a
+        `src/dos/integration_test.zig` (loads + runs a real tiny program — the milestone test).
+- [ ] **Build wiring** (mirror cpu/bus/machine in `build.zig`, verified APIs `b.addModule`/`addTest`/
+      `addRunArtifact`/`step`):
+  - [ ] `bridge_mod = b.addModule("bridge", ...)` (the shared leaf, D16) with `addImport("cpu"/"bus"/
+        "bus_contract")` — depends only on the leaves; imports NEITHER `bios` nor `dos`.
+  - [ ] `bios_mod = b.addModule("bios", ...)` with `addImport("cpu"/"bus"/"machine"/"devices"/
+        "bus_contract")` **plus** `addImport("bridge", bridge_mod)`.
+  - [ ] `dos_mod = b.addModule("dos", ...)` with the same imports **plus** `addImport("bridge",
+        bridge_mod)` — **does NOT import `bios`** (D12 reversed: no dos→bios edge).
+  - [ ] `test-bridge`, `test-bios`, and `test-dos` steps; wire all three into the top-level `test` step
+        alongside `test-cpu`/`test-bus`/`test-machine`.
+- [ ] **The CPU `CallbackSink` contract (the one CPU edit — CONFIRMED OK to modify `src/cpu/`, D2):**
+  - [ ] In `src/abi/bus_contract.zig` add `assertCallbackSinkContract(comptime Sink)` verifying **only
+        `fn (*Sink, u8) void`** (`dispatchCallback`). **The contract must NOT name `*Cpu`** —
+        `bus_contract.zig` is a leaf both `cpu` and `bus` import and cannot reference the CPU type without
+        inverting the graph (D2 refined). The `Sink` **holds its own `*Cpu`**, set at wire time.
+  - [ ] In `src/cpu/`: add `CallbackSink` to `Options` (default `NullCallbackSink` that raises `#UD`
+        via `raiseFault(VEC_UD, .fault, null)` — faithful, never a silent NOP). The Grp4 `/7` arm
+        (currently `else => try exec.ud(cpu)` in `exec_ctrl.zig:198`) instead: **`fetch8` the id byte
+        itself** (note `decodeModRM` already ran for `0xFE 0x38` and its `[BX+SI]` decode for modrm
+        `0x38` is **inert** — reg=7 does no memory access), then `cb.dispatchCallback(id)`. **Advance EIP
+        past the stub AFTER `dispatchCallback` returns, and ONLY if the handler did not change CS:IP**
+        (the spice86 conditional-advance: snapshot CS:IP before the call, compare after; if the handler
+        jumped/IRETed away, do nothing). **The `NullSink` `#UD` path must NOT pre-advance EIP** so the
+        existing `interrupts.zig:72-74` fault rollback to `instr_start_eip` stays correct. **This is a
+        small, surgical `src/cpu/` change — call it out in the milestone sign-off and to the user.**
+  - [ ] The machine constructs `CpuWith(Bus, .{ .Pic, .Scheduler = Machine, .CallbackSink = *Services })`
+        and passes `&self.services`, then **sets the `Services` `*Cpu` back-pointer** (the sink holds the
+        CPU it dispatches to). Document the wiring in machine init order (after devices + CPU
+        construction, before/at BIOS POST).
+
+### 0b. Callback allocation + stub planting (D1/D4)
+
+- [ ] **`Bridge.allocCallback(type: CbType) u8`** — returns a stable id (assigned in fixed registration
+      order, D14), reserves a slot. `CbType = enum { iret, retf, iret_sti, iret_eoi_pic1, iret_eoi_pic2 }`.
+- [ ] **Define `CB_SLOT_SIZE` for zdos's 3-byte/1-byte-id stub (D1) — do NOT inherit DOSBox's
+      `CB_SIZE=32` / 2-byte-id math.** Slot = `0xFE 0x38 <id>` (3 bytes) + the per-id return tail; size
+      the slot to fit the largest tail (the `iret_eoi` EOI sequence). Comptime-assert it.
+- [ ] **`Bridge.plantStub(id, type)`** — write `0xFE 0x38 <id>` (3 bytes, 1-byte id) + the return tail
+      for `type` into the BIOS ROM image at `F000:CB_BASE + id*CB_SLOT_SIZE`. **Re-derive the tail bytes
+      from the ISA** (`0xCF` IRET, `0xCB` RETF, `0xFB` STI, the EOI `OUT 0x20,AL` sequence) — do not copy
+      DOSBox's builder. The image is handed to `bus.loadRom(0xF0000, image)` at init so the bytes are real
+      guest code (D4 faithfulness).
+- [ ] **`Bridge.plantTrampoline(stop_id) -> seg:off`** (for D3 `runGuestInt`) — plant `CD nn` (`INT n`,
+      patched per call) + `0xFE 0x38 <stop_id>` in the ROM region; `runGuestInt` points CS:IP here.
+- [ ] **`Bridge.setRealVec(id, intnum)`** — point IVT[intnum] (guest RAM at `intnum*4`) at the slot's
+      `seg:offset` via `cpu.bus.writePhys16`. (LIDT default base 0, so IVT is at linear 0.)
+- [ ] **Comptime/registration map** id → handler fn (D7) + id → `cb_cost` entry (D5); assert every id
+      has both (no silent default). The callback-slot count `N` is a **provisional / comptime-asserted
+      cap** (sized from a BaK trace later; too-small N fails loudly at comptime).
+
+### 0c. The dispatch entry + synthetic cost (D2/D5)
+
+- [ ] **`Services.dispatchCallback(id)`** (the `CallbackSink` method — **signature `fn (*Services,
+      u8) void`, no `*Cpu` in the contract**; the sink uses its held `*Cpu`, D2 refined): (1) `cpu.st.cycles
+      += cb_cost.base[id]` (**the synthetic cost, D5 — before the handler**); (2) look up handler by id;
+      (3) call `handler(ctx, cpu)`; (4) the handler may add a work-proportional increment (D5 formula).
+      The Grp4 `/7` arm advances EIP past the 3-byte stub **after this returns and only if CS:IP was not
+      changed** (so an IRET/jump handler is not double-advanced; D1/0a). The stub's return tail (already
+      in RAM) resumes the guest when `executeOne` continues.
+- [ ] **Stop-sentinel cost — resolve the guard-vs-sentinel conflict explicitly (determinism-critical).**
+      The no-hole guard wants every dispatched callback to advance the ledger by ≥ the table base, but the
+      `runGuestInt` stop sentinel is pure control-flow that should add **zero** work. Resolve with
+      **EITHER** (chosen): the CPU recognizes the reserved stop slot **without** going through
+      `dispatchCallback` — the Grp4 arm sees the stop id, exits the re-entry loop, and the guard is
+      **exempted** for that reserved id; **OR** the stop sentinel is given a **documented fixed cost
+      counted as part of `runGuestInt`** (so the ledger still moves and the guard holds). Do not leave it
+      ambiguous — pick one and state it in `cb_cost.zig`.
+- [ ] **By-construction guard (determinism-critical):** assert in debug builds that `dispatchCallback`
+      advanced `cpu.st.cycles` by ≥ the table base (mirrors cpu.md's Phase 1a guard) — **no host-serviced
+      trap may leave the ledger unchanged.** The reserved stop sentinel is carved out of this guard per
+      the resolution above.
+- [ ] **`Bridge.setGuestCF/ZF/IF(cpu, bool)`** (D4) — patch the FLAGS word in the IRET frame on the
+      guest stack: `cpu.segWrite16(.ss, SP+4, patched)` (the frame is IP@SP, CS@SP+2, FLAGS@SP+4 —
+      re-derived from the IVT push order in interrupts.zig:196-200). Used by every handler to return
+      carry/error.
+
+### 0d. Re-entrancy: `runGuestInt` via a real `INT n` trampoline (D3 — the #1 fix)
+
+- [ ] **Reserve a "stop" callback** (id 0 convention): its handler sets `ctx.reentry_done = true`. Plant
+      its stub at init; plant the **`INT n; <stop-callback>` trampoline** (Phase 0b `plantTrampoline`).
+- [ ] **`Bridge.runGuestInt(intnum) void` — execute a REAL `INT n` through the trampoline (NOT a
+      hand-rolled far-return frame).** An INT handler ends in **IRET**, not RETF; the old "push a
+      far-return frame + set CS:IP = IVT[intnum]" approach built the wrong frame shape. Instead:
+  - [ ] Save `cpu.st` CS:IP/SP **and the re-entry seam scratch `cpu.dec` + `cpu.instr_start_eip`** (a
+        nested step runs `cpu.dec.reset()` and overwrites `instr_start_eip`, clobbering per-instruction
+        decode state the outer `executeOne` still needs after return — `cpu.zig:77-79`, `dispatch.zig:53`).
+  - [ ] Patch the trampoline's `INT n` immediate to `intnum`; point CS:IP at the trampoline.
+  - [ ] **Drive the re-entry loop through the MACHINE step primitive** (`fireDue` + `nextEventCycle`),
+        **NOT raw `cpu.step()`**, so PIT/IRQ events fire during re-entry and the BDA tick stays
+        cycle-deterministic. The bridge is below the machine: the **machine supplies the step/`fireDue`
+        primitive to the bridge** (injected at wire time) OR the machine owns `runGuestInt` and calls the
+        bridge's save/restore + trampoline primitives. **State the chosen wiring here.**
+  - [ ] The CPU executing the real `INT n` builds its **own IRET frame (FLAGS/CS/IP)** and dispatches
+        through the IVT exactly as the guest would; when the guest handler `IRET`s it lands on the
+        trampoline's stop callback → `reentry_done = true` → loop exits.
+  - [ ] Restore CS:IP/SP + the seam scratch (`cpu.dec`, `cpu.instr_start_eip`); clear `reentry_done`.
+  - **The nested guest instructions charge their real cycle cost through the normal ledger (no separate
+    path) — determinism preserved; only leaf host services add synthetic cost (D5); the stop sentinel is
+    cost-exempt per 0c.**
+- [ ] **Re-entrancy depth guard** — a small fixed max-depth counter (flag overflow loudly, never
+      recurse unboundedly; mirrors spice86's call-stack depth guard).
+- [ ] **Document the breakpoint limitation:** a debugger breakpoint cannot land *mid-host-service* (the
+      handler runs inline in `dispatchCallback`, off the machine's normal instruction boundary) nor
+      inside `runGuestInt`'s nested step loop. This is **acceptable** (host services are atomic from the
+      guest's view); document it so the API/MCP server's breakpoint semantics account for it.
+
+### 0e. Phase 0 tests (`bridge_test.zig`)
+
+- [ ] **Round-trip:** plant an `.iret` callback, point IVT[0x80] at it, register a handler that does
+      `AX += 1`; hand-assemble a guest program `INT 0x80; HLT`; run via the machine; assert AX bumped,
+      the guest resumed past the INT, and `cpu.st.cycles` advanced by `interrupt_delivery + cb_cost`.
+- [ ] **FLAGS return:** a handler that sets carry → assert the guest's FLAGS after IRET has CF set
+      (proves the D4 stack patch).
+- [ ] **Re-entrancy:** host calls `runGuestInt(0x80)` directly (no guest INT instruction) → the real
+      `INT 0x80` runs through the trampoline → the handler runs → guest `IRET` → stop callback fires →
+      returns; assert state, that nested guest work was charged, and that the outer `cpu.dec`/
+      `instr_start_eip` seam scratch was restored intact.
+- [ ] **Determinism:** run the round-trip twice → byte-identical State + RAM + `cycles` (the
+      no-hole-across-a-trap proof, in miniature).
+- [ ] **Unsupported/NullSink:** a callback id with no handler raises `#UD` (D2 default) — not a NOP.
+
+---
+
+## Phase 1: The determinism + synthetic-cost contract (cross-cutting — establish before services)
+
+Goal: write down and enforce the module's determinism rules before any service code, so every BIOS/DOS
+handler is born deterministic. **Done when** the contract is documented in the module headers and the
+enforcement asserts/grep-tests exist.
+
+- [ ] **The synthetic-cycle-cost contract (D5) written in `cb_cost.zig` header:** every callback charges
+      a fixed cost; per-service work-proportional formulas are documented and pure; the table is total
+      (comptime-asserted), labeled interim/provisional. State explicitly: *this is what closes the
+      Spice86 hole.*
+- [ ] **Pure-function invariant (D6/D13):** no handler reads host time, host I/O latency, RNG, host
+      scheduling, or env. File-read/write counts come from guest registers; clock values come from the
+      BDA tick / emulated epoch. Document + grep-enforce (Phase 9).
+- [ ] **No-hole guard:** the `dispatchCallback` cost-charge + the debug assert (Phase 0c) — every trap
+      advances the ledger.
+- [ ] **Deterministic init:** the IVT, BDA, first PSP, first MCB, DTA, SFT, drive table, EMS state are
+      all initialized to documented values with no uninitialized fields (`CLAUDE.md` #5).
+- [ ] **No per-op alloc:** the SFT, drive table, MCB views, EMS handle table are preallocated on the
+      `Service` ctx; handlers allocate nothing per call (counting-allocator guard, Phase 9). (Host file
+      buffers for read/write copy directly between the host `File` and guest RAM via a **fixed stack
+      scratch buffer** routed through `bus.writeGuestBlock`/`readGuestBlock` (D19) — no per-call heap, no
+      per-byte `writePhys8` loop on the warm path.)
+- [ ] **Bus bulk-copy addition (D19 — flag as a bus addition):** add `bus.writeGuestBlock(phys,
+      []const u8)` / `bus.readGuestBlock(phys, []u8)` — one A20/region check per span, `@memcpy`
+      into/out of `bus.ram`, per-byte fallback only on a region-crossing span (the `MEM_BlockWrite`/
+      `MEM_BlockRead` shape; mirrors the existing `loadRom` `@memcpy` at `bus.zig:519`). The loader image
+      copy + AH=3F/40 use it. **This is the only `src/bus/` edit this module needs — call it out.**
+
+---
+
+## Phase 2: BIOS — IVT, BDA, POST stand-in, callback wiring (replaces machine's M-D9 stand-ins)
+
+Goal: bring up the BIOS far enough that the DOS kernel and a real program have a working IVT, BDA, and
+the BIOS services they call. **Done when** the BIOS POST lands a documented IVT+BDA, programs the
+PIC/PIT (taking over the machine's stand-ins), and the BIOS callback stubs are planted.
+
+- [ ] **IVT initialization** — fill all 256 vectors. Hardware/unused vectors point at a default
+      "unhandled interrupt" callback (D11 policy — flags, doesn't silently NOP). Serviced vectors
+      (INT 08h, 10h, 11h, 12h, 13h, 15h, 16h, 1Ah, 1Ch, 21h, 67h, …) point at their callback stubs.
+- [ ] **BIOS Data Area (BDA @ 0040:0000, `bda.zig`):** the fields BaK/DOS touch — equipment word
+      (0040:0010), conventional memory size KB (0040:0013), keyboard buffer head/tail/ring
+      (0040:001A-003D), the **timer tick count** (0040:006C, 4 bytes) + tick-overflow (0040:0070),
+      current video mode (0040:0049), columns (0040:004A), cursor position/shape. Initialize
+      deterministically. (Re-derive offsets from the documented BDA layout — public spec.)
+- [ ] **POST stand-in (`bios.zig`):** the BIOS init that **replaces machine M-D9's
+      `programDefaultPic`/`programDefaultTimer`/`enableA20`** with the real BIOS doing the same port
+      writes (the machine helpers were explicitly flagged temporary). Sets IVT+BDA, programs the PIC
+      vector bases + cascade unmask (master 0x08, slave 0x70), programs PIT ch0 mode 3 reload 0 (~18.2 Hz),
+      enables A20 via `bus.setA20(true)`. **The devices process the port writes normally — no
+      special-casing (ground rule).** Reconcile order with machine init (machine constructs devices +
+      CPU + Services, then runs BIOS POST).
+- [ ] **Plant all BIOS callback stubs** (Phase 0b) and set their vectors.
+- [ ] Tests (`bios_test.zig`): POST → IVT entries point at F000 stubs; BDA fields at documented values;
+      A20 enabled; PIC/PIT programmed (read back through the bus/devices). Two POSTs byte-identical.
+
+---
+
+## Phase 3: BIOS services (curated to what BaK + DOS need; flag stubs-with-deferred-subfunctions)
+
+Goal: the BIOS INT handlers BaK and the DOS kernel call. Each is a callback handler (D7) charging D5
+cost. **Done when** the in-scope subfunctions work against the VGA/keyboard/PIT devices and unit tests
+pass; deferred subfunctions are flagged (D11), not faked.
+
+- [ ] **INT 10h — video (`int10.zig`).** **The pixel store is the VGA *device*** (bus B11 MMIO + ports,
+      a separate `src/devices/` module); INT 10h *drives* it via port writes / MMIO. In scope for BaK:
+      AH=00 set video mode (incl. **mode 13h** 320×200×256 — BaK's mode; writes the VGA registers +
+      updates BDA video mode), AH=02 set cursor pos, AH=03 get cursor, AH=0E teletype output, AH=0C/0D
+      write/read pixel, AH=0F get mode, AH=10 palette/DAC (mode 13h palette set — BaK sets its palette).
+      **Flag deferred:** the full VESA/SVGA, font, and scroll-region subfunctions — implemented when a
+      BaK trace shows them, not stubbed. (The VGA device itself is out of scope here — flagged in
+      "Out of scope".)
+- [ ] **INT 16h — keyboard (`int16.zig`).** AH=00/10 read key (blocking — consumes from the **BDA
+      keyboard ring buffer** filled by the INT 09h/IRQ1 handler), AH=01/11 check key (peek), AH=02 get
+      shift flags. The ring buffer is BDA state; INT 09h (keyboard IRQ) enqueues scancodes from the
+      keyboard device. **Determinism:** key input is scripted/seeded external input (`CLAUDE.md` #3),
+      delivered at deterministic cycles via the device→PIC→IRQ path; INT 16h reads the buffer, never the
+      host. (The keyboard device + INT 09h are flagged in "Out of scope" for the device half; INT 16h +
+      the BDA buffer are here.)
+- [ ] **INT 1Ah — time-of-day (`int1a.zig`).** AH=00 get tick count (reads BDA 0040:006C + overflow
+      flag), AH=01 set tick. **No host clock (D13)** — the tick is PIT-driven.
+- [ ] **INT 08h / IRQ0 default handler (`int08.zig`).** Increments the BDA tick count (0040:006C),
+      handles midnight rollover (set 0040:0070), chains **INT 1Ch** (user timer tick — default is an
+      IRET stub the guest can hook; BaK's animation may hook it), sends EOI to the PIC (the `.iret_eoi`
+      callback type, D4). Fed by the PIT's IRQ0 (machine Phase 5). **Determinism:** fires at the
+      deterministic IRQ-recognition cycle (machine M-D6).
+- [ ] **INT 11h / 12h (`int11_12.zig`).** INT 11h → equipment word (from BDA). INT 12h → conventional
+      memory size KB (from BDA, typically 640). Complete (small).
+- [ ] **INT 13h — disk (`int13.zig`). DEFERRED-BY-DEFAULT.** BaK loads via DOS, not BIOS disk; a
+      real-mode game using INT 21h file calls does not touch INT 13h. **Default the whole vector to the
+      D11 flag path** (the unsupported-service signal) and **pull subfunctions in only on trace
+      evidence.** Do not pre-build AH=00/02/03/08/15; do not fake sector reads.
+- [ ] **INT 15h — system services (`int15.zig`).** The subfunctions a 386 game touches: AH=88 get
+      extended memory size, AH=87 move block (rarely by BaK), AH=C0 get config, AH=24 A20 control.
+      Curate to what a BaK trace shows; flag the rest deferred. (EMS does **not** go through INT 15h —
+      it's INT 67h, Phase 7.)
+- [ ] **INT 33h — mouse driver (`int33.zig`, D18 — host-serviced trap, NOT deferred to the device
+      half).** A callback + driver state on the `Service` ctx; reads raw motion/buttons from the mouse
+      *device* via the **same scripted-input seam as the keyboard** (deterministic external input,
+      `CLAUDE.md` #3), never the host. In scope (BaK needs it): **AX=0** reset/get-present (returns
+      present + button count), **AX=1/2** show/hide cursor, **AX=3** get position + button state,
+      **AX=4** set position, **AX=0x0C** set user event handler (far callback the guest installs —
+      invoked via the bridge when a mouse event is delivered), **AX=0x14** swap event handler. Driver
+      state (position, button mask, visibility, the installed event handler far-ptr) is snapshot state
+      (D14). Charges D5 cost; deferred subfunctions flag (D11).
+- [ ] **INT 2Fh — multiplex (minimal, D18).** Default = **faithful "not installed" / no-handler
+      semantics** (do NOT fault, do NOT fake an installed TSR). Which AX probes BaK issues is
+      trace-driven; a flagged stub (D11 signal) for an unhandled AX is fine — never a fabricated "yes,
+      installed" reply.
+- [ ] Tests (`bios_test.zig`): INT 10h set mode 13h updates BDA + VGA mode register; INT 16h reads a
+      key enqueued into the BDA buffer; INT 1Ah returns the PIT-driven tick; INT 08h bumps the tick +
+      EOIs; INT 33h AX=3 returns a scripted position/buttons; INT 13h hits the D11 flag path (asserted).
+      Each charges D5 cost; deferred subfunctions hit the D11 flag path (asserted).
+
+---
+
+## Phase 4: DOS kernel — INT 21h dispatch + PSP/MCB/DTA/SFT + the curated function set
+
+Goal: the INT 21h kernel BaK needs, with the guest-RAM data structures and the host-FS file API.
+**Done when** the curated INT 21h functions work against a host temp dir, the structures are
+byte-accurate, and unsupported subfunctions flag (D11).
+
+- [ ] **DOS init (`dos.zig`):** install the INT 21h callback (+ INT 20h terminate, INT 27h TSR, INT 2Fh
+      multiplex minimally, **INT 22/23/24 default handlers** — terminate/Ctrl-C/critical-error vectors),
+      build the **first MCB** at the top of conventional memory (the arena), **store the DOS version in
+      the PSP version bytes** (AH=30 reads there → **5.0**; see the AH=30 item), set up the initial DTA,
+      the drive table (mount BaK's dir as C:), the **character-device table** (CON/AUX/PRN/NUL, D17) and
+      the SFT with the standard handles (0-4: CON/CON/CON/AUX/PRN as **device** objects, the pre-opened
+      stdin/stdout/stderr).
+- [ ] **PSP (`psp.zig`, D9):** the 256-byte structure as a guest-RAM view — INT 20h at offset 0,
+      memory-top segment, the saved **INT 22/23/24** vectors (offsets 0x0A/0x0E/0x12), the parent PSP
+      (0x16), the **DOS-version bytes**, environment segment (0x2C), the command-tail (0x80, 128 bytes).
+      **JFT file-table indirection (D9 corrected):** build the **far pointer at PSP:0x34 → PSP:0x18** and
+      set **max_files = 20 at PSP:0x32**. The default 20-handle JFT lives at PSP:0x18, but **ALL JFT
+      access (allocate/lookup/free a handle) goes through the 0x34 far pointer, NOT a hardcoded 0x18** —
+      so a program that relocates its JFT (rare, but faithful) still works. `buildPsp(seg, env_seg,
+      parent, cmdtail)` also builds the **FCBs at 0x5C/0x6C** (see EXEC) and writes 0x34/0x32.
+- [ ] **MCB chain (`mcb.zig`, D9):** 16-byte headers ('M'=link / 'Z'=last signature, owner PSP segment,
+      size in paragraphs) in the arena. `alloc(paras) ?seg`, `free(seg)`, `resize(seg, paras)` — the
+      AH=48/49/4A services. Re-derive the layout from the **dosbox-test-suite MCB behavioral spec**
+      (`plans/dosbox-test-suite.md`), not GPL code. First-fit/best-fit/last-fit per the AH=58 strategy
+      (default first-fit).
+- [ ] **DTA (`dta.zig`, D9):** the 128-byte Disk Transfer Area; AH=1A set DTA, AH=2F get DTA; find-first/
+      find-next write the found-file record into the DTA (the `DTAExtendName` name split — re-derive,
+      D10). The find record's **date/time fields (offsets 0x16/0x18) come from the deterministic source
+      (1993-01-01 epoch / replayed config), NEVER host `stat` mtime** (D13). Default DTA at PSP:0x80.
+- [ ] **SFT + JFT (`sft.zig`, D9/D17):** the host-side `sft: [N]SftEntry`, where **`SftEntry` is a
+      tagged union with a device dimension**:
+      `SftEntry = struct { ref: union(enum) { device: *DosCharDevice, file: HostFile }, position: u64,
+      mode, path: [128]u8, path_len: u8, ... }` — **`path` is an inline `[128]u8 + len` (MAX_PATH), NOT a
+      `[]u8`** (no per-open alloc; the SFT is one flat snapshot-friendly array, D14). `openHandle()`
+      allocates a JFT slot in the current PSP (through the **0x34 file-table pointer**, D9) → SFT index.
+      Handles 0-4 pre-opened as **device** entries (CON/CON/CON/AUX/PRN). The `[N]` cap is **provisional /
+      comptime-asserted** (sized from a BaK trace later; too-small N fails loudly).
+- [ ] **SFT snapshot integrity (D11/D14):** record per open handle enough to detect a replayed-file
+      mismatch on restore — the **file length** and (ideally) a **content hash**. On restore, if the
+      re-opened file's length/hash differs, **FLAG (D11-style structural signal), do not silently
+      diverge.** Specify **open-mode/append-position restore**: a write/append handle restores its saved
+      position (does NOT re-truncate); a read handle re-seeks to its saved position.
+- [ ] **The curated INT 21h function set (`int21.zig`) — exactly what BaK needs.** Switch on AH; each
+      charges D5 cost; the **default (unknown-AH) arm follows D11 rule (b): return AL=0 with carry CLEAR
+      (faithful real-DOS behavior) AND raise the structural `unsupported{int,ah,al}` signal** — not a
+      fabricated CF error. **In scope:**
+  - [ ] **Program control:** AH=00 / INT 20h terminate; **AH=4C terminate with code** (the normal exit —
+        sets the exit code, **restores INT 22/23/24 from the terminating PSP**, frees the PSP's memory,
+        and transfers to the saved **INT 22** return address — see the INT 22/23/24 item); **AH=30 get
+        DOS version** → reads the **PSP version bytes** (5.0: AL=5, AH=0), returns **BH=OEM=0xFF**,
+        **BL:CX = serial = 0**; AH=4D get return code. **AH=31 TSR — DEFERRED-BY-DEFAULT** (D11 flag);
+        pull in only on trace evidence.
+  - [ ] **Char I/O (minimal):** AH=02 output char, AH=06/07 direct console I/O, **AH=09 print $-string**
+        (used by the loader test), AH=01/08 input char. (BaK uses VGA directly, but the loader/runtime
+        may print.)
+  - [ ] **File handles (the core BaK path):** **AH=3C create, 3D open, 3E close, 3F read, 40 write,
+        42 lseek** (SEEK_SET/CUR/END), AH=41 unlink, AH=43 get/set attributes, AH=44 IOCTL, AH=56 rename.
+        **AH=3D open resolves the character-device table (CON, AUX, PRN, NUL, `EMMXXXX0`) BEFORE the
+        drive VFS** (D17): a name matching a device returns a **device** SFT entry; otherwise fall through
+        to the VFS. **AH=44 AL=00 (get device info)** returns the **device bit (bit 7 set)** for a device
+        handle (clear for a file). **read/write/seek route to the device** for device handles (CON →
+        keyboard/VGA seam; NUL → discard), to the host `File` otherwise. **AH=45/46 dup/dup2 —
+        DEFERRED-BY-DEFAULT** (D11 flag; pull in on trace evidence). File reads/writes copy between the
+        host `File` (via `File.reader`/`writer`, D6/Phase 5) and guest memory at DS:DX for CX bytes
+        **through `bus.writeGuestBlock`/`readGuestBlock` + a fixed stack scratch buffer (D19)**; **count
+        from CX (guest input) → D5 cost `base + CX*per_byte`.**
+  - [ ] **Directory search:** **AH=4E find-first, 4F find-next** (wildcards `*`/`?`; writes the DTA
+        record; uses the VFS `findFirst`/`findNext` over the host dir with 8.3 munging, D10), AH=47
+        get-cwd, AH=3B chdir. **AH=39/3A mkdir/rmdir — DEFERRED-BY-DEFAULT** (D11 flag; pull in on trace
+        evidence).
+  - [ ] **DTA + date/time + misc:** AH=1A set DTA, AH=2F get DTA; **AH=2A get date, 2C get time** (from
+        the BDA tick + emulated epoch, D13 — NOT host clock), AH=2B/2D set date/time (update the
+        emulated state); **AH=57 get/set file date-time** → from the deterministic source, NOT host
+        `stat` (D13); **AH=25 set interrupt vector / AH=35 get interrupt vector — both read/write the
+        guest-RAM IVT** (the single source of truth that BOTH the trap-stub install path *and* AH=25/35
+        mutate; a game hooks INT vectors via these — must work and must see the same bytes the bridge
+        wrote); AH=19 get current drive, AH=0E select drive; AH=50 set PSP, AH=51/62 get PSP.
+  - [ ] **Memory (MCB):** **AH=48 allocate, 49 free, 4A resize** (the MCB chain), AH=58 get/set alloc
+        strategy.
+  - [ ] **EXEC:** **AH=4B load-and-execute / load-overlay** → calls the loader (Phase 6). **Model the
+        EXEC param block at ES:BX: `envseg / cmdtail far-ptr / fcb1 far-ptr / fcb2 far-ptr`.** On EXEC:
+        (1) read the **caller's return CS:IP off the caller stack** and set the *current* PSP's INT 22
+        BEFORE the new child PSP snapshots 22/23/24 (so terminate unwinds to the right place — see below);
+        (2) build the child PSP including the **FCBs at 0x5C/0x6C** parsed from fcb1/fcb2, and derive
+        **AX from FCB drive validity** (AL/AH = BL/BH = 0/0xFF per the drive-valid convention); (3) build
+        the child's **environment block** (see the env-block item in Phase 6). The loader (Phase 6) does
+        the image load/relocate/register-setup. The initial BaK load is a direct loader call, not via
+        INT 21h (Phase 6).
+  - [ ] **INT 22/23/24 + terminate unwind:** the terminate vector (INT 22), Ctrl-C (INT 23), and
+        critical-error (INT 24) addresses are **snapshotted into each PSP** (offsets 0x0A/0x0E/0x12) at
+        PSP build. On **EXEC**, set INT 22 to the **caller's return CS:IP** (read off the caller stack)
+        **before** the child PSP snapshots 22/23/24. On **terminate (AH=4C / AH=00 / INT 20h)**, **restore
+        22/23/24 from the terminating PSP** and **transfer control to the saved INT 22** — this is what
+        a re-entrant EXEC unwinds to (the parent resumes after its `INT 21h AH=4B`).
+- [ ] **Deferred-and-flagged (D11), not faked:** the FCB file API (AH=0F-0x24, CP/M legacy), network/
+      share (AH=5xxx), LFN (AH=71xx), AH=44 IOCTL beyond the basics, AH=63 (DBCS), country info
+      (AH=38). Each hits the unsupported-service flag path; none returns a fabricated success.
+- [ ] Tests (`int21_test.zig`, against a `std.testing` temp dir mounted as C:): create→write→close→
+      open→read→seek→read-again→close round-trip; find-first/find-next over a few files (8.3 munging);
+      AH=48/49/4A MCB alloc/free/resize; AH=2A/2C return the PIT-driven date/time (not host); an
+      unsupported AH flags (D11). Each asserts the D5 cost advanced the ledger.
+
+---
+
+## Phase 5: Host-FS VFS + 8.3 name munging (`vfs.zig`, `name83.zig`)
+
+Goal: the single-host-directory drive backend BaK needs, with deterministic 8.3 munging. **Done when**
+the VFS open/read/write/seek/find against a host dir works and the munging unit tests (re-derived from
+the spec) pass.
+
+- [ ] **`DosDrive` interface (D8):** `open`, `create`, `close`, `read`, `write`, `seek`, `findFirst`,
+      `findNext`, `unlink`, `getAttr`, `setAttr`, `rename` — the methods INT 21h calls. Drive table
+      `drives: [26]?*DosDrive`.
+- [ ] **`HostDirDrive` over `std.Io.Dir` (verified 0.16 API):** holds the host `Dir` + an `io: Io`
+      handle. `open` → `Dir.openFile(io, munged_to_host_name, .{ .mode })`; `create` →
+      `Dir.createFile`; `read`/`write` via `File.reader(io, buf)`/`File.writer(io, buf)` +
+      `Reader.seekTo`/`Writer.seekTo`; `getSize` via `Reader.getSize`; `findFirst`/`findNext` via
+      `Dir.iterate()`. **Grep `references/zig/lib/std/Io/Dir.zig` + `Io/File*.zig` for exact signatures
+      — the `io: Io` parameter is mandatory on every call.**
+- [ ] **DOS path → host path:** parse `C:\DIR\FILE.EXT`, strip the drive, map `\`→host separator,
+      munge each component to/from 8.3 (D10). Reject paths escaping the mounted dir (security/faithfulness).
+- [ ] **8.3 munging (`name83.zig`, D10 — re-derive, do NOT copy GPL):** uppercase; split name(≤8)+ext(≤3)
+      on last dot; validate 8.3 charset; **deterministic long→short generation:** when a host file has a
+      long name, generate `NAME~N.EXT` with **N assigned over a deterministically sorted directory
+      listing** (sort `Dir.iterate()` results — host iteration order is not guaranteed, `CLAUDE.md` #5).
+- [ ] **Determinism (D6):** file content is fixed external input; cost is synthetic; no host time; the
+      directory enumeration is deterministically ordered.
+- [ ] Tests (`name83_test.zig`, `dos_test.zig`): munging unit tests re-derived from the dosbox-test-suite
+      spec (uppercase, split, illegal-char handling, `~N` generation determinism — same dir twice →
+      identical short names); VFS round-trip against a temp dir.
+
+---
+
+## Phase 6: EXE/COM loader (`loader.zig`) — the path that starts Betrayal at Krondor
+
+Goal: parse + load an MZ EXE (and a flat COM), build the PSP, apply relocations, set up registers, and
+transfer control — and define the **initial-load entry point that boots BaK**. **Done when** a tiny
+COM and a tiny EXE both load and run to a clean exit with the asserted output + exit code.
+
+- [ ] **`loadProgram(path, cmdtail, mode) !void`** — the core. `mode = { load_and_run, load_overlay,
+      load_only }` (AH=4B AL selects).
+- [ ] **Read the header via the VFS** (D6 — synthetic cost). **MZ EXE** if first two bytes are `MZ`
+      (0x5A4D) or `ZM`; else **COM** (re-derive the branch from dos_execute.cpp:332, not copying):
+- [ ] **EXE path** (re-derive `struct EXE_Header`, dos_execute.cpp:27): read `pages`, `relocations`,
+      `headersize` (paragraphs), `minmemory`/`maxmemory`, `initSS:initSP`, `initCS:initIP`, `reloctable`
+      offset. Compute `headersize_bytes = headersize*16`, `imagesize = pages*512 - headersize_bytes`.
+  - [ ] **Allocate via MCB** (Phase 4): `minsize = paras(imagesize + minmemory*16 + 256)` (the +256 =
+        PSP); honor `maxmemory`. Flag failure (insufficient memory) faithfully (carry + error code).
+  - [ ] **Build the environment block** (explicit step): alloc an env MCB (**owner = the new PSP**),
+        **inherit the parent's env** (or a minimal default for the root/initial load), write the trailing
+        **`0x0001` word + the program's canonical path** (the DOS env terminator + program-name string),
+        and set **PSP[0x2C] = envseg**.
+  - [ ] **Build the PSP** (Phase 4) at the allocation base; set parent, environment (envseg above),
+        command-tail, the **0x34→0x18 file-table far pointer + max_files=20 at 0x32** (D9), the **FCBs at
+        0x5C/0x6C** parsed from the EXEC param block (for the initial BaK load synthesize a default-drive
+        FCB), the JFT inherited from parent (or the standard handles for the initial load), and snapshot
+        INT 22/23/24.
+  - [ ] **Load the image** at `loadseg = pspseg + 16` (after the PSP); copy `imagesize` bytes from the
+        file into guest RAM **via `bus.writeGuestBlock` + a fixed stack scratch buffer (D19)** — no
+        per-byte loop.
+  - [ ] **Apply relocations:** for each of `relocations` fixups at `reloctable`, read the seg:off fixup,
+        add `loadseg` to the word at that guest address (the classic EXE relocation — re-derive).
+  - [ ] **Set registers:** CS = loadseg + initCS, IP = initIP, SS = loadseg + initSS, SP = initSP,
+        DS = ES = pspseg, **AX from the FCB drive validity** (BL/BH = 0/0xFF). Set the DTA to PSP:0x80.
+- [ ] **COM path:** allocate the largest free block; build the PSP at base (including the env block,
+      0x34/0x32 file-table indirection, FCBs, and INT 22/23/24 snapshot as above); load the file flat at
+      PSP:0x100 (via `bus.writeGuestBlock`, D19); CS=DS=ES=SS=pspseg, IP=0x100; **SP = 0xFFFE** normally,
+      **but if `memsize < 0x1000` set `SP = (memsize<<4) - 2`** (the COM stack guard for a tiny
+      allocation); push a 0 return word; DTA at PSP:0x80.
+- [ ] **`load_and_run`** transfers control (the loader returns; the machine run loop then executes the
+      loaded program). **`load_overlay`** loads into a caller-specified segment without a new PSP (BaK
+      may overlay-load). **Initial load = how zdos starts BaK:** the machine, after BIOS POST + DOS init,
+      calls `dos.loadProgram(bak_exe_path, "", .load_and_run)` to load BaK as the initial process, then
+      runs. **Specify this path explicitly** — it is the v1 boot sequence.
+- [ ] Tests (`loader_test.zig`): a hand-assembled **COM** that does INT 21h AH=09 print-string then
+      AH=4C exit(code) → assert the printed bytes (captured via the CON device / a recording handler)
+      and the exit code; a tiny **EXE** with one relocation → assert the fixup applied + it runs +
+      exits. Both byte-identical across two runs.
+
+---
+
+## Phase 7: EMS INT 67h service (`ems.zig`) — drives the bus EMS MMIO device (D15)
+
+Goal: the LIM EMS handler BaK needs, owning the EMS manager that the bus's MMIO page-frame device
+remaps through (bus B8). **Done when** allocate/map/free pages work and a mapped page is visible through
+the page-frame window.
+
+- [ ] **EMS manager state (on the `Service` ctx):** the backing store (deterministic zero-init, owned
+      here per bus B12), a handle table (`handles: [N]?EmsHandle { pages }` — **`N` is a provisional /
+      comptime-asserted cap**, sized from a BaK trace later; too-small N fails loudly), the 4-page
+      (16 KiB each) page-frame map (`frame_map: [4]?{handle, logical_page}`). The page-frame window
+      (typically 0xE0000, 64 KiB) is registered on the bus once via `mapMmio` (machine wiring); the MMIO
+      handler's `getHostPtr`/read/write point at the currently-mapped backing slices (B8 internal remap).
+- [ ] **Install INT 67h** (callback + IVT) **and register `EMMXXXX0` in the DOS character-device table
+      (D17)** — the documented EMS-presence probe is `INT 21h AH=3D open "EMMXXXX0"` + an AH=44 IOCTL, so
+      the device MUST be name-resolvable ahead of the VFS. **Without it BaK cannot detect EMS** (dosbox
+      `ems.cpp:1451`). (Also expose the classic `EMMXXXX0` device header at the page-frame segment for
+      programs that probe via the IVT-67h vector → header path; re-derive.)
+- [ ] **The LIM EMS subfunction set (`ems.zig`, AH switch) — curated to BaK:** AH=40 get status,
+      AH=41 get page-frame segment, AH=42 get unallocated/total page count, AH=43 allocate handle +
+      pages, AH=44 **map page** (handle, logical page → physical frame slot — performs the bus remap
+      by pointing the frame slot at the backing slice), AH=45 free handle, AH=46 get EMS version,
+      AH=47/48 save/restore page map. Flag the rest deferred (D11).
+- [ ] **Determinism:** synthetic D5 cost per call; deterministic backing zero-init; the remap is a pure
+      pointer/slice swap (no host state). Snapshot: handle table + frame map + backing store (D14).
+- [ ] Tests (`dos_test.zig` / a `ems_test.zig`): allocate a handle with pages, map a logical page to a
+      frame slot, write through the page-frame window, remap, read back the new page's bytes; free; the
+      whole sequence byte-identical twice.
+
+---
+
+## Phase 8: The deterministic host-serviced-trap regression (THE differentiator)
+
+Goal: prove the host-serviced traps leave **no hole** in the cycle ledger — the property that separates
+zdos from Spice86. **Done when** a program doing real file I/O run to cycle N twice is byte-identical
+**including the cycle position**.
+
+- [ ] **The milestone program** (`integration_test.zig`): a hand-assembled real-mode program (loaded
+      via the loader) that opens a file in the mounted host dir, reads N bytes into a buffer, seeks,
+      reads again, writes a few bytes, closes, prints a `$`-string (AH=09), and exits (AH=4C). It
+      exercises the full bridge → INT 21h → VFS → synthetic-cost path.
+- [ ] **Run it through the machine** (real CPU + bus + PIC + PIT + BIOS + DOS + a `std.testing` temp
+      dir with fixed file content).
+- [ ] **The core regression (`CLAUDE.md` #1/#6 — the Spice86-hole closure):** run **twice** (two fresh
+      machines, same fixed file content) to cycle N; assert **byte-identical CPU State (regs/flags/EIP/
+      **cycles**), guest RAM, PSP/MCB/DTA, the printed output, and the exit code.** The cycle position
+      being identical across two runs **despite real host file I/O** is the literal proof the
+      host-serviced trap charges a fixed synthetic cost and has no ledger hole — *state this in the test
+      as the differentiator.*
+- [ ] **Host-timing-independence check:** run the same program with an artificial host I/O delay (e.g.
+      a slow `io: Io` wrapper in the test) → assert the cycle ledger is **identical** to the no-delay
+      run (proves host I/O timing never touches the ledger, D6).
+- [ ] **Snapshot-mid-service (D14):** run to a cycle with a file open + memory allocated, snapshot,
+      restore (re-open SFT paths + seek), run to N → byte-identical vs the un-snapshotted run.
+
+---
+
+## Phase 9: Module determinism contract + audit gate
+
+- [ ] **No host time / RNG / thread / env / host-I/O-timing in `src/bios/` or `src/dos/`** — grep-enforced
+      (`@embedFile` every source; reject `std.time`, `std.Random`, `std.Thread`, `getenv`,
+      `process.getEnv`). **Extend the grep to ban host file-timestamp use in `src/dos/`: reject `mtime`,
+      `ctime`, and any stat-timestamp read** (the Spice86 leak, D13 — DOS-visible date/time fields come
+      from the deterministic source, never host `stat`). The `io: Io` file API is allowed (content is
+      fixed input); its *timing* must never reach the ledger (the cost is synthetic, D5).
+- [ ] **Cycle-ledger completeness:** every callback charges its D5 cost (the by-construction guard,
+      Phase 0c); the comptime totality check (every id has a cost); the re-entrant guest work charges
+      normally. **There are no holes — state this as the closing of the Spice86 hole.**
+- [ ] **No uninitialized state:** IVT/BDA/PSP/MCB/DTA/SFT/drives/EMS reset every field; two fresh DOS+BIOS
+      inits byte-identical (`CLAUDE.md` #5).
+- [ ] **No per-op alloc** (counting-allocator guard over a representative INT 21h sequence).
+- [ ] **Snapshot/restore round-trip (D14):** a populated DOS+BIOS state round-trips byte-identical with
+      callback ids re-bound by id and SFT handles re-bound by path+position.
+- [ ] **Unsupported-service honesty (D11):** every unimplemented subfunction flags/surfaces; asserted in
+      tests; none returns a fabricated success. The "implemented set" is enumerable.
+
+---
+
+## Milestone ordering & "done when" criteria
+
+- [ ] **M0 — Callback bridge round-trips.** `zig build` + `zig build test-bridge`/`test-bios` green; the
+      `0xFE 0x38 <id>` trap reaches a host handler via the CPU `CallbackSink` (the one surgical `src/cpu/`
+      edit; contract names no `*Cpu`, D2 refined) and resumes via IRET; the D4 stack-FLAGS patch works;
+      **`runGuestInt` re-entrancy works via the real-`INT n` trampoline driven through the machine step,
+      with the `cpu.dec`/`instr_start_eip` seam scratch saved/restored** (D3 rewritten); the bridge lives
+      in the shared leaf imported by both bios and dos with no dos→bios edge (D12 reversed/D16); every
+      trap charges the D5 synthetic cost (the no-hole guard fires; the stop sentinel is carved out); the
+      round-trip is byte-identical twice including `cycles`. (Phase 0-1) **This is the foundation
+      everything hangs off.**
+- [ ] **M1 — BIOS core + INT 10h/16h/1Ah.** POST lands the IVT+BDA, takes over the machine's M-D9
+      stand-ins (real PIC/PIT/A20 init), plants the BIOS stubs; INT 10h (mode 13h), INT 16h (BDA
+      keyboard buffer), INT 1Ah / INT 08h (PIT-driven tick, no host clock) work; deferred subfunctions
+      flag (D11). (Phases 2-3)
+- [ ] **M2 — DOS INT 21h core + VFS + char devices.** INT 21h dispatch with PSP/MCB/DTA/SFT (guest-RAM
+      views + host SFT with the `{device,file}` tagged union + inline `[128]u8` path, D9/D17); the
+      character-device table (CON/AUX/PRN/NUL, AH=3D resolving devices before the VFS, AH=44 device bit,
+      D17); the curated function set (file open/create/close/read/write/seek 3C-42, find 4E/4F, DTA
+      1A/2F, date/time 2A-2C + AH=57 from the PIT/epoch not host `stat` D13, mem 48-4A, get-version 30
+      from PSP version bytes, set/get vector 25/35 over the single-source guest IVT, char I/O, get/set
+      PSP, INT 22/23/24 unwind) works against a host temp dir via the `HostDirDrive` VFS with re-derived
+      8.3 munging (D10); the unknown-AH default returns AL=0/CF-clear + the structural signal (D11 split).
+      (Phases 4-5)
+- [ ] **M3 — EXE/COM loader runs a real program.** A COM (AH=09 print + AH=4C exit) and an EXE (with a
+      relocation) both load (MCB alloc, PSP build, relocations, register setup) and run to a clean exit
+      with asserted output + exit code; the **initial-load path that boots BaK** is specified and wired
+      (machine calls `dos.loadProgram` after POST+DOS-init). (Phase 6)
+- [ ] **M4 — EMS + determinism sign-off.** INT 67h (allocate/map/free pages) drives the bus EMS MMIO
+      remap (D15); the **deterministic host-serviced-trap regression** (Phase 8) is green —
+      run-to-cycle-N-twice byte-identical **including cycle position** despite real file I/O, plus the
+      host-I/O-timing-independence check and the snapshot-mid-service round-trip (with SFT length/hash
+      mismatch flagging, D11/D14). All DECISIONS (D1-D19) recorded/honored; the Phase 9 audit (grep
+      no-host-time + no-host-file-timestamp, cycle-ledger completeness, no-uninit, zero-alloc, snapshot
+      round-trip, unsupported-service honesty) is fully green. `zig build` / `zig build test` /
+      `test-bridge` / `test-bios` / `test-dos` all green. **The Spice86 cycle-ledger
+      hole is closed: every host-serviced trap charges a fixed synthetic cost; the ledger has no hole.**
+      Ready for the API/MCP server (`src/api/`) and the VGA/keyboard/mouse devices to complete the BaK
+      target.
+
+---
+
+## Out of scope (kept as seams, flagged — not built here)
+
+- **The VGA device, the keyboard device + INT 09h/IRQ1, the mouse DEVICE:** separate `src/devices/`
+  modules. INT 10h (this module) *drives* the VGA device; the VGA register/framebuffer implementation
+  (bus B11 MMIO + ports 3C0-3DA) is the device's. INT 16h + the BDA keyboard buffer are here; the
+  keyboard *device* that fills the buffer via IRQ1 is a device. **INT 33h — the mouse DRIVER — is HERE
+  (D18, Phase 3), not out of scope;** only the mouse *device* (raw motion/buttons via the scripted-input
+  seam) is a device. They wire through the same device→PIC→IRQ + callback seams (machine `DeviceCtx`).
+- **Sound (INT 1Ah PC-speaker beyond tick, Sound Blaster, AdLib, INT 2Fh sound):** deferrable per the
+  charter (`CLAUDE.md` First target: "sound (deferrable)").
+- **FCB-based file API (INT 21h 0x0F-0x24), network/share (5xxx), LFN (71xx), DBCS, country info:**
+  deferred-and-flagged (D11) — handle-based file I/O is what 1993 games use; build the FCB path only if
+  a BaK trace shows it, never faked.
+- **Additional VFS backends (`fatDrive` disk images, `isoDrive` CD, overlay/copy-on-write, MSCDEX
+  INT 2Fh AH=15):** the `DosDrive` interface keeps the seam (D8); only `HostDirDrive` is built — BaK
+  loads from a directory.
+- **The shell / COMMAND.COM / AUTOEXEC / batch processing:** zdos loads BaK directly as the initial
+  process (Phase 6); no command interpreter is needed for the v1 target.
+- **XMS / DPMI / DOS extenders / protected mode:** CPU-deferred (cpu.md Deferred section); BaK is plain
+  real-mode MZ with EMS via INT 67h (D15), no extender.
+- **PRM-accurate synthetic cycle costs:** the D5 costs are *fixed* (satisfying the prime directive) but
+  **interim/provisional**, not measured-real-DOS timings (a fidelity-only later pass, like cpu.md D6 /
+  machine M-D8a); the real figures are not available offline and are not invented (ground rule).
+- **TSR chains / multiple concurrent processes beyond a parent/child EXEC:** the PSP tree supports
+  parent→child EXEC (Phase 6) but a full TSR-resident ecosystem is not built; flagged.
