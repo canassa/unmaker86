@@ -25,12 +25,39 @@ not an afterthought.
 **The ground rule is especially load-bearing here.** This is a huge API surface. An INT 21h
 subfunction or BIOS service we cannot support faithfully **must be flagged / surfaced** (a structural
 "unsupported DOS service" signal the API server sees), **never silently faked** to "appear to work."
-Faking DOS is the precise failure mode (`CLAUDE.md` §"Ground rule") this project exists to escape. The
-scope below is **curated to what BaK needs**; everything else is explicitly **deferred and flagged**,
-not padded in.
+Faking DOS is the precise failure mode (`CLAUDE.md` §"Ground rule") this project exists to escape.
+
+> **SECOND-PASS RE-SCOPE — READ FIRST (the premise correction).** The first pass curated the INT 21h /
+> BIOS set to *"what Betrayal at Krondor calls during gameplay"* and accepted each module against
+> **self-authored fixtures**. Both were wrong, and an external oracle proved it: **no real compiled DOS
+> program calls only "gameplay" services** — every real C runtime (Borland/Turbo C, MSC, Watcom),
+> *including BaK's*, runs a startup that makes ~a dozen INT 21h calls **before `main`** (memory-sizing,
+> existence-probe, env/argv, file open). A four-agent-reviewed "done" DOS module then **failed the first
+> real compiler `.EXE`**, because fixtures can only test what was built. **The scope is therefore
+> re-based** from "what BaK's gameplay calls" to a **real-CRT-complete baseline** (D8a/D20 below): the
+> *union* of what real CRTs call at startup + runtime. And the **acceptance methodology is replaced**
+> (D21 below): "DOS done" now means **"zdos matches dosbox-x on real binaries"** — `dosbox-x` mints
+> golden output for real `.EXE`s and `zig build test-oracle` asserts zdos reproduces it (the DOS
+> equivalent of the CPU's ProcessorTests conformance vectors). Hand-assembled fixtures remain ONLY for
+> cycle-exact determinism testing (zdos's separate guarantee), **never for sufficiency**. See
+> `plans/dos-oracle-report.md` for the empirical, traced worklist that drives the second pass.
+>
+> **This is completion + re-scope, NOT a rewrite.** The genuinely-sound first-pass work stays (see
+> D22): the callback bridge (Phase 0), the determinism / cycle-ledger contract (D5, Phase 1/8),
+> guest-RAM structure modeling (D9), and the now-fixed loader `max_alloc` handling (Phase 6) are correct
+> and validated. The second pass **completes** the function surface, fixes the fidelity gaps the oracle
+> exposed, and **re-gates** acceptance on the oracle.
 
 **Read before starting (source of truth — do not work from memory):**
-- `CLAUDE.md` — the charter. **Host-serviced DOS/BIOS** (Spice86 lineage) **+ the prime directive (no
+- **`plans/dos-oracle-report.md` — the empirical second-pass worklist.** The corpus (real Borland C++ 3.1
+  `.EXE`s) + each PASS/DIVERGE + the exact failing INT 21h call, traced and cross-checked against
+  `references/dosbox-staging/src/dos/`. The 3 live divergences (FILEIO/SUBDIR/ARGENV) below are folded in
+  from it. This is the second pass's truth, not a self-authored fixture.
+- **`references/dosbox-staging/src/dos/dos.cpp` — the real INT 21h surface + correct return semantics**
+  (the `DOS_21Handler` AH switch). Every promoted/fixed function below is pinned to a line here (e.g.
+  AH=43 AL=00 existence check at `dos.cpp:1106-1120`; AH=33 break-check at `dos.cpp:881`; the unknown-AH
+  default `reg_al=0` at `dos.cpp:1610`).
+- `CLAUDE.md` — the charter (and the **BaK v1 acceptance target**: real-mode 386, DOS 5.0, ~1 MB EMS). **Host-serviced DOS/BIOS** (Spice86 lineage) **+ the prime directive (no
   holes in the cycle ledger)** = every host-serviced trap charges a fixed synthetic cost. The **ground
   rule** (no fakes/stubs; flag, don't bypass). The **First target: Betrayal at Krondor** (real-mode
   386, loads via INT 21h file calls, needs **EMS via a host INT 67h handler** — no EMM386/V86; EMS
@@ -99,8 +126,11 @@ Do **not** write code or touch other files while working from this plan; it is t
 
 > **Proportionality note.** Be thorough on **the callback-trampoline bridge (Phase 0)** and **the
 > synthetic-cycle-cost / determinism contract (D5, Phase 1)** — they are the foundation everything
-> hangs off and the literal differentiator. Curate the INT 21h / BIOS service set to **what BaK
-> needs**; flag the rest deferred. Do not pad the per-subfunction minutiae of services BaK never calls.
+> hangs off and the literal differentiator (these are DONE and validated — D22). For the INT 21h / BIOS
+> service set, the bar is now the **real-CRT-complete baseline** (D8a/D20): implement the union of what
+> real CRTs call at startup + runtime, gated by the oracle (D21), **not** a hand-picked "gameplay" list.
+> Still flag-and-defer genuine non-CRT breadth (FCB API, network/share, LFN, DBCS) per D11 — but a CRT
+> startup call is in-scope by definition, even if "gameplay" never touches it.
 
 ---
 
@@ -275,18 +305,48 @@ Do **not** write code or touch other files while working from this plan; it is t
       time/RNG/scheduling** (audit, Phase 9), and must read counts from guest registers so D5 costs stay
       pure.
 
-- [x] **D8 — Host-FS VFS: a `DosDrive` abstraction with ONE backend for BaK — a `HostDirDrive` mapping
-      one host directory to one DOS drive letter; `std.Io.Dir`-based. RECOMMENDED (curated).** Weighing:
-      DOSBox has 6 drive backends (`localDrive`/`fatDrive`/`isoDrive`/…); spice86 has `DosDriveManager`
-      + path resolver. **BaK needs exactly one:** a real-mode game that loads its data files from a
-      directory. **zdos:** a `DosDrive` interface (the methods BaK exercises — `open`, `create`, `close`,
-      `read`, `write`, `seek`, `findFirst`, `findNext`, `unlink`, `getAttr`, `rename`) with a single
-      `HostDirDrive` backend over `std.Io.Dir` (verified API — Phase 5). A drive table `drives[26]`
-      (A:..Z:); BaK's install dir mounts as `C:`. **8.3 name munging** (D10) maps DOS 8.3 names ↔ host
-      filenames. **Rationale:** ground rule says don't build speculative breadth; BaK needs one host
-      directory mapped to one drive; the interface keeps the seam for `fatDrive`/CD later (flagged
-      deferred). FCB-based file API (CP/M legacy, INT 21h 0x0F-0x24) is **deferred-and-flagged** unless a
-      BaK trace shows it (handle-based 0x3C-0x42 is what 1993 games use).
+- [x] **D8 — Host-FS VFS: a `DosDrive` abstraction with ONE backend — a `HostDirDrive` mapping one host
+      directory to one DOS drive letter; `std.Io.Dir`-based. RECOMMENDED.** DOSBox has 6 drive backends
+      (`localDrive`/`fatDrive`/`isoDrive`/…); spice86 has `DosDriveManager` + path resolver. **zdos needs
+      one backend:** a real-mode game / real program that loads its files from a directory tree. A
+      `DosDrive` interface (`open`, `create`, `close`, `read`, `write`, `seek`, `findFirst`, `findNext`,
+      `unlink`, `getAttr`, `rename`, plus the dir ops in D8b) with a single `HostDirDrive` backend over
+      `std.Io.Dir` (verified API — Phase 5). A drive table `drives[26]` (A:..Z:); the install dir mounts
+      as `C:`. **8.3 name munging** (D10) maps DOS 8.3 names ↔ host filenames. **Rationale:** one host
+      directory tree mapped to one drive covers BaK + the corpus; the interface keeps the seam for
+      `fatDrive`/CD later (flagged deferred). FCB-based file API (CP/M legacy, INT 21h 0x0F-0x24) is
+      **deferred-and-flagged** unless a trace shows it (handle-based 0x3C-0x42 is what 1993 games + CRTs
+      use).
+
+- [x] **D8a — RE-SCOPE: the curation target is a REAL-CRT-COMPLETE baseline, NOT "BaK gameplay". NEW
+      (supersedes the "curated to what BaK needs" framing of D8/D7/D11 and the proportionality note).**
+      The first pass's defining error: it scoped the INT 21h/BIOS set to the calls BaK issues *during
+      gameplay*, but **never to what it takes to START any real compiled program.** Every real CRT
+      (Borland/Turbo C, MSC, Watcom) — including BaK's — runs a startup that makes ~a dozen INT 21h calls
+      before `main` (AH=30 version, AH=4A memory-sizing, AH=33 break-check, AH=29 parse-filename,
+      AH=48/4A heap, the env/argv setup, an AH=43 existence-probe, AH=3C/3D file open). A "done" module
+      curated to gameplay therefore **fails the first real `.EXE`** (`plans/dos-oracle-report.md`). **New
+      target:** the **union of what real CRTs call at startup + runtime.** This promotes into scope
+      (previously missing or wrong — see D20 for per-function detail): **AH=33** (Ctrl-Break get/set),
+      **AH=29** (parse filename into FCB), **AH=59** (get extended error info), **AH=52** (Get List of
+      Lists / SysVars + a real MCB anchor), **AH=44 IOCTL `AL=01/06/07`** (set device info / input-status
+      / output-status — only `AL=00` existed), **AH=45/46** (dup / dup2), and the **AH=43 AL=00 existence
+      fix** (see D20). **Rationale:** a CRT startup call is in-scope by definition; the oracle, not a
+      gameplay trace, defines sufficiency. This is NOT speculative breadth (D11 still defers FCB/network/
+      LFN/DBCS) — it is the irreducible floor for running *any* real program.
+
+- [x] **D8b — RE-SCOPE: subdirectory / multi-component path traversal is IN-SCOPE (was Out of scope).
+      NEW (a hard BaK blocker — SUBDIR divergence).** The first pass's single-directory VFS took only the
+      FINAL path component (`fn resolve` → `lastIndexOfAny(p, "\\/")`), so `SUB\DATA.TXT` resolved to
+      `DATA.TXT` at the mount root and failed (`plans/dos-oracle-report.md` §2; reference
+      `drive_local.cpp` + `DOS_MakeName` in `dos_files.cpp` walk `SUB\` as a real directory). **BaK loads
+      its data files from subdirectories**, so this blocks v1. **The VFS must resolve multi-component DOS
+      paths:** canonicalize `C:\SUB\DATA.TXT`, translate `\`→`/`, 8.3-munge each component, and open the
+      leaf relative to the mount root (walking real host subdirectories). It must also support the
+      directory-navigation calls a CRT/program uses: **AH=3B chdir** (was a no-op success), **AH=47
+      getcwd**, and **AH=39/3A mkdir/rmdir** (were deferred-unsupported) — promoted as needed. **Moved out
+      of "Out of scope."** **Rationale:** real path resolution is not optional for a program that opens
+      `SUB\FILE`; the single-dir shortcut was the explicit blocker the oracle surfaced.
 
 - [x] **D9 — PSP/MCB/DTA/SFT representation: thin typed "views" over guest RAM (the DOSBox `MemStruct`
       model), NOT host-side mirror structs. RECOMMENDED.** The PSP (256 bytes), MCB chain (16-byte
@@ -321,10 +381,11 @@ Do **not** write code or touch other files while working from this plan; it is t
       faithfully (split into two faithful sub-rules). DECIDED + CORRECTED (ground rule, load-bearing).**
       An AH (or AH/AL) we have not implemented does **not** silently return a fabricated success. The
       policy splits:
-  - **(a) Functions with a defined DOS error path** set **CF=1 + AX=error code ONLY where DOS itself
-    does** (e.g. open a missing file → CF=1, AX=2). This is a *faithful* failure, not an invention — used
-    only for subfunctions that have a real DOS error return.
-  - **(b) The generic unknown-AH default** returns **AL=0 with carry CLEAR** — because that is what real
+  - **(a) [D11a] Functions with a defined DOS error path** set **CF=1 + AX=error code ONLY where DOS
+    itself does** (e.g. open a missing file → CF=1, AX=2; **AH=43 AL=00 on a missing file → CF=1, AX=2**,
+    `dos.cpp:1106-1120` — the FILEIO fix, D20). This is a *faithful* failure, not an invention — used only
+    for subfunctions that have a real DOS error return, and it must set `dos.errorcode` (for AH=59, D20).
+  - **(b) [D11b] The generic unknown-AH default** returns **AL=0 with carry CLEAR** — because that is what real
     DOS actually does for an unknown AH (`dosbox dos.cpp:1610`: `reg_al = 0; break;`); real DOS does
     **NOT** set CF for an unknown function. **Do not fabricate a CF=error here** — that would itself be a
     fake. The "surface, never fake" goal is met **not** by a fabricated CF, but by **also raising the
@@ -447,6 +508,85 @@ Do **not** write code or touch other files while working from this plan; it is t
       faster and still a single deterministic operation (cost stays the synthetic D5 formula, not host
       copy time). **Flag: this is an addition to `src/bus/` — call it out to the user; it is the only
       bus edit this module needs.**
+
+- [ ] **D20 — Promote the real-CRT-baseline INT 21h functions into scope, pinned to `dos.cpp`. NEW
+      (the concrete function list behind D8a + the AH=43 fidelity fix).** Each is a CRT-startup/runtime
+      call the oracle proved real programs make; semantics pinned to `references/dosbox-staging/src/dos/
+      dos.cpp`:
+  - **AH=43 AL=00 (get file attributes) — FIX, do not stub (FILEIO divergence, HIGHEST PRIORITY).** The
+    first pass returned `CX=0x20, CF=0` **unconditionally** without consulting the VFS. Real DOS
+    (`dos.cpp:1106-1120`: `DOS_GetFileAttr` → on absent file `CALLBACK_SCF(true); reg_ax=dos.errorcode`)
+    returns **CF=1, AX=2 (file-not-found)** when the file is missing. The CRT's `fopen("...","wb")` calls
+    AH=43 AL=00 to probe existence; the stub's fake success makes the CRT open-for-write (AH=3D AL=01)
+    instead of create (AH=3C), and `fopen` fails (`plans/dos-oracle-report.md` §1). **Fix:** resolve the
+    path through the VFS; return CF=1/AX=2 when absent, the real attribute bits + CF=0 when present.
+    Localized — the VFS already has the open/stat seam.
+  - **AH=33 (extended break checking) — ADD** (`dos.cpp:881-910`): AL=00 get breakcheck → DL=flag; AL=01
+    set breakcheck from DL; AL=02 get+set; AL=05 boot-drive (DL=3); AL=06 get-true-version
+    (BL/BH/DL=major/minor/revision). Store `breakcheck` as deterministic DOS state. CRTs query it at
+    startup.
+  - **AH=29 (parse filename into FCB) — ADD** (`dos.cpp:743`): parse a command-tail filename at DS:SI
+    into the FCB at ES:DI, honoring the AL parse-control bits; return AL=parse result (0 / 1 wildcards /
+    0xFF bad drive). Re-derive the parse from the documented rules. The CRT uses it to build argv/FCBs.
+  - **AH=59 (get extended error info) — ADD** (`dos.cpp:1337`): return the **last DOS error** (the
+    `dos.errorcode` set by the most recent failing call) in AX, plus the error class / suggested action /
+    locus bytes (BH/BL/CH). Maintain a deterministic `last_error` on the Dos ctx, set by every faithful
+    error path. CRTs call this after a failed file op.
+  - **AH=52 (Get List of Lists / SysVars) — ADD** (`dos.cpp:1256`): return ES:BX → the DOS internal
+    SysVars table, with a **real MCB anchor** (the first-MCB segment at the documented offset) so a
+    program that walks the MCB chain from SysVars sees the genuine chain (D9). Build a minimal but
+    byte-accurate SysVars structure in guest RAM; do NOT fake the anchor.
+  - **AH=44 IOCTL `AL=01/06/07` — ADD** (`dos.cpp:1138`, `DOS_IOCTL`): `AL=01` set device-info word (for
+    a device handle), `AL=06` get input status (device/file → AL=0xFF ready / 0x00), `AL=07` get output
+    status. Route through the SFT `{device,file}` union (D17). Only `AL=00` existed.
+  - **AH=45 / AH=46 (dup / dup2) — ADD** (`dos.cpp:1146-1162`): AH=45 allocate a new JFT slot pointing at
+    the same SFT entry (returns new handle in AX); AH=46 force handle CX to alias handle BX. The SFT
+    needs a **reference count** so a dup'd entry closes only when the last handle does. CRTs dup for
+    stdio redirection.
+  - **General fidelity pin:** all of the above set **CF + AX=dos.errorcode on the real DOS error path
+    only** (D11a), never a fabricated CF; each charges a D5 cost; each maintains `last_error` for AH=59.
+
+- [ ] **D21 — ACCEPTANCE METHODOLOGY: the oracle replaces hand-assembled fixtures as the sufficiency
+      gate. NEW — THE MOST IMPORTANT CHANGE (supersedes every first-pass "done when" / milestone that
+      asserted self-authored fixtures).** The first pass accepted the DOS module against fixtures it wrote
+      itself — which can only test what was built, so a four-agent "done" still failed the first real
+      `.EXE`. **The external oracle is now the truth source** (`plans/dos-oracle-report.md`):
+  - **`tools/oracle.sh <program.exe> [data...]`** runs a real `.EXE` under **dosbox-x headless** and mints
+    a committed golden (`<program>.expected`: `exit_code` + verbatim console bytes). This is a MINT step
+    (run once when adding a corpus program), NOT a `zig build test`-time dependency — the golden is
+    vendored and the test runs offline.
+  - **`zig build test-oracle`** (`src/dos/oracle_test.zig`) loads each corpus `.EXE` through the real
+    machine and **asserts zdos reproduces the dosbox-x golden** (exit code + console bytes). This is the
+    DOS equivalent of the CPU's ProcessorTests conformance vectors: truth is **external, not
+    self-authored.**
+  - **"DOS done" ≡ "zdos matches dosbox-x on real binaries."** A phase/milestone is "done" when its
+    relevant corpus programs **pass `test-oracle`**, not when a fixture passes. The matched programs are
+    listed as permanent regressions (`PASSING`); the known-divergent ones are an asserted worklist
+    (`DIVERGING`, each asserted to STILL diverge so a fix promotes it loudly — never tweak zdos to force a
+    match; the divergence is the deliverable).
+  - **The acceptance ladder (the v1 gate):** `HELLO ✅ → MALLOC ✅ → FILEIO → ARGENV → SUBDIR → (extend
+    the corpus) → **BaK boots**`. HELLO/MALLOC are passing regressions; FILEIO/ARGENV/SUBDIR are the live
+    second-pass worklist; BaK booting (matching a dosbox-x BaK golden, or the documented BaK boot
+    sequence) is the v1 gate.
+  - **Hand-assembled fixtures keep ONE job:** **cycle-exact determinism** testing (the run-twice-byte-
+    identical-including-cycle-position regressions, Phase 8) — zdos's *separate* guarantee that dosbox-x
+    cannot make. They are **never** the sufficiency gate. **Rationale:** sufficiency must be measured
+    against real-software truth, not against what the author thought to build; determinism must be
+    measured by zdos's own ledger. Two truths, two test mechanisms.
+
+- [ ] **D22 — What is ALREADY validated and sound (do NOT churn it). NEW (frames this as completion +
+      re-scope, not a rewrite).** The second pass MUST keep these — they are correct and tested:
+  - **The callback-trampoline bridge** (Phase 0, D1-D4/D16): the `0xFE 0x38 <id>` trap, the `CallbackSink`
+    CPU edit, `runGuestInt` re-entrancy, the FLAGS-patch helpers — round-trips, green (`test-bridge`).
+  - **The determinism / cycle-ledger contract** (D5, Phase 1 + the Phase 8 run-twice regression): every
+    trap charges a fixed synthetic cost; the Spice86 hole is closed. This is the differentiator and it
+    holds — do not destabilize it.
+  - **Guest-RAM structure modeling** (D9): PSP/MCB/DTA as byte-accurate guest-RAM views, the SFT-on-host +
+    JFT-in-PSP split — correct and faithful.
+  - **The loader `max_alloc` handling** (Phase 6, the `min/max/maxfree` rule): the real-CRT regression was
+    already found and FIXED (a Borland `.EXE` with `maxmemory=0xFFFF` now gets the largest free block);
+    covered by `borland_test.zig`. **Rationale:** the second pass is targeted completion of the function
+    surface + the oracle re-gate, on top of a sound foundation — not a restart.
 
 ---
 
@@ -674,11 +814,12 @@ pass; deferred subfunctions are flagged (D11), not faked.
 
 ---
 
-## Phase 4: DOS kernel — INT 21h dispatch + PSP/MCB/DTA/SFT + the curated function set
+## Phase 4: DOS kernel — INT 21h dispatch + PSP/MCB/DTA/SFT + the real-CRT-complete function set
 
-Goal: the INT 21h kernel BaK needs, with the guest-RAM data structures and the host-FS file API.
-**Done when** the curated INT 21h functions work against a host temp dir, the structures are
-byte-accurate, and unsupported subfunctions flag (D11).
+Goal: the INT 21h kernel that starts + runs any real compiled program (the real-CRT baseline, D8a), with
+the guest-RAM data structures and the host-FS file API. **Done when** the relevant corpus programs pass
+`test-oracle` (D21) — NOT when a self-authored fixture passes; the structures are byte-accurate; and
+unsupported subfunctions flag (D11). (Per-function fixtures still exist for cycle-exact determinism only.)
 
 - [x] **DOS init (`dos.zig`):** install the INT 21h callback (+ INT 20h terminate, INT 27h TSR, INT 2Fh
       multiplex minimally, **INT 22/23/24 default handlers** — terminate/Ctrl-C/critical-error vectors),
@@ -720,7 +861,8 @@ byte-accurate, and unsupported subfunctions flag (D11).
       **PARTIAL:** the SFT records `snap_len` (file length) per handle and the position/mode for restore;
       the content-hash + the re-open-and-compare-on-restore rebind path are NOT yet wired (the SFT struct
       has `snap_hash` reserved). Flagged as the precise next item for full D14 SFT restore.
-- [x] **The curated INT 21h function set (`int21.zig`) — exactly what BaK needs.** Switch on AH; each
+- [x] **The INT 21h function set (`int21.zig`) — the real-CRT-complete baseline (D8a, NOT "BaK
+      gameplay").** Switch on AH; each
       charges D5 cost; the **default (unknown-AH) arm follows D11 rule (b): return AL=0 with carry CLEAR
       (faithful real-DOS behavior) AND raise the structural `unsupported{int,ah,al}` signal** — not a
       fabricated CF error. **In scope:**
@@ -730,24 +872,45 @@ byte-accurate, and unsupported subfunctions flag (D11).
         DOS version** → reads the **PSP version bytes** (5.0: AL=5, AH=0), returns **BH=OEM=0xFF**,
         **BL:CX = serial = 0**; AH=4D get return code. **AH=31 TSR — DEFERRED-BY-DEFAULT** (D11 flag);
         pull in only on trace evidence.
+  - [ ] **CRT-startup additions (D8a/D20) — required to START any real program:** **AH=33** extended
+        break-checking (AL=00/01/02 get/set/get+set the deterministic `breakcheck` flag, AL=05 boot-drive
+        DL=3, AL=06 true-version, `dos.cpp:881-910`); **AH=29** parse-filename-into-FCB (DS:SI → ES:DI per
+        the AL bits, returns AL=0/1/0xFF, `dos.cpp:743`); **AH=59** get-extended-error (return the
+        deterministic `last_error` in AX + class/action/locus bytes, `dos.cpp:1337`); **AH=52** Get List
+        of Lists / SysVars (ES:BX → a byte-accurate SysVars table with a **real first-MCB anchor**, D9 —
+        not a faked pointer, `dos.cpp:1256`). Maintain `last_error` on the Dos ctx, set by every D11a
+        error path.
   - [x] **Char I/O (minimal):** AH=02 output char, AH=06/07 direct console I/O, **AH=09 print $-string**
         (used by the loader test), AH=01/08 input char. (BaK uses VGA directly, but the loader/runtime
         may print.)
-  - [x] **File handles (the core BaK path):** **AH=3C create, 3D open, 3E close, 3F read, 40 write,
-        42 lseek** (SEEK_SET/CUR/END), AH=41 unlink, AH=43 get/set attributes, AH=44 IOCTL, AH=56 rename.
+  - [x] **File handles (the core file path):** **AH=3C create, 3D open, 3E close, 3F read, 40 write,
+        42 lseek** (SEEK_SET/CUR/END), AH=41 unlink, **AH=43 get/set attributes**, **AH=44 IOCTL**,
+        AH=56 rename.
         **AH=3D open resolves the character-device table (CON, AUX, PRN, NUL, `EMMXXXX0`) BEFORE the
         drive VFS** (D17): a name matching a device returns a **device** SFT entry; otherwise fall through
-        to the VFS. **AH=44 AL=00 (get device info)** returns the **device bit (bit 7 set)** for a device
-        handle (clear for a file). **read/write/seek route to the device** for device handles (CON →
-        keyboard/VGA seam; NUL → discard), to the host `File` otherwise. **AH=45/46 dup/dup2 —
-        DEFERRED-BY-DEFAULT** (D11 flag; pull in on trace evidence). File reads/writes copy between the
-        host `File` (via `File.reader`/`writer`, D6/Phase 5) and guest memory at DS:DX for CX bytes
-        **through `bus.writeGuestBlock`/`readGuestBlock` + a fixed stack scratch buffer (D19)**; **count
-        from CX (guest input) → D5 cost `base + CX*per_byte`.**
+        to the VFS. **read/write/seek route to the device** for device handles (CON → keyboard/VGA seam;
+        NUL → discard), to the host `File` otherwise. File reads/writes copy between the host `File` (via
+        `File.reader`/`writer`, D6/Phase 5) and guest memory at DS:DX for CX bytes **through
+        `bus.writeGuestBlock`/`readGuestBlock` + a fixed stack scratch buffer (D19)**; **count from CX
+        (guest input) → D5 cost `base + CX*per_byte`.**
+  - [ ] **AH=43 AL=00 existence check — FIX (D20/D11a, FILEIO divergence, HIGHEST PRIORITY).** Currently
+        `fn getSetAttr` returns `CX=0x20, CF=0` **unconditionally**, never consulting the VFS — which
+        makes the CRT's `fopen("wb")` open-for-write instead of create, so `fopen` fails. Resolve the path
+        through the VFS: **CF=1, AX=2 (file-not-found) when absent**; real attribute bits + CF=0 when
+        present (`dos.cpp:1106-1120`). AL=01 set-attr stays as is.
+  - [ ] **AH=44 IOCTL `AL=01/06/07` — ADD (D20).** AL=00 (get device info, device bit 7) exists; add
+        AL=01 (set device info), AL=06 (get input status → AL=0xFF/0x00), AL=07 (get output status),
+        routed through the SFT `{device,file}` union (D17). `DOS_IOCTL`, `dos.cpp:1138`.
+  - [ ] **AH=45 dup / AH=46 dup2 — ADD (D20, was DEFERRED).** AH=45 allocates a new JFT slot aliasing the
+        same SFT entry (new handle in AX); AH=46 forces CX to alias BX. Add an SFT **reference count** so
+        the entry closes only on the last handle. `dos.cpp:1146-1162`. CRTs dup for stdio redirection.
   - [x] **Directory search:** **AH=4E find-first, 4F find-next** (wildcards `*`/`?`; writes the DTA
-        record; uses the VFS `findFirst`/`findNext` over the host dir with 8.3 munging, D10), AH=47
-        get-cwd, AH=3B chdir. **AH=39/3A mkdir/rmdir — DEFERRED-BY-DEFAULT** (D11 flag; pull in on trace
-        evidence).
+        record; uses the VFS `findFirst`/`findNext` over the host dir with 8.3 munging, D10).
+  - [ ] **Directory navigation — PROMOTE to real path support (D8b, SUBDIR divergence).** **AH=47
+        get-cwd** (write the current dir string at DS:SI, `dos.cpp:1163`), **AH=3B chdir** (was a no-op
+        success — make it validate + set the per-drive current dir against the VFS, `dos.cpp:1007`),
+        **AH=39 mkdir / AH=3A rmdir** (were DEFERRED — implement against the VFS, `dos.cpp:986/996`).
+        These back the multi-component path resolution the corpus + BaK need.
   - [x] **DTA + date/time + misc:** AH=1A set DTA, AH=2F get DTA; **AH=2A get date, 2C get time** (from
         the BDA tick + emulated epoch, D13 — NOT host clock), AH=2B/2D set date/time (update the
         emulated state); **AH=57 get/set file date-time** → from the deterministic source, NOT host
@@ -783,8 +946,10 @@ byte-accurate, and unsupported subfunctions flag (D11).
         22/23/24 from the terminating PSP** and **transfer control to the saved INT 22** — this is what
         a re-entrant EXEC unwinds to (the parent resumes after its `INT 21h AH=4B`).
 - [x] **Deferred-and-flagged (D11), not faked:** the FCB file API (AH=0F-0x24), network/share (AH=5xxx),
-      LFN (AH=71xx), AH=44 IOCTL beyond AL=00, DBCS, country info — all hit the unsupported-service flag
-      path (AL=0/CF-clear + the structural signal); none returns a fabricated success.
+      LFN (AH=71xx), AH=44 IOCTL beyond the AL=00/01/06/07 promoted in D20, DBCS, country info — all hit
+      the unsupported-service flag path (AL=0/CF-clear + the structural signal); none returns a fabricated
+      success. (NOTE: AH=33/29/59/52, AH=44 AL=01/06/07, AH=45/46 are now IN-SCOPE per D8a/D20 — they are
+      no longer on this deferred list.)
 - [x] Tests (`int21_test.zig`, against a `std.testing` temp dir mounted as C:): create→write→close→
       open→read→seek→read-again→close round-trip; find-first/find-next over a few files (8.3 munging);
       AH=48/49/4A MCB alloc/free/resize; AH=2A/2C return the PIT-driven date/time (not host); an
@@ -794,23 +959,33 @@ byte-accurate, and unsupported subfunctions flag (D11).
 
 ## Phase 5: Host-FS VFS + 8.3 name munging (`vfs.zig`, `name83.zig`)
 
-Goal: the single-host-directory drive backend BaK needs, with deterministic 8.3 munging. **Done when**
-the VFS open/read/write/seek/find against a host dir works and the munging unit tests (re-derived from
-the spec) pass.
+Goal: the host-directory-**tree** drive backend (with multi-component path resolution, D8b) + deterministic
+8.3 munging. **Done when** `SUBDIR.EXE` passes `test-oracle` (D21 — the real gate for path resolution),
+VFS open/read/write/seek/find/chdir/mkdir/rmdir against a host dir tree works, and the munging unit tests
+(re-derived from the spec, kept for determinism) pass.
 
 - [x] **`DosDrive` backend (D8):** `HostDirDrive` exposes `open`/`create`/`close`/`readAt`/`writeAt`/
       `size`/`enumerate`/`unlink`/`rename`. Drive table `drives: [26]?HostDirDrive` on the Dos ctx.
-      (The interface is the concrete `HostDirDrive` — the single backend BaK needs; the seam for more
-      backends is the `drives` table + the method set.)
+      (The interface is the concrete `HostDirDrive` — the single backend; the seam for more backends is
+      the `drives` table + the method set.)
+- [ ] **Subdirectory ops on the backend (D8b — SUBDIR divergence):** extend `HostDirDrive` with
+      `chdir`/`mkdir`/`rmdir`/`getcwd` over the host dir tree, and have `open`/`create`/`enumerate`
+      resolve **multi-component** paths (below). Track a per-drive current directory (deterministic init
+      to root) for the AH=3B/47 calls.
 - [x] **`HostDirDrive` over `std.Io.Dir` (verified 0.16 API):** holds the host `Dir` + an `io: Io`
       handle. `open` → `Dir.openFile(io, munged_to_host_name, .{ .mode })`; `create` →
       `Dir.createFile`; `read`/`write` via `File.reader(io, buf)`/`File.writer(io, buf)` +
       `Reader.seekTo`/`Writer.seekTo`; `getSize` via `Reader.getSize`; `findFirst`/`findNext` via
       `Dir.iterate()`. **Grep `references/zig/lib/std/Io/Dir.zig` + `Io/File*.zig` for exact signatures
       — the `io: Io` parameter is mandatory on every call.**
-- [x] **DOS path → host path:** parse `C:\...\FILE.EXT`, strip the drive, take the final component
-      (single-dir VFS), munge to 8.3 (D10). (Subdir traversal is not built — BaK loads from one dir;
-      the path-escape guard is inherent in the single-dir mount.)
+- [ ] **DOS path → host path — MULTI-COMPONENT (D8b — FIX, replaces the single-dir shortcut).** The
+      first pass took only the FINAL component (`fn resolve` → `lastIndexOfAny(p, "\\/")`), so
+      `SUB\DATA.TXT` resolved to `DATA.TXT` at root and failed (`plans/dos-oracle-report.md` §2).
+      **Replace with real resolution:** canonicalize `C:\...\FILE.EXT` (apply chdir-relative base for a
+      relative path), strip the drive, translate `\`→`/`, **8.3-munge each component** (D10), and open the
+      leaf relative to the mount root, **walking real host subdirectories** (`drive_local.cpp` +
+      `DOS_MakeName`). **Keep a path-escape guard** (reject `..` traversal above the mount root) now that
+      the single-dir mount no longer provides it implicitly.
 - [x] **8.3 munging (`name83.zig`, D10 — re-derive, do NOT copy GPL):** uppercase; split name(≤8)+ext(≤3)
       on last dot; validate 8.3 charset; **deterministic long→short generation:** when a host file has a
       long name, generate `NAME~N.EXT` with **N assigned over a deterministically sorted directory
@@ -825,9 +1000,11 @@ the spec) pass.
 
 ## Phase 6: EXE/COM loader (`loader.zig`) — the path that starts Betrayal at Krondor
 
-Goal: parse + load an MZ EXE (and a flat COM), build the PSP, apply relocations, set up registers, and
-transfer control — and define the **initial-load entry point that boots BaK**. **Done when** a tiny
-COM and a tiny EXE both load and run to a clean exit with the asserted output + exit code.
+Goal: parse + load an MZ EXE (and a flat COM), build the PSP **+ a real environment block** (D20), apply
+relocations, set up registers, and transfer control — and define the **initial-load entry point that
+boots BaK**. **Done when** `HELLO.EXE`/`MALLOC.EXE`/`ARGENV.EXE` pass `test-oracle` (D21 — the real gate,
+covering env/argv[0] fidelity), with the hand-assembled COM/EXE fixtures retained for cycle-exact
+determinism only.
 
 - [x] **`loadProgram(path, cmdtail, mode) !void`** — the core. `mode = { load_and_run, load_overlay,
       load_only }` (AH=4B AL selects).
@@ -847,10 +1024,17 @@ COM and a tiny EXE both load and run to a clean exit with the asserted output + 
         with only `minsize` paragraphs, `memtop - DGROUP` was smaller than the required stack+heap and
         the CRT `abort()`ed (exit 3) before `main`. `loadExe` now follows the real `min/max/maxfree`
         rule; covered by `borland_test.zig` running the real `examples/dos-src/HELLO.EXE`.
-  - [x] **Build the environment block** (explicit step): alloc an env MCB (**owner = the new PSP**),
-        **inherit the parent's env** (or a minimal default for the root/initial load), write the trailing
-        **`0x0001` word + the program's canonical path** (the DOS env terminator + program-name string),
-        and set **PSP[0x2C] = envseg**.
+  - [ ] **Build a REAL environment block — FIX (ARGENV divergence, D20).** The first pass wrote an EMPTY
+        env (just the double-null + `0x0001` + a `"PROGRAM.EXE"` **placeholder** path) — so `getenv("PATH")`
+        returned null and **`argv[0]` was `C:\PROGRAM.EXE` instead of the real EXE name**
+        (`plans/dos-oracle-report.md` §3; reference `MakeEnv`, `dos_execute.cpp`). Fix both:
+    - [ ] alloc an env MCB (**owner = the new PSP**); **inherit/populate** the parent's env (or, for the
+          root/initial load, a **pinned deterministic env** — a fixed `PATH`/`COMSPEC` constant, NOT the
+          host environment, a determinism requirement: never read `getenv` from the host);
+    - [ ] terminate the var list with the double-null, then write the **`0x0001` word + the program's
+          CANONICAL path** (the real `C:\<EXE name>`, not a placeholder) so the CRT derives the correct
+          `argv[0]` from it;
+    - [ ] set **PSP[0x2C] = envseg**.
   - [x] **Build the PSP** (Phase 4) at the allocation base; set parent, environment (envseg above),
         command-tail, the **0x34→0x18 file-table far pointer + max_files=20 at 0x32** (D9), the **FCBs at
         0x5C/0x6C** parsed from the EXEC param block (for the initial BaK load synthesize a default-drive
@@ -957,7 +1141,77 @@ zdos from Spice86. **Done when** a program doing real file I/O run to cycle N tw
 
 ---
 
+## Phase 10: The SECOND PASS — oracle-driven completion (trace → fix → re-run corpus)
+
+Goal: promote the live `DIVERGING` corpus programs to `PASSING` against the dosbox-x golden, then extend
+the corpus toward BaK. **This phase is driven by `plans/dos-oracle-report.md`, not by hand-authored
+fixtures.** The loop is always: **trace the failing INT 21h call → fix faithfully (never tweak-to-match)
+→ re-run `zig build test-oracle` → the program flips `DIVERGING`→`PASSING` loudly.** **Done when** the
+ladder `HELLO ✅ → MALLOC ✅ → FILEIO → ARGENV → SUBDIR → (extend) → BaK boots` is green (D21).
+
+> **PLAN-change vs IMPLEMENTATION-completion.** Items in **DECISIONS** (D8a/D8b/D20/D21/D22) are the
+> PLAN/scope/premise changes. The checkboxes below + the promoted items already inlined into Phases 4-6
+> are the IMPLEMENTATION-completion tasks. The two are kept distinct on purpose.
+
+### 10a. The oracle harness (the new sufficiency gate, D21)
+
+- [ ] **`tools/oracle.sh <program.exe> [data...]`** — mints the dosbox-x golden (`<program>.expected`:
+      `exit_code` + verbatim console bytes; headless `-silent -fastlaunch -nogui -exit` + the device-off
+      `-set` list; stdout redirected to a file on the mounted drive and read back; exit code via the
+      `if errorlevel` ladder; bounded by `ulimit -f` + `timeout 120`). MINT-once, vendored, offline.
+- [ ] **`src/dos/oracle_test.zig` + `zig build test-oracle`** — loads each corpus `.EXE` through the real
+      machine and asserts zdos reproduces the golden (exit code + console bytes). `PASSING` programs are
+      permanent regressions; `DIVERGING` programs are asserted to STILL diverge (a fix promotes them
+      loudly — the divergence is the deliverable, never force a match). `<STEM>.args` sidecars feed the
+      identical argv to oracle + harness.
+- [ ] Wire `test-oracle` into the top-level acceptance set (alongside `test-bridge`/`test-bios`/`test-dos`).
+
+### 10b. The 3 traced worklist items (fold-in from `plans/dos-oracle-report.md`)
+
+- [ ] **FILEIO — AH=43 AL=00 existence check (HIGHEST PRIORITY).** Implement the D20/D11a fix (Phase 4):
+      AH=43 AL=00 resolves the path through the VFS, returns CF=1/AX=2 when absent. **Re-run:** `FILEIO.EXE`
+      flips `DIVERGING`→`PASSING`. (`dos-oracle-report.md` §1; `dos.cpp:1106-1120`.)
+- [ ] **SUBDIR — multi-component path resolution.** Implement the D8b VFS work (Phase 5) + AH=3B/47/39/3A
+      (Phase 4). **Re-run:** `SUBDIR.EXE` flips `DIVERGING`→`PASSING`. (`dos-oracle-report.md` §2;
+      `drive_local.cpp` + `DOS_MakeName`.) This unblocks BaK's subdir data loading.
+- [ ] **ARGENV — real env block + canonical argv[0].** Implement the D20 env-block fix (Phase 6): real
+      `C:\<EXE>` trailing path + a pinned deterministic populated env. **Re-run:** `ARGENV.EXE` flips
+      `DIVERGING`→`PASSING`. (`dos-oracle-report.md` §3; `MakeEnv`, `dos_execute.cpp`.)
+
+### 10c. INT 21h fidelity audit (the AH=43 bug proves fidelity gaps exist within the curated set)
+
+- [ ] **A pass over EVERY already-implemented INT 21h function, verifying real-DOS return fidelity against
+      `references/dosbox-staging/src/dos/dos.cpp`** — because the AH=43 stub showed a "done + 4-agent-
+      reviewed" function can be silently unfaithful. For each implemented AH/AL, confirm:
+  - [ ] **CF on the error path** is set exactly where `dos.cpp` sets `CALLBACK_SCF(true)` — and CLEARED
+        on success — not unconditionally one way (the AH=43 failure mode).
+  - [ ] **The return-register values** (AX / and where applicable BX/CX/DX/ES:BX) match `dos.cpp` on both
+        the success and error paths (e.g. AH=48 returns max-block in BX on failure; AH=47 AX=0x0100).
+  - [ ] **The DOS error code** in AX on failure matches the real `dos.errorcode`, and `last_error` (for
+        AH=59) is updated.
+  - [ ] **MCB-chain integrity** after AH=48/49/4A (links/signatures/owner correct, no orphaned blocks).
+  - [ ] **PSP fields** written by the loader/EXEC (0x2C env, 0x32/0x34 JFT, 0x5C/0x6C FCBs, 0x0A/0x0E/0x12
+        vectors, version bytes) match the documented layout `dos.cpp`/`dos_execute.cpp` expect.
+  - [ ] Record each gap found as a numbered fidelity fix; re-run `test-oracle` after each.
+
+### 10d. Extend the corpus toward BaK
+
+- [ ] Add corpus programs covering the next CRT-startup/runtime surfaces the report flags as missing
+      (AH=33/29/59/52, AH=44 AL=01/06/07, AH=45/46 — mint a golden + assert) so the baseline is proven by
+      real binaries, not fixtures.
+- [ ] **The v1 gate: BaK boots** — `test-oracle` (or the documented BaK boot sequence) shows zdos
+      matching dosbox-x on the real BaK `.EXE` load + early run. This is the acceptance ladder's terminus.
+
+---
+
 ## Milestone ordering & "done when" criteria
+
+> **RE-GATE (D21).** M0/M1 (the bridge + BIOS core) are validated by their own tests and stay `[x]`. But
+> **M2-M4's "done" was asserted against self-authored fixtures and is NOT sufficient** — the first-pass
+> M2-M4 passed yet the module failed the first real `.EXE`. They are kept below as the implementation
+> record, but the **real acceptance gate is now M5 (the oracle ladder)**: a phase is "done" only when its
+> corpus programs pass `test-oracle`. Fixtures remain ONLY for cycle-exact determinism (M4's Phase-8
+> regression). The `[x]` on M2-M4 means "the first-pass code exists," not "real software passes."
 
 - [x] **M0 — Callback bridge round-trips.** `zig build` + `zig build test-bridge`/`test-bios` green; the
       `0xFE 0x38 <id>` trap reaches a host handler via the CPU `CallbackSink` (the one surgical `src/cpu/`
@@ -995,7 +1249,15 @@ zdos from Spice86. **Done when** a program doing real file I/O run to cycle N tw
       `test-bridge` / `test-bios` / `test-dos` all green. **The Spice86 cycle-ledger
       hole is closed: every host-serviced trap charges a fixed synthetic cost; the ledger has no hole.**
       Ready for the API/MCP server (`src/api/`) and the VGA/keyboard/mouse devices to complete the BaK
-      target.
+      target. **NOTE (D21): this M4 sign-off was against self-authored fixtures; real-software
+      sufficiency is M5.**
+- [ ] **M5 — THE REAL ACCEPTANCE GATE: zdos matches dosbox-x on real binaries (the oracle ladder, D21).**
+      `zig build test-oracle` green up the ladder: **HELLO ✅ → MALLOC ✅** (passing regressions) **→
+      FILEIO** (AH=43 existence fix) **→ ARGENV** (real env/argv[0]) **→ SUBDIR** (multi-component path) **→
+      (extended corpus for AH=33/29/59/52, AH=44 AL=01/06/07, AH=45/46) → BaK boots**. The INT 21h fidelity
+      audit (Phase 10c) is complete with every gap recorded + fixed. "DOS done" ≡ "matches dosbox-x on
+      real binaries"; the hand-assembled fixtures retain only the cycle-exact determinism job (M4/Phase 8).
+      (Phase 10) **This is the v1 DOS gate — not M2-M4.**
 
 ---
 
@@ -1013,8 +1275,10 @@ zdos from Spice86. **Done when** a program doing real file I/O run to cycle N tw
   deferred-and-flagged (D11) — handle-based file I/O is what 1993 games use; build the FCB path only if
   a BaK trace shows it, never faked.
 - **Additional VFS backends (`fatDrive` disk images, `isoDrive` CD, overlay/copy-on-write, MSCDEX
-  INT 2Fh AH=15):** the `DosDrive` interface keeps the seam (D8); only `HostDirDrive` is built — BaK
-  loads from a directory.
+  INT 2Fh AH=15):** the `DosDrive` interface keeps the seam (D8); only `HostDirDrive` is built — mapping a
+  host directory **tree** (with subdirectory traversal, D8b) to a drive. **NOTE: subdirectory / multi-
+  component path resolution is now IN-SCOPE (D8b, Phase 5) — it was moved OUT of this Out-of-scope list,
+  being a hard BaK blocker (SUBDIR divergence).**
 - **The shell / COMMAND.COM / AUTOEXEC / batch processing:** zdos loads BaK directly as the initial
   process (Phase 6); no command interpreter is needed for the v1 target.
 - **XMS / DPMI / DOS extenders / protected mode:** CPU-deferred (cpu.md Deferred section); BaK is plain
