@@ -1,0 +1,16 @@
+exit_code: 0
+--- output ---
+orig wrote: 4
+orig pos after write: 4
+dup ok (newfd>orig): 1
+dup pos (shared w/ orig): 4
+dup wrote: 6
+dup seek -> 2
+orig pos sees dup seek: 2
+dup read after orig close: 10 [AAAABBBBBB]
+dup2 rc: 0
+redirected read via b: 3 [XYZ]
+set_handle_count(40) rc: 0
+opened 25 files (want 25 > default 20)
+all above default-20 limit: 1
+done

@@ -150,5 +150,15 @@ pub fn Psp(comptime Cpu: type) type {
         pub fn jftFree(self: Self, handle: u16) void {
             self.jftSet(handle, JFT_FREE);
         }
+
+        pub fn setMaxFiles(self: Self, n: u16) void {
+            self.wr16(OFF_JFT_SIZE, n);
+        }
+        /// Repoint the JFT far pointer (0x34) at `seg:off` — used by AH=67 when a
+        /// larger JFT is allocated outside the PSP's inline 20-byte table.
+        pub fn setJftPtr(self: Self, seg: u16, off: u16) void {
+            self.wr16(OFF_JFT_PTR, off);
+            self.wr16(OFF_JFT_PTR + 2, seg);
+        }
     };
 }

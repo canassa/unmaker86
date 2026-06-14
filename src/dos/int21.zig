@@ -136,6 +136,7 @@ pub fn Int21(comptime Cpu: type) type {
                 0x56 => renameFile(dos, cpu, br),
                 0x45 => dupHandle(dos, cpu, br),
                 0x46 => dup2Handle(dos, cpu, br),
+                0x67 => setHandleCount(dos, cpu, br),
 
                 // ---- Directory search ----
                 0x4E => findFirst(dos, cpu, br),
@@ -1215,6 +1216,42 @@ pub fn Int21(comptime Cpu: type) type {
             dos.psp().jftSet(dst, idx);
             e.refcount +%= 1;
             cpu.st.setReg16(EAX, dst);
+            br.setGuestCF(false);
+        }
+
+        /// AH=67 Set Handle Count (dos.cpp:2956 -> DOS_PSP::SetNumFiles,
+        /// dos_classes.cpp:428). BX = requested per-process open-file limit. Grows
+        /// the PSP's Job File Table above the inline 20-slot table when asked for
+        /// more than 20, by allocating a larger block from the DOS arena and
+        /// repointing the 0x34 JFT far pointer at it. Always succeeds (CF clear) in
+        /// dosbox-x; an allocation failure is the one faithful error path.
+        ///
+        /// Semantics mirror SetNumFiles EXACTLY:
+        ///   - clamp the request to a minimum of 20;
+        ///   - only (re)allocate when count>20 AND count+2 > current max_files;
+        ///   - on realloc: add 2 for safety, size the block in paragraphs, copy the
+        ///     first 20 handles from the current JFT (the rest = JFT_FREE), and set
+        ///     the new far pointer; max_files becomes the +2 value;
+        ///   - otherwise max_files becomes the clamped count (no block change).
+        fn setHandleCount(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            var count = cpu.st.getReg16(EBX);
+            if (count < psp_mod.DEFAULT_MAX_FILES) count = psp_mod.DEFAULT_MAX_FILES; // 20 minimum
+            const p = dos.psp();
+            if (count > psp_mod.DEFAULT_MAX_FILES and @as(u32, count) + 2 > p.maxFiles()) {
+                count += 2; // a few more for safety (dos_classes.cpp:434)
+                const paras: u16 = (count / 16) + @intFromBool(count % 16 > 0);
+                const seg = dos.mcb().alloc(paras, dos.current_psp) orelse
+                    return dos.dosError(cpu, br, Dos.ERR_NOT_ENOUGH_MEM);
+                // Copy the existing handles into the new table; the first 20 come
+                // from the current JFT, the remainder are free.
+                var i: u16 = 0;
+                while (i < count) : (i += 1) {
+                    const v: u8 = if (i < psp_mod.DEFAULT_MAX_FILES) p.jftGet(i) else psp_mod.JFT_FREE;
+                    cpu.bus.writePhys8((@as(u32, seg) << 4) + i, v);
+                }
+                p.setJftPtr(seg, 0);
+            }
+            p.setMaxFiles(count);
             br.setGuestCF(false);
         }
 

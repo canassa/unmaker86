@@ -139,6 +139,21 @@ const PASSING = [_]Program{
     // deterministic by a double-mint byte-identical diff. The one created file is
     // removed before exit so the committed corpus stays byte-identical.
     .{ .exe = "OPENEXT.EXE" },
+    // File-handle management / Job File Table band (band 13): INT 21h AH=45 dup,
+    // AH=46 dup2/force-dup, AH=67 set-handle-count. HANDLES.EXE proves the dup
+    // SHARES one SFT entry (DOS_DuplicateEntry): writing/seeking via the dup moves
+    // the original's file pointer (one shared position), and closing the original
+    // leaves the file ALIVE through the dup (SFT refcount > 1 at close — the
+    // structural requirement for dup). dup2 (DOS_ForceDuplicateEntry) redirects a
+    // handle onto another's file, closing the target's prior file first (the
+    // stdout/stdin redirection primitive). AH=67 (DOS_PSP::SetNumFiles,
+    // dos_classes.cpp:428) raises the per-process limit above the default 20 by
+    // allocating a larger JFT from the DOS arena and repointing the PSP's 0x34 JFT
+    // far pointer, after which 25 simultaneous open handles all succeed. Only
+    // oracle-able values are printed (byte counts, positions, content, error codes
+    // — NO timestamps); proven deterministic by a triple-mint byte-identical diff.
+    // The created files are all removed before exit so the corpus stays clean.
+    .{ .exe = "HANDLES.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented
