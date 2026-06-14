@@ -10,3 +10,17 @@ zig-out/
 
 # stray test/conformance output
 conf.out
+
+# The 35 MB Borland C++ 3.1 toolchain is kept out of git by
+# toolchain/bc31/.gitignore (which ignores all but itself). The small built
+# corpus .EXE + .expected goldens under examples/dos-src/ ARE committed.
+
+# DOS oracle/compile scratch left in the mounted corpus dir (the committed
+# artifacts are the .C source, the .EXE, the .args sidecar, and the .expected
+# golden — NOT the intermediate .OBJ or the dosbox redirect scratch files).
+examples/dos-src/*.OBJ
+examples/dos-src/BUILD.LOG
+examples/dos-src/OUT.TXT
+examples/dos-src/CODE.TXT
+examples/dos-src/SCRATCH.DAT
+examples/dos-src/LV.TXT

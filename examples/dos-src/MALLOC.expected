@@ -1,0 +1,4 @@
+exit_code: 0
+--- output ---
+allocated 8 chunks of 4096 bytes
+verified 32768 bytes

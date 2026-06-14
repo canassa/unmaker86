@@ -1,0 +1,8 @@
+exit_code: 0
+--- output ---
+argc=4
+argv[0]=C:\ARGENV.EXE
+argv[1]=alpha
+argv[2]=beta
+argv[3]=gamma
+PATH=Z:\;Z:\SYSTEM;Z:\BIN;Z:\DOS;Z:\4DOS;Z:\DEBUG;Z:\TEXTUTIL

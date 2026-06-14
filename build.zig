@@ -316,6 +316,24 @@ pub fn build(b: *std.Build) void {
     for (dosbios_imports) |imp| dos_borland_t.root_module.addImport(imp.name, imp.mod);
     dos_borland_t.root_module.addOptions("build_options", opts);
     const dos_borland = b.addRunArtifact(dos_borland_t);
+
+    // The EXTERNAL-ORACLE conformance suite: for each corpus `.EXE`, run it on
+    // zdos and assert its CON output + exit code == the committed dosbox-x-minted
+    // `.expected` golden (offline; the goldens are vendored, minted by
+    // tools/oracle.sh). Needs the examples-dir path via build_options.
+    const dos_oracle_t = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dos/oracle_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    for (dosbios_imports) |imp| dos_oracle_t.root_module.addImport(imp.name, imp.mod);
+    dos_oracle_t.root_module.addOptions("build_options", opts);
+    const dos_oracle = b.addRunArtifact(dos_oracle_t);
+    const oracle_test_step = b.step("test-oracle", "Run the dosbox-x external-oracle conformance suite");
+    oracle_test_step.dependOn(&dos_oracle.step);
+
     const dos_test_step = b.step("test-dos", "Run the DOS kernel + loader + EMS tests");
     dos_test_step.dependOn(&dos_unit.step);
     dos_test_step.dependOn(&dos_int21.step);
@@ -323,6 +341,7 @@ pub fn build(b: *std.Build) void {
     dos_test_step.dependOn(&dos_loader.step);
     dos_test_step.dependOn(&dos_integration.step);
     dos_test_step.dependOn(&dos_borland.step);
+    dos_test_step.dependOn(&dos_oracle.step);
 
     // Top-level test step aggregates the CPU + bus + machine tests.
     const test_step = b.step("test", "Run all unit tests");
@@ -345,6 +364,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&dos_loader.step);
     test_step.dependOn(&dos_integration.step);
     test_step.dependOn(&dos_borland.step);
+    test_step.dependOn(&dos_oracle.step);
 
     // Dedicated full-conformance sweep: runs ALL vendored 80386 real-mode
     // vectors and reports per-opcode pass/fail/revoked counts. Separate from

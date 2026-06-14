@@ -1,0 +1,4 @@
+exit_code: 0
+--- output ---
+read 29 bytes after seek: file I/O roundtrip 0123456789
+checksum: 2235
