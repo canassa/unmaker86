@@ -99,6 +99,17 @@ const PASSING = [_]Program{
     // the words in the SFT (epoch-seeded, SET-overwritten) so its own round-trip
     // is deterministic, while the golden only pins the host-independent behavior.
     .{ .exe = "FILEDATE.EXE" },
+    // Find-first/find-next glob band (band 10): INT 21h AH=4E/4F directory
+    // enumeration EXTENDING DIRLIST/DIRSCAN. FINDFILE.EXE creates a fresh FFDIR
+    // subtree at runtime, enumerates with the '?' single-char wildcard
+    // ("FILE?.DAT" -> FILE1/2/3 but NOT FILE10), a '*' extension glob, "*.*",
+    // and a NO-MATCH glob ("*.XYZ"). It prints name + SIZE + attribute and tears
+    // the tree down so the committed corpus stays clean. SIZE is oracle-able
+    // (find_size = stat.st_size for fixed-content files); the find DATE/TIME are
+    // NOT printed (dosbox-x derives them from host mtime — non-deterministic,
+    // drive_local.cpp find_date/find_time = localtime(st_mtime); proven by a
+    // triple-mint byte-identical diff — see plans/dos-oracle-report.md band 10).
+    .{ .exe = "FINDFILE.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented

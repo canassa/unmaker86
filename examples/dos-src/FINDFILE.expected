@@ -1,0 +1,22 @@
+exit_code: 0
+--- output ---
+mask FFDIR\*.DAT: 5 entries
+  DATA.DAT        12 attr=20
+  FILE1.DAT        1 attr=20
+  FILE10.DAT      10 attr=20
+  FILE2.DAT        2 attr=20
+  FILE3.DAT        3 attr=20
+mask FFDIR\FILE?.DAT: 3 entries
+  FILE1.DAT        1 attr=20
+  FILE2.DAT        2 attr=20
+  FILE3.DAT        3 attr=20
+mask FFDIR\*.*: 7 entries
+  DATA.DAT        12 attr=20
+  FILE1.DAT        1 attr=20
+  FILE10.DAT      10 attr=20
+  FILE2.DAT        2 attr=20
+  FILE3.DAT        3 attr=20
+  NOTES.TXT        7 attr=20
+  READ.ME          4 attr=20
+mask FFDIR\*.XYZ: no match
+FINDFILE done
