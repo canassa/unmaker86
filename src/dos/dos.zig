@@ -339,5 +339,6 @@ pub fn Dos(comptime Cpu: type) type {
         pub const ERR_INVALID_FUNC: u16 = 1;
         pub const ERR_NO_MORE_FILES: u16 = 18;
         pub const ERR_INVALID_DRIVE: u16 = 15;
+        pub const ERR_FILE_EXISTS: u16 = 80; // DOSERR_FILE_ALREADY_EXISTS (AH=5B)
     };
 }

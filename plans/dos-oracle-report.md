@@ -425,3 +425,99 @@ under a real glob with mixed attrs (the DTA date/time fields already come from
 the epoch, so they are oracle-able unlike AH=57 GET). Avoid any path that reports
 a host file's stored timestamp back to the guest — that family is the documented
 non-deterministic boundary.
+
+---
+
+## Band 11 — AH=43 file attributes + AH=5B exclusive create (1 program; corpus 32 → 33)
+
+### Program added: `FILEATTR.EXE`
+
+Exercises the file-attribute surface (`_dos_getfileattr` → INT 21h AH=43 AL=00,
+`_dos_setfileattr` → AH=43 AL=01) and exclusive create (`_dos_creatnew` →
+AH=5B). It: creates a file (ARCHIVE), GETs its attr, SETs READ_ONLY, GETs again
+to confirm, write-opens it, clears READ_ONLY, GETs again, exclusive-creates a new
+name (succeeds), exclusive-creates the SAME name (fails EEXIST), GETs a missing
+file (file-not-found), and removes every file it created (corpus stays
+byte-identical).
+
+### The AH=43 divergence (the known `[ ]` worklist item) — was a REAL bug
+
+`getSetAttr` previously (a) returned `st.attr` from `vfs.stat`, which **always**
+reported `ATTR_ARCHIVE` (0x20) for a file and never the READ_ONLY bit, (b) treated
+AH=43 AL=01 (SET) as a pure no-op existence check, and (c) did not set the
+undocumented AX=attr on GET or AX=0x0202 on SET. So a SET-READ_ONLY followed by a
+GET wrongly returned 0x20 instead of 0x21 — the documented FILEIO divergence.
+
+Root cause: the attribute was synthesized as a constant in `vfs.stat`, and SET had
+no backing store at all.
+
+### Oracle truth (double-mint byte-identical — determinism proof)
+
+Minted twice with `tools/oracle.sh`; `diff` of the two mints is EMPTY (identical):
+
+```
+attr.initial=20            (ARCHIVE)
+attr.readonly=21           (ARCHIVE | READ_ONLY, after SET)
+write-open ALLOWED
+attr.cleared=20            (ARCHIVE, after clearing READ_ONLY)
+write-open ok after clear
+creatnew ok
+creatnew dup denied ax=80  (DOSERR_FILE_ALREADY_EXISTS)
+getattr missing ret=2      (file-not-found)
+```
+
+dosbox-x's `localDrive::GetFileAttr` (non-WIN32 path, drive_local.cpp:2070)
+returns ARCHIVE plus READ_ONLY iff the host inode is not owner-writable;
+`SetFileAttr` (drive_local.cpp:1997) chmods the owner-write bit. AH=5B
+(dos.cpp:2550) probes existence via a read open and fails EEXIST (80) if present.
+
+### KEY oracle finding: a per-file READ_ONLY attribute does NOT block a write-open
+
+`write-open ALLOWED` is genuine (reproduced in isolation; double-mint identical):
+dosbox-x's `localDrive::FileOpen` (drive_local.cpp:1545) refuses writes ONLY on a
+whole-drive read-only MOUNT, never on a per-file READ_ONLY attribute. So zdos must
+not reject the write-open either.
+
+### zdos fix — attribute OVERRIDE, not host chmod (structural decision)
+
+zdos does **not** chmod the host file the way dosbox-x does, for two reasons:
+(1) chmod-ing a committed corpus file is a hygiene/permission hazard, and (2) a
+0444 host file makes a later host write-open fail with EACCES — which would print
+`write-open denied` and DIVERGE from the golden's `write-open ALLOWED`. Instead
+`vfs.zig` keeps a fixed-capacity per-drive `AttrOverride` table keyed by the
+resolved host path:
+
+- `stat` returns inode-derived bits (ARCHIVE, +READ_ONLY iff `permissions.readOnly()`)
+  merged with any SET override (settable bits from the override; VOLUME/DIRECTORY
+  always from the inode, dos_files.cpp:1391 mask).
+- `setAttr` (AH=43 AL=01) requires the file to exist (else file-not-found) and
+  records the merged attr; `create`/`unlink` clear a stale override.
+- `createNew` (AH=5B) fails `error.AlreadyExists` → DOSERR_FILE_ALREADY_EXISTS
+  (80) if the name exists, else create+truncate+return handle.
+
+GET now returns CX=AX=attr/CF clear; SET returns AX=0x0202/CF clear; an illegal
+AH=43 subfunction returns AX=1/CF set (dos.cpp:2238).
+
+### AH=5A (create temp file) — SKIPPED, with reason
+
+AH=5A generates a filename DOS-side and writes it back to the caller's buffer
+(dos.cpp:2530, `DOS_CreateTempFile`). The generated name is derived from a
+counter/PID-like value and is **not** guaranteed stable across dosbox-x runs, and
+asserting only "creation succeeded" would leave a randomly-named file in the
+mounted dir that the program cannot reliably remove (a corpus-hygiene hazard).
+Per the band guidance, 5A is deferred; band 11 focuses on 43 + 5B (both cleanly
+oracle-able and self-cleaning).
+
+### Status
+
+`zig build test-oracle` green (exit 0) — **33/33 programs PASSING**, prior
+32-program corpus intact (no regression). `zig build test` green (exit 0), all
+targets. `git status examples/dos-src/` shows only the three committed band files
+(`FILEATTR.{C,EXE,expected}`); no stray runtime files (the program removes
+`ATTRTEST.DAT`/`EXCLNEW.DAT` before exit).
+
+### Next uncovered DOS area
+
+Candidates: **AH=5C local file-region locking** (a clean lock/unlock contract once
+SHARE-mode bits are parsed) or **AH=6C extended open/create** (sharing + action
+flags). Both stay within the deterministic, no-host-timestamp boundary.

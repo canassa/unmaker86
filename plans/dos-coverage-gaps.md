@@ -91,7 +91,7 @@ Citations are `dosbox-staging/src/...` `file:line`.
 | 40 | Write file/device | 1067 | **IMPL** | int21.zig:123 |
 | 41 | Unlink (delete) | 1082 | **IMPL** | int21.zig:125 |
 | 42 | LSEEK | 1091 | **IMPL** | int21.zig:124 (AL=0/1/2) |
-| 43 | Get/set file attributes | 1106 | **PLAN** | int21.zig:126; **AL=00 existence FIX still `[ ]`** (FILEIO, D20) |
+| 43 | Get/set file attributes | 1106 | **IMPL** | int21.zig `getSetAttr`; AL=00/01 CLOSED (band 11, FILEATTR) — RO/ARCHIVE bits + vfs AttrOverride |
 | 44 | IOCTL | 1138 | **IMPL/partial** | int21.zig:127; AL=00/01/06/07 impl — see §1.2 |
 | 45 | DUP handle | 1146 | **IMPL** | int21.zig:129 (D20) |
 | 46 | DUP2/FORCEDUP | 1154 | **IMPL** | int21.zig:130 (D20) |
@@ -114,8 +114,8 @@ Citations are `dosbox-staging/src/...` `file:line`.
 | 57 | Get/set file date-time | 1288 | **IMPL** | int21.zig:91 (deterministic, D13) |
 | 58 | Get/set alloc strategy | 1307 | **IMPL** | int21.zig:150 `allocStrategy` (also UMB-link AL=02/03) |
 | 59 | Get extended error info | 1337 | **IMPL** | int21.zig:143 `extendedError` (D20) |
-| 5A | Create temp file | 1348 | **GAP** | `tmpfile()` in CRTs; Tier 2 |
-| 5B | Create new file (fail if exists) | 1362 | **GAP** | exclusive create; `fopen("x")`/`O_EXCL` — Tier 2 |
+| 5A | Create temp file | 1348 | **GAP** | `tmpfile()` in CRTs; Tier 2 — DOS-generated name not proven stable across runs, deferred (band 11) |
+| 5B | Create new file (fail if exists) | 1362 | **IMPL** | int21.zig `createNewFile`; exclusive create → EEXIST(80) (band 11, FILEATTR) |
 | 5C | FLOCK (region lock/unlock) | 1379 | **GAP** | file locking; SHARE-aware programs — Tier 2/3, see §3 |
 | 5D | Network/server functions | 1401 | **DEFER** | network; AL=06 returns SDA ptr (note: SDA leak) |
 | 5E | Network/printer functions | 1413 | **DEFER** | network |
@@ -494,8 +494,9 @@ These are correctness/structure issues that "function is present" does not captu
 These plan items are `[ ]`/`[~]` in `bios-dos.md` and visibly partial in `src/dos/` today (another agent
 is completing them — do not treat as final "missing"):
 
-- **AH=43 AL=00 existence FIX** (FILEIO divergence) — int21.zig `getSetAttr` still returns
-  CX=0x20/CF=0 unconditionally (plan §4 `[ ]`, Phase 10b).
+- ~~**AH=43 AL=00 existence FIX** (FILEIO divergence)~~ — CLOSED (band 11, FILEATTR). `getSetAttr`
+  now returns the real RO/ARCHIVE bits (inode-derived + a per-drive `vfs.AttrOverride` table that
+  records AH=43 AL=01 SETs without chmod-ing the host file); AH=5B exclusive create also landed.
 - **AH=3B/47/39/3A subdir path support** (SUBDIR divergence) — VFS multi-component resolution `[ ]`
   (Phase 5); `chdir`/`getCwd`/`mkdir`/`rmdir` present in int21.zig but the VFS subdir-ops backend `[ ]`.
 - **Real env block + canonical argv[0]** (ARGENV divergence) — loader `[ ]` (Phase 6).

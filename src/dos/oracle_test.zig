@@ -110,6 +110,21 @@ const PASSING = [_]Program{
     // drive_local.cpp find_date/find_time = localtime(st_mtime); proven by a
     // triple-mint byte-identical diff — see plans/dos-oracle-report.md band 10).
     .{ .exe = "FINDFILE.EXE" },
+    // File ATTRIBUTES + exclusive create band (band 11): INT 21h AH=43 AL=00/01
+    // (get/set file attributes) and AH=5B (create-new / exclusive create).
+    // FILEATTR.EXE creates a file, reads its attributes (ARCHIVE=0x20), sets
+    // READ_ONLY (-> 0x21), confirms a write-open is STILL allowed (dosbox-x's
+    // localDrive::FileOpen ignores the per-file read-only bit — only a read-only
+    // MOUNT refuses writes; drive_local.cpp:1545), clears READ_ONLY (-> 0x20),
+    // exclusive-creates a new name (succeeds), exclusive-creates the SAME name
+    // (fails EEXIST/AX=80), gets a missing file's attr (AX=2), and removes every
+    // file it created so the corpus stays byte-identical. The attribute bits are
+    // inode-derived (oracle-able), NOT timestamps; proven deterministic by a
+    // double-mint diff (see plans/dos-oracle-report.md band 11). zdos stores the
+    // SET attribute in a per-drive override table (vfs.zig AttrOverride) rather
+    // than chmod-ing the host file, so GET reflects SET, write-open is unaffected,
+    // and no committed corpus file's permissions are ever touched.
+    .{ .exe = "FILEATTR.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented

@@ -130,6 +130,7 @@ pub fn Int21(comptime Cpu: type) type {
                 0x42 => seekFile(dos, cpu, br),
                 0x41 => unlinkFile(dos, cpu, br),
                 0x43 => getSetAttr(dos, cpu, br),
+                0x5B => createNewFile(dos, cpu, br),
                 0x44 => ioctl(dos, cpu, br),
                 0x56 => renameFile(dos, cpu, br),
                 0x45 => dupHandle(dos, cpu, br),
@@ -689,21 +690,61 @@ pub fn Int21(comptime Cpu: type) type {
             br.setGuestCF(false);
         }
 
+        /// AH=43 Get/Set File Attributes (dos.cpp:2212).
+        ///   AL=00 GET -> CX = attr, AX = attr (undocumented), CF clear; on a
+        ///               missing file CF set, AX = errorcode (dos.cpp:2219).
+        ///   AL=01 SET <- CX = attr; AX = 0x0202 ("ax destroyed"), CF clear; on a
+        ///               missing file CF set, AX = errorcode (dos.cpp:2229).
+        /// The attribute bits returned for a local-drive file come from the inode
+        /// (ARCHIVE, plus READ_ONLY iff the host file is not owner-writable —
+        /// drive_local.cpp:2070) MERGED with any prior AH=43 SET (vfs stores the
+        /// set attribute rather than chmod-ing the host file; see vfs.zig
+        /// AttrOverride for why). A subfunction other than 00/01 returns AX=1, CF
+        /// set (dos.cpp:2238).
         fn getSetAttr(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
             const al = cpu.st.getReg8(0);
+            if (al != 0 and al != 1) { // illegal subfunction (dos.cpp:2238)
+                cpu.st.setReg16(EAX, 1);
+                return br.setGuestCF(true);
+            }
             var pbuf: [128]u8 = undefined;
             const path = readPath(cpu, &pbuf);
             var rbuf: [128]u8 = undefined;
             const r = resolve(dos, path, &rbuf) orelse return dos.dosError(cpu, br, Dos.ERR_PATH_NOT_FOUND);
             const drive = dos.drivePtr(r.drive) orelse return dos.dosError(cpu, br, Dos.ERR_PATH_NOT_FOUND);
-            if (al == 0) { // get attr -> CX, CF=1/AX=2 when absent (dos.cpp:1106)
+            if (al == 0) { // GET
                 const st = drive.stat(r.path) catch |e| return dos.dosError(cpu, br, vfsErrToDos(e));
                 cpu.st.setReg16(ECX, st.attr);
+                cpu.st.setReg16(EAX, st.attr); // undocumented: AX = attr (dos.cpp:2221)
                 br.setGuestCF(false);
-            } else { // set attr: accept only if the file exists (real DOS errors otherwise)
-                _ = drive.stat(r.path) catch |e| return dos.dosError(cpu, br, vfsErrToDos(e));
+            } else { // SET (al == 1)
+                const attr: u8 = @truncate(cpu.st.getReg16(ECX));
+                drive.setAttr(r.path, attr) catch |e| return dos.dosError(cpu, br, vfsErrToDos(e));
+                cpu.st.setReg16(EAX, 0x0202); // "ax destroyed" (dos.cpp:2231)
                 br.setGuestCF(false);
             }
+        }
+
+        /// AH=5B Create New File / exclusive create (dos.cpp:2550). DS:DX -> name,
+        /// CX = attributes. Fails with DOSERR_FILE_ALREADY_EXISTS (80) if the name
+        /// already exists; otherwise creates + truncates and returns the handle in
+        /// AX (CF clear). Contrast AH=3C (create-or-truncate), which never fails on
+        /// an existing name. dosbox-x implements the "exists?" probe as a read open
+        /// + close; zdos's vfs.createNew does the same existence check.
+        fn createNewFile(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            var pbuf: [128]u8 = undefined;
+            const path = readPath(cpu, &pbuf);
+            // A device name (CON/AUX/PRN) cannot be exclusively created; dosbox-x
+            // routes AH=5B through DOS_CreateFile which would open the device — but
+            // the corpus never exclusively-creates a device, so resolve the VFS.
+            var rbuf: [128]u8 = undefined;
+            const r = resolve(dos, path, &rbuf) orelse return dos.dosError(cpu, br, Dos.ERR_PATH_NOT_FOUND);
+            const drive = dos.drivePtr(r.drive) orelse return dos.dosError(cpu, br, Dos.ERR_PATH_NOT_FOUND);
+            const hf = drive.createNew(r.path) catch |e| switch (e) {
+                error.AlreadyExists => return dos.dosError(cpu, br, Dos.ERR_FILE_EXISTS),
+                else => return dos.dosError(cpu, br, vfsErrToDos(e)),
+            };
+            finishFileOpen(dos, cpu, br, hf, r, .read_write);
         }
 
         fn ioctl(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
@@ -1179,6 +1220,7 @@ pub fn Int21(comptime Cpu: type) type {
                 error.NoMoreFiles => Dos.ERR_NO_MORE_FILES,
                 error.PathError => Dos.ERR_PATH_NOT_FOUND,
                 error.IoFailed => Dos.ERR_ACCESS_DENIED,
+                error.AlreadyExists => Dos.ERR_FILE_EXISTS,
             };
         }
     };

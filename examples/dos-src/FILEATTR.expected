@@ -1,0 +1,10 @@
+exit_code: 0
+--- output ---
+attr.initial=20
+attr.readonly=21
+write-open ALLOWED
+attr.cleared=20
+write-open ok after clear
+creatnew ok
+creatnew dup denied ax=80
+getattr missing ret=2

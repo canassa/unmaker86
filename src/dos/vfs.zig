@@ -36,12 +36,22 @@ pub const VfsError = error{
     NoMoreFiles,
     IoFailed,
     PathError,
+    /// Exclusive create (AH=5B) on a name that already exists.
+    AlreadyExists,
 };
 
 /// DOS attribute bits (subset).
 pub const ATTR_READONLY: u8 = 0x01;
+pub const ATTR_HIDDEN: u8 = 0x02;
+pub const ATTR_SYSTEM: u8 = 0x04;
+pub const ATTR_VOLUME: u8 = 0x08;
 pub const ATTR_DIRECTORY: u8 = 0x10;
 pub const ATTR_ARCHIVE: u8 = 0x20;
+
+/// Bits SetFileAttr (AH=43 AL=01) may NOT change: VOLUME + DIRECTORY are taken
+/// from the existing entry (dos_files.cpp:1391 attr_mask). Everything else
+/// (READONLY/HIDDEN/SYSTEM/ARCHIVE) is settable.
+pub const ATTR_SET_MASK: u8 = ATTR_VOLUME | ATTR_DIRECTORY;
 
 /// Stat result for a resolved DOS path (AH=43 get-attr, existence probes).
 pub const StatResult = struct {
@@ -59,13 +69,62 @@ pub const HostFile = struct {
     file: Io.File,
 };
 
+/// A DOS-attribute override for one host file (AH=43 AL=01 SET). zdos does NOT
+/// chmod the host file the way dosbox-x does (chmod would (a) mutate a committed
+/// corpus file — a hygiene/permission hazard — and (b) make a later host
+/// write-open fail with EACCES, which dosbox-x's localDrive::FileOpen does NOT do
+/// for a per-FILE read-only bit: it only refuses writes on a whole-drive
+/// read-only MOUNT, dos drive_local.cpp:1545). Instead the set attribute is held
+/// here, keyed by the resolved host-relative path, so GET reflects SET, write-open
+/// is unaffected, and no host state is touched. The override is per machine boot
+/// (reset on init) — deterministic and snapshot-friendly.
+const AttrOverride = struct {
+    path: [MAX_HOST_PATH]u8 = @splat(0),
+    path_len: u8 = 0,
+    attr: u8 = 0,
+    in_use: bool = false,
+};
+
 /// The single host-directory drive backend.
 pub const HostDirDrive = struct {
     dir: Io.Dir,
     io: Io,
+    /// Fixed-capacity DOS-attribute override table (no per-call alloc). Sized for
+    /// the corpus + BaK working set; a full table fails the SET loudly rather
+    /// than silently dropping an attribute.
+    attr_overrides: [32]AttrOverride = @splat(.{}),
 
     pub fn init(dir: Io.Dir, io: Io) HostDirDrive {
         return .{ .dir = dir, .io = io };
+    }
+
+    /// Find the override slot for a host-relative path, or null.
+    fn findOverride(self: *HostDirDrive, host: []const u8) ?*AttrOverride {
+        for (&self.attr_overrides) |*o| {
+            if (o.in_use and std.mem.eql(u8, o.path[0..o.path_len], host)) return o;
+        }
+        return null;
+    }
+
+    /// Set (or update) the DOS attribute override for `host`. Returns false if the
+    /// table is full (the caller surfaces a faithful DOS error, never a silent
+    /// drop). VOLUME/DIRECTORY are NOT stored here (they come from the inode).
+    fn putOverride(self: *HostDirDrive, host: []const u8, attr: u8) bool {
+        if (host.len > MAX_HOST_PATH) return false;
+        if (self.findOverride(host)) |o| {
+            o.attr = attr;
+            return true;
+        }
+        for (&self.attr_overrides) |*o| {
+            if (!o.in_use) {
+                @memcpy(o.path[0..host.len], host);
+                o.path_len = @intCast(host.len);
+                o.attr = attr;
+                o.in_use = true;
+                return true;
+            }
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------
@@ -266,27 +325,78 @@ pub const HostDirDrive = struct {
         return .{ .file = f };
     }
 
-    /// Create (or truncate) a file by DOS-relative path (read_write).
+    /// Create (or truncate) a file by DOS-relative path (read_write). A fresh
+    /// create resets any stale attribute override for this name (the new file
+    /// starts as a plain ARCHIVE file, like a real DOS create).
     pub fn create(self: *HostDirDrive, dos_path: []const u8) VfsError!HostFile {
         var hbuf: [MAX_HOST_PATH]u8 = undefined;
         const host = self.resolveHostPath(dos_path, &hbuf) orelse return error.PathError;
         const f = self.dir.createFile(self.io, host, .{ .read = true, .truncate = true }) catch |e| {
             return mapErr(e);
         };
+        self.clearOverride(host);
         return .{ .file = f };
     }
 
+    /// Drop any attribute override for a host-relative path (e.g. on a fresh
+    /// create, which gives the file default attributes).
+    fn clearOverride(self: *HostDirDrive, host: []const u8) void {
+        if (self.findOverride(host)) |o| o.in_use = false;
+    }
+
+    /// Exclusive create (INT 21h AH=5B): create a NEW file that must not already
+    /// exist. Mirrors dosbox-x dos.cpp:2550 — it first probes existence with a
+    /// read open and, if the file opens, fails with FILE_ALREADY_EXISTS; otherwise
+    /// it creates. Here we surface that as error.AlreadyExists so the INT 21h layer
+    /// can return DOSERR_FILE_ALREADY_EXISTS (80). A non-existent name creates +
+    /// truncates exactly like `create`.
+    pub fn createNew(self: *HostDirDrive, dos_path: []const u8) VfsError!HostFile {
+        if (self.stat(dos_path)) |_| {
+            return error.AlreadyExists;
+        } else |e| switch (e) {
+            error.NotFound => {}, // good: the name is free, fall through to create
+            else => return e,
+        }
+        return self.create(dos_path);
+    }
+
     /// Stat a DOS-relative path (existence + attributes). NotFound when absent.
+    /// The DOS attribute mirrors dosbox-x localDrive::GetFileAttr (non-WIN32 path,
+    /// drive_local.cpp:2070): a regular file is ARCHIVE, a directory is DIRECTORY,
+    /// and the READ_ONLY bit is set iff the host inode's owner-write bit is clear.
+    /// On top of that, any AH=43 SET override for this path supersedes the
+    /// settable bits (READONLY/HIDDEN/SYSTEM/ARCHIVE); VOLUME/DIRECTORY always come
+    /// from the inode (they cannot be set, dos_files.cpp:1391).
     pub fn stat(self: *HostDirDrive, dos_path: []const u8) VfsError!StatResult {
         var hbuf: [MAX_HOST_PATH]u8 = undefined;
         const host = self.resolveHostPath(dos_path, &hbuf) orelse return error.NotFound;
         const st = self.dir.statFile(self.io, host, .{}) catch |e| return mapErr(e);
         const is_dir = st.kind == .directory;
+        var attr: u8 = if (is_dir) ATTR_DIRECTORY else ATTR_ARCHIVE;
+        if (st.permissions.readOnly()) attr |= ATTR_READONLY;
+        if (self.findOverride(host)) |o| {
+            // Settable bits from the override; structural bits from the inode.
+            attr = (o.attr & ~ATTR_SET_MASK) | (attr & ATTR_SET_MASK);
+        }
         return .{
             .size = @intCast(@min(st.size, std.math.maxInt(u32))),
-            .attr = if (is_dir) ATTR_DIRECTORY else ATTR_ARCHIVE,
+            .attr = attr,
             .is_dir = is_dir,
         };
+    }
+
+    /// Apply an AH=43 AL=01 (set file attributes) request to a DOS-relative path.
+    /// Mirrors dosbox-x DOS_SetFileAttr (dos_files.cpp:1347): the file must exist;
+    /// VOLUME/DIRECTORY bits cannot be changed (they are taken from the existing
+    /// entry); the rest are recorded. NotFound when absent; IoFailed if the
+    /// override table is full (surfaced as a faithful DOS error, never dropped).
+    pub fn setAttr(self: *HostDirDrive, dos_path: []const u8, attr: u8) VfsError!void {
+        const cur = try self.stat(dos_path); // NotFound if absent (== dosbox)
+        var hbuf: [MAX_HOST_PATH]u8 = undefined;
+        const host = self.resolveHostPath(dos_path, &hbuf) orelse return error.NotFound;
+        // Keep VOLUME/DIRECTORY from the existing entry; take the rest from `attr`.
+        const merged = (attr & ~ATTR_SET_MASK) | (cur.attr & ATTR_SET_MASK);
+        if (!self.putOverride(host, merged)) return error.IoFailed;
     }
 
     pub fn close(self: *HostDirDrive, hf: HostFile) void {
@@ -297,6 +407,7 @@ pub const HostDirDrive = struct {
         var hbuf: [MAX_HOST_PATH]u8 = undefined;
         const host = self.resolveHostPath(dos_path, &hbuf) orelse return error.NotFound;
         self.dir.deleteFile(self.io, host) catch |e| return mapErr(e);
+        self.clearOverride(host); // a deleted name carries no attribute override
     }
 
     pub fn mkdir(self: *HostDirDrive, dos_path: []const u8) VfsError!void {
