@@ -58,6 +58,11 @@ const PASSING = [_]Program{
     .{ .exe = "FARHEAP.EXE" },
     .{ .exe = "DOSERR.EXE" },
     .{ .exe = "VECTORS.EXE" },
+    // Child-process EXEC band: SPAWN.EXE launches CHILD.EXE via INT 21h AH=4B
+    // AL=00 (load-and-execute, P_WAIT), captures its return code, and resumes —
+    // the full EXEC / DOS_Terminate unwind. The golden interleaves parent+child
+    // output and ends with the captured rc. CHILD.EXE lives next to it on C:.
+    .{ .exe = "SPAWN.EXE" },
     // Console/stdin INPUT band (scripted stdin via "<STEM>.in"): AH=0A buffered
     // line, AH=01/08 char read+echo, AH=0B status + AH=0C flush/read, CRT
     // scanf/fgets (AH=3F on handle 0). Goldens minted with dosbox-x `< IN.TXT`.
@@ -95,7 +100,7 @@ fn parseGolden(bytes: []const u8) !Golden {
     return .{ .exit_code = @intCast(code), .output = bytes[after_marker + 1 ..] };
 }
 
-const RunResult = struct { output: []u8, ret_code: u16, terminated: bool };
+const RunResult = struct { output: []u8, ret_code: u16, terminated: bool, cycles: u64 };
 
 /// Boot a fresh machine, mount examples/ as C:, load+run `exe` with `args`,
 /// return a heap copy of the CON output + the exit code. Caller frees output.
@@ -130,7 +135,7 @@ fn runOnZdos(alloc: std.mem.Allocator, dir: std.Io.Dir, io: std.Io, exe: []const
     }.done, 500_000_000);
 
     const out = try alloc.dupe(u8, m.dos.dev_table.con.output());
-    return .{ .output = out, .ret_code = m.dos.ret_code, .terminated = m.dos.terminated };
+    return .{ .output = out, .ret_code = m.dos.ret_code, .terminated = m.dos.terminated, .cycles = m.cpu.st.cycles };
 }
 
 /// Read a corpus golden file from the examples dir.
@@ -212,4 +217,26 @@ test "external oracle: DIVERGING corpus still diverges (documented worklist)" {
             return error.DivergenceResolved;
         }
     }
+}
+
+// The nested child EXEC (AH=4B) re-enters the machine step loop to run the child
+// to termination. That re-entry MUST be cycle-deterministic: two runs of the
+// parent-spawns-child program must produce byte-identical output AND an identical
+// final cycle ledger (the child's cycles are real work charged through the normal
+// ledger — no hole, no host-time leak). This guards the EXEC run-loop integration.
+test "EXEC determinism: SPAWN (parent+nested child) run-twice byte-identical" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, build_options.dos_examples_dir, .{ .iterate = true });
+    defer dir.close(io);
+
+    const a = try runOnZdos(alloc, dir, io, "SPAWN.EXE", "");
+    defer alloc.free(a.output);
+    const b = try runOnZdos(alloc, dir, io, "SPAWN.EXE", "");
+    defer alloc.free(b.output);
+
+    try std.testing.expect(a.terminated and b.terminated);
+    try std.testing.expectEqual(a.ret_code, b.ret_code);
+    try std.testing.expectEqualStrings(a.output, b.output);
+    try std.testing.expectEqual(a.cycles, b.cycles);
 }

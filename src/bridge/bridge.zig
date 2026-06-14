@@ -382,6 +382,31 @@ pub fn Bridge(comptime Cpu: type) type {
         pub fn onStopSentinel(self: *Self) void {
             self.reentry_done = true;
         }
+
+        /// Drive the MACHINE step until `predicate(ctx)` is true (D3 wiring). Used by
+        /// the EXEC path to run a loaded CHILD program to termination NESTED inside
+        /// the parent's INT 21h handler — the same deterministic, event-honoring
+        /// machine step `runGuestInt` uses (no separate timing path; the nested
+        /// instructions charge their real cycles through the normal ledger). The
+        /// caller has already set CS:IP/SS:SP to the child entry; this just runs.
+        /// BOUNDED — panics if the child never terminates (a structural bug, never a
+        /// silent hang).
+        pub fn runUntil(self: *Self, ctx: *anyopaque, predicate: *const fn (*anyopaque) bool) void {
+            std.debug.assert(self.step_one != null); // stepper must be wired
+            std.debug.assert(self.depth < MAX_DEPTH); // depth guard (D3)
+            self.depth += 1;
+            defer self.depth -= 1;
+
+            var guard: u64 = 0;
+            const max_steps: u64 = 2_000_000_000; // bounded; flag loudly if exceeded
+            while (!predicate(ctx)) {
+                self.step_one.?(self.step_ctx.?);
+                guard += 1;
+                if (guard >= max_steps) {
+                    std.debug.panic("bridge.runUntil: child did not terminate within {d} steps", .{max_steps});
+                }
+            }
+        }
     };
 }
 

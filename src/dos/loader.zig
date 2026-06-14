@@ -21,6 +21,26 @@ pub const MZ_MAGIC2: u16 = 0x4D5A; // 'ZM'
 
 pub const LoadMode = enum { load_and_run, load_overlay, load_only };
 
+/// Parsed AH=4B EXEC parameter block (the data at ES:BX), threaded into the
+/// loader so a child inherits the caller's environment + command tail + FCBs and
+/// links to the parent PSP. Absent (null) for the initial boot load, which
+/// synthesizes a default env + empty tail + root parent. Re-derived from the
+/// documented EXEC param-block layout + dos_execute.cpp:473-528.
+pub const ExecParams = struct {
+    /// Environment segment from the block (+0x00). 0 = copy the caller's env.
+    env_seg: u16,
+    /// Far pointer to the command tail (+0x02): { len byte, chars, 0x0D }.
+    cmdtail_seg: u16,
+    cmdtail_off: u16,
+    /// Far pointers to the two parsed FCBs (+0x06, +0x0A) -> child PSP 0x5C/0x6C.
+    fcb1_seg: u16,
+    fcb1_off: u16,
+    fcb2_seg: u16,
+    fcb2_off: u16,
+    /// The parent (caller) PSP segment -> child PSP 0x16 (parent link).
+    parent_psp: u16,
+};
+
 /// The MZ EXE header fields (re-derived). All u16, little-endian, from offset 0.
 pub const ExeHeader = struct {
     signature: u16,
@@ -67,6 +87,21 @@ pub fn Loader(comptime Cpu: type) type {
             cmdtail: []const u8,
             mode: LoadMode,
         ) LoadError!Result {
+            return loadProgramExec(dos, cpu, drive_idx, host_name, cmdtail, mode, null);
+        }
+
+        /// Like `loadProgram` but with the optional parsed EXEC param block (a child
+        /// EXEC). `params == null` is the initial boot load (synthesized env, empty
+        /// tail, root parent).
+        pub fn loadProgramExec(
+            dos: *Dos,
+            cpu: *Cpu,
+            drive_idx: u8,
+            host_name: []const u8,
+            cmdtail: []const u8,
+            mode: LoadMode,
+            params: ?ExecParams,
+        ) LoadError!Result {
             const drive = dos.drivePtr(drive_idx) orelse return error.NotFound;
             const hf = drive.open(host_name, .read_only) catch return error.NotFound;
             defer drive.close(hf);
@@ -84,9 +119,9 @@ pub fn Loader(comptime Cpu: type) type {
             const prog_path = canonicalProgPath(drive_idx, host_name, &path_buf);
 
             if (sig == MZ_MAGIC1 or sig == MZ_MAGIC2) {
-                return loadExe(dos, cpu, drive, hf, fsize, cmdtail, mode, prog_path);
+                return loadExe(dos, cpu, drive, hf, fsize, cmdtail, mode, prog_path, params);
             }
-            return loadCom(dos, cpu, drive, hf, fsize, cmdtail, mode, prog_path);
+            return loadCom(dos, cpu, drive, hf, fsize, cmdtail, mode, prog_path, params);
         }
 
         // ----------------------------------------------------------------
@@ -101,6 +136,7 @@ pub fn Loader(comptime Cpu: type) type {
             cmdtail: []const u8,
             mode: LoadMode,
             prog_path: []const u8,
+            params: ?ExecParams,
         ) LoadError!Result {
             var hdr_bytes: [28]u8 = undefined;
             const n = drive.readAt(hf, 0, &hdr_bytes) catch return error.IoFailed;
@@ -129,18 +165,24 @@ pub fn Loader(comptime Cpu: type) type {
             else
                 0xFFFF;
 
-            const env_seg = buildEnv(dos, cpu, prog_path) orelse return error.NoMemory;
+            // The child's environment: when a param block supplies a nonzero env
+            // segment (Borland's spawn builds a fresh env block holding the
+            // parent's putenv'd vars), use it directly (dos_execute.cpp MakeEnv:
+            // *segment != 0 path). Otherwise synthesize/copy (boot or env_seg==0).
+            const owner_for_alloc = if (params) |pp| pp.parent_psp else dos.current_psp;
+            const env_seg = resolveEnv(dos, cpu, prog_path, params, owner_for_alloc) orelse return error.NoMemory;
+            const env_owned = envWasAllocated(params);
 
             const maxfree = dos.mcb().largestFree();
             if (maxfree < minsize) {
-                _ = dos.mcb().free(env_seg);
+                if (env_owned) _ = dos.mcb().free(env_seg);
                 return error.NoMemory;
             }
             const want: u16 = @min(maxfree, maxsize);
 
-            const psp_seg = dos.mcb().alloc(want, dos.current_psp) orelse {
+            const psp_seg = dos.mcb().alloc(want, owner_for_alloc) orelse {
                 // free env on failure
-                _ = dos.mcb().free(env_seg);
+                if (env_owned) _ = dos.mcb().free(env_seg);
                 return error.NoMemory;
             };
 
@@ -154,7 +196,7 @@ pub fn Loader(comptime Cpu: type) type {
             applyRelocations(cpu, drive, hf, h, load_seg) catch return error.IoFailed;
 
             // Build the PSP + env + JFT inherit.
-            buildPsp(dos, cpu, psp_seg, env_seg, want, cmdtail);
+            buildPsp(dos, cpu, psp_seg, env_seg, want, cmdtail, params);
             dos.current_psp = psp_seg;
             dos.dta_seg = psp_seg;
             dos.dta_off = 0x80;
@@ -198,22 +240,25 @@ pub fn Loader(comptime Cpu: type) type {
             cmdtail: []const u8,
             mode: LoadMode,
             prog_path: []const u8,
+            params: ?ExecParams,
         ) LoadError!Result {
             if (fsize > 0xFE00) return error.BadImage; // COM max ~64KB - PSP - stack
 
-            const env_seg = buildEnv(dos, cpu, prog_path) orelse return error.NoMemory;
+            const owner_for_alloc = if (params) |pp| pp.parent_psp else dos.current_psp;
+            const env_seg = resolveEnv(dos, cpu, prog_path, params, owner_for_alloc) orelse return error.NoMemory;
+            const env_owned = envWasAllocated(params);
             // COM grabs the largest free block.
             const largest = dos.mcb().largestFree();
             if (largest < 17) {
-                _ = dos.mcb().free(env_seg);
+                if (env_owned) _ = dos.mcb().free(env_seg);
                 return error.NoMemory;
             }
-            const psp_seg = dos.mcb().alloc(largest, dos.current_psp) orelse {
-                _ = dos.mcb().free(env_seg);
+            const psp_seg = dos.mcb().alloc(largest, owner_for_alloc) orelse {
+                if (env_owned) _ = dos.mcb().free(env_seg);
                 return error.NoMemory;
             };
 
-            buildPsp(dos, cpu, psp_seg, env_seg, largest, cmdtail);
+            buildPsp(dos, cpu, psp_seg, env_seg, largest, cmdtail, params);
             dos.current_psp = psp_seg;
             dos.dta_seg = psp_seg;
             dos.dta_off = 0x80;
@@ -281,19 +326,97 @@ pub fn Loader(comptime Cpu: type) type {
             cpu.st.setReg16(EBX, 0x0000);
         }
 
-        fn buildPsp(dos: *Dos, cpu: *Cpu, psp_seg: u16, env_seg: u16, total_paras: u16, cmdtail: []const u8) void {
+        fn buildPsp(dos: *Dos, cpu: *Cpu, psp_seg: u16, env_seg: u16, total_paras: u16, cmdtail: []const u8, params: ?ExecParams) void {
             const p = Psp.at(cpu, psp_seg);
             const mem_top = psp_seg + total_paras;
-            p.build(mem_top, env_seg, dos.current_psp, cmdtail);
-            // Snapshot INT 22/23/24 from the current IVT (D-EXEC unwind).
+            // The parent link (PSP 0x16): the caller PSP for a child EXEC, else the
+            // current PSP (boot self-parents through the caller, dos_execute.cpp:482).
+            const parent = if (params) |pp| pp.parent_psp else dos.current_psp;
+            p.build(mem_top, env_seg, parent, cmdtail);
+            // Snapshot INT 22/23/24 from the current IVT (dos_execute.cpp:486
+            // SaveVectors) — done by the EXEC caller AFTER setting INT 22 to the
+            // caller's return CS:IP, so the child's saved INT22 = parent resume.
             p.saveVectors(
                 cpu.bus.readPhys32(0x22 * 4),
                 cpu.bus.readPhys32(0x23 * 4),
                 cpu.bus.readPhys32(0x24 * 4),
             );
+            // Copy the two parsed FCBs from the EXEC param block into the child PSP
+            // at 0x5C/0x6C (dos_execute.cpp:488-489 SetFCB1/SetFCB2).
+            if (params) |pp| {
+                copyFcb(cpu, pp.fcb1_seg, pp.fcb1_off, psp_seg, psp_mod.OFF_FCB1);
+                copyFcb(cpu, pp.fcb2_seg, pp.fcb2_off, psp_seg, psp_mod.OFF_FCB2);
+            }
             // Inherit the standard handles (0-4) into the new PSP's JFT.
             var h: u16 = 0;
             while (h < 5) : (h += 1) p.jftSet(h, @intCast(h));
+        }
+
+        /// Copy a 16-byte FCB (the unopened/parsed part DOS forwards) from a far
+        /// source into the child PSP at `dst_off`.
+        fn copyFcb(cpu: *Cpu, src_seg: u16, src_off: u16, psp_seg: u16, dst_off: u16) void {
+            const src = (@as(u32, src_seg) << 4) + src_off;
+            const dst = (@as(u32, psp_seg) << 4) + dst_off;
+            var i: u16 = 0;
+            while (i < 16) : (i += 1) cpu.bus.writePhys8(dst + i, cpu.bus.readPhys8(src + i));
+        }
+
+        /// True iff the loader (not the caller) allocated the env block — so it is
+        /// freed on a load failure. The loader allocates env only when there is no
+        /// param block, or the param block's env_seg is 0 (copy-the-caller case).
+        fn envWasAllocated(params: ?ExecParams) bool {
+            if (params) |pp| return pp.env_seg == 0;
+            return true;
+        }
+
+        /// Resolve the child's environment segment. A child EXEC with a nonzero
+        /// param-block env_seg uses it directly (Borland's spawn already built the
+        /// block with the parent's vars — dos_execute.cpp MakeEnv *segment!=0).
+        /// Otherwise the loader allocates a fresh block: copying the caller's env
+        /// (env_seg==0 child case) or the pinned default (boot), then appends the
+        /// 0x0001 word + the canonical program path so the CRT derives argv[0].
+        fn resolveEnv(dos: *Dos, cpu: *Cpu, prog_path: []const u8, params: ?ExecParams, owner: u16) ?u16 {
+            if (params) |pp| {
+                if (pp.env_seg != 0) return pp.env_seg;
+                // env_seg==0: copy the caller's environment block.
+                return copyEnv(dos, cpu, dos.current_psp, prog_path, owner);
+            }
+            return buildEnv(dos, cpu, prog_path);
+        }
+
+        /// Copy the parent's environment block (the NUL-terminated var list up to
+        /// the double-NUL) into a fresh MCB block owned by `owner`, then append the
+        /// 0x0001 word + the program path (MakeEnv, dos_execute.cpp:180-227).
+        fn copyEnv(dos: *Dos, cpu: *Cpu, parent_psp: u16, prog_path: []const u8, owner: u16) ?u16 {
+            const parent_env = Psp.at(cpu, parent_psp).envSeg();
+            if (parent_env == 0) return buildEnv(dos, cpu, prog_path);
+            const src_base: u32 = @as(u32, parent_env) << 4;
+            // Find the double-NUL that ends the var list (bounded scan).
+            var vlen: u32 = 0;
+            while (vlen < 0x7FFF) : (vlen += 1) {
+                if (cpu.bus.readPhys8(src_base + vlen) == 0 and
+                    cpu.bus.readPhys8(src_base + vlen + 1) == 0) break;
+            }
+            vlen += 1; // include the first NUL of the double-NUL
+            const env_bytes: usize = vlen + 1 + 2 + prog_path.len + 1;
+            const paras: u16 = @intCast((env_bytes + 15) / 16 + 1);
+            const seg = dos.mcb().alloc(paras, owner) orelse return null;
+            var off: u32 = @as(u32, seg) << 4;
+            var i: u32 = 0;
+            while (i < vlen) : (i += 1) {
+                cpu.bus.writePhys8(off, cpu.bus.readPhys8(src_base + i));
+                off += 1;
+            }
+            cpu.bus.writePhys8(off, 0); // second NUL of the double-NUL
+            off += 1;
+            cpu.bus.writePhys16(off, 0x0001);
+            off += 2;
+            for (prog_path) |c| {
+                cpu.bus.writePhys8(off, c);
+                off += 1;
+            }
+            cpu.bus.writePhys8(off, 0);
+            return seg;
         }
 
         /// Build the environment block (D6 EXEC step, dos_execute.cpp MakeEnv): the
@@ -380,35 +503,177 @@ pub fn Loader(comptime Cpu: type) type {
         // ----------------------------------------------------------------
         // AH=4B EXEC (Phase 4) — model the param block + unwind setup.
         // ----------------------------------------------------------------
+        /// AH=4B AL=00 — load and execute a child to termination, then resume the
+        /// caller (the full EXEC / DOS_Terminate unwind). Host-serviced shape: the
+        /// INT 21h trap stub will IRET back to the caller when this returns, so
+        /// rather than "set up the child and return" (the real-DOS RETF-to-child
+        /// shape), zdos runs the CHILD NESTED — exactly like the bridge's
+        /// `runGuestInt` runs a guest INT — then restores the parent and returns.
+        /// Steps mirror dos_execute.cpp:473-528 (EXEC setup) + :114-178 (Terminate):
+        ///   (1) parse path (DS:DX) + the EXEC param block (ES:BX);
+        ///   (2) set INT 22 = caller return CS:IP off the caller IRET frame, so the
+        ///       child PSP's SaveVectors captures the parent resume address;
+        ///   (3) snapshot the parent CPU state + current PSP/DTA + terminated flag;
+        ///   (4) load + start the child (child PSP links to the parent, inherits env);
+        ///   (5) drive the machine step until the CHILD terminates (nested run);
+        ///   (6) on terminate, restore the parent PSP/DTA + CPU state (keeping the
+        ///       advanced cycle ledger — no hole) and clear `terminated` for the
+        ///       parent; the child's exit code stays in `dos.ret_code` for AH=4D.
         pub fn exec(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
-            // For the v1 target the initial BaK load is a direct loader call (the
-            // machine boot path), not via INT 21h. AH=4B for a child EXEC is
-            // partially modeled: read the path, set the current PSP's INT 22 to the
-            // caller return, load+run, and on terminate unwind to INT 22. Full
-            // child-process state save/restore is exercised by the loader tests.
+            const al = cpu.st.getReg8(0);
+            if (al != 0) {
+                // AL=01 load-but-don't-run / AL=03 overlay are not in scope for the
+                // child-EXEC band; flag faithfully (D11) without faking a run.
+                dos.unsupported(cpu, br, 0x21);
+                return;
+            }
+
+            // (1a) The program path at DS:DX (ASCIIZ).
             var pbuf: [128]u8 = undefined;
-            const seg = cpu.st.selector[@intFromEnum(Seg.ds)];
-            const off = cpu.st.getReg16(@intFromEnum(Reg32.edx));
+            const dseg = cpu.st.selector[@intFromEnum(Seg.ds)];
+            const doff = cpu.st.getReg16(@intFromEnum(Reg32.edx));
             var i: usize = 0;
             while (i < pbuf.len - 1) : (i += 1) {
-                const c = cpu.bus.readPhys8((@as(u32, seg) << 4) + off + @as(u32, @intCast(i)));
+                const c = cpu.bus.readPhys8((@as(u32, dseg) << 4) + doff + @as(u32, @intCast(i)));
                 if (c == 0) break;
                 pbuf[i] = c;
             }
             const path = pbuf[0..i];
             const r = resolveExecPath(dos, path) orelse {
-                cpu.st.setReg16(EAX, Dos.ERR_FILE_NOT_FOUND);
-                br.setGuestCF(true);
+                dos.dosError(cpu, br, Dos.ERR_FILE_NOT_FOUND);
                 return;
             };
+
+            // (1b) The EXEC param block at ES:BX (re-derived layout).
+            const eseg = cpu.st.selector[@intFromEnum(Seg.es)];
+            const ebx = cpu.st.getReg16(@intFromEnum(Reg32.ebx));
+            const pb: u32 = (@as(u32, eseg) << 4) + ebx;
+            const params: ExecParams = .{
+                .env_seg = cpu.bus.readPhys16(pb + 0x00),
+                .cmdtail_off = cpu.bus.readPhys16(pb + 0x02),
+                .cmdtail_seg = cpu.bus.readPhys16(pb + 0x04),
+                .fcb1_off = cpu.bus.readPhys16(pb + 0x06),
+                .fcb1_seg = cpu.bus.readPhys16(pb + 0x08),
+                .fcb2_off = cpu.bus.readPhys16(pb + 0x0A),
+                .fcb2_seg = cpu.bus.readPhys16(pb + 0x0C),
+                .parent_psp = dos.current_psp,
+            };
+
+            // The child's command tail: the byte-counted string at the far ptr
+            // (len byte, then chars; a trailing 0x0D follows). Copied so the loader
+            // can write it into the child PSP at 0x80.
+            var ctbuf: [128]u8 = undefined;
+            const ct = readCmdtail(cpu, params.cmdtail_seg, params.cmdtail_off, &ctbuf);
+
+            // (2) Set INT 22 = the caller's return CS:IP, read off the IRET frame
+            // the CPU pushed for this INT 21h (IP@SS:SP, CS@SS:SP+2 —
+            // interrupts.zig push order FLAGS,CS,IP). dos_execute.cpp:476 reads the
+            // same words. The child PSP's SaveVectors (buildPsp) then captures this
+            // as the child's INT22 = the parent resume address.
+            const sp = cpu.st.getReg16(@intFromEnum(Reg32.esp));
+            const ss = cpu.st.selector[@intFromEnum(Seg.ss)];
+            const ret_ip = cpu.bus.readPhys16((@as(u32, ss) << 4) + sp);
+            const ret_cs = cpu.bus.readPhys16((@as(u32, ss) << 4) + sp + 2);
+            const caller_int22: u32 = (@as(u32, ret_cs) << 16) | ret_ip;
+            cpu.bus.writePhys32(0x22 * 4, caller_int22);
+
+            // (3) Snapshot the parent so it can resume after the child terminates.
+            const save = ParentSnapshot.capture(dos, cpu);
+
+            // (4) Load + start the child. buildPsp links it to the parent and runs
+            // SaveVectors (capturing the INT22 we just set). On failure: restore the
+            // parent INT22 and the parent state, then return a faithful error.
             var hostbuf: [13]u8 = undefined;
             const hn = r.name.display(&hostbuf);
-            _ = loadProgram(dos, cpu, r.drive, hn, "", .load_and_run) catch {
-                cpu.st.setReg16(EAX, Dos.ERR_FILE_NOT_FOUND);
-                br.setGuestCF(true);
+            _ = loadProgramExec(dos, cpu, r.drive, hn, ct, .load_and_run, params) catch |e| {
+                cpu.bus.writePhys32(0x22 * 4, save.parent_int22);
+                save.restore(dos, cpu);
+                dos.dosError(cpu, br, switch (e) {
+                    error.NotFound => Dos.ERR_FILE_NOT_FOUND,
+                    error.NoMemory => Dos.ERR_NOT_ENOUGH_MEM,
+                    else => Dos.ERR_FILE_NOT_FOUND,
+                });
                 return;
             };
+            const child_psp = dos.current_psp;
+
+            // (5) Run the child NESTED until it terminates (AH=4C/00/INT20 sets
+            // dos.terminated). Driven through the bridge's machine stepper so PIT/
+            // IRQ events fire and the nested instructions charge real cycles — no
+            // separate timing path, no ledger hole (mirrors runGuestInt, D3).
+            dos.terminated = false;
+            br.runUntil(dos, struct {
+                fn done(ctx: *anyopaque) bool {
+                    const d: *Dos = @ptrCast(@alignCast(ctx));
+                    return d.terminated;
+                }
+            }.done);
+
+            // (6) DOS_Terminate unwind (dos_execute.cpp:114-178): the child's
+            // terminate already restored INT 22/23/24 from the child PSP (dos.zig
+            // terminate). Free the child's memory, switch back to the parent PSP +
+            // DTA, restore the parent CPU state (keeping the advanced cycle ledger),
+            // and clear `terminated` so the PARENT keeps running. The child's exit
+            // code remains in dos.ret_code for AH=4D / the spawn() return.
+            freeProcessMemory(dos, child_psp);
+            save.restore(dos, cpu);
+            dos.terminated = false;
+            // Per dos_execute.cpp:540-543 (LOAD) the caller resumes with CF clear;
+            // the exit code is fetched separately via AH=4D.
             br.setGuestCF(false);
+        }
+
+        /// The parent state captured across a nested child run. Restores everything
+        /// EXCEPT the cycle ledger (which must stay monotonic — the child's cycles
+        /// are real work, no hole). Mirrors the bridge runGuestInt save/restore.
+        const ParentSnapshot = struct {
+            st: @import("cpu").state.State,
+            dec: @import("cpu").decode.Decoded,
+            instr_start_eip: u32,
+            current_psp: u16,
+            dta_seg: u16,
+            dta_off: u16,
+            parent_int22: u32,
+
+            fn capture(dos: *Dos, cpu: *Cpu) ParentSnapshot {
+                return .{
+                    .st = cpu.st,
+                    .dec = cpu.dec,
+                    .instr_start_eip = cpu.instr_start_eip,
+                    .current_psp = dos.current_psp,
+                    .dta_seg = dos.dta_seg,
+                    .dta_off = dos.dta_off,
+                    .parent_int22 = cpu.bus.readPhys32(0x22 * 4),
+                };
+            }
+
+            fn restore(self: ParentSnapshot, dos: *Dos, cpu: *Cpu) void {
+                const saved_cycles = cpu.st.cycles;
+                cpu.st = self.st;
+                cpu.st.cycles = saved_cycles; // keep the advanced ledger (no hole)
+                cpu.dec = self.dec;
+                cpu.instr_start_eip = self.instr_start_eip;
+                dos.current_psp = self.current_psp;
+                dos.dta_seg = self.dta_seg;
+                dos.dta_off = self.dta_off;
+            }
+        };
+
+        /// Read the byte-counted command tail at a far pointer into `buf`, returning
+        /// the chars (without the length byte or the trailing CR).
+        fn readCmdtail(cpu: *Cpu, seg: u16, off: u16, buf: []u8) []const u8 {
+            const base: u32 = (@as(u32, seg) << 4) + off;
+            const n: usize = @min(cpu.bus.readPhys8(base), @as(u8, @intCast(@min(buf.len, 126))));
+            var i: usize = 0;
+            while (i < n) : (i += 1) buf[i] = cpu.bus.readPhys8(base + 1 + @as(u32, @intCast(i)));
+            return buf[0..i];
+        }
+
+        /// Free all MCB blocks owned by `psp_seg` (DOS_FreeProcessMemory,
+        /// dos_execute.cpp:172). The child's PSP block + its env block + any heap it
+        /// allocated under its own PSP are released back to the arena.
+        fn freeProcessMemory(dos: *Dos, psp_seg: u16) void {
+            dos.mcb().freeByOwner(psp_seg);
         }
 
         const ResolvedExec = struct { drive: u8, name: name83.Name83 };

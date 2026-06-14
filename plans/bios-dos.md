@@ -924,31 +924,29 @@ unsupported subfunctions flag (D11). (Per-function fixtures still exist for cycl
         wrote); AH=19 get current drive, AH=0E select drive; AH=50 set PSP, AH=51/62 get PSP.
   - [x] **Memory (MCB):** **AH=48 allocate, 49 free, 4A resize** (the MCB chain), AH=58 get/set alloc
         strategy.
-  - [x] **EXEC:** **AH=4B load-and-execute / load-overlay** → calls the loader (Phase 6). **PARTIAL:**
-        AH=4B reads the path, loads + runs the child via the loader, and returns CF on failure. The full
-        EXEC param-block parse (FCB1/FCB2 → child PSP 0x5C/0x6C, AX-from-drive-validity) + the caller-
-        stack INT 22 unwind + child→parent state restore are NOT fully wired (the initial BaK load is a
-        direct `loadProgram` call, which IS complete). Flagged for the EXEC-unwind follow-up. **Model the
-        EXEC param block at ES:BX: `envseg / cmdtail far-ptr / fcb1 far-ptr / fcb2 far-ptr`.** On EXEC:
-        (1) read the **caller's return CS:IP off the caller stack** and set the *current* PSP's INT 22
-        BEFORE the new child PSP snapshots 22/23/24 (so terminate unwinds to the right place — see below);
-        (2) build the child PSP including the **FCBs at 0x5C/0x6C** parsed from fcb1/fcb2, and derive
-        **AX from FCB drive validity** (AL/AH = BL/BH = 0/0xFF per the drive-valid convention); (3) build
-        the child's **environment block** (see the env-block item in Phase 6). The loader (Phase 6) does
-        the image load/relocate/register-setup. The initial BaK load is a direct loader call, not via
-        INT 21h (Phase 6).
-  - [~] **INT 22/23/24 + terminate unwind (PARTIAL):** the vectors are snapshotted into each PSP at PSP
-        build (loader.buildPsp), and `terminate` restores 22/23/24 from the terminating PSP. The
-        EXEC-time "set INT 22 = caller's return CS:IP off the caller stack before the child snapshots"
-        + the transfer-to-saved-INT-22 on terminate are NOT wired (the initial process stops the run loop
-        on `terminated` instead). Flagged for the EXEC-unwind follow-up.
-        Original spec:
-  - [ ] **INT 22/23/24 + terminate unwind:** the terminate vector (INT 22), Ctrl-C (INT 23), and
-        critical-error (INT 24) addresses are **snapshotted into each PSP** (offsets 0x0A/0x0E/0x12) at
-        PSP build. On **EXEC**, set INT 22 to the **caller's return CS:IP** (read off the caller stack)
-        **before** the child PSP snapshots 22/23/24. On **terminate (AH=4C / AH=00 / INT 20h)**, **restore
-        22/23/24 from the terminating PSP** and **transfer control to the saved INT 22** — this is what
-        a re-entrant EXEC unwinds to (the parent resumes after its `INT 21h AH=4B`).
+  - [x] **EXEC:** **AH=4B AL=00 load-and-execute** → the full child-process EXEC + DOS_Terminate unwind
+        (`loader.zig fn exec`, cited to dos_execute.cpp:473-528 + :114-178). DONE: AH=4B parses the EXEC
+        param block at ES:BX (`envseg / cmdtail far-ptr / fcb1 far-ptr / fcb2 far-ptr`), reads the path at
+        DS:DX, (1) reads the **caller's return CS:IP off the caller IRET frame (SS:SP, SS:SP+2)** and sets
+        INT 22 BEFORE the child PSP snapshots 22/23/24 (so the child's saved INT22 = the parent resume);
+        (2) builds the child PSP with the **parent link at 0x16**, **FCB1/FCB2 copied to 0x5C/0x6C** from
+        the param block, and inherits the env (the param-block env_seg directly when nonzero — Borland's
+        spawn pre-builds it with the parent's putenv'd vars; else a copy of the caller's env via MakeEnv);
+        (3) runs the **child NESTED** to termination via the bridge stepper (`Bridge.runUntil`, the same
+        deterministic, event-honoring machine step `runGuestInt` uses); (4) on terminate, frees the child's
+        process memory (`McbChain.freeByOwner`), restores the parent PSP/DTA + CPU state (keeping the
+        advanced cycle ledger — no hole), clears `terminated` so the parent resumes, and returns CF=0. The
+        child's exit code stays in `dos.ret_code` for AH=4D (which Borland's spawnl reads as the return).
+        AL=01/03 (load-only/overlay) flag faithfully (D11). Verified: `SPAWN.EXE`+`CHILD.EXE` reproduce
+        the dosbox-x golden EXACTLY (interleaved parent+child output + `rc=7`), and the nested run is
+        cycle-deterministic (run-twice byte-identical, `oracle_test.zig`).
+  - [x] **INT 22/23/24 + terminate unwind:** DONE. The vectors are snapshotted into each PSP at PSP build
+        (loader.buildPsp, offsets 0x0A/0x0E/0x12); `terminate` (dos.zig) restores 22/23/24 from the
+        terminating PSP. On **EXEC** INT 22 is set to the caller's return CS:IP (off the IRET frame) before
+        the child PSP's SaveVectors. The parent resume is wired via the nested-run unwind (the host-serviced
+        equivalent of "transfer to saved INT 22"): rather than IRET-to-INT22, the EXEC handler restores the
+        parent CPU state directly and returns, so the parent's own trap-stub IRET resumes it right after its
+        `INT 21h AH=4B` (CF=0). The initial process still stops the outer run loop on `terminated`.
 - [x] **Deferred-and-flagged (D11), not faked:** the FCB file API (AH=0F-0x24), network/share (AH=5xxx),
       LFN (AH=71xx), AH=44 IOCTL beyond the AL=00/01/06/07 promoted in D20, DBCS, country info — all hit
       the unsupported-service flag path (AL=0/CF-clear + the structural signal); none returns a fabricated

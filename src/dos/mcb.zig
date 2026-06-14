@@ -127,6 +127,20 @@ pub fn McbChain(comptime Cpu: type) type {
             return true;
         }
 
+        /// Free every block owned by `owner_psp` (DOS_FreeProcessMemory on a child
+        /// terminate, dos_execute.cpp:172) and coalesce. Walks the whole chain.
+        pub fn freeByOwner(self: Self, owner_psp: u16) void {
+            var mcb = self.first;
+            while (true) {
+                const s = self.sig(mcb);
+                const blocksz = self.size(mcb);
+                if (self.owner(mcb) == owner_psp) self.wr16(mcb, OFF_OWNER, OWNER_FREE);
+                if (s == SIG_LAST) break;
+                mcb = mcb + 1 + blocksz;
+            }
+            self.coalesce();
+        }
+
         fn coalesce(self: Self) void {
             // Walk from `first`, merging adjacent free blocks (simple + correct).
             var cur = self.first;

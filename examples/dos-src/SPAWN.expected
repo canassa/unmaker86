@@ -1,0 +1,8 @@
+exit_code: 0
+--- output ---
+parent: before
+child: hello from CHILD.EXE
+child: CHILDVAR=from-parent
+child: argc=2
+child: argv[1]=kid
+parent: after rc=7
