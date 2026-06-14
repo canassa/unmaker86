@@ -124,6 +124,7 @@ pub fn Int21(comptime Cpu: type) type {
                 // ---- File handles ----
                 0x3C => createFile(dos, cpu, br),
                 0x3D => openFile(dos, cpu, br),
+                0x6C => extendedOpen(dos, cpu, br),
                 0x3E => closeFile(dos, cpu, br),
                 0x3F => readFile(dos, cpu, br),
                 0x40 => writeFile(dos, cpu, br),
@@ -613,6 +614,15 @@ pub fn Int21(comptime Cpu: type) type {
                     }
                 },
                 .file => |hf| {
+                    // Access-mode enforcement (drive_local.cpp:2819 LocalFile::Write):
+                    // a file opened OPEN_READ (read-only access mode, AH=3D/6C BX
+                    // low bits = 0) rejects ANY write with DOSERR_ACCESS_DENIED (5)
+                    // — the live check in dosbox-x is at the file-object level (the
+                    // DTA-layer check in DOS_WriteFile is commented out,
+                    // dos_files.cpp:858). The per-FILE read-only ATTRIBUTE is a
+                    // different thing and is NOT enforced on open (band 11); this is
+                    // the open ACCESS MODE and IS enforced (band 12).
+                    if (e.mode == .read_only) return dos.dosError(cpu, br, Dos.ERR_ACCESS_DENIED);
                     const drive = dos.drivePtr(e.drive) orelse return dos.dosError(cpu, br, Dos.ERR_INVALID_HANDLE);
                     while (done < count) {
                         const chunk = @min(@as(u32, count) - done, scratch.len);
@@ -745,6 +755,113 @@ pub fn Int21(comptime Cpu: type) type {
                 else => return dos.dosError(cpu, br, vfsErrToDos(e)),
             };
             finishFileOpen(dos, cpu, br, hf, r, .read_write);
+        }
+
+        /// AH=6C Extended Open/Create (dos.cpp:3002 -> DOS_OpenFileExtended,
+        /// dos_files.cpp:1138). The combined open-or-create call that well-written
+        /// DOS apps use. Register frame (note: the filename is at DS:SI, NOT DS:DX):
+        ///   BX = open mode (access bits 0-2 + sharing/inheritance bits)
+        ///   CX = create attributes (for the create path)
+        ///   DX = action: low nibble (if-exists) 0=fail / 1=open / 2=replace;
+        ///                high nibble (if-not-exists) 0x00=fail / 0x10=create
+        /// On success: CF clear, AX = handle, CX = action TAKEN (1=opened,
+        /// 2=created, 3=replaced/truncated). On failure: CF set, AX = error.
+        ///
+        /// Semantics mirror DOS_OpenFileExtended exactly:
+        ///   - action==0 -> DOSERR_FUNCTION_NUMBER_INVALID (1).
+        ///   - (action&0x0f)>2 or (action&0xf0)>0x10 -> invalid (1).
+        ///   - file EXISTS: low nibble 0 -> FILE_ALREADY_EXISTS (80);
+        ///                  1 -> open it, taken=1; 2 -> close+recreate, taken=3.
+        ///   - file ABSENT: high nibble 0 -> error from the failed open;
+        ///                  0x10 -> create it, taken=2.
+        fn extendedOpen(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            const bx = cpu.st.getReg16(EBX);
+            const action = cpu.st.getReg16(EDX);
+
+            // Validate the action parameter (dos_files.cpp:1143-1153).
+            if (action == 0 or (action & 0x0f) > 2 or (action & 0xf0) > 0x10) {
+                return dos.dosError(cpu, br, Dos.ERR_INVALID_FUNC);
+            }
+
+            // Read the ASCIIZ filename from DS:SI (NOT DS:DX — dos.cpp:3003).
+            var pbuf: [128]u8 = undefined;
+            const path = readPathDsSi(cpu, &pbuf);
+            const mode: vfs.OpenMode = switch (bx & 0x07) {
+                0 => .read_only,
+                1 => .write_only,
+                else => .read_write,
+            };
+
+            // A device name routes through the open path (dosbox-x calls
+            // DOS_OpenFile, which resolves the device table first, D17). A device
+            // always "exists"; the corpus never extended-opens a device, but stay
+            // faithful: open it and report taken=1 for action low nibble 1.
+            if (dos.dev_table.resolve(path)) |dev| {
+                if ((action & 0x0f) == 0) return dos.dosError(cpu, br, Dos.ERR_FILE_EXISTS);
+                openDeviceHandle(dos, cpu, br, dev, mode);
+                if (!br.guestCF()) cpu.st.setReg16(ECX, if ((action & 0x0f) == 2) 3 else 1);
+                return;
+            }
+
+            var rbuf: [128]u8 = undefined;
+            const r = resolve(dos, path, &rbuf) orelse return dos.dosError(cpu, br, Dos.ERR_PATH_NOT_FOUND);
+            const drive = dos.drivePtr(r.drive) orelse return dos.dosError(cpu, br, Dos.ERR_PATH_NOT_FOUND);
+
+            // Existence is probed exactly like DOS_OpenFileExtended: try the open
+            // first (dos_files.cpp:1154). A successful open means the file exists.
+            if (drive.open(r.path, mode)) |hf| {
+                switch (action & 0x0f) {
+                    0x00 => { // fail if exists
+                        drive.close(hf);
+                        return dos.dosError(cpu, br, Dos.ERR_FILE_EXISTS);
+                    },
+                    0x01 => { // open the existing file, taken = 1
+                        finishExtendedOpen(dos, cpu, br, hf, r, mode, 1);
+                    },
+                    0x02 => { // replace: close + recreate (truncate), taken = 3
+                        drive.close(hf);
+                        const nf = drive.create(r.path) catch |e| return dos.dosError(cpu, br, vfsErrToDos(e));
+                        finishExtendedOpen(dos, cpu, br, nf, r, mode, 3);
+                    },
+                    else => unreachable, // validated above
+                }
+            } else |e| switch (e) {
+                error.NotFound => {
+                    // File doesn't exist (dos_files.cpp:1173).
+                    if ((action & 0xf0) == 0) {
+                        // if-not-exists = fail: return the open's error code.
+                        return dos.dosError(cpu, br, Dos.ERR_FILE_NOT_FOUND);
+                    }
+                    // Create it, taken = 2.
+                    const nf = drive.create(r.path) catch |ce| return dos.dosError(cpu, br, vfsErrToDos(ce));
+                    finishExtendedOpen(dos, cpu, br, nf, r, mode, 2);
+                },
+                else => return dos.dosError(cpu, br, vfsErrToDos(e)),
+            }
+        }
+
+        /// Finish an AH=6C open: build the SFT/JFT entry exactly like
+        /// finishFileOpen, then set CX = the action taken (the AH=6C-specific
+        /// return). On a slot/JFT overflow finishFileOpen sets CF + AX and CX is
+        /// left as the caller's input (the open failed), matching dosbox-x (it
+        /// only writes *status on success).
+        fn finishExtendedOpen(dos: *Dos, cpu: *Cpu, br: *Bridge, hf: vfs.HostFile, r: Resolved, mode: vfs.OpenMode, taken: u16) void {
+            finishFileOpen(dos, cpu, br, hf, r, mode);
+            if (!br.guestCF()) cpu.st.setReg16(ECX, taken);
+        }
+
+        /// Read an ASCIIZ path at DS:SI into `out`; returns the slice. (AH=6C
+        /// passes the name at DS:SI, unlike most file calls which use DS:DX.)
+        fn readPathDsSi(cpu: *Cpu, out: []u8) []u8 {
+            const seg = cpu.st.selector[@intFromEnum(Seg.ds)];
+            const off = cpu.st.getReg16(@intFromEnum(Reg32.esi));
+            var i: usize = 0;
+            while (i < out.len - 1) : (i += 1) {
+                const c = cpu.bus.readPhys8((@as(u32, seg) << 4) + off + @as(u32, @intCast(i)));
+                if (c == 0) break;
+                out[i] = c;
+            }
+            return out[0..i];
         }
 
         fn ioctl(dos: *Dos, cpu: *Cpu, br: *Bridge) void {

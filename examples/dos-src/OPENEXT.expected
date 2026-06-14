@@ -1,0 +1,14 @@
+exit_code: 0
+--- output ---
+open-missing ret=2
+create taken=2
+wrote=14
+reopen taken=1
+size.before=14
+truncate taken=3
+size.after=0
+fail-if-exists ret=80
+action-zero ret=1
+rdonly-open ok
+rdonly-write denied ret=5 wrote=14
+rdonly-read ret=0 got=0

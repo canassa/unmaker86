@@ -125,6 +125,20 @@ const PASSING = [_]Program{
     // than chmod-ing the host file, so GET reflects SET, write-open is unaffected,
     // and no committed corpus file's permissions are ever touched.
     .{ .exe = "FILEATTR.EXE" },
+    // Extended open/create + access-mode band (band 12): INT 21h AH=6C
+    // (DOS_OpenFileExtended, dos_files.cpp:1138) and the AH=3D access mode.
+    // OPENEXT.EXE drives 6C through every action arm — open-only on a missing
+    // file (-> error 2), create-if-missing (taken=2), open-existing (taken=1),
+    // replace/truncate (taken=3, size 0 after), fail-if-exists (-> error 80),
+    // and the invalid action==0 (-> error 1). It then proves the access mode is
+    // honored: open O_RDONLY + attempt a write -> DOSERR_ACCESS_DENIED (5)
+    // (dosbox-x's live check is LocalFile::Write, drive_local.cpp:2819; the
+    // DTA-layer check in DOS_WriteFile is commented out, dos_files.cpp:858), while
+    // a read on the read-only handle succeeds. Only oracle-able values are printed
+    // (action codes, error codes, sizes, byte counts — NO timestamps); proven
+    // deterministic by a double-mint byte-identical diff. The one created file is
+    // removed before exit so the committed corpus stays byte-identical.
+    .{ .exe = "OPENEXT.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented

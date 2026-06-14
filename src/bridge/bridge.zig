@@ -307,6 +307,17 @@ pub fn Bridge(comptime Cpu: type) type {
             self.patchFlag(0x0200, value);
         }
 
+        /// Read the carry flag from the guest's IRET FLAGS image (the value the
+        /// stub's IRET will restore). Lets a service that delegates to another
+        /// service (e.g. AH=6C reusing the AH=3D/3C finish path) learn whether the
+        /// delegate set CF without re-deriving success. Defaults to "set" (failed)
+        /// if the frame can't be read, the conservative choice.
+        pub fn guestCF(self: *Self) bool {
+            const off = self.flagsFrameOff();
+            const cur = self.cpu.segRead16(.ss, off) catch return true;
+            return (cur & 0x0001) != 0;
+        }
+
         fn patchFlag(self: *Self, mask: u16, value: bool) void {
             const off = self.flagsFrameOff();
             const cur = self.cpu.segRead16(.ss, off) catch return;
