@@ -1,0 +1,12 @@
+exit_code: 0
+--- output ---
+mask DIR\*.*: 5 entries
+  ALPHA.TXT
+  BETA.TXT
+  DELTA.TXT
+  GAMMA.DAT
+  PROG.BIN
+mask DIR\*.TXT: 3 entries
+  ALPHA.TXT
+  BETA.TXT
+  DELTA.TXT

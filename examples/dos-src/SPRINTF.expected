@@ -1,0 +1,10 @@
+exit_code: 0
+--- output ---
+fmt=42|00007|ff|100|Z|hi
+fmt2=[13      |+9|   3.142]
+scan: a=123 b=456 sum=579
+atoi("-2048")=-2048
+strtol hex=255 dec=-100 rest=xyz
+strtoul=65000
+dbl: 3.50+7.25=10.75
+strlen(fmt)=5

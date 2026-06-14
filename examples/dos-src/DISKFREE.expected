@@ -1,0 +1,6 @@
+exit_code: 0
+--- output ---
+sectors_per_cluster=64
+bytes_per_sector=512
+total_clusters=65535
+avail_clusters=61440

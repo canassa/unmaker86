@@ -43,6 +43,13 @@ const PASSING = [_]Program{
     .{ .exe = "FILEIO.EXE" },
     .{ .exe = "ARGENV.EXE", .args = "alpha beta gamma" },
     .{ .exe = "SUBDIR.EXE" },
+    .{ .exe = "SPRINTF.EXE" },
+    .{ .exe = "RENFILE.EXE" },
+    .{ .exe = "APPEND.EXE" },
+    .{ .exe = "FFLUSH.EXE" },
+    .{ .exe = "COUNTRY.EXE" },
+    .{ .exe = "DIRLIST.EXE" },
+    .{ .exe = "DISKFREE.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented

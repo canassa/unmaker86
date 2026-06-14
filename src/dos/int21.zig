@@ -143,6 +143,11 @@ pub fn Int21(comptime Cpu: type) type {
                 0x59 => extendedError(dos, cpu, br),
                 0x52 => sysVars(dos, cpu, br),
 
+                // ---- Disk / locale / commit (Tier-1 real-program surface) ----
+                0x36 => getFreeDiskSpace(dos, cpu, br),
+                0x38 => getCountryInfo(dos, cpu, br),
+                0x68, 0x6A => commitFile(dos, cpu, br),
+
                 // ---- Memory (MCB) ----
                 0x48 => allocMem(dos, cpu, br),
                 0x49 => freeMem(dos, cpu, br),
@@ -625,6 +630,84 @@ pub fn Int21(comptime Cpu: type) type {
             const drive = dos.drivePtr(r.drive) orelse return dos.dosError(cpu, br, Dos.ERR_PATH_NOT_FOUND);
             drive.rmdir(r.path) catch |e| return dos.dosError(cpu, br, vfsErrToDos(e));
             cpu.st.setReg16(EAX, 5);
+            br.setGuestCF(false);
+        }
+
+        // ===================================================================
+        // Disk free space / country info / commit (Tier-1 real-program surface)
+        // ===================================================================
+
+        /// AH=36 Get Free Disk Space (dos.cpp:920). For a present drive returns the
+        /// deterministic synthetic geometry dosbox-x reports for a mounted local
+        /// drive: AX=sectors/cluster, BX=free clusters, CX=bytes/sector,
+        /// DX=total clusters. These are FIXED constants (not host statvfs) so the
+        /// report is reproducible on both sides — verified byte-identical across
+        /// three dosbox-x mints (the DISKFREE golden). An invalid drive returns
+        /// AX=0xFFFF (dos.cpp:945), never CF.
+        fn getFreeDiskSpace(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            _ = br;
+            const dl = cpu.st.getReg8(2);
+            const drive: u8 = if (dl == 0) dos.current_drive else dl - 1;
+            if (dos.drivePtr(drive) == null) {
+                cpu.st.setReg16(EAX, 0xFFFF); // invalid drive (dos.cpp:945)
+                return;
+            }
+            cpu.st.setReg16(EAX, 64); // sectors per cluster
+            cpu.st.setReg16(EBX, 61440); // free clusters
+            cpu.st.setReg16(ECX, 512); // bytes per sector
+            cpu.st.setReg16(EDX, 65535); // total clusters
+        }
+
+        /// AH=38 Get Country Info (dos.cpp:963, DX != 0xFFFF). Writes the 0x18-byte
+        /// country block to DS:DX, sets BX=country number, AH=0, AL=BL, CF clear.
+        /// The block is the fixed US (country 1) layout dosbox-x reports — a DOS
+        /// constant table, not host locale (deterministic). Bytes are exactly the
+        /// COUNTRY golden: "$" currency, ',' thousands, '.' decimal, '/' date sep,
+        /// ':' time sep, 2 currency digits, ',' data list separator. The casemap
+        /// far-pointer field (offset 0x12) is zeroed (deterministic; programs that
+        /// need real case mapping are out of band).
+        fn getCountryInfo(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            _ = dos;
+            const dx = cpu.st.getReg16(EDX);
+            if (dx == 0xFFFF) {
+                // Set-country: accept current (US) only; AX=0, CF clear.
+                cpu.st.setReg16(EAX, 0);
+                br.setGuestCF(false);
+                return;
+            }
+            // 0x18-byte country block (US / country 1), matching the dosbox-x golden.
+            const country = [_]u8{
+                0x00, 0x00, // date format (0 = USA m-d-y)
+                0x24, 0x00, 0x00, 0x00, 0x00, // currency string "$"
+                0x2C, 0x00, // thousands separator ","
+                0x2E, 0x00, // decimal separator "."
+                0x2F, 0x00, // date separator "/"
+                0x3A, 0x00, // time separator ":"
+                0x00, // currency format
+                0x02, // digits after decimal
+                0x00, // time format (0 = 12-hour)
+                0x00, 0x00, 0x00, 0x00, // casemap far pointer (deterministic 0)
+                0x2C, 0x00, // data-list separator ","
+            };
+            const seg = cpu.st.selector[@intFromEnum(Seg.ds)];
+            const base = (@as(u32, seg) << 4) + dx;
+            for (country, 0..) |b, i| cpu.bus.writePhys8(base + @as(u32, @intCast(i)), b);
+            cpu.st.setReg16(EBX, 1); // country number = 1 (USA)
+            cpu.st.setReg8(0, 1); // AL = BL
+            cpu.st.setReg8(4, 0); // AH = 0
+            br.setGuestCF(false);
+        }
+
+        /// AH=68/6A Commit File / FFLUSH (dos.cpp:1554). BL = handle. zdos's VFS
+        /// writes through to the host file with no DOS-level buffering (writeAt
+        /// seeks + writes immediately), so a commit is a faithful no-op-success on
+        /// a valid handle; an invalid handle returns CF=1/AX=6. On success real DOS
+        /// sets AH=0x68 (dos.cpp:1557).
+        fn commitFile(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            const handle = cpu.st.getReg8(3); // BL
+            const e = sftFor(dos, handle) orelse return dos.dosError(cpu, br, Dos.ERR_INVALID_HANDLE);
+            _ = e;
+            cpu.st.setReg8(4, 0x68); // AH = 0x68 (dos.cpp:1557)
             br.setGuestCF(false);
         }
 

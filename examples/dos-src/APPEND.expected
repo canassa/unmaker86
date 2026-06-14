@@ -1,0 +1,3 @@
+exit_code: 0
+--- output ---
+appended file (18 bytes): first-second-third

@@ -1,0 +1,5 @@
+exit_code: 0
+--- output ---
+after fflush read 34 bytes:
+line=1 value=100
+line=2 value=200

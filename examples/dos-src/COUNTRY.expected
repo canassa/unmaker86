@@ -1,0 +1,12 @@
+exit_code: 0
+--- output ---
+date_format=0
+currency_style=0
+currency_digits=2
+time_format=0
+currency=24 00 00 00 00 
+thousands_sep=2C 00 
+decimal_sep=2E 00 
+date_sep=2F 00 
+time_sep=3A 00 
+data_sep=2C 00 

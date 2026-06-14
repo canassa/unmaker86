@@ -1,0 +1,4 @@
+exit_code: 0
+--- output ---
+after rename read 20 bytes: renamed payload 9876
+rename+remove OK
