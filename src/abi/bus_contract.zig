@@ -60,6 +60,19 @@ pub fn assertFaultSinkContract(comptime Sink: type) void {
     assertMethod(Sink, "onShutdown", fn (*Sink) void);
 }
 
+/// Verify the CallbackSink hook (the guest->host callback-trap bridge, D2). The
+/// CPU's Grp4 `/7` (`0xFE 0x38 <id>`) arm reads the id byte and calls
+/// `sink.dispatchCallback(id)` synchronously, inline in `executeOne`.
+///
+/// CRITICAL (D2 refined): the contract must NOT name `*Cpu`. This is a shared
+/// leaf both `src/cpu/` and `src/bus/` import; it cannot reference the CPU type
+/// without inverting the module graph. The `Sink` therefore holds its OWN `*Cpu`
+/// (set at wire time by the machine, exactly as the `Services` aggregate is
+/// constructed with the CPU pointer), so the signature is only `fn (*Sink, u8)`.
+pub fn assertCallbackSinkContract(comptime Sink: type) void {
+    assertMethod(Sink, "dispatchCallback", fn (*Sink, u8) void);
+}
+
 fn assertMethod(comptime T: type, comptime name: []const u8, comptime Sig: type) void {
     if (!@hasDecl(T, name)) {
         @compileError("Bus contract: type '" ++ @typeName(T) ++

@@ -1,5 +1,9 @@
 const std = @import("std");
 
+/// A (module name, module) pair for a test artifact's imports. File-scope so the
+/// same named type is used everywhere (anonymous struct literals would not unify).
+const Imp = struct { name: []const u8, mod: *std.Build.Module };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -62,6 +66,45 @@ pub fn build(b: *std.Build) void {
 
     // The machine module: wires cpu + bus + devices + scheduler. Imports all of
     // them plus the contract leaf (asserts Scheduler/FaultSink) and timing.
+    //
+    // The callback-trampoline bridge: the SHARED LEAF (D12/D16) both `bios` and
+    // `dos` import; neither imports the other. Depends only on cpu + bus + the
+    // contract leaf (already leaves). Imports NEITHER bios NOR dos.
+    const bridge_mod = b.addModule("bridge", .{
+        .root_source_file = b.path("src/bridge/bridge.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bridge_mod.addImport("cpu", cpu_mod);
+    bridge_mod.addImport("bus", bus_mod);
+    bridge_mod.addImport("bus_contract", bus_contract_mod);
+
+    // The BIOS module: IVT/BDA/POST + BIOS INT handlers. Imports cpu/bus/devices/
+    // timing + the bridge leaf. Does NOT import dos.
+    const bios_mod = b.addModule("bios", .{
+        .root_source_file = b.path("src/bios/bios.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bios_mod.addImport("cpu", cpu_mod);
+    bios_mod.addImport("bus", bus_mod);
+    bios_mod.addImport("devices", devices_mod);
+    bios_mod.addImport("timing", timing_mod);
+    bios_mod.addImport("bridge", bridge_mod);
+
+    // The DOS module: INT 21h kernel + loader + VFS + EMS. Imports cpu/bus/devices/
+    // timing + the bridge leaf. Does NOT import bios (D12 reversed: no dos->bios).
+    const dos_mod = b.addModule("dos", .{
+        .root_source_file = b.path("src/dos/dos.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dos_mod.addImport("cpu", cpu_mod);
+    dos_mod.addImport("bus", bus_mod);
+    dos_mod.addImport("devices", devices_mod);
+    dos_mod.addImport("timing", timing_mod);
+    dos_mod.addImport("bridge", bridge_mod);
+
     const machine_mod = b.addModule("machine", .{
         .root_source_file = b.path("src/machine/machine.zig"),
         .target = target,
@@ -72,6 +115,9 @@ pub fn build(b: *std.Build) void {
     machine_mod.addImport("devices", devices_mod);
     machine_mod.addImport("bus_contract", bus_contract_mod);
     machine_mod.addImport("timing", timing_mod);
+    machine_mod.addImport("bridge", bridge_mod);
+    machine_mod.addImport("bios", bios_mod);
+    machine_mod.addImport("dos", dos_mod);
 
     // Dedicated CPU test step.
     const cpu_tests = b.addTest(.{
@@ -130,7 +176,7 @@ pub fn build(b: *std.Build) void {
             tgt: anytype,
             opt: anytype,
             path: []const u8,
-            imports: []const struct { name: []const u8, mod: *std.Build.Module },
+            imports: []const Imp,
         ) *std.Build.Step.Run {
             const t = bld.addTest(.{
                 .root_module = bld.createModule(.{
@@ -204,6 +250,45 @@ pub fn build(b: *std.Build) void {
     machine_test_step.dependOn(&machine_determinism.step);
     machine_test_step.dependOn(&machine_integration.step);
 
+    // ---- Bridge / BIOS / DOS tests (test-bridge / test-bios / test-dos) ----
+    const dosbios_imports = [_]Imp{
+        .{ .name = "cpu", .mod = cpu_mod },
+        .{ .name = "bus", .mod = bus_mod },
+        .{ .name = "devices", .mod = devices_mod },
+        .{ .name = "timing", .mod = timing_mod },
+        .{ .name = "bridge", .mod = bridge_mod },
+        .{ .name = "bios", .mod = bios_mod },
+        .{ .name = "dos", .mod = dos_mod },
+        .{ .name = "machine", .mod = machine_mod },
+    };
+
+    const bridge_unit = MachineTest.add(b, target, optimize, "src/bridge/bridge.zig", &.{
+        .{ .name = "cpu", .mod = cpu_mod },
+        .{ .name = "bus", .mod = bus_mod },
+        .{ .name = "bridge", .mod = bridge_mod },
+    });
+    const bridge_rt = MachineTest.add(b, target, optimize, "src/bridge/bridge_test.zig", &dosbios_imports);
+    const bridge_test_step = b.step("test-bridge", "Run the callback-bridge tests");
+    bridge_test_step.dependOn(&bridge_unit.step);
+    bridge_test_step.dependOn(&bridge_rt.step);
+
+    const bios_unit = MachineTest.add(b, target, optimize, "src/bios/bios_test.zig", &dosbios_imports);
+    const bios_test_step = b.step("test-bios", "Run the BIOS tests");
+    bios_test_step.dependOn(&bridge_unit.step);
+    bios_test_step.dependOn(&bios_unit.step);
+
+    const dos_unit = MachineTest.add(b, target, optimize, "src/dos/dos_test.zig", &dosbios_imports);
+    const dos_int21 = MachineTest.add(b, target, optimize, "src/dos/int21_test.zig", &dosbios_imports);
+    const dos_name83 = MachineTest.add(b, target, optimize, "src/dos/name83_test.zig", &dosbios_imports);
+    const dos_loader = MachineTest.add(b, target, optimize, "src/dos/loader_test.zig", &dosbios_imports);
+    const dos_integration = MachineTest.add(b, target, optimize, "src/dos/integration_test.zig", &dosbios_imports);
+    const dos_test_step = b.step("test-dos", "Run the DOS kernel + loader + EMS tests");
+    dos_test_step.dependOn(&dos_unit.step);
+    dos_test_step.dependOn(&dos_int21.step);
+    dos_test_step.dependOn(&dos_name83.step);
+    dos_test_step.dependOn(&dos_loader.step);
+    dos_test_step.dependOn(&dos_integration.step);
+
     // Top-level test step aggregates the CPU + bus + machine tests.
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_cpu_tests.step);
@@ -216,6 +301,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&machine_unit.step);
     test_step.dependOn(&machine_determinism.step);
     test_step.dependOn(&machine_integration.step);
+    test_step.dependOn(&bridge_unit.step);
+    test_step.dependOn(&bridge_rt.step);
+    test_step.dependOn(&bios_unit.step);
+    test_step.dependOn(&dos_unit.step);
+    test_step.dependOn(&dos_int21.step);
+    test_step.dependOn(&dos_name83.step);
+    test_step.dependOn(&dos_loader.step);
+    test_step.dependOn(&dos_integration.step);
 
     // Dedicated full-conformance sweep: runs ALL vendored 80386 real-mode
     // vectors and reports per-opcode pass/fail/revoked counts. Separate from

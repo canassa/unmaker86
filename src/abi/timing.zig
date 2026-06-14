@@ -29,6 +29,19 @@ pub const CPU_CLOCK_HZ: u64 = PIT_TICK_RATE * 12;
 pub const cycles_num: u64 = 12;
 pub const cycles_den: u64 = 1;
 
+/// The PINNED emulated wall-clock epoch (D13): `1993-01-01 00:00:00`. ALL
+/// DOS/BIOS-visible date/time (INT 21h AH=2A/2C, INT 1Ah, the DTA find record,
+/// AH=57 file date-time, directory timestamps) derive from this fixed epoch plus
+/// the emulated BDA tick count — NEVER the host wall clock or host file
+/// mtime/ctime (the Spice86 non-determinism leak this project closes). A project
+/// constant; same binary + same inputs => same clock, every run.
+pub const epoch_year: u16 = 1993;
+pub const epoch_month: u8 = 1; // January
+pub const epoch_day: u8 = 1;
+pub const epoch_hour: u8 = 0;
+pub const epoch_minute: u8 = 0;
+pub const epoch_second: u8 = 0;
+
 comptime {
     // The pinned ratio must be exact (den divides num) so the documented
     // "remainder always 0" invariant holds for the BaK path.

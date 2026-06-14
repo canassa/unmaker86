@@ -34,6 +34,9 @@ const bus_mod = @import("bus");
 const devices = @import("devices");
 const contract = @import("bus_contract");
 const timing = @import("timing");
+const bridge_mod = @import("bridge");
+const bios_mod = @import("bios");
+const dos_mod = @import("dos");
 
 pub const scheduler = @import("scheduler.zig");
 pub const run_loop = @import("run_loop.zig");
@@ -44,10 +47,62 @@ const Pit = devices.Pit;
 const Scheduler = scheduler.Scheduler;
 const EventKind = scheduler.EventKind;
 
-/// The CPU specialized over the real Bus, the real Pic (InterruptController), and
-/// the Machine itself (Scheduler + FaultSink). The instantiation IS the M0
-/// integration gate (CpuWith runs all three contract asserts, cpu.zig:60-63).
-pub const Cpu = cpu_mod.CpuWith(Bus, .{ .Pic = Pic, .Scheduler = Machine });
+/// The CPU specialized over the real Bus, the real Pic (InterruptController), the
+/// Machine itself (Scheduler + FaultSink), and the `Services` aggregate as the
+/// `CallbackSink` (D2). The instantiation IS the M0 integration gate (CpuWith runs
+/// all four contract asserts). NOTE the mutual recursion Cpu <-> Services is
+/// resolved by pointer indirection: Cpu holds `?*Services`, Services holds `*Cpu`
+/// + `Bridge(Cpu)`-by-value; the pointer breaks the size cycle (acyclic layout).
+pub const Cpu = cpu_mod.CpuWith(Bus, .{ .Pic = Pic, .Scheduler = Machine, .CallbackSink = Services });
+pub const Bios = bios_mod.Bios(Cpu);
+pub const Dos = dos_mod.Dos(Cpu);
+pub const Bridge = bridge_mod.Bridge(Cpu);
+
+/// The `Services` aggregate (D2/D12/D16) — the CPU's `CallbackSink`. It MUST be a
+/// plain `struct` decl (NOT a generic function call) so the mutual recursion
+/// `Cpu <-> Services` resolves the SAME way `Scheduler = Machine` does: a struct
+/// decl's fields/methods are analyzed lazily, and every cross-reference here is a
+/// pointer (`cpu`/`bios`/`dos`) except `bridge` (by value, which only needs `Cpu`'s
+/// size — and `Cpu` holds only a `?*Services` pointer to us). A generic
+/// `Services(Cpu,...)` function would force full evaluation mid-`CpuWith` and
+/// deadlock the comptime cycle.
+pub const Services = struct {
+    cpu: *Cpu = undefined,
+    bios: *Bios = undefined,
+    dos: *Dos = undefined,
+    bridge: Bridge = .{},
+    owner: [bridge_mod.CB_MAX]Owner = @splat(.none),
+
+    pub const Owner = enum { none, stop, bios, dos };
+
+    pub fn wire(self: *Services, cpu: *Cpu, bios: *Bios, dos: *Dos) void {
+        self.cpu = cpu;
+        self.bios = bios;
+        self.dos = dos;
+        self.owner = @splat(.none);
+        self.bridge.init(cpu);
+        self.owner[self.bridge.stop_id] = .stop;
+        cpu.cb = self;
+    }
+
+    pub fn setOwner(self: *Services, id: u8, who: Owner) void {
+        self.owner[id] = who;
+    }
+
+    /// The CallbackSink contract (D2): fn (*Services, u8) void. The Grp4 `/7` arm
+    /// calls this synchronously, inline in executeOne, after fetch8-ing the id.
+    pub fn dispatchCallback(self: *Services, id: u8) void {
+        // (1) The synthetic cost (D5) is charged BEFORE the handler. The stop
+        // sentinel is cost-exempt (base 0) and routed without a handler.
+        _ = self.bridge.chargeBase(id);
+        switch (self.owner[id]) {
+            .stop => self.bridge.onStopSentinel(),
+            .bios => self.bios.dispatch(id, self.cpu, &self.bridge),
+            .dos => self.dos.dispatch(id, self.cpu, &self.bridge),
+            .none => std.debug.panic("callback id {d} dispatched with no owner", .{id}),
+        }
+    }
+};
 
 /// The machine's stable id for the PIT as a scheduler event source (M-D11).
 pub const PIT_SOURCE_ID: u16 = 1;
@@ -74,6 +129,12 @@ pub const Machine = struct {
     pit: Pit = .{},
     sched: Scheduler = .{},
     cpu: Cpu = undefined,
+    /// The host-serviced BIOS + DOS + the CallbackSink aggregate (D2/D12).
+    bios: Bios = .{},
+    dos: Dos = .{},
+    svc: Services = .{},
+    /// The BIOS ROM image the bridge plants stubs into (loaded at POST).
+    bios_image: [Bridge.IMAGE_LEN]u8 = @splat(0),
 
     /// Shutdown latched by `onShutdown` (M-D12). The run loop observes it.
     shutdown: bool = false,
@@ -146,8 +207,68 @@ pub const Machine = struct {
             .schedule = schedThunk,
             .cancel = cancelThunk,
         };
+        // (e) the host-serviced BIOS + DOS + the CallbackSink aggregate (D2/D12).
+        self.bios.init(&self.cpu);
+        self.dos.init(&self.cpu);
+        self.svc.wire(&self.cpu, &self.bios, &self.dos); // also sets cpu.cb = &svc
+        // Inject the machine's one-step primitive for the bridge's re-entrancy
+        // (D3): runGuestInt drives `stepOnceThunk` (fireDue + cpu.step + HLT FF).
+        self.svc.bridge.setStepper(self, stepOnceThunk);
         self.reset();
         self.assertWired();
+    }
+
+    /// The bridge's injected one-step primitive (D3): one machine step so PIT/IRQ
+    /// events fire during re-entrancy. Used by `runGuestInt`.
+    fn stepOnceThunk(ctx: *anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(ctx));
+        _ = run_loop.step(self);
+    }
+
+    // setOwner thunks for BIOS/DOS callback registration (records id -> subsystem
+    // in the Services routing table).
+    fn biosOwnerThunk(ctx: *anyopaque, id: u8) void {
+        const self: *Machine = @ptrCast(@alignCast(ctx));
+        self.svc.setOwner(id, .bios);
+    }
+    fn dosOwnerThunk(ctx: *anyopaque, id: u8) void {
+        const self: *Machine = @ptrCast(@alignCast(ctx));
+        self.svc.setOwner(id, .dos);
+    }
+
+    /// Run the full BIOS POST + DOS init (Phase 2/4). Registers BIOS + DOS
+    /// callbacks through the bridge, plants all stubs into the BIOS image, loads it
+    /// into the BIOS ROM window, points the IVT at the stubs, programs PIC/PIT/A20,
+    /// lands the BDA, builds the DOS arena MCB + standard handles. After this the
+    /// machine can `bootProgram`.
+    pub fn post(self: *Machine) void {
+        const br = &self.svc.bridge;
+        // Register callbacks (the stop sentinel id 0 was reserved in svc.wire).
+        self.bios.registerCallbacks(br, self, biosOwnerThunk);
+        self.dos.registerCallbacks(br, self, dosOwnerThunk);
+        // Plant all stubs + the re-entrancy trampoline into the BIOS image, then
+        // load it so the bytes are real guest code at the vectors (D4).
+        @memset(&self.bios_image, 0);
+        br.plantAll(&self.bios_image);
+        self.bus.loadRom(Bridge.IMAGE_BASE, &self.bios_image);
+        // The re-entrancy trampoline lives in conventional RAM (writable; its INT
+        // immediate is patched per runGuestInt). Plant it after reset zeroed RAM.
+        br.plantTrampoline();
+        // BIOS POST: PIC/PIT/A20 + IVT (unhandled-default + serviced) + BDA.
+        self.bios.post(br);
+        // DOS init: vectors + arena MCB + standard handles. The arena spans low
+        // DOS memory; place the first MCB at segment 0x0800 (32 KiB) and let it run
+        // up to 0x9000 (just below the UMA), ~0x8800 paragraphs.
+        self.dos.dosInit(br, 0x0800, 0x8800);
+        // Register the EMS MMIO page-frame device on the bus (D15/B8).
+        _ = self.bus.mapMmio(dos_mod.ems_frame_phys, dos_mod.ems_frame_len, self.dos.ems.memHandler());
+    }
+
+    /// Load a program from a mounted drive and start it (the v1 boot path). The
+    /// machine, after `post`, calls this to load BaK (or a test program) as the
+    /// initial process, then runs.
+    pub fn bootProgram(self: *Machine, drive: u8, host_name: []const u8, cmdtail: []const u8) !void {
+        _ = try Dos.LoaderType.loadProgram(&self.dos, &self.cpu, drive, host_name, cmdtail, .load_and_run);
     }
 
     /// Debug-only self-check (M-D1): trips LOUDLY if the machine moved after wire.
@@ -198,6 +319,12 @@ pub const Machine = struct {
         self.pit.reset();
         self.sched.reset();
         self.shutdown = false;
+        // Re-init the host-serviced state (the callback ids + routing are re-
+        // established by `post`; ids stay stable since registration order is fixed).
+        self.bios.init(&self.cpu);
+        self.dos.init(&self.cpu);
+        self.svc.wire(&self.cpu, &self.bios, &self.dos);
+        self.svc.bridge.setStepper(self, stepOnceThunk);
     }
 
     // -----------------------------------------------------------------------

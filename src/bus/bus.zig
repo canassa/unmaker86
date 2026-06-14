@@ -519,6 +519,54 @@ pub const Bus = struct {
         @memcpy(self.ram[phys_start..][0..bytes.len], bytes);
     }
 
+    /// Bounded bulk write of `bytes` into guest physical memory starting at
+    /// `phys` (D19 — the `MEM_BlockWrite` shape). The warm host-service path (the
+    /// EXE/COM loader image copy + INT 21h AH=40 write) uses this instead of a
+    /// per-byte `writePhys8` loop. ONE A20/region check per span: if the whole
+    /// A20-masked span lies in one contiguous `.ram` run inside the slab, a single
+    /// `@memcpy`; otherwise a per-byte fallback (region-crossing / ROM / MMIO /
+    /// A20-wrap). Deterministic: a pure memory operation, no host I/O timing — the
+    /// cycle cost is charged by the synthetic D5 formula at the bridge, not here.
+    pub fn writeGuestBlock(self: *Bus, phys: u32, bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        const len: u32 = @intCast(bytes.len);
+        if (self.contiguousRamSpan(phys, len)) |start| {
+            @memcpy(self.ram[start..][0..bytes.len], bytes);
+            return;
+        }
+        for (bytes, 0..) |b, i| self.writePhys8(phys +% @as(u32, @intCast(i)), b);
+    }
+
+    /// Bounded bulk read of `dst.len` bytes from guest physical memory starting at
+    /// `phys` (D19 — the `MEM_BlockRead` shape). Mirror of `writeGuestBlock`.
+    pub fn readGuestBlock(self: *Bus, phys: u32, dst: []u8) void {
+        if (dst.len == 0) return;
+        const len: u32 = @intCast(dst.len);
+        if (self.contiguousRamSpan(phys, len)) |start| {
+            @memcpy(dst, self.ram[start..][0..dst.len]);
+            return;
+        }
+        for (dst, 0..) |*b, i| b.* = self.readPhys8(phys +% @as(u32, @intCast(i)));
+    }
+
+    /// If `[phys, phys+len)` A20-masks to a contiguous run that stays within the
+    /// slab, never crosses an A20-mask wrap, and is entirely `.ram` pages, return
+    /// the masked start offset for a single `@memcpy`; else null (per-byte path).
+    fn contiguousRamSpan(self: *const Bus, phys: u32, len: u32) ?u32 {
+        const start = a20.apply(self.a20_mask, phys);
+        const end = a20.apply(self.a20_mask, phys +% (len - 1));
+        // A non-contiguous masked span (an A20 wrap inside the run) -> per-byte.
+        if (end != start +% (len - 1)) return null;
+        if (@as(u64, start) + len > memmap.ram_total_size) return null;
+        const first = memmap.pageIndex(start);
+        const last = memmap.pageIndex(start + (len - 1));
+        var p = first;
+        while (p <= last) : (p += 1) {
+            if (self.page_kind[p] != .ram) return null;
+        }
+        return start;
+    }
+
     /// Reset `[phys_start, phys_start+len)` to `defaultPageKind` (the DOSBox
     /// `MEM_ResetPageHandler` analog) — for device teardown.
     pub fn unmapRegion(self: *Bus, phys_start: u32, len: u32) void {

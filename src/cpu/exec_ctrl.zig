@@ -182,7 +182,7 @@ pub fn grp5(cpu: anytype) !void {
     }
 }
 
-// ---- Grp4 (0xFE): INC/DEC r/m8 ----
+// ---- Grp4 (0xFE): INC/DEC r/m8, plus the `/7` callback-trap (D1/D2) ----
 pub fn grp4(cpu: anytype) !void {
     try dispatch.decodeModRM(cpu);
     const alu = @import("alu.zig");
@@ -195,8 +195,32 @@ pub fn grp4(cpu: anytype) !void {
             const v: u64 = try exec.readRM8(cpu);
             try exec.writeRM8(cpu, @truncate(alu.dec(&cpu.st.eflags, .b8, v)));
         },
+        // reg=7 (`0xFE 0x38`): the guest->host callback trap (D1/D2). On a real
+        // 386 this is an illegal GRP4 encoding (#UD). zdos reuses it as the
+        // bridge opcode: read the 1-byte id that FOLLOWS `0xFE 0x38` and dispatch
+        // to the host sink. The ModR/M (0x38 = mod00 reg7 rm000 = [BX+SI]) decode
+        // already ran above and is INERT for reg=7 (no memory access).
+        7 => try callbackTrap(cpu),
         else => try exec.ud(cpu),
     }
+}
+
+/// The `0xFE 0x38 <id>` callback-trap arm (D2). For the default `NullCallbackSink`
+/// (or an unwired `cpu.cb`) this faithfully raises `#UD` WITHOUT pre-advancing
+/// EIP (so the interrupts.zig fault rollback to `instr_start_eip` stays correct).
+/// For a real sink: `fetch8` the id (this advances EIP past the 3-byte stub to
+/// the natural resume point), then `dispatchCallback(id)`; the handler may change
+/// CS:IP (an IRET/jump return tail), in which case its value wins — there is no
+/// double-advance because EIP is only ever advanced by the single `fetch8`.
+fn callbackTrap(cpu: anytype) !void {
+    const Cpu = @TypeOf(cpu.*);
+    const cpu_mod = @import("cpu.zig");
+    if (comptime Cpu.CallbackSink == cpu_mod.NullCallbackSink) {
+        return exec.ud(cpu);
+    }
+    const sink = cpu.cb orelse return exec.ud(cpu);
+    const id = try dispatch.fetch8(cpu); // advances EIP past the stub
+    sink.dispatchCallback(id);
 }
 
 // ---- Far transfers (real mode: simple CS:IP load + limit check) ----

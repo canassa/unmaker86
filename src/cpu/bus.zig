@@ -18,6 +18,7 @@ pub const assertBusContract = bus_contract.assertBusContract;
 pub const assertInterruptControllerContract = bus_contract.assertInterruptControllerContract;
 pub const assertSchedulerContract = bus_contract.assertSchedulerContract;
 pub const assertFaultSinkContract = bus_contract.assertFaultSinkContract;
+pub const assertCallbackSinkContract = bus_contract.assertCallbackSinkContract;
 
 // ---------------------------------------------------------------------------
 // TestBus — a real Bus over a RAM array, NOT a prohibited fake.

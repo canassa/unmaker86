@@ -46,10 +46,21 @@ pub const NullScheduler = struct {
     }
 };
 
+/// Default callback sink (D2): a `0xFE 0x38 <id>` callback opcode with no
+/// registered sink faithfully raises `#UD` (never a silent NOP — ground rule).
+/// The `dispatchCallback` method exists only to satisfy the contract; the Grp4
+/// `/7` arm recognizes this type at comptime and takes the `#UD` path directly
+/// (which must NOT pre-advance EIP, so the interrupts.zig fault rollback to
+/// `instr_start_eip` stays correct).
+pub const NullCallbackSink = struct {
+    pub fn dispatchCallback(_: *NullCallbackSink, _: u8) void {}
+};
+
 /// Options bundling the comptime hook types alongside the Bus.
 pub const Options = struct {
     Pic: type = NullPic,
     Scheduler: type = NullScheduler,
+    CallbackSink: type = NullCallbackSink,
 };
 
 /// Build the CPU type for a given Bus (and optional hook types).
@@ -61,17 +72,22 @@ pub fn CpuWith(comptime Bus: type, comptime opts: Options) type {
     bus_mod.assertBusContract(Bus);
     bus_mod.assertInterruptControllerContract(opts.Pic);
     bus_mod.assertSchedulerContract(opts.Scheduler);
+    bus_mod.assertCallbackSinkContract(opts.CallbackSink);
 
     return struct {
         const Self = @This();
         pub const BusType = Bus;
         pub const PicType = opts.Pic;
         pub const SchedulerType = opts.Scheduler;
+        pub const CallbackSink = opts.CallbackSink;
 
         st: State = .{},
         bus: *Bus,
         pic: *opts.Pic,
         sched: *opts.Scheduler,
+        /// The guest->host callback-trap sink (D2). null until the machine wires
+        /// the `Services` aggregate; a `0xFE 0x38` opcode with no sink #UDs.
+        cb: ?*opts.CallbackSink = null,
 
         // ---- Per-instruction decode scratch (reset each step; no alloc) ----
         dec: decode.Decoded = .{},
