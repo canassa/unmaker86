@@ -70,6 +70,20 @@ const PASSING = [_]Program{
     .{ .exe = "GETCH.EXE" },
     .{ .exe = "STDSTAT.EXE" },
     .{ .exe = "CSCANF.EXE" },
+    // Deep subdirectory / multi-component path band (D8b — the BaK-critical
+    // directory-tree area). These create their OWN tree at runtime and tear it
+    // down, so reruns are stable with no committed fixture:
+    //   MKTREE  — nested AH=39 mkdir + AH=3A rmdir (non-empty rmdir => AX=5) +
+    //             create/read a file at SUB1\SUB2\DEEP.TXT (multi-level path).
+    //   CDTEST  — per-drive CWD: AH=3B chdir into SUB1\SUB2, AH=47 getcwd, open
+    //             a file relative to CWD and via "..\\", chdir ".." and "\\".
+    //   DIRSCAN — AH=4E/4F findfirst with a directory-PATH-prefix mask
+    //             ("SUB1\\*.*", "SUB1\\SUB2\\*.TXT") incl. the subdir ATTR bit.
+    //   MOVEDIR — AH=56 rename moving a file across subdirectories.
+    .{ .exe = "MKTREE.EXE" },
+    .{ .exe = "CDTEST.EXE" },
+    .{ .exe = "DIRSCAN.EXE" },
+    .{ .exe = "MOVEDIR.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented

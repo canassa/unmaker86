@@ -1,0 +1,13 @@
+exit_code: 0
+--- output ---
+getcwd cf=0 -> []
+chdir SUB1\SUB2    cf=0 ax=0
+getcwd cf=0 -> [SUB1\SUB2]
+open INNER.TXT      -> [inner file]
+open ..\TOP.TXT     -> [top level file]
+chdir ..           cf=0 ax=0
+getcwd cf=0 -> [SUB1]
+open TOP.TXT        -> [top level file]
+chdir \            cf=0 ax=0
+getcwd cf=0 -> []
+CDTEST done

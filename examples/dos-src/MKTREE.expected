@@ -1,0 +1,11 @@
+exit_code: 0
+--- output ---
+mkdir SUB1           cf=0 ax=0
+mkdir SUB1\SUB2      cf=0 ax=0
+create SUB1\SUB2\DEEP.TXT OK
+read 23 bytes: deep tree payload 13579
+rmdir SUB1\SUB2      cf=1 ax=5
+remove SUB1\SUB2\DEEP.TXT OK
+rmdir SUB1\SUB2      cf=0 ax=0
+rmdir SUB1           cf=0 ax=0
+MKTREE done

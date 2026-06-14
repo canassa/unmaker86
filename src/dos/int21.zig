@@ -324,26 +324,64 @@ pub fn Int21(comptime Cpu: type) type {
                 p = p[2..];
             }
             if (p.len == 0) return null;
-            // Absolute (leading separator): path is from the drive root, ignore CWD.
-            if (p[0] == '\\' or p[0] == '/') {
-                const rel = p[1..];
-                if (rel.len > path_buf.len) return null;
-                @memcpy(path_buf[0..rel.len], rel);
-                return .{ .drive = drive, .path = path_buf[0..rel.len] };
+
+            // Build the un-normalized DOS-relative path: an absolute path (leading
+            // separator) ignores the CWD; a relative path is prefixed by the
+            // per-drive current directory. Then canonicalize `.`/`..` away so the
+            // VFS only ever sees a clean root-relative path — mirroring
+            // dos_files.cpp:256-363 `DOS_MakeName`, which collapses `.`/`..`
+            // against `curdir` and clamps `..` at the drive root (never errors).
+            var jbuf: [256]u8 = undefined;
+            var jlen: usize = 0;
+            if (p[0] != '\\' and p[0] != '/') {
+                const cwd = dos.cwdOf(drive);
+                if (cwd.len != 0) {
+                    if (cwd.len + 1 > jbuf.len) return null;
+                    @memcpy(jbuf[0..cwd.len], cwd);
+                    jbuf[cwd.len] = '\\';
+                    jlen = cwd.len + 1;
+                }
+            } else {
+                p = p[1..]; // drop the leading separator (path is from root)
             }
-            // Relative: prefix the per-drive current directory (empty = root).
-            const cwd = dos.cwdOf(drive);
-            if (cwd.len == 0) {
-                if (p.len > path_buf.len) return null;
-                @memcpy(path_buf[0..p.len], p);
-                return .{ .drive = drive, .path = path_buf[0..p.len] };
+            if (jlen + p.len > jbuf.len) return null;
+            @memcpy(jbuf[jlen..][0..p.len], p);
+            jlen += p.len;
+
+            const norm = normalizePath(jbuf[0..jlen], path_buf) orelse return null;
+            return .{ .drive = drive, .path = norm };
+        }
+
+        /// Canonicalize a DOS-relative path (no drive, '\' or '/' separators) by
+        /// collapsing `.` (current) and `..` (parent) components, writing the
+        /// cleaned root-relative path (no leading separator, '\' separators) into
+        /// `out`. `..` at the root is clamped (stays at root), matching
+        /// `DOS_MakeName`. Returns the slice into `out`, or null if it overflows.
+        fn normalizePath(in: []const u8, out: []u8) ?[]const u8 {
+            var written: usize = 0; // length of the canonical path so far
+            var it = std.mem.tokenizeAny(u8, in, "\\/");
+            while (it.next()) |comp| {
+                if (comp.len == 0) continue;
+                if (std.mem.eql(u8, comp, ".")) continue;
+                if (std.mem.eql(u8, comp, "..")) {
+                    // Drop the last component (clamp at root).
+                    if (std.mem.lastIndexOfScalar(u8, out[0..written], '\\')) |i| {
+                        written = i;
+                    } else {
+                        written = 0;
+                    }
+                    continue;
+                }
+                if (written != 0) {
+                    if (written + 1 > out.len) return null;
+                    out[written] = '\\';
+                    written += 1;
+                }
+                if (written + comp.len > out.len) return null;
+                @memcpy(out[written..][0..comp.len], comp);
+                written += comp.len;
             }
-            const total = cwd.len + 1 + p.len;
-            if (total > path_buf.len) return null;
-            @memcpy(path_buf[0..cwd.len], cwd);
-            path_buf[cwd.len] = '\\';
-            @memcpy(path_buf[cwd.len + 1 ..][0..p.len], p);
-            return .{ .drive = drive, .path = path_buf[0..total] };
+            return out[0..written];
         }
 
         // ===================================================================

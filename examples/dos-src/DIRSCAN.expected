@@ -1,0 +1,10 @@
+exit_code: 0
+--- output ---
+mask SUB1\*.*: 3 entries
+  A.TXT        file
+  B.DAT        file
+  SUB2         <DIR>
+mask SUB1\SUB2\*.TXT: 2 entries
+  X.TXT        file
+  Y.TXT        file
+DIRSCAN done

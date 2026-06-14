@@ -970,24 +970,30 @@ VFS open/read/write/seek/find/chdir/mkdir/rmdir against a host dir tree works, a
       `size`/`enumerate`/`unlink`/`rename`. Drive table `drives: [26]?HostDirDrive` on the Dos ctx.
       (The interface is the concrete `HostDirDrive` — the single backend; the seam for more backends is
       the `drives` table + the method set.)
-- [ ] **Subdirectory ops on the backend (D8b — SUBDIR divergence):** extend `HostDirDrive` with
+- [x] **Subdirectory ops on the backend (D8b — SUBDIR divergence):** extend `HostDirDrive` with
       `chdir`/`mkdir`/`rmdir`/`getcwd` over the host dir tree, and have `open`/`create`/`enumerate`
       resolve **multi-component** paths (below). Track a per-drive current directory (deterministic init
-      to root) for the AH=3B/47 calls.
+      to root) for the AH=3B/47 calls. DONE + oracle-verified by the deep-subdir band (MKTREE/CDTEST/
+      DIRSCAN/MOVEDIR): nested AH=39/3A mkdir/rmdir (non-empty rmdir => AX=5), AH=3B chdir + AH=47
+      getcwd with `.`/`..` normalization, AH=4E findfirst with a directory-path-prefix mask, AH=56
+      cross-directory rename — all matching the dosbox-x goldens.
 - [x] **`HostDirDrive` over `std.Io.Dir` (verified 0.16 API):** holds the host `Dir` + an `io: Io`
       handle. `open` → `Dir.openFile(io, munged_to_host_name, .{ .mode })`; `create` →
       `Dir.createFile`; `read`/`write` via `File.reader(io, buf)`/`File.writer(io, buf)` +
       `Reader.seekTo`/`Writer.seekTo`; `getSize` via `Reader.getSize`; `findFirst`/`findNext` via
       `Dir.iterate()`. **Grep `references/zig/lib/std/Io/Dir.zig` + `Io/File*.zig` for exact signatures
       — the `io: Io` parameter is mandatory on every call.**
-- [ ] **DOS path → host path — MULTI-COMPONENT (D8b — FIX, replaces the single-dir shortcut).** The
+- [x] **DOS path → host path — MULTI-COMPONENT (D8b — FIX, replaces the single-dir shortcut).** The
       first pass took only the FINAL component (`fn resolve` → `lastIndexOfAny(p, "\\/")`), so
       `SUB\DATA.TXT` resolved to `DATA.TXT` at root and failed (`plans/dos-oracle-report.md` §2).
-      **Replace with real resolution:** canonicalize `C:\...\FILE.EXT` (apply chdir-relative base for a
-      relative path), strip the drive, translate `\`→`/`, **8.3-munge each component** (D10), and open the
-      leaf relative to the mount root, **walking real host subdirectories** (`drive_local.cpp` +
-      `DOS_MakeName`). **Keep a path-escape guard** (reject `..` traversal above the mount root) now that
-      the single-dir mount no longer provides it implicitly.
+      **Replaced with real resolution:** `int21.zig fn resolve` builds the joined path (chdir-relative
+      base for a relative path, or root for an absolute one), then `fn normalizePath` canonicalizes
+      `.`/`..` away (clamping `..` at the drive root, mirroring `DOS_MakeName` dos_files.cpp:256-363)
+      so the VFS only ever sees a clean root-relative path. `vfs.zig resolveHostPath` strips the drive,
+      translates `\`→`/`, **8.3-munges each component** (D10), and opens the leaf relative to the mount
+      root, **walking real host subdirectories** (`drive_local.cpp` + `DOS_MakeName`). `..` never
+      reaches the VFS (normalized away upstream), so the path-escape guard is enforced by the
+      normalizer's root-clamp. Oracle-verified by CDTEST (`..\\TOP.TXT`, `chdir ..`, `chdir \\`).
 - [x] **8.3 munging (`name83.zig`, D10 — re-derive, do NOT copy GPL):** uppercase; split name(≤8)+ext(≤3)
       on last dot; validate 8.3 charset; **deterministic long→short generation:** when a host file has a
       long name, generate `NAME~N.EXT` with **N assigned over a deterministically sorted directory
@@ -1172,9 +1178,14 @@ ladder `HELLO ✅ → MALLOC ✅ → FILEIO → ARGENV → SUBDIR → (extend) �
 - [ ] **FILEIO — AH=43 AL=00 existence check (HIGHEST PRIORITY).** Implement the D20/D11a fix (Phase 4):
       AH=43 AL=00 resolves the path through the VFS, returns CF=1/AX=2 when absent. **Re-run:** `FILEIO.EXE`
       flips `DIVERGING`→`PASSING`. (`dos-oracle-report.md` §1; `dos.cpp:1106-1120`.)
-- [ ] **SUBDIR — multi-component path resolution.** Implement the D8b VFS work (Phase 5) + AH=3B/47/39/3A
-      (Phase 4). **Re-run:** `SUBDIR.EXE` flips `DIVERGING`→`PASSING`. (`dos-oracle-report.md` §2;
-      `drive_local.cpp` + `DOS_MakeName`.) This unblocks BaK's subdir data loading.
+- [x] **SUBDIR — multi-component path resolution.** DONE: the D8b VFS work (Phase 5) + AH=3B/47/39/3A
+      (Phase 4). `SUBDIR.EXE` is `PASSING`. (`dos-oracle-report.md` §2; `drive_local.cpp` +
+      `DOS_MakeName`.) This unblocks BaK's subdir data loading. Further hardened by the deep-subdir
+      band (MKTREE/CDTEST/DIRSCAN/MOVEDIR, all `PASSING`): nested mkdir/rmdir, per-drive CWD with
+      `.`/`..` normalization, findfirst with a directory-path-prefix mask + subdir attr bit, and
+      cross-directory rename — the FULL tree, not a single committed leaf. The backend was NOT
+      leaf-only for the file/dir ops (it already walked the tree); the one real gap was `.`/`..`
+      normalization in `int21.zig fn resolve`, now fixed via `fn normalizePath`.
 - [ ] **ARGENV — real env block + canonical argv[0].** Implement the D20 env-block fix (Phase 6): real
       `C:\<EXE>` trailing path + a pinned deterministic populated env. **Re-run:** `ARGENV.EXE` flips
       `DIVERGING`→`PASSING`. (`dos-oracle-report.md` §3; `MakeEnv`, `dos_execute.cpp`.)

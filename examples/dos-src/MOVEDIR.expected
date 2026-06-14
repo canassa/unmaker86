@@ -1,0 +1,5 @@
+exit_code: 0
+--- output ---
+rename SUB1\FROM.TXT -> SUB2\TO.TXT OK
+dest read 22 bytes: moved across dirs 2468
+MOVEDIR done
