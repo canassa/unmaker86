@@ -1,0 +1,13 @@
+[submodule "references/zig"]
+	path = references/zig
+	url = https://codeberg.org/ziglang/zig
+	branch = 0.16.x
+[submodule "references/dosbox-x"]
+	path = references/dosbox-x
+	url = https://github.com/joncampbell123/dosbox-x
+[submodule "references/dosbox-staging"]
+	path = references/dosbox-staging
+	url = https://github.com/dosbox-staging/dosbox-staging
+[submodule "references/spice86"]
+	path = references/spice86
+	url = https://github.com/OpenRakis/Spice86

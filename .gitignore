@@ -1,0 +1,12 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# direnv
+.direnv/
+
+# IDE
+.idea/
+
+# stray test/conformance output
+conf.out
