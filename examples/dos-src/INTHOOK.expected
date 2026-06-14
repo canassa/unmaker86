@@ -1,0 +1,11 @@
+exit_code: 0
+--- output ---
+install round-trip = 1
+isr ax result = 1337
+isr dispatch ok = 1
+isr ax result 2 = 42
+restore round-trip = 1
+break flag after set = 1
+break flag restored = 1
+int24 store round-trip = 1
+int24 restore round-trip = 1

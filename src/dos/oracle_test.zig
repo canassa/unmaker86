@@ -95,6 +95,28 @@ const PASSING = [_]Program{
     .{ .exe = "FARHEAP.EXE" },
     .{ .exe = "DOSERR.EXE" },
     .{ .exe = "VECTORS.EXE" },
+    // Interrupt vector install/dispatch + Ctrl-Break band (band 17): the
+    // "interruptions" surface. INTHOOK.EXE installs a REAL guest ISR (a Borland
+    // 'interrupt' function) on the free user vector INT 0x61 via AH=25, then
+    // dispatches it with int86 carrying a register frame: the ISR reads the
+    // caller's BX/CX and writes their sum into the AX of the pushed frame, which
+    // IRET pops back so int86's outregs.x.ax observes it (1000+337=1337, then
+    // 40+2=42). This exercises the CORE interrupt path end to end — CD nn ->
+    // deliverViaIvt (push FLAGS/CS/IP, jump to the guest-installed CS:IP) -> the
+    // guest 'interrupt' routine runs with the caller's regs -> IRET restores the
+    // (modified) AX -> back to the caller — not merely IVT memory get/set (which
+    // VECTORS.EXE already covers via geninterrupt + a marker). It also round-
+    // trips the AH=33 Ctrl-Break flag (AL=00 get / AL=01 set, dos.cpp:1796-1801)
+    // and stores+reads-back the INT 24h critical-error vector (AH=25/35) the way
+    // a program does at startup (no forced critical error — mostly-moot on the
+    // VFS), restoring every vector and the break flag before exit (good DOS
+    // citizenship + proves both get/set directions). Only oracle-able values are
+    // printed (the computed register results, the boolean round-trip checks, the
+    // break flag); the raw handler/vector seg:off is load-dependent so only the
+    // read-back == stored equality is asserted. Proven deterministic by a triple-
+    // mint byte-identical diff; the program creates no files, so the committed
+    // corpus stays byte-identical.
+    .{ .exe = "INTHOOK.EXE" },
     // XMS install-probe band (band 8): the canonical XMS install-check handshake
     // via INT 2Fh AX=4300. zdos defers XMS, so the faithful answer is "not
     // installed" (AL != 0x80); the program then falls back to EMS. The golden was
