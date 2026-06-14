@@ -13,6 +13,9 @@ pub fn build(b: *std.Build) void {
     // reproducible per CLAUDE.md). The data is committed in the repo.
     const opts = b.addOptions();
     opts.addOption([]const u8, "testdata_80386", b.pathFromRoot("src/cpu/testdata/80386"));
+    // Absolute path to the committed Borland-C++-3.1 example programs, so the DOS
+    // loader regression can mount + run the real `HELLO.EXE` fixture offline.
+    opts.addOption([]const u8, "dos_examples_dir", b.pathFromRoot("examples/dos-src"));
 
     // The shared contract leaf module (B10): the single source of truth for the
     // comptime Bus/hook contracts. BOTH `cpu` and `bus` import it; neither
@@ -118,6 +121,24 @@ pub fn build(b: *std.Build) void {
     machine_mod.addImport("bridge", bridge_mod);
     machine_mod.addImport("bios", bios_mod);
     machine_mod.addImport("dos", dos_mod);
+
+    // The headless runner frontend: loads a real-mode DOS program through the
+    // emulated loader, runs it, and dumps its CON output. `zig build run -- prog`.
+    const exe = b.addExecutable(.{
+        .name = "zdos",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("machine", machine_mod);
+    b.installArtifact(exe);
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    const run_step = b.step("run", "Run a DOS program: zig build run -- <program>");
+    run_step.dependOn(&run_cmd.step);
 
     // Dedicated CPU test step.
     const cpu_tests = b.addTest(.{
@@ -282,12 +303,26 @@ pub fn build(b: *std.Build) void {
     const dos_name83 = MachineTest.add(b, target, optimize, "src/dos/name83_test.zig", &dosbios_imports);
     const dos_loader = MachineTest.add(b, target, optimize, "src/dos/loader_test.zig", &dosbios_imports);
     const dos_integration = MachineTest.add(b, target, optimize, "src/dos/integration_test.zig", &dosbios_imports);
+    // The real-CRT regression: load + run the committed Borland C++ 3.1 HELLO.EXE
+    // through the full machine and assert its CON output + exit code (needs the
+    // examples-dir path via build_options).
+    const dos_borland_t = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dos/borland_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    for (dosbios_imports) |imp| dos_borland_t.root_module.addImport(imp.name, imp.mod);
+    dos_borland_t.root_module.addOptions("build_options", opts);
+    const dos_borland = b.addRunArtifact(dos_borland_t);
     const dos_test_step = b.step("test-dos", "Run the DOS kernel + loader + EMS tests");
     dos_test_step.dependOn(&dos_unit.step);
     dos_test_step.dependOn(&dos_int21.step);
     dos_test_step.dependOn(&dos_name83.step);
     dos_test_step.dependOn(&dos_loader.step);
     dos_test_step.dependOn(&dos_integration.step);
+    dos_test_step.dependOn(&dos_borland.step);
 
     // Top-level test step aggregates the CPU + bus + machine tests.
     const test_step = b.step("test", "Run all unit tests");
@@ -309,6 +344,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&dos_name83.step);
     test_step.dependOn(&dos_loader.step);
     test_step.dependOn(&dos_integration.step);
+    test_step.dependOn(&dos_borland.step);
 
     // Dedicated full-conformance sweep: runs ALL vendored 80386 real-mode
     // vectors and reports per-opcode pass/fail/revoked counts. Separate from

@@ -838,6 +838,15 @@ COM and a tiny EXE both load and run to a clean exit with the asserted output + 
       offset. Compute `headersize_bytes = headersize*16`, `imagesize = pages*512 - headersize_bytes`.
   - [x] **Allocate via MCB** (Phase 4): `minsize = paras(imagesize + minmemory*16 + 256)` (the +256 =
         PSP); honor `maxmemory`. Flag failure (insufficient memory) faithfully (carry + error code).
+        **FIXED (real-CRT regression):** the original implementation allocated EXACTLY `minsize` and
+        ignored `maxmemory` — it never grabbed the largest free block. Real DOS EXEC (dosbox-staging
+        `dos_execute.cpp:352-386`) computes `maxsize = paras(imagesize + maxmemory*16 + 256)` (or
+        `0xFFFF` when `maxmemory==0`), then allocates `memsize = min(maxfree, maxsize)` and fails only
+        if `maxfree < minsize`. A Borland C++ 3.1 `.EXE` sets `maxmemory=0xFFFF` ("give me all of
+        memory") and its `C0*.OBJ` startup sizes its DGROUP stack+heap against PSP[0x02] (memtop);
+        with only `minsize` paragraphs, `memtop - DGROUP` was smaller than the required stack+heap and
+        the CRT `abort()`ed (exit 3) before `main`. `loadExe` now follows the real `min/max/maxfree`
+        rule; covered by `borland_test.zig` running the real `examples/dos-src/HELLO.EXE`.
   - [x] **Build the environment block** (explicit step): alloc an env MCB (**owner = the new PSP**),
         **inherit the parent's env** (or a minimal default for the root/initial load), write the trailing
         **`0x0001` word + the program's canonical path** (the DOS env terminator + program-name string),

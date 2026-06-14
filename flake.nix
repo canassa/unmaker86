@@ -19,7 +19,13 @@
       in
       {
         devShells.default = pkgs.mkShell {
-          packages = [ zig ];
+          packages = [
+            zig
+            # dosbox-x: runs the period DOS toolchain (Borland C++ 3.1 in
+            # toolchain/bc31) headless to build real .EXE test programs for zdos.
+            # Run headless with: -silent -fastlaunch -nogui -exit (see tools/bcc.sh).
+            pkgs.dosbox-x
+          ];
 
           shellHook = ''
             echo "zdos dev shell — $(zig version)"

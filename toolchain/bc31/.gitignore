@@ -1,0 +1,12 @@
+# Borland C++ 3.1 — the default compiler for KRONDOR's C code (bc31). A full
+# install of the toolchain. Proprietary; NOT committed. Place your own copy here:
+#
+#     toolchain/bc31/BIN/BCC.EXE    <- the compiler `bak build` invokes
+#     toolchain/bc31/INCLUDE/       <- system headers
+#     toolchain/bc31/LIB/           <- runtime libraries
+#     toolchain/bc31/...            <- the rest of the install (BGI, CLASSLIB, ...)
+#
+# `bak build` stages these into the FreeDOS/qemu-KVM VM to compile bc31 functions.
+# Keep this directory in the repo (via this file), ignore everything in it.
+*
+!.gitignore

@@ -108,12 +108,30 @@ pub fn Loader(comptime Cpu: type) type {
             const load_bytes = image_size - header_bytes;
             _ = fsize;
 
-            // Allocate: PSP (16 paras) + image + min_alloc.
-            const image_paras: u32 = (load_bytes + 15) / 16;
-            const total_paras: u32 = 16 + image_paras + h.min_alloc;
-            const want: u16 = @intCast(@min(total_paras, 0xFFFF));
+            // Decide the program memory-block size exactly like real DOS EXEC
+            // (dosbox-staging dos_execute.cpp:352-386):
+            //   minsize = para(imagesize + min_alloc*16 + 256)   ; PSP (256B) + image + min
+            //   maxsize = para(imagesize + max_alloc*16 + 256)   ; or 0xFFFF if max_alloc==0
+            //   memsize = min(maxfree, maxsize), and fail if maxfree < minsize
+            // The block size INCLUDES the 16-paragraph PSP; loadseg = pspseg + 16.
+            // Honoring max_alloc (0xFFFF => "give me all of memory") is essential:
+            // the Borland C0 startup sizes its DGROUP stack/heap against PSP[2]
+            // (memtop) and aborts if the block is only `minsize` (D6).
+            const minsize: u16 = long2para(load_bytes + (@as(u32, h.min_alloc) << 4) + 256);
+            const maxsize: u16 = if (h.max_alloc != 0)
+                long2para(load_bytes + (@as(u32, h.max_alloc) << 4) + 256)
+            else
+                0xFFFF;
 
             const env_seg = buildEnv(dos, cpu, host_path_placeholder) orelse return error.NoMemory;
+
+            const maxfree = dos.mcb().largestFree();
+            if (maxfree < minsize) {
+                _ = dos.mcb().free(env_seg);
+                return error.NoMemory;
+            }
+            const want: u16 = @min(maxfree, maxsize);
+
             const psp_seg = dos.mcb().alloc(want, dos.current_psp) orelse {
                 // free env on failure
                 _ = dos.mcb().free(env_seg);
@@ -280,6 +298,13 @@ pub fn Loader(comptime Cpu: type) type {
                 fpos += n;
                 if (n < chunk) break;
             }
+        }
+
+        /// Round a byte count up to paragraphs (16-byte units), saturating at
+        /// 0xFFFF (real DOS long2para — dosbox-staging dos.h:354).
+        fn long2para(bytes: u32) u16 {
+            if (bytes > 0xFFFF0) return 0xFFFF;
+            return @intCast(if (bytes & 0xF != 0) (bytes >> 4) + 1 else bytes >> 4);
         }
 
         fn parseHeader(b: *const [28]u8) ExeHeader {
