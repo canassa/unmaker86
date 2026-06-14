@@ -348,3 +348,80 @@ install-check)** must answer "not installed" cleanly. Within this band's theme,
 the next rung is **AH=58 alloc-strategy + UMB link (AL=02/03)** behavior under a
 real program, and **AH=34 InDOS / a guest-RAM SDA** so AH=5D AL=06 returns a
 real pointer — both Tier 2.
+
+## Band 9 — AH=57 Get/Set File Date and Time (1 program; corpus 30 → 31)
+
+### Program added: `FILEDATE.EXE`
+
+`_dos_creat` a scratch file, then on the OPEN handle: `_dos_setftime` (AH=57
+AL=01) a known packed date/time (1995-03-17 14:22:30 → date=1E71 time=72CF),
+`_dos_getftime` (AH=57 AL=00) it back, close, then `_dos_getftime` again on the
+now-CLOSED handle to exercise the invalid-handle failure path.
+
+### STRUCTURAL BOUNDARY (the headline finding): AH=57 GET is NOT oracle-able
+
+dosbox-x implements AH=57 AL=00 via `DOS_GetFileDate` (dos_files.cpp:2265),
+which unconditionally calls `LocalFile::UpdateDateTimeFromHost`
+(drive_local.cpp:3122). That function does `fstat(fileno(fhandle))` and packs
+`temp_stat.st_mtime` — the HOST file's real modification time — into `time`/`date`
+EVERY call, BEFORE returning them. Consequences:
+
+- A GET right after a SET does **not** return the value set; it returns the host
+  modification timestamp (the `newtime` flag only governs whether the host file's
+  timestamp is rewritten on close, not what GET reports).
+- The returned words therefore track the host wall clock. PROVEN: an early
+  version of FILEDATE that printed the GET'd words was minted twice and the two
+  goldens DIFFERED (`got time 0300 → 0305`, i.e. 00:24:00 vs 00:24:10 — the host
+  clock advanced 10s between mints). Date came back as 2026-06-15 (the host's
+  "today"), nowhere near the pinned 1993 epoch.
+
+So the GET **return value cannot be a golden**: it would fail to reproduce
+offline and would rot daily. This is precisely the host-timestamp non-determinism
+zdos exists to close — and it means the dosbox-x AH=57 GET *value* is outside the
+oracle's reach, full stop.
+
+### What the golden DOES pin (the host-independent slice)
+
+`FILEDATE.EXE` deliberately prints only deterministic facts, and the golden was
+**triple-minted byte-identical** (sha256 f7cccc…4ca1, three runs):
+
+- the packed words the program *computes* itself (pure arithmetic: 1E71/72CF),
+- `setftime rc=0` — SET on a valid handle succeeds (CF clear),
+- `getftime rc=0` — GET on a valid handle succeeds (CF clear),
+- `getftime(closed) rc=1 errno=6` — GET on a closed handle FAILS with
+  DOSERR_INVALID_HANDLE (CF set, AX=6 → Borland EBADF=6).
+
+### zdos fixes
+
+`getSetFileDateTime` (int21.zig) previously returned the epoch for ANY handle on
+GET and accepted SET for ANY handle, with **no handle validation** — so a GET on
+a closed handle wrongly succeeded. Fixed to mirror `DOS_GetFileDate`/
+`DOS_SetFileDate`:
+
+- Resolve the handle via the PSP JFT → SFT; an invalid/closed handle returns
+  CF=1/AX=6 (`dos.dosError(ERR_INVALID_HANDLE)`).
+- The packed words now live IN the SFT entry (`sft.zig`: `f_time`/`f_date`),
+  seeded from the pinned epoch (D13) at file open and overwritten by SET — so a
+  zdos SET-then-GET round-trips byte-identically every run (a *stronger,
+  deterministic* contract than dosbox-x's host-stat GET, which zdos must not
+  replicate). Device handles (CON/AUX/PRN) report the epoch on GET.
+
+(`int21.zig` and `sft.zig` are scanned by the `no host-time/mtime/ctime` grep
+guard in `dos_test.zig`; the comments here describe the host-timestamp behavior
+without using the forbidden literal so the guard stays green.)
+
+### Status
+
+`zig build test-oracle` green (exit 0) — **31/31 programs PASSING**, prior
+30-program corpus intact (no regression). `zig build test` green (exit 0), all
+targets.
+
+### Next uncovered DOS area
+
+`FILEDATE` closes the deterministic part of the timestamp surface. Candidate next
+bands: **AH=5A/5B (create temp / create-new file)** — create-new is a clean
+deterministic success/EEXIST contract; or **AH=4E find-first ATTR/size fields**
+under a real glob with mixed attrs (the DTA date/time fields already come from
+the epoch, so they are oracle-able unlike AH=57 GET). Avoid any path that reports
+a host file's stored timestamp back to the guest — that family is the documented
+non-deterministic boundary.

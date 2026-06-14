@@ -90,6 +90,15 @@ const PASSING = [_]Program{
     .{ .exe = "CDTEST.EXE" },
     .{ .exe = "DIRSCAN.EXE" },
     .{ .exe = "MOVEDIR.EXE" },
+    // File date/time band (band 9): INT 21h AH=57 get/set on an open handle. The
+    // golden asserts the DETERMINISTIC slice — the program-computed packed words,
+    // SET (AL=01) + GET (AL=00) success on a valid handle, and GET failure
+    // (CF/AX=6 -> EBADF) on a closed handle. The GET *return value* is NOT in the
+    // golden: dosbox-x derives it from the host mtime (non-deterministic; proven
+    // by a double-mint diff — see plans/dos-oracle-report.md band 9). zdos keeps
+    // the words in the SFT (epoch-seeded, SET-overwritten) so its own round-trip
+    // is deterministic, while the golden only pins the host-independent behavior.
+    .{ .exe = "FILEDATE.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented

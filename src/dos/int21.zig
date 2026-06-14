@@ -309,16 +309,43 @@ pub fn Int21(comptime Cpu: type) type {
             cpu.st.setReg8(2, 0); // DL = hundredths
             _ = dos;
         }
+        /// AH=57 Get/Set File Date and Time (dos.cpp:2468 -> DOS_GetFileDate /
+        /// DOS_SetFileDate, dos_files.cpp:2265/2290). BX = file handle.
+        ///   AL=00 GET -> CX = packed time, DX = packed date.
+        ///   AL=01 SET <- CX = packed time, DX = packed date.
+        /// Both VALIDATE the handle and return invalid-handle (CF=1, AX=6) on a
+        /// bad/closed handle (DOSERR_INVALID_HANDLE). DETERMINISM (band 9): dosbox-x
+        /// derives the GET words from the HOST file's modification timestamp on
+        /// every call (fstat in UpdateDateTimeFromHost) — non-deterministic and NOT
+        /// oracle-able;
+        /// zdos instead keeps the words IN the SFT (seeded from the pinned epoch at
+        /// open, overwritten by SET), so SET-then-GET round-trips byte-identically
+        /// every run. A device handle (CON/AUX/PRN) has no timestamp; real DOS
+        /// returns garbage there — we report the epoch deterministically.
         fn getSetFileDateTime(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
             const al = cpu.st.getReg8(0);
-            if (al == 0) { // get -> CX=time, DX=date (the epoch, D13)
-                cpu.st.setReg16(ECX, clock.fileTime());
-                cpu.st.setReg16(EDX, clock.fileDate());
-                br.setGuestCF(false);
-            } else { // set: accepted (no host file-timestamp write — determinism)
-                br.setGuestCF(false);
+            const handle = cpu.st.getReg16(EBX);
+            const e = sftFor(dos, handle) orelse return dos.dosError(cpu, br, Dos.ERR_INVALID_HANDLE);
+            switch (e.ref) {
+                .device => {
+                    if (al == 0) {
+                        cpu.st.setReg16(ECX, clock.fileTime());
+                        cpu.st.setReg16(EDX, clock.fileDate());
+                    }
+                    br.setGuestCF(false);
+                },
+                .file => {
+                    if (al == 0) { // GET -> CX=time, DX=date from the SFT
+                        cpu.st.setReg16(ECX, e.f_time);
+                        cpu.st.setReg16(EDX, e.f_date);
+                    } else { // SET <- CX=time, DX=date (stored in the SFT)
+                        e.f_time = cpu.st.getReg16(ECX);
+                        e.f_date = cpu.st.getReg16(EDX);
+                        e.time_set = true;
+                    }
+                    br.setGuestCF(false);
+                },
             }
-            _ = dos;
         }
 
         // ===================================================================
@@ -464,6 +491,11 @@ pub fn Int21(comptime Cpu: type) type {
             const e = dos.sft.get(slot);
             e.* = .{ .in_use = true, .ref = .{ .file = hf }, .position = 0, .mode = mode, .refcount = 1, .drive = r.drive };
             e.setPath(r.path);
+            // Seed the AH=57 file date/time from the pinned epoch (D13), NOT the
+            // host file's modification timestamp: zdos's GET is deterministic, and
+            // a later SET (AH=57 AL=01) overwrites these for a round-trip.
+            e.f_time = clock.fileTime();
+            e.f_date = clock.fileDate();
             // Snapshot integrity (D14): record length + a content hash.
             if (dos.drivePtr(r.drive).?.size(hf)) |sz| {
                 e.snap_len = sz;

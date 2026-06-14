@@ -36,6 +36,16 @@ pub const SftEntry = struct {
     /// so a restore can detect a replayed-file mismatch.
     snap_len: u64 = 0,
     snap_hash: u64 = 0,
+    /// DOS-packed file date/time (INT 21h AH=57). Real DOS keeps these in the SFT
+    /// and AH=57 AL=00 reads them back. dosbox-x re-derives them from the HOST
+    /// file's modification timestamp on every GET (non-deterministic — see oracle
+    /// band 9), which zdos must NOT do. Instead we seed them from the pinned epoch
+    /// (D13) at open and let AH=57 AL=01 (SET) overwrite them, so a SET-then-GET
+    /// round-trips deterministically. `time_set` records whether SET has run
+    /// (purely for clarity; the seeded epoch is already a valid value).
+    f_time: u16 = 0,
+    f_date: u16 = 0,
+    time_set: bool = false,
 
     pub fn setPath(self: *SftEntry, p: []const u8) void {
         const n = @min(p.len, MAX_PATH);

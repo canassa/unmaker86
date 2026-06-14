@@ -1,0 +1,6 @@
+exit_code: 0
+--- output ---
+packed: date=1E71 time=72CF
+setftime rc=0
+getftime rc=0
+getftime(closed) rc=1 errno=6
