@@ -1,0 +1,7 @@
+exit_code: 0
+--- output ---
+^C
+bytes: 65 66 3 67 68
+handler ran = 1
+count = 5
+saw ctrlc = 1

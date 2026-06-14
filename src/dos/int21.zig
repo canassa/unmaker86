@@ -80,18 +80,26 @@ pub fn Int21(comptime Cpu: type) type {
                         dos.dev_table.con.writeByte(dl);
                     }
                 },
-                0x07, 0x08 => { // input char without echo -> AL
+                0x07 => { // direct char input, no echo, NOT break-checked (dos.cpp:1211)
                     var b: [1]u8 = undefined;
                     const n = dos.dev_table.con.read(&b);
                     cpu.st.setReg8(0, if (n == 1) b[0] else 0);
                 },
-                0x09 => printString(dos, cpu, br),
-                0x01 => { // input char with echo -> AL
+                0x08 => { // char input, no echo, break-checked (dos.cpp:1218)
                     var b: [1]u8 = undefined;
                     const n = dos.dev_table.con.read(&b);
                     const c: u8 = if (n == 1) b[0] else 0;
+                    if (c == 3) _ = breakTest(dos, cpu, br); // Ctrl-C -> INT 23h
                     cpu.st.setReg8(0, c);
-                    dos.dev_table.con.writeByte(c);
+                },
+                0x09 => printString(dos, cpu, br),
+                0x01 => { // input char with echo -> AL, break-checked (dos.cpp:1125)
+                    var b: [1]u8 = undefined;
+                    const n = dos.dev_table.con.read(&b);
+                    const c: u8 = if (n == 1) b[0] else 0;
+                    if (c == 3) _ = breakTest(dos, cpu, br); // Ctrl-C -> INT 23h
+                    cpu.st.setReg8(0, c);
+                    dos.dev_table.con.writeByte(c); // DOS echoes AFTER the break check
                 },
                 0x0A => bufferedInput(dos, cpu, br),
                 0x0B => { // get STDIN status -> AL = 0xFF ready / 0x00 not ready
@@ -252,7 +260,6 @@ pub fn Int21(comptime Cpu: type) type {
         /// deterministically (programs in this band are scripted to end with CR
         /// before EOF, so this path is not exercised by the corpus).
         fn bufferedInput(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
-            _ = br;
             const con = &dos.dev_table.con;
             const seg = cpu.st.selector[@intFromEnum(Seg.ds)];
             const data = (@as(u32, seg) << 4) + cpu.st.getReg16(EDX);
@@ -274,6 +281,7 @@ pub fn Int21(comptime Cpu: type) type {
                     }
                     continue;
                 }
+                if (c == 3) _ = breakTest(dos, cpu, br); // Ctrl-C -> INT 23h (dos.cpp:1311)
                 if (read == free and c != 13) { // buffer full, not CR: bell
                     con.writeByte(7);
                     continue;
@@ -306,6 +314,52 @@ pub fn Int21(comptime Cpu: type) type {
                 },
                 else => cpu.st.setReg8(0, 0),
             }
+        }
+
+        /// DOS Ctrl-C break handling (dos.cpp:652 `DOS_BreakTest` + :734
+        /// `DOS_BreakAction` + :645 `DOS_PrintCBreak`). Called by the char-input
+        /// services AH=01/08/0A when the byte just read is 0x03 (Ctrl-C), exactly
+        /// like dosbox-x (dos.cpp:1130/1222/1311). It:
+        ///   1. prints "^C\r\n" to STDOUT (DOS_PrintCBreak),
+        ///   2. sets the caller's CF (DOS_BreakTest sets reg_flags|=1 before the
+        ///      callout — so an INT 23h handler that wants to CONTINUE clears it),
+        ///   3. INVOKES the guest INT 23h handler as REAL guest code via the
+        ///      bridge re-entrancy trampoline (`runGuestInt(0x23)`) — the same
+        ///      machinery EXEC/EMS use; the handler runs on the CPU (no host-side
+        ///      faking), charging its real cycles through the ledger.
+        ///
+        /// Continue-vs-abort (dos.cpp:704-716): real DOS decides by the handler's
+        /// return form — IRET (SP unchanged) or RETF with CF clear => CONTINUE;
+        /// RETF leaving CF set => TERMINATE (abort). Borland's `interrupt` keyword
+        /// (and the DOS default handler) end in IRET, so the overwhelmingly common
+        /// case — and the one the corpus exercises — is CONTINUE. zdos's
+        /// `runGuestInt` delivers a real `INT 0x23` and returns when the handler
+        /// IRETs; an IRET handler is the CONTINUE path, so this models it directly.
+        /// (A handler that aborts via RETF-with-CF is out of scope here: it cannot
+        /// be expressed by a C `interrupt` routine and would require a hand-written
+        /// far-return stub; flagged honestly rather than faked. The DEFAULT INT 23h
+        /// — dos.zig dispatch `.int23` => IRET — therefore also CONTINUES, a
+        /// deliberate divergence from real DOS's abort-by-default default handler,
+        /// acceptable because Ctrl-C is scripted input in zdos, never host-driven,
+        /// and any program that cares installs its own handler.)
+        ///
+        /// Returns true if the program should CONTINUE the input call (always, in
+        /// the supported continue path); a future abort path would return false so
+        /// the caller bails out of the service (matching dosbox's `return
+        /// CBRET_NONE`).
+        fn breakTest(dos: *Dos, cpu: *Cpu, br: *Bridge) bool {
+            _ = cpu;
+            // (1) DOS_PrintCBreak: "^C\r\n" to STDOUT.
+            _ = dos.dev_table.con.write("^C\r\n");
+            // (2) Set the caller's CF (the IRET-frame FLAGS image) before the
+            // callout, mirroring `reg_flags |= 1` in DOS_BreakTest.
+            br.setGuestCF(true);
+            // (3) Invoke the guest INT 23h handler as real guest code. It runs on
+            // the CPU through the bridge trampoline and returns on IRET.
+            br.runGuestInt(0x23);
+            // Continue path (IRET handler). See the doc comment for the abort
+            // boundary, which is out of scope for this band.
+            return true;
         }
 
         // ===================================================================

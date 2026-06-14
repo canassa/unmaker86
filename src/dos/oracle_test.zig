@@ -135,6 +135,27 @@ const PASSING = [_]Program{
     .{ .exe = "GETCH.EXE" },
     .{ .exe = "STDSTAT.EXE" },
     .{ .exe = "CSCANF.EXE" },
+    // INT 23h Ctrl-C / Ctrl-Break handler dispatch band (band 18): the DOS
+    // break-check callout. CTRLC.EXE installs a custom INT 23h 'interrupt'
+    // handler (setvect 0x23) that sets a global flag and returns via IRET
+    // (CONTINUE), then reads scripted stdin one char at a time with AH=08
+    // (break-checked, dos.cpp:1218). The committed CTRLC.in stream "AB\x03CD\r"
+    // carries a Ctrl-C (0x03): when AH=08 reads it, DOS fires the break path
+    // (dos.cpp:1222 -> DOS_BreakAction + DOS_BreakTest, dos.cpp:652) which prints
+    // "^C\r\n" to STDOUT, sets the caller CF, and INVOKES INT 23h as REAL guest
+    // code (CALLBACK_RunRealInt(0x23)). zdos models this with the bridge
+    // re-entrancy trampoline runGuestInt(0x23) — the guest handler actually runs
+    // on the CPU and sets its flag (proven by VECTORS/INTHOOK that a Borland
+    // 'interrupt' handler reaches a C global), then IRETs -> CONTINUE, so AH=08
+    // returns AL=3 and the program is NOT aborted. The golden captures the DOS
+    // "^C\r\n", the byte codes (incl. the 3), handler-ran=1, count=5,
+    // saw-ctrlc=1, and exit_code=0 — all oracle-able and deterministic; the
+    // handler/vector seg:off is load-dependent and NOT printed. Proven
+    // deterministic by a triple-mint byte-identical diff (incl. exit code). The
+    // program creates no files, so the committed corpus stays byte-identical.
+    // (The RETF-with-CF ABORT return form is out of band scope — it cannot be
+    // expressed by a C 'interrupt' routine; see int21.zig breakTest.)
+    .{ .exe = "CTRLC.EXE" },
     // Deep subdirectory / multi-component path band (D8b — the BaK-critical
     // directory-tree area). These create their OWN tree at runtime and tear it
     // down, so reruns are stable with no committed fixture:
