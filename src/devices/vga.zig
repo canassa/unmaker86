@@ -5,11 +5,20 @@
 //! for the DAC ports (0x3C6/0x3C7/0x3C8/0x3C9) + the misc-output register (0x3C2).
 //! The machine OWNS the `Vga` value and registers both seams at `wire`.
 //!
-//! Scope (faithful to dosbox-x `vgaonly`, the mode-13h subset only):
+//! Scope (faithful to dosbox-x `vgaonly`, the mode-13h subset + the text page):
 //!   - 256 KiB linear VRAM (dosbox-x `vga.mem.memsize` for plain VGA). In mode 13h
 //!     the CPU window A000:offset maps DIRECTLY to vram[offset] (the linear/chained
 //!     256-color mapping, one byte = one pixel = one palette index). Only the first
 //!     64 KiB is reachable through the 64 KiB A000 window — exactly mode 13h.
+//!   - The TEXT-MODE video pages: color B800:0000 (modes 0-3) + mono B000:0000
+//!     (mode 7), two 32 KiB slabs (`text_vram`/`text_vram_mono`) mapped as RAM-like
+//!     MMIO exactly like the A000 framebuffer (getHostPtr fast path + peek8). They
+//!     hold the flat interleaved {char,attr} cell the guest reads/writes — both a
+//!     direct `putch` (direct video) and the INT 10h text services (src/bios/int10.zig
+//!     AH=00/06/07/08/09/0A/0E/13) land here. The debugger reads the grid via a pure
+//!     peek at `GET /api/screen`. Determinism: guest RAM (zero-init at reset,
+//!     caller-copied in snapshot like vram); NO cursor blink, NO glyph rasterization
+//!     (those are renderer/host-timed concerns zdos never models). → plans/text-mode-video.md.
 //!   - The 256-entry x 3-byte 6-bit DAC palette, programmed/read through the
 //!     0x3C8/0x3C7/0x3C9 port state machine with the exact index auto-advance
 //!     dosbox-x implements (vga_dac.cpp:255-396, `vgaonly` => not Paradise).

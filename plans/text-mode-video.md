@@ -681,7 +681,7 @@ the new code.** No new `sources`-array entry is correct or needed.
 Each box ≈ one focused commit; `zig build test` (+ `test-blackbox`, `test-oracle`) stay green
 throughout. Ordered so each phase is independently testable.
 
-- [ ] **P1 — Text-page backing region (two slabs).** Add the §3.1 geometry/cell constants + **two**
+- [x] **P1 — Text-page backing region (two slabs).** Add the §3.1 geometry/cell constants + **two**
       `[0x8000]u8` slabs (`text_vram`@B8000, `text_vram_mono`@B0000) — alloc both in `Vga.init` (single
       struct literal), free both in `deinit`, `@memset(...,0)` both in `reset` (NOT `@splat`) — plus
       `textMemHandler()` / `textMonoMemHandler()` each with **both `getHostPtr` AND `peek8`** (+
@@ -690,7 +690,7 @@ throughout. Ordered so each phase is independently testable.
       `mapMmio(TEXT_COLOR_PHYS, …, textMemHandler())` + `mapMmio(TEXT_MONO_PHYS, …, textMonoMemHandler())`.
       Unit-test: a direct bus write to B800:0000 (and B000:0000) reads back (both were dropped before).
       No INT 10h change yet.
-- [ ] **P2 — Snapshot round-trip for `text_vram` (caller-copy, NOT a struct field).** Confirm the
+- [x] **P2 — Snapshot round-trip for `text_vram` (caller-copy, NOT a struct field).** Confirm the
       snapshot **caller** dupes `machine.vga.text_vram`/`text_vram_mono` and restores them into the
       re-init'd machine's slabs (the same out-of-band path as `vram`/`bus.ram`; do **NOT** add a
       `Snapshot` struct field — see §3.1/§3.4). Extend the `machine.zig:515-517` doc comment to mention
@@ -698,12 +698,12 @@ throughout. Ordered so each phase is independently testable.
       (`src/debug/controller.zig:130,702-706`). Test: write B800, snapshot (dupe slab), mutate, restore,
       `expectEqualSlices` byte-identical — **mirror the caller-copy pattern at `controller_test.zig:304,329`**
       (dupe + restore + `expectEqualSlices`), NOT a `Vga.Snapshot`/`Machine.Snapshot` field round-trip.
-- [ ] **P3 — INT 10h cell helpers + AH=09/0A write-char + AH=08 read.** Add `writeCharCell` (F2:
+- [x] **P3 — INT 10h cell helpers + AH=09/0A write-char + AH=08 read.** Add `writeCharCell` (F2:
       `useattr=false` ⇒ char only) / `readCharCell` (§3.2, live BDA cols) and the AH=09 (attr) / AH=0A
       (no-attr) / **AH=08** (read char+attr — a one-liner on `readCharCell`) dispatch arms to
       `src/bios/int10.zig` (replace the `else` fallthrough at `:63` for these AHs). Unit/black-box test:
       AH=09 writes a char+attr at the cursor, read back via B800 + via AH=08.
-- [ ] **P4 — INT 10h AH=0E teletype + AH=06/07 scroll + AH=01/03 cursor shape.** Add `scrollWindow`
+- [x] **P4 — INT 10h AH=0E teletype + AH=06/07 scroll + AH=01/03 cursor shape.** Add `scrollWindow`
       (§3.2, `int10_char.cpp:197-236,264-295`, inclusive bounds F3) and the full `teletype` control-char
       machine (BS/CR/LF/wrap/scroll, **BEL no-op** D-TM-BEL, end-of-screen fill = attr-at-cursor F4,
       cursor word col=lo/row=hi F7) replacing the AH=0E no-op at `src/bios/int10.zig:53-56`. Wire AH=06/07.
@@ -711,13 +711,13 @@ throughout. Ordered so each phase is independently testable.
       of the hardcoded `0x0607` (`int10.zig:49`), so set-then-get cursor shape round-trips. Test:
       teletype a string → cells land + cursor advances + wraps + scrolls (§5.2); AH=01 then AH=03 returns
       the set shape.
-- [ ] **P5 — INT 10h AH=00 text mode-set + AH=13 write-string.** Extend `setMode` to handle text
+- [x] **P5 — INT 10h AH=00 text mode-set + AH=13 write-string.** Extend `setMode` to handle text
       modes 0–3 (B8000) / 7 (B0000): program BDA mode/cols/page-size, **`OFF_NB_ROWS = rows-1`** (F8),
       CRTC-base + clear the page with a **16-bit `0x0720` word fill** over cols*rows cells (F6 — NOT a
       byte memset) per FinishSetMode (`int10_modes.cpp:30-37`). Add AH=13 WriteString (each char via
       `teletype`, **`useattr=true` always** F5, restore cursor when AL bit0=0). Test: set mode 3 clears
       the page to 0x0720; write-string places a row and bit0=0 leaves the cursor put.
-- [ ] **P6 — `/api/screen` read.** Add `Controller.screen` (pure peek of the **BDA active page** at the
+- [x] **P6 — `/api/screen` read.** Add `Controller.screen` (pure peek of the **BDA active page** at the
       BDA-implied base, cols/rows from BDA, §4.2.1), `screen_get` **`void`** Command + `ScreenResult`
       POD with a `[MAX_SCREEN_CELLS=4000]u8` cells buffer (`queue.zig`), `screenResp` filling the full
       cells (`worker.zig`), JSON serialization (`json_wire.zig`, §4.1 shape) with `attrs` driven by a
@@ -725,17 +725,17 @@ throughout. Ordered so each phase is independently testable.
       (`server.zig` after `:278`). Test: write cells, `GET /api/screen`, assert the grid string + cursor;
       assert the read is **side-effect-free** — snapshot before == after (mirror
       `controller_test.zig:321-329`).
-- [ ] **P7 — KEYECHO real-`putch` acceptance gate.** Revert `examples/dos-src/KEYECHO.C:42-56` to real
+- [x] **P7 — KEYECHO real-`putch` acceptance gate.** Revert `examples/dos-src/KEYECHO.C:42-56` to real
       `putch()`, recompile (`tools/bcc.sh`), update `tests/blackbox/keyecho_test.zig` to assert the
       echo via `/api/screen` (§5.1). Confirm ESC still terminates (ret 0). **This green is the gate.**
-- [ ] **P8 — Determinism + grep-gate + VIDTEXT.** Two-run byte-identity of `text_vram`/`text_vram_mono`
+- [x] **P8 — Determinism + grep-gate + VIDTEXT.** Two-run byte-identity of `text_vram`/`text_vram_mono`
       + `/api/screen` via the caller-copy path (§5.3). **Confirm the existing BIOS / devices / api / debug
       grep gates still pass** with the new code (`int10.zig` is ALREADY in the BIOS gate
       `determinism_test.zig:22`; `vga.zig` in the devices gate `pit_test.zig:61`; controller/api modules
       gated) — **do NOT add `int10.zig` to the devices gate** (§5.5). Update `examples/dos-src/VIDTEXT.C`
       to assert teletype now that it is modeled (§5.2), removing the "deferred text-subsystem" boundary
       note.
-- [ ] **P9 — Docs + (optional) text oracle band.** Flip the ROADMAP backlog item
+- [x] **P9 — Docs + (optional) text oracle band.** Flip the ROADMAP backlog item
       (`plans/ROADMAP.md:25`) to done; update the `KEYECHO.C` header note (no longer "unobservable").
       Add the text-buffer-content oracle band note to `plans/io-oracle.md` §1 (§5.4 — text cells ARE a
       valid cross-emulator golden, unlike retrace bits). The oracle program itself can be a follow-up.

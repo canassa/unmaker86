@@ -178,6 +178,18 @@ from the cycle counter (emulated time = f(cycles), CLAUDE #2) via integer math �
 zdos* (a retrace-poll loop terminates reproducibly), but they are NOT a faithful cross-emulator
 oracle and must stay out of the blob.
 
+**Text-buffer content IS a valid golden (recommended follow-up band).** Unlike the retrace bits, the
+**text page B800:0000 cell content after a deterministic INT 10h sequence is a faithful cross-emulator
+golden** — it is pure guest-observable device state, the same VRAM-readback discipline already proven
+for mode 13h (§1.2/§1.3). A text-oracle band: a BC3.1 program issues a fixed INT 10h text sequence
+(set mode 3, teletype / write-char / scroll a known pattern), reads back the first `cols*rows*2` B800
+cells, and `fwrite`s them as a binary blob; mint the golden under headless dosbox-x and zdos reproduces
+it byte-identically offline (the cells are a pure function of the INT 10h calls). This is the K1/V-band
+analog for text — the text page + INT 10h text services landed (`plans/text-mode-video.md`), so this is
+now buildable. **The one value to exclude: cursor *blink* phase (not modeled); the cursor *position*
+(BDA) IS a valid golden.** (Today `VIDTEXT.EXE` already asserts the teletyped cells + advanced cursor
+via AH=08 over the CON-text golden; a binary B800-blob band is the natural next step.)
+
 ---
 
 ## 2. Keyboard
