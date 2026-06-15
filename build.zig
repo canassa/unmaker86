@@ -134,6 +134,21 @@ pub fn build(b: *std.Build) void {
     debug_mod.addImport("cpu", cpu_mod);
     debug_mod.addImport("machine", machine_mod);
 
+    // The HTTP/JSON API server (Milestone 2): sits ABOVE debug + machine in the
+    // module graph ("observes machine; never drives timing"). The production `api`
+    // code imports only `debug` (Controller + shared types) + `cpu` (Reg32/Seg/
+    // Flags enums for register-set decoding). Nothing below it imports api. The
+    // listener thread never touches the machine; a single worker thread owns the
+    // Controller and runs one method per command (determinism constraint #4).
+    const api_mod = b.addModule("api", .{
+        .root_source_file = b.path("src/api/api.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    api_mod.addImport("debug", debug_mod);
+    api_mod.addImport("cpu", cpu_mod);
+    api_mod.addImport("machine", machine_mod);
+
     // The headless runner frontend: loads a real-mode DOS program through the
     // emulated loader, runs it, and dumps its CON output. `zig build run -- prog`.
     const exe = b.addExecutable(.{
@@ -146,6 +161,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("machine", machine_mod);
     exe.root_module.addImport("debug", debug_mod);
+    exe.root_module.addImport("api", api_mod);
     b.installArtifact(exe);
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -396,6 +412,31 @@ pub fn build(b: *std.Build) void {
     const debug_test_step = b.step("test-debug", "Run the debugger control-core tests");
     debug_test_step.dependOn(&debug_tests.step);
 
+    // ---- HTTP/JSON API server tests (test-api) ----
+    // The api test root imports the api module's own submodules (via the module
+    // root's `test {}` aggregator) plus debug/cpu (the production deps) and the
+    // machine-building set (machine/bus/devices/timing) so an in-process test can
+    // build a real machine + Controller and drive the queue/worker. The single
+    // real-socket integration test gets its OWN step (test-api-integration), NOT
+    // folded into `test`, so the default gate stays deterministic and CI-stable.
+    const api_imports = [_]Imp{
+        .{ .name = "api", .mod = api_mod },
+        .{ .name = "debug", .mod = debug_mod },
+        .{ .name = "machine", .mod = machine_mod },
+        .{ .name = "cpu", .mod = cpu_mod },
+        .{ .name = "bus", .mod = bus_mod },
+        .{ .name = "devices", .mod = devices_mod },
+        .{ .name = "timing", .mod = timing_mod },
+    };
+    const api_tests = MachineTest.add(b, target, optimize, "src/api/api.zig", &api_imports);
+    const api_test_step = b.step("test-api", "Run the HTTP/JSON API-server tests");
+    api_test_step.dependOn(&api_tests.step);
+
+    // The single real-socket integration test (opt-in; not in the default `test`).
+    const api_integration = MachineTest.add(b, target, optimize, "src/api/server_integration_test.zig", &api_imports);
+    const api_integration_step = b.step("test-api-integration", "Run the real-socket API integration test (opt-in)");
+    api_integration_step.dependOn(&api_integration.step);
+
     // Top-level test step aggregates the CPU + bus + machine tests.
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_cpu_tests.step);
@@ -421,6 +462,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&dos_oracle.step);
     test_step.dependOn(&io_oracle.step);
     test_step.dependOn(&debug_tests.step);
+    test_step.dependOn(&api_tests.step);
 
     // Dedicated full-conformance sweep: runs ALL vendored 80386 real-mode
     // vectors and reports per-opcode pass/fail/revoked counts. Separate from
