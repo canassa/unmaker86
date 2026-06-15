@@ -1,0 +1,6 @@
+exit_code: 0
+--- output ---
+equip_nofpu=0065
+memkb=640
+eq_match=1
+mem_match=1

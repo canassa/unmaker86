@@ -1,0 +1,9 @@
+exit_code: 0
+--- output ---
+support cf=0 bx=0003
+enable cf=0 status=1
+disable cf=0 status=0
+reenable cf=0 status=1
+toggle_off status=0
+toggle_on status=1
+extmem_cf=0

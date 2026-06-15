@@ -341,6 +341,71 @@ const PASSING = [_]Program{
     // the committed corpus stays byte-identical. This CLOSES the last I/O oracle
     // modality — video/keyboard/mouse/sound are all now proven against dosbox-x.
     .{ .exe = "SND1.EXE" },
+    // BIOS equipment + memory-size band: INT 11h (equipment word -> AX) and INT
+    // 12h (conventional memory size in KiB -> AX), both pure BDA reads (no host
+    // clock, no I/O) so fully deterministic and oracle-able. BIOSEQ.EXE prints the
+    // two INT returns and reads the SAME two words back from the BDA via a far
+    // pointer (0040:0010 equipment, 0040:0013 memsize), asserting INT==BDA for
+    // each. The CONFIG-dependent values are dosbox-x's POST truth: equip=0x0067
+    // (floppy|FPU|PS2-mouse|80x25-color|2-floppies — bios.cpp:10623-10679) and
+    // memkb=640. zdos was matched to the oracle EXCEPT the math-coprocessor bit
+    // (0x02): bda.zig initDefaults now seeds 0x0065 (was a stale 0x0021), i.e.
+    // dosbox's 0x0067 with the FPU bit CLEARED — zdos's CPU has no FPU (CLAUDE.md),
+    // so advertising one is a fake that makes Borland's float runtime emit x87 ops
+    // zdos can't execute (it hangs SPRINTF's %f path). The faithful FPU-less value
+    // clears bit 1; this is the one capability-driven divergence. BIOSEQ.EXE
+    // therefore asserts equip_nofpu = equip & ~0x02 (both -> 0x0065) and the raw
+    // FPU bit is NOT pinned; every other bit agrees with the oracle. INT 11h/12h
+    // read the word via int11_12.zig handle11/handle12. Proven deterministic by a
+    // triple-mint byte-identical diff; the program creates no files.
+    .{ .exe = "BIOSEQ.EXE" },
+    // INT 10h text/cursor band: AH=0F get-mode (boot text mode 03h / 80 cols /
+    // page 0), AH=02 set-cursor + AH=03 get-cursor+shape round-trips (the BDA
+    // cursor word at 0040:0050 and the cursor-shape word 0x0607 = the boot mode's
+    // INT10_SetCursorShape(6,7), int10_modes.cpp:988). All pure BDA reads/writes
+    // (int10.zig AH=0F/02/03), deterministic and oracle-able. DETERMINISM
+    // BOUNDARY: AH=0E teletype's cursor advance is exercised but NOT asserted —
+    // dosbox-x's INT10_TeletypeOutput moves the cursor (text VRAM + wrap/scroll)
+    // while zdos defers the VGA *text* subsystem (mode 13h graphics is the modeled
+    // video path; CON text flows through INT 21h), so its AH=0E is a faithful no-op
+    // for the framebuffer and leaves the BDA cursor where AH=02 set it. VIDTEXT.EXE
+    // therefore asserts only the explicitly-SET cursor (the agreed surface), the
+    // mode triple, and the shape word — mirroring the host-mtime exclusion in the
+    // DOS-phase bands. Proven deterministic by a triple-mint byte-identical diff;
+    // the program creates no files.
+    .{ .exe = "VIDTEXT.EXE" },
+    // INT 15h A20-gate band: AH=24 AL=03 query support (BX=0x0003), AL=02 status,
+    // AL=01 enable, AL=00 disable, with status re-reads proving the gate toggles
+    // both ways across several cycles (int15.zig drives cpu.bus.setA20/a20Enabled,
+    // a pure machine-model boolean — deterministic, oracle-able). DETERMINISM
+    // BOUNDARY: the BOOT A20 default is NOT asserted — it legitimately differs
+    // (dosbox-x boots A20 masked; zdos's BIOS POST enables it per its documented
+    // design, bios.zig post()). A20GATE.EXE ESTABLISHES a known state with AL=01
+    // first and asserts only A20 booleans it just SET, so the AH=24 control PATH
+    // (the feature) is proven boot-default-independent. SCOPE BOUNDARY: AH=88
+    // extended-memory SIZE is NOT asserted —
+    // dosbox-x returns its configured ext-mem (~15 MiB; bios.cpp:7094) while zdos
+    // models a 1 MiB real-mode machine with NO extended memory (XMS deferred, same
+    // scope as the xms=false oracle pin), so its faithful answer is 0. Reporting
+    // 15 MiB would FAKE RAM zdos lacks; so A20GATE.EXE exercises the AH=88 path and
+    // asserts only the host-independent success carry flag (extmem_cf=0), the part
+    // both honor. Proven deterministic by a triple-mint byte-identical diff; the
+    // program creates no files.
+    .{ .exe = "A20GATE.EXE" },
+    // INT 1Ah timer-tick band: the DETERMINISTIC round-trip. A bare AH=00 get-tick
+    // read advances with emulated time (BDA tick 0040:006C, bumped by the INT 08h
+    // handler off the PIT) = non-oracle-able. TIMERTK.EXE instead AH=01 SETs the
+    // tick to a known CX:DX and AH=00 GETs it back IMMEDIATELY, asserting the
+    // recovered CX:DX equals the stored value (no host clock read — only the value
+    // just written). AL (midnight-overflow flag) reads back 0: with no PIT rollover
+    // between the set and the immediate get, BIOS_24_HOURS_FLAG stays 0 in both
+    // (dosbox-x INT1A_Handler bios.cpp:3083; zdos int1a.zig handle AH=00/01).
+    // Three distinct values are round-tripped (incl. a near-rollover high tick) to
+    // prove it is the STORED value, not a fixed echo. Proven deterministic by a
+    // triple-mint byte-identical diff (incl. the AL=0 flag); the program creates no
+    // files. The advancing get-tick read itself is the carried determinism boundary
+    // (host-time-derived) and is never asserted.
+    .{ .exe = "TIMERTK.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented

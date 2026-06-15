@@ -1,0 +1,5 @@
+exit_code: 0
+--- output ---
+rt1 cx=0012 dx=3456 al=00 match=1
+rt2 cx=0000 dx=0001 al=00 match=1
+rt3 cx=0017 dx=FFFF al=00 match=1

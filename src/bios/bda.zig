@@ -72,10 +72,27 @@ pub fn Bda(comptime Cpu: type) type {
         /// Deterministic BDA init at POST (CLAUDE #5). Documented values for a
         /// 640 KiB / VGA / 1-floppy real-mode PC, matching BaK's expectations.
         pub fn initDefaults(self: Self) void {
-            // Equipment word: VGA color (bits 4-5 = 00), 1 floppy present (bit 0),
-            // 80x87 absent (bit 1 = 0). 0x0021 = floppy present + bit5 (initial
-            // video mode). Use the classic 0x0021 from a typical VGA POST.
-            self.wr16(OFF_EQUIPMENT, 0x0021);
+            // Equipment word (0040:0010) — matched to dosbox-x's POST value under
+            // the headless oracle config (the external truth source), EXCEPT for the
+            // math-coprocessor bit (see below). dosbox-x builds it in BIOS_Post
+            // (bios.cpp:10623-10679) and reports 0x0067 = the OR of:
+            //   0x01  bit 0      floppy installed (bios.cpp:10669 — always 1)
+            //   0x02  bit 1      math coprocessor present (C_FPU + enable_fpu;
+            //                    bios.cpp:10635) — CLEARED HERE. zdos's CPU does NOT
+            //                    implement the FPU (CLAUDE.md target "does not use
+            //                    the FPU"), so advertising one is a FAKE: Borland's
+            //                    float runtime probes this bit and, if set, emits
+            //                    real x87 instructions zdos cannot execute (it hangs
+            //                    SPRINTF's %f path). The faithful answer for an
+            //                    FPU-less machine is bit 1 = 0 — a justified,
+            //                    capability-driven divergence from the oracle (the
+            //                    one bit we MUST NOT mirror), documented in BIOSEQ.
+            //   0x04  bit 2      PS/2 mouse reported (bios.cpp:10659) — zdos models
+            //                    INT 33h, so this is consistent.
+            //   0x20  bits 4-5   startup 80x25 color (EGAVGA_ARCH; bios.cpp:10650)
+            //   0x40  bit 6      two floppies configured (bios.cpp:10673)
+            // => 0x0067 & ~0x02 = 0x0065. A deterministic constant (CLAUDE #5).
+            self.wr16(OFF_EQUIPMENT, 0x0065);
             self.wr16(OFF_MEMSIZE_KB, 640); // 640 KiB conventional
             self.wr8(OFF_KB_FLAG0, 0);
             self.wr8(OFF_KB_FLAG1, 0);
