@@ -146,6 +146,68 @@ test "INT 13h (deferred) hits the D11 unsupported flag path" {
     try std.testing.expectEqual(@as(u8, 0x13), machine_mod.Bios.last_unsupported.?.int);
 }
 
+// ---------------------------------------------------------------------------
+// Text-mode video INT 10h services (P3-P5). The default boot mode is 0x03
+// (80x25 color text), so the cells land in text_vram (B8000). Cell layout is
+// flat {char,attr}: byte0 = char, byte1 = attr.
+// ---------------------------------------------------------------------------
+
+test "INT 10h AH=09 writes char+attr at the cursor (read back via B800 + AH=08)" {
+    const alloc = std.testing.allocator;
+    const m = try boot(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    // One snippet: set cursor (2,3); AH=09 write 'X' attr 0x1F; AH=08 read it back.
+    //   AH=02 DX=0x0203 BH=0 (set cursor)
+    //   AH=09 AL='X' BL=0x1F CX=1 (write char+attr, cursor unchanged)
+    //   AH=08 BH=0 (read char+attr at cursor -> AL=char, AH=attr)
+    loadCode(m, &.{
+        0xB8, 0x00, 0x02, // MOV AX,0x0200
+        0xBB, 0x00, 0x00, // MOV BX,0
+        0xBA, 0x03, 0x02, // MOV DX,0x0203 (row=2,col=3)
+        0xCD, 0x10, // INT 10h (AH=02)
+        0xB8, 0x58, 0x09, // MOV AX,0x0958 (AH=09, AL='X')
+        0xBB, 0x1F, 0x00, // MOV BX,0x001F (BL=attr 0x1F, BH=page 0)
+        0xB9, 0x01, 0x00, // MOV CX,1
+        0xCD, 0x10, // INT 10h (AH=09)
+        0xB4, 0x08, // MOV AH,0x08
+        0xCD, 0x10, // INT 10h (AH=08)
+        0xF4, // HLT
+    });
+    run(m);
+    // Cell (2,3) at B8000 + (2*80+3)*2 = 0xB8000 + 326.
+    const at: u32 = 0xB8000 + (2 * 80 + 3) * 2;
+    try std.testing.expectEqual(@as(u8, 'X'), m.bus.readPhys8(at));
+    try std.testing.expectEqual(@as(u8, 0x1F), m.bus.readPhys8(at + 1));
+    // AH=08 returned the same cell: AL='X', AH=0x1F.
+    try std.testing.expectEqual(@as(u8, 'X'), m.cpu.st.getReg8(0)); // AL
+    try std.testing.expectEqual(@as(u8, 0x1F), m.cpu.st.getReg8(4)); // AH
+}
+
+test "INT 10h AH=0A writes char only, preserving the attribute byte (F2)" {
+    const alloc = std.testing.allocator;
+    const m = try boot(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    // Pre-set the attribute byte at cell (0,0) so we can prove AH=0A leaves it.
+    m.bus.writePhys8(0xB8001, 0x4E);
+    // Cursor (0,0); AH=0A AL='Q' BL=0x07 (ignored) CX=1.
+    loadCode(m, &.{
+        0xB8, 0x00, 0x02, 0xBB, 0x00, 0x00, 0xBA, 0x00, 0x00, 0xCD, 0x10, // cursor (0,0)
+        0xB8, 0x51, 0x0A, // MOV AX,0x0A51 (AH=0A, AL='Q')
+        0xBB, 0x07, 0x00, // BL=0x07 (must be ignored)
+        0xB9, 0x01, 0x00, // CX=1
+        0xCD, 0x10, 0xF4,
+    });
+    run(m);
+    try std.testing.expectEqual(@as(u8, 'Q'), m.bus.readPhys8(0xB8000));
+    try std.testing.expectEqual(@as(u8, 0x4E), m.bus.readPhys8(0xB8001)); // untouched
+}
+
 test "no host-time / RNG / thread in the BIOS sources (grep, Phase 9)" {
     const sources = [_][]const u8{
         @embedFile("bios.zig"),

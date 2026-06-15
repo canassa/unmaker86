@@ -30,6 +30,13 @@ const PORT_DAC_DATA: u16 = 0x3C9; // DAC data (VGAREG_DAC_DATA)
 const VRAM_SEG: u32 = 0xA000;
 const MODE13_WIDTH: u32 = 320;
 
+// Text-mode video page bases (mirror src/devices/vga.zig). The flat {char,attr}
+// cell layout — byte0 = char, byte1 = attr — at pstart + page*PAGE_SIZE +
+// (row*cols+col)*2 (dosbox int10_char.cpp:526-538; identical to spice86).
+const TEXT_COLOR_PHYS: u32 = 0xB8000; // modes 0-3 (color)
+const TEXT_MONO_PHYS: u32 = 0xB0000; // mode 7 (mono)
+const TEXT_PAGE_SIZE: u32 = 0x1000; // dosbox plength for text modes
+
 pub fn Int10(comptime Cpu: type) type {
     return struct {
         pub fn handle(bios: anytype, cpu: *Cpu, br: anytype) void {
@@ -48,6 +55,14 @@ pub fn Int10(comptime Cpu: type) type {
                     cpu.st.setReg16(2, dx);
                     cpu.st.setReg16(1, 0x0607); // standard underline cursor shape
                 },
+                0x08 => { // read char+attr at cursor -> AL=char, AH=attr
+                    const page = cpu.st.getReg8(7); // BH
+                    const c = readCharCellAtCursor(cpu, page);
+                    cpu.st.setReg8(0, c.chr); // AL
+                    cpu.st.setReg8(4, c.attr); // AH
+                },
+                0x09 => writeCharRep(cpu, true), // write char+attr at cursor x CX
+                0x0A => writeCharRep(cpu, false), // write char (attr untouched) x CX
                 0x0C => putPixel(cpu, bda), // write graphics pixel
                 0x0D => getPixel(cpu, bda), // read graphics pixel
                 0x0E => { // teletype output AL (best-effort; CON path is INT 21h)
@@ -123,6 +138,100 @@ pub fn Int10(comptime Cpu: type) type {
                 bus.writePhys16(bda_mod.BDA_PHYS + bda_mod.OFF_CURSOR_POS + page * 2, 0);
             }
             bus.writePhys8(bda_mod.BDA_PHYS + bda_mod.OFF_ACTIVE_PAGE, 0);
+        }
+
+        // ==================================================================
+        // Text-mode video — the flat {char,attr} cell helpers + the AH=08/09/0A
+        // services. All geometry comes from the LIVE BDA (cols = OFF_VIDEO_COLS,
+        // rows = OFF_NB_ROWS+1, Finding F1) — zdos has no text CurMode table, so
+        // the BDA is the single source of truth (mirrors spice86 uniformly). Each
+        // service is a host-serviced trap charged the bridge's synthetic base; the
+        // cell read/writes go through the bus to text_vram + the BDA (no hole).
+        // ==================================================================
+
+        const CharCell = struct { chr: u8, attr: u8 };
+
+        /// The physical base of the active text page (B8000 color / B0000 mono),
+        /// chosen by the BDA video mode (mode 7 = mono). The slabs are always
+        /// mapped, so this is purely "which window does the BDA mode designate".
+        inline fn textBase(cpu: *Cpu) u32 {
+            const mode = cpu.bus.readPhys8(bda_mod.BDA_PHYS + bda_mod.OFF_VIDEO_MODE);
+            return if (mode == 0x07) TEXT_MONO_PHYS else TEXT_COLOR_PHYS;
+        }
+
+        /// Live text columns from the BDA (OFF_VIDEO_COLS). Defaults sanely to 80
+        /// so a stride is never zero even if the BDA is mid-mode-set.
+        inline fn textCols(cpu: *Cpu) u16 {
+            const c = cpu.bus.readPhys16(bda_mod.BDA_PHYS + bda_mod.OFF_VIDEO_COLS);
+            return if (c == 0) 80 else c;
+        }
+
+        /// Live text rows from the BDA (OFF_NB_ROWS is rows-1, so +1).
+        inline fn textRows(cpu: *Cpu) u16 {
+            return @as(u16, cpu.bus.readPhys8(bda_mod.BDA_PHYS + bda_mod.OFF_NB_ROWS)) + 1;
+        }
+
+        /// Physical address of the {char,attr} cell at (page,row,col) — the §2.2
+        /// layout `pstart + page*PAGE_SIZE + (row*cols+col)*2` (int10_char.cpp:526).
+        inline fn cellPhys(cpu: *Cpu, page: u8, row: u16, col: u16) u32 {
+            const cols = textCols(cpu);
+            const idx: u32 = (@as(u32, row) * cols + col) * 2;
+            return textBase(cpu) + @as(u32, page) * TEXT_PAGE_SIZE + idx;
+        }
+
+        /// Write a {char,attr} cell. `useattr=false` writes the CHAR byte ONLY and
+        /// leaves the attribute byte untouched (Finding F2 — preserve the existing
+        /// color; do NOT write a default attr like spice86 does).
+        fn writeCharCell(cpu: *Cpu, page: u8, row: u16, col: u16, chr: u8, attr: u8, useattr: bool) void {
+            const at = cellPhys(cpu, page, row, col);
+            cpu.bus.writePhys8(at, chr);
+            if (useattr) cpu.bus.writePhys8(at + 1, attr);
+        }
+
+        /// Read a {char,attr} cell back (symmetric; used by AH=08 and the F4 scroll
+        /// fill-attr).
+        fn readCharCell(cpu: *Cpu, page: u8, row: u16, col: u16) CharCell {
+            const at = cellPhys(cpu, page, row, col);
+            return .{ .chr = cpu.bus.readPhys8(at), .attr = cpu.bus.readPhys8(at + 1) };
+        }
+
+        /// The BDA cursor for `page`, decomposed col = word&0xFF, row = word>>8
+        /// (Finding F7; matches AH=02 DX = (DH=row)<<8 | (DL=col)).
+        inline fn cursorRowCol(cpu: *Cpu, page: u8) struct { row: u16, col: u16 } {
+            const w = cpu.bus.readPhys16(bda_mod.BDA_PHYS + bda_mod.OFF_CURSOR_POS + @as(u16, page) * 2);
+            return .{ .row = w >> 8, .col = w & 0xFF };
+        }
+        inline fn setCursorRowCol(cpu: *Cpu, page: u8, row: u16, col: u16) void {
+            const w: u16 = (@as(u16, @truncate(row)) << 8) | @as(u16, @truncate(col));
+            cpu.bus.writePhys16(bda_mod.BDA_PHYS + bda_mod.OFF_CURSOR_POS + @as(u16, page) * 2, w);
+        }
+
+        fn readCharCellAtCursor(cpu: *Cpu, page: u8) CharCell {
+            const c = cursorRowCol(cpu, page);
+            return readCharCell(cpu, page, c.row, c.col);
+        }
+
+        /// AH=09 (useattr=true: BL=attr) / AH=0A (useattr=false: char only). Writes
+        /// AL (char) BL (attr) CX times at the CURRENT cursor WITHOUT advancing it
+        /// (int10.cpp:105-111). v1 operates on page 0 (BH ignored beyond 0, D-TM2).
+        fn writeCharRep(cpu: *Cpu, useattr: bool) void {
+            const page = cpu.st.getReg8(7); // BH
+            const chr = cpu.st.getReg8(0); // AL
+            const attr = cpu.st.getReg8(3); // BL
+            var count = cpu.st.getReg16(@intFromEnum(Reg32.ecx)); // CX
+            if (count == 0) return;
+            const cur = cursorRowCol(cpu, page);
+            const cols = textCols(cpu);
+            var row = cur.row;
+            var col = cur.col;
+            while (count > 0) : (count -= 1) {
+                writeCharCell(cpu, page, row, col, chr, attr, useattr);
+                col += 1;
+                if (col >= cols) {
+                    col = 0;
+                    row += 1;
+                }
+            }
         }
 
         // ------------------------------------------------------------------
