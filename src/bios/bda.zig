@@ -107,7 +107,13 @@ pub fn Bda(comptime Cpu: type) type {
             self.wr16(OFF_KB_BUF_END, KB_BUF_HI);
             self.wr8(OFF_VIDEO_MODE, 0x03); // 80x25 text at boot
             self.wr16(OFF_VIDEO_COLS, 80);
+            self.wr8(OFF_NB_ROWS, 24); // text rows - 1 (80x25)
             self.wr8(OFF_ACTIVE_PAGE, 0);
+            // Boot cursor shape = the text-mode underline cursor: FinishSetMode does
+            // INT10_SetCursorShape(6,7) => CURSOR_TYPE = (first<<8)|last = 0x0607
+            // (int10_modes.cpp:988). AH=03 reads this word, so set-then-get and the
+            // boot value both round-trip (int10.zig AH=01/03).
+            self.wr16(OFF_CURSOR_SHAPE, 0x0607);
             self.wr32(OFF_TICK_COUNT, 0);
             self.wr8(OFF_TICK_OVERFLOW, 0);
         }

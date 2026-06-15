@@ -49,11 +49,16 @@ pub fn Int10(comptime Cpu: type) type {
                     const dx = cpu.st.getReg16(2); // DX = row:col
                     cpu.bus.writePhys16(bda_mod.BDA_PHYS + bda_mod.OFF_CURSOR_POS + @as(u16, page) * 2, dx);
                 },
+                0x01 => { // set cursor shape: CX = start/end scanlines -> BDA
+                    cpu.bus.writePhys16(bda_mod.BDA_PHYS + bda_mod.OFF_CURSOR_SHAPE, cpu.st.getReg16(1));
+                },
                 0x03 => { // get cursor position -> DX, cursor shape -> CX
                     const page = cpu.st.getReg8(7);
                     const dx = cpu.bus.readPhys16(bda_mod.BDA_PHYS + bda_mod.OFF_CURSOR_POS + @as(u16, page) * 2);
                     cpu.st.setReg16(2, dx);
-                    cpu.st.setReg16(1, 0x0607); // standard underline cursor shape
+                    // Read the BDA cursor shape (set-then-get round-trips; was a
+                    // hardcoded 0x0607 before — the v1 fix).
+                    cpu.st.setReg16(1, cpu.bus.readPhys16(bda_mod.BDA_PHYS + bda_mod.OFF_CURSOR_SHAPE));
                 },
                 0x08 => { // read char+attr at cursor -> AL=char, AH=attr
                     const page = cpu.st.getReg8(7); // BH
@@ -61,13 +66,21 @@ pub fn Int10(comptime Cpu: type) type {
                     cpu.st.setReg8(0, c.chr); // AL
                     cpu.st.setReg8(4, c.attr); // AH
                 },
+                0x06 => scroll(cpu, false), // scroll window up (AL lines; AL=0 clear)
+                0x07 => scroll(cpu, true), // scroll window down
                 0x09 => writeCharRep(cpu, true), // write char+attr at cursor x CX
                 0x0A => writeCharRep(cpu, false), // write char (attr untouched) x CX
                 0x0C => putPixel(cpu, bda), // write graphics pixel
                 0x0D => getPixel(cpu, bda), // read graphics pixel
-                0x0E => { // teletype output AL (best-effort; CON path is INT 21h)
-                    // No VGA text device modeled (mode 13h is graphics); faithful
-                    // no-op for the framebuffer. The DOS CON path carries text.
+                0x0E => { // teletype output AL (text mode: useattr=false, F2)
+                    // Graphics modes (e.g. 13h) keep the framebuffer no-op as
+                    // before — v1 text services are text-mode only (§3.2 deferral).
+                    if (bda.videoMode() == 0x13) {
+                        // no-op for the graphics framebuffer
+                    } else {
+                        const page = cpu.bus.readPhys8(bda_mod.BDA_PHYS + bda_mod.OFF_ACTIVE_PAGE);
+                        teletype(cpu, page, cpu.st.getReg8(0), cpu.st.getReg8(3), false); // AL=char, BL=attr
+                    }
                 },
                 0x0F => { // get current video mode -> AL=mode, AH=cols, BH=page
                     cpu.st.setReg8(0, bda.videoMode());
@@ -211,9 +224,137 @@ pub fn Int10(comptime Cpu: type) type {
             return readCharCell(cpu, page, c.row, c.col);
         }
 
-        /// AH=09 (useattr=true: BL=attr) / AH=0A (useattr=false: char only). Writes
-        /// AL (char) BL (attr) CX times at the CURRENT cursor WITHOUT advancing it
-        /// (int10.cpp:105-111). v1 operates on page 0 (BH ignored beyond 0, D-TM2).
+        /// Scroll/clear a text window (AH=06/07 → INT10_ScrollWindow,
+        /// int10_char.cpp:193-294). Inclusive upper-left (rul,cul) / lower-right
+        /// (rlr,clr); `rlr`/`clr` are clamped to rows-1/cols-1 and the column range
+        /// is treated as inclusive `[cul,clr]` (dosbox's internal `clr++` is its
+        /// exclusive-loop convention — F3). `nlines > 0` scrolls content UP by
+        /// nlines (the bottom rows are freed + filled), `< 0` scrolls content DOWN,
+        /// `== 0` clears the whole window. Exposed rows are filled with
+        /// (attr<<8 | ' '). Text-mode only for v1 (page 0, D-TM2).
+        fn scrollWindow(cpu: *Cpu, page: u8, rul_in: u8, cul: u8, rlr_in: u8, clr_in: u8, nlines_in: i32, attr: u8) void {
+            const cols = textCols(cpu);
+            const rows = textRows(cpu);
+            if (rul_in > rlr_in) return;
+            if (cul > clr_in) return;
+            var rlr = rlr_in;
+            var clr = clr_in;
+            if (rlr >= rows) rlr = @intCast(rows - 1);
+            if (clr >= cols) clr = @intCast(cols - 1);
+            // The number of cells per row in the window is (clr - cul + 1).
+            const fill_word: u16 = (@as(u16, attr) << 8) | ' ';
+            const base = textBase(cpu) + @as(u32, page) * TEXT_PAGE_SIZE;
+
+            const fillRow = struct {
+                fn run(c: *Cpu, b: u32, ncols: u16, row: u16, cl: u8, cr: u8, fw: u16) void {
+                    var x: u16 = cl;
+                    while (x <= cr) : (x += 1) {
+                        c.bus.writePhys16(b + (@as(u32, row) * ncols + x) * 2, fw);
+                    }
+                }
+            }.run;
+            const copyRow = struct {
+                fn run(c: *Cpu, b: u32, ncols: u16, rold: u16, rnew: u16, cl: u8, cr: u8) void {
+                    var x: u16 = cl;
+                    while (x <= cr) : (x += 1) {
+                        const v = c.bus.readPhys16(b + (@as(u32, rold) * ncols + x) * 2);
+                        c.bus.writePhys16(b + (@as(u32, rnew) * ncols + x) * 2, v);
+                    }
+                }
+            }.run;
+
+            const nlines = nlines_in;
+            if (nlines == 0) {
+                // Clear the whole window: fill rows [rul, rlr].
+                var r: u16 = rul_in;
+                while (r <= rlr) : (r += 1) fillRow(cpu, base, cols, r, cul, clr, fill_word);
+                return;
+            }
+            if (nlines > 0) {
+                // Scroll UP by nlines: row r <- row r+nlines, for r in [rul, rlr-nlines].
+                const n: u16 = @intCast(nlines);
+                if (n > rlr - rul_in) {
+                    // Scrolls everything off — just clear the window.
+                    var r: u16 = rul_in;
+                    while (r <= rlr) : (r += 1) fillRow(cpu, base, cols, r, cul, clr, fill_word);
+                    return;
+                }
+                var r: u16 = rul_in;
+                while (r + n <= rlr) : (r += 1) copyRow(cpu, base, cols, r + n, r, cul, clr);
+                // Fill the exposed bottom n rows.
+                var fr: u16 = rlr - n + 1;
+                while (fr <= rlr) : (fr += 1) fillRow(cpu, base, cols, fr, cul, clr, fill_word);
+            } else {
+                // Scroll DOWN by |nlines|: row r <- row r-|nlines| from the bottom up.
+                const n: u16 = @intCast(-nlines);
+                if (n > rlr - rul_in) {
+                    var r: u16 = rul_in;
+                    while (r <= rlr) : (r += 1) fillRow(cpu, base, cols, r, cul, clr, fill_word);
+                    return;
+                }
+                var r: u16 = rlr;
+                while (r >= rul_in + n) : (r -= 1) copyRow(cpu, base, cols, r - n, r, cul, clr);
+                // Fill the exposed top n rows.
+                var fr: u16 = rul_in;
+                while (fr < rul_in + n) : (fr += 1) fillRow(cpu, base, cols, fr, cul, clr, fill_word);
+            }
+        }
+
+        /// Teletype output of one char to the active page (AH=0E text mode;
+        /// int10_char.cpp:743-810). Honors BS/CR/LF + default-advance + col-wrap +
+        /// end-of-screen scroll. `useattr=false` (AH=0E) writes the char byte only
+        /// (F2); the AH=13 path passes `useattr=true`. End-of-screen scroll fills
+        /// the new bottom line with the attribute AT THE CURSOR (F4). BEL (chr 7)
+        /// is a deterministic SILENT no-op (D-TM-BEL — never dosbox's 333 ms
+        /// PIC_FullIndex busy-wait). Reads/writes the BDA cursor (col=lo/row=hi, F7).
+        fn teletype(cpu: *Cpu, page: u8, chr: u8, attr: u8, useattr: bool) void {
+            const cols = textCols(cpu);
+            const rows = textRows(cpu);
+            const cur = cursorRowCol(cpu, page);
+            var row = cur.row;
+            var col = cur.col;
+            switch (chr) {
+                7 => return, // BEL: deterministic silent no-op (cursor unchanged)
+                8 => if (col > 0) {
+                    col -= 1;
+                },
+                '\r' => col = 0,
+                '\n' => row += 1, // dosbox does NOT reset col on LF
+                else => {
+                    writeCharCell(cpu, page, row, col, chr, attr, useattr);
+                    col += 1;
+                },
+            }
+            if (col == cols) {
+                col = 0;
+                row += 1;
+            }
+            if (row == rows) {
+                // End-of-screen scroll: fill the new bottom line with the attr at
+                // the cursor (F4). dosbox reads INT10_ReadCharAttr at the BDA cursor
+                // (still the ENTRY position — SetCursorPos runs at the end), so we
+                // read the entry cursor cell's attr, not the advanced local cell.
+                const fill = readCharCellAtCursor(cpu, page).attr;
+                scrollWindow(cpu, page, 0, 0, @intCast(rows - 1), @intCast(cols - 1), 1, fill);
+                row -= 1;
+            }
+            setCursorRowCol(cpu, page, row, col);
+        }
+
+        /// AH=06 (scroll up) / AH=07 (scroll down). AL=line count (0 ⇒ clear the
+        /// whole window), BH=fill attribute, CH/CL = upper-left row/col, DH/DL =
+        /// inclusive lower-right row/col (int10.cpp:96-100). v1 = page 0 (D-TM2).
+        fn scroll(cpu: *Cpu, down: bool) void {
+            const al = cpu.st.getReg8(0); // line count
+            const bh = cpu.st.getReg8(7); // fill attribute
+            const cul = cpu.st.getReg8(1); // CL
+            const rul = cpu.st.getReg8(5); // CH
+            const clr = cpu.st.getReg8(2); // DL
+            const rlr = cpu.st.getReg8(6); // DH
+            const n: i32 = if (down) -@as(i32, al) else @as(i32, al);
+            scrollWindow(cpu, 0, rul, cul, rlr, clr, n, bh);
+        }
+
         fn writeCharRep(cpu: *Cpu, useattr: bool) void {
             const page = cpu.st.getReg8(7); // BH
             const chr = cpu.st.getReg8(0); // AL

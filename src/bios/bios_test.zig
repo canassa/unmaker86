@@ -208,6 +208,118 @@ test "INT 10h AH=0A writes char only, preserving the attribute byte (F2)" {
     try std.testing.expectEqual(@as(u8, 0x4E), m.bus.readPhys8(0xB8001)); // untouched
 }
 
+test "INT 10h AH=0E teletype writes cells, advances + wraps the cursor" {
+    const alloc = std.testing.allocator;
+    const m = try boot(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    // Cursor (0,0); teletype 'H','i'. Cells (0,0)='H', (0,1)='i'; cursor -> (0,2).
+    loadCode(m, &.{
+        0xB8, 0x00, 0x02, 0xBB, 0x00, 0x00, 0xBA, 0x00, 0x00, 0xCD, 0x10, // set cursor (0,0)
+        0xB8, 0x48, 0x0E, 0xCD, 0x10, // MOV AX,0x0E48 ('H'); INT 10h
+        0xB8, 0x69, 0x0E, 0xCD, 0x10, // MOV AX,0x0E69 ('i'); INT 10h
+        0xF4,
+    });
+    run(m);
+    try std.testing.expectEqual(@as(u8, 'H'), m.bus.readPhys8(0xB8000)); // cell (0,0)
+    try std.testing.expectEqual(@as(u8, 'i'), m.bus.readPhys8(0xB8000 + 2)); // cell (0,1)
+    // Cursor word at 0040:0050 = (row<<8)|col = 0x0002.
+    try std.testing.expectEqual(@as(u16, 0x0002), m.bus.readPhys16(0x400 + 0x50));
+
+    // CR resets col to 0; LF advances row (col unchanged) — on a fresh machine
+    // (the previous one has halted; loadCode does not clear the halt flag).
+    const m2 = try boot(alloc);
+    defer {
+        m2.deinit();
+        alloc.destroy(m2);
+    }
+    loadCode(m2, &.{
+        0xB8, 0x00, 0x02, 0xBB, 0x00, 0x00, 0xBA, 0x02, 0x00, 0xCD, 0x10, // cursor (0,2)
+        0xB8, 0x0D, 0x0E, 0xCD, 0x10, // CR -> col=0
+        0xB8, 0x0A, 0x0E, 0xCD, 0x10, // LF -> row=1
+        0xF4,
+    });
+    run(m2);
+    try std.testing.expectEqual(@as(u16, 0x0100), m2.bus.readPhys16(0x400 + 0x50)); // (row=1,col=0)
+}
+
+test "INT 10h AH=0E end-of-screen scroll moves rows up, fills bottom with cursor attr" {
+    const alloc = std.testing.allocator;
+    const m = try boot(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    // Mark cell (1,0) so after one scroll-up it lands at (0,0). Put cursor at the
+    // last row, last col with a known attr (0x1F) so the LF-driven scroll fills the
+    // new bottom row with 0x1F, and the cursor stays on the last row.
+    // Pre-write cell (1,0) = 'B' attr 0x07.
+    m.bus.writePhys8(0xB8000 + (1 * 80 + 0) * 2, 'B');
+    m.bus.writePhys8(0xB8000 + (1 * 80 + 0) * 2 + 1, 0x07);
+    // Set cursor (24,0) with attr 0x1F via AH=09 (write a space attr there), then
+    // teletype LF to force the scroll (row 24 -> 25 == nrows).
+    loadCode(m, &.{
+        0xB8, 0x00, 0x02, 0xBB, 0x00, 0x00, 0xBA, 0x00, 0x18, 0xCD, 0x10, // cursor (24,0)
+        0xB8, 0x20, 0x09, 0xBB, 0x1F, 0x00, 0xB9, 0x01, 0x00, 0xCD, 0x10, // AH=09 ' ' attr 0x1F at (24,0)
+        0xB8, 0x0A, 0x0E, 0xCD, 0x10, // LF -> row 25 -> scroll up by 1
+        0xF4,
+    });
+    run(m);
+    // Old row 1 ('B') is now at row 0.
+    try std.testing.expectEqual(@as(u8, 'B'), m.bus.readPhys8(0xB8000 + (0 * 80 + 0) * 2));
+    // The new bottom row (24) is filled with space + the cursor's attr (0x1F).
+    try std.testing.expectEqual(@as(u8, ' '), m.bus.readPhys8(0xB8000 + (24 * 80 + 0) * 2));
+    try std.testing.expectEqual(@as(u8, 0x1F), m.bus.readPhys8(0xB8000 + (24 * 80 + 0) * 2 + 1));
+    // Cursor stayed on the last row (row 24), col 0 (LF keeps col).
+    try std.testing.expectEqual(@as(u16, (24 << 8) | 0), m.bus.readPhys16(0x400 + 0x50));
+}
+
+test "INT 10h AH=06 scroll-up window + AH=07 clear; AH=01/03 cursor-shape round-trip" {
+    const alloc = std.testing.allocator;
+    const m = try boot(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    // Fill cells (0,0)='0', (1,0)='1', (2,0)='2'. Scroll the window rows [0..2]
+    // up by 1 (AH=06 AL=1): row1->row0, row2->row1, row2 filled with BH attr+space.
+    m.bus.writePhys8(0xB8000 + (0 * 80) * 2, '0');
+    m.bus.writePhys8(0xB8000 + (1 * 80) * 2, '1');
+    m.bus.writePhys8(0xB8000 + (2 * 80) * 2, '2');
+    // AH=06 AL=1 BH=0x4E CH=0 CL=0 DH=2 DL=0 (window rows 0..2, col 0..0).
+    loadCode(m, &.{
+        0xB8, 0x01, 0x06, // MOV AX,0x0601 (AH=06 AL=1)
+        0xBB, 0x00, 0x4E, // MOV BX,0x4E00 (BH=0x4E fill attr)
+        0xB9, 0x00, 0x00, // MOV CX,0x0000 (CH=0 CL=0 upper-left)
+        0xBA, 0x00, 0x02, // MOV DX,0x0200 (DH=2 DL=0 lower-right)
+        0xCD, 0x10, 0xF4,
+    });
+    run(m);
+    try std.testing.expectEqual(@as(u8, '1'), m.bus.readPhys8(0xB8000 + (0 * 80) * 2)); // row1 -> row0
+    try std.testing.expectEqual(@as(u8, '2'), m.bus.readPhys8(0xB8000 + (1 * 80) * 2)); // row2 -> row1
+    try std.testing.expectEqual(@as(u8, ' '), m.bus.readPhys8(0xB8000 + (2 * 80) * 2)); // filled
+    try std.testing.expectEqual(@as(u8, 0x4E), m.bus.readPhys8(0xB8000 + (2 * 80) * 2 + 1)); // fill attr
+
+    // AH=01 set cursor shape CX=0x0A0B, then AH=03 read it back in CX.
+    const m2 = try boot(alloc);
+    defer {
+        m2.deinit();
+        alloc.destroy(m2);
+    }
+    loadCode(m2, &.{
+        0xB8, 0x01, 0x01, // MOV AX,0x0101 (AH=01)
+        0xB9, 0x0B, 0x0A, // MOV CX,0x0A0B
+        0xCD, 0x10,
+        0xB8, 0x03, 0x03, // MOV AX,0x0303 (AH=03)
+        0xBB, 0x00, 0x00, // BH=0
+        0xCD, 0x10, 0xF4,
+    });
+    run(m2);
+    try std.testing.expectEqual(@as(u16, 0x0A0B), m2.cpu.st.getReg16(1)); // CX = the set shape
+}
+
 test "no host-time / RNG / thread in the BIOS sources (grep, Phase 9)" {
     const sources = [_][]const u8{
         @embedFile("bios.zig"),
