@@ -131,18 +131,42 @@ test "#6 disarmed transparency: controller w/ no bps == bare run_loop" {
 
 test "#9 terminal precedence: halted_forever beats a simultaneously-true cycle bp" {
     const alloc = std.testing.allocator;
+
+    // First find H = the exact cycle at which this program reaches its permanent
+    // HLT, from a bare reference run (no breakpoints). The debugger never perturbs
+    // the run, so H is identical on the breakpointed machine below.
+    const ref = try makeMachine(alloc);
+    defer destroy(alloc, ref);
+    loadNopProg(ref);
+    var rctrl = Controller.init(ref);
+    try std.testing.expectEqual(
+        @as(std.meta.Tag(debug.StopReason), .halted_forever),
+        std.meta.activeTag(rctrl.runUntilEvent(100_000)),
+    );
+    const H: u64 = ref.cpu.st.cycles;
+
+    // Now arm a cycle bp at EXACTLY H. The cycle condition (cycles >= H, see
+    // breakpoints.matches) first becomes true at the very boundary the machine
+    // also goes permanently halted — the two are SIMULTANEOUSLY satisfied. The
+    // controller checks terminals before the breakpoint scan, so it must report
+    // `halted_forever`. If that precedence were inverted, this same run would
+    // return `.breakpoint` instead — so this test now genuinely guards precedence.
     const m = try makeMachine(alloc);
     defer destroy(alloc, m);
     loadNopProg(m);
     var ctrl = Controller.init(m);
-    // A cycle bp at 0 is always satisfiable; the program HLTs permanently. The
-    // controller must report the terminal (halted_forever), not the breakpoint.
-    // We run far enough to reach HLT; the cycle bp at a high value never triggers
-    // before HLT, so set it past the HLT cycle but still reachable... instead use
-    // at_cycle huge so it never fires; the terminal must surface.
-    _ = try ctrl.addBreakpoint(.{ .cycle = .{ .at_cycle = 1_000_000 } }, false);
+    const id = try ctrl.addBreakpoint(.{ .cycle = .{ .at_cycle = H } }, false);
     const r = ctrl.runUntilEvent(100_000);
+
     try std.testing.expectEqual(@as(std.meta.Tag(debug.StopReason), .halted_forever), std.meta.activeTag(r));
+    // Prove the breakpoint was genuinely co-eligible at the stop boundary (its
+    // cycle condition holds), so the terminal really did win over a *matching*
+    // breakpoint rather than over one that simply never fired.
+    try std.testing.expect(m.cpu.st.cycles >= H);
+    // And the persistent bp was NOT consumed — the terminal short-circuited the
+    // scan, so it is still armed.
+    try std.testing.expect((try ctrl.getBreakpoint(id)).enabled);
+    try std.testing.expectEqual(@as(u32, 1), ctrl.set.active_count);
 }
 
 test "#8 tie-break determinism: lowest id reported; all matching one-shots consumed" {
