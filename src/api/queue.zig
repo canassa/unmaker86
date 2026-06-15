@@ -106,6 +106,11 @@ pub const Command = union(enum) {
     /// has printed so far. Side-effect-free (no clear-on-read); the worker copies the
     /// device buffer into the response POD.
     console_get: void,
+    /// Read the active VGA text page (B8000/B0000 cells) — the side-effect-free
+    /// screen grid for `GET /api/screen`. A `void` command: the `?attrs=1` flag is
+    /// parsed server-side and drives JSON serialization only (Finding 5), so the
+    /// worker always fills the full cells buffer.
+    screen_get: void,
     status: void,
     reset: void,
     load: LoadCmd,
@@ -184,6 +189,21 @@ pub const ConsoleResult = struct {
     bytes: [MAX_CONSOLE]u8 = undefined,
 };
 
+/// The active text page's cell grid, copied inline (80x25x2 = 4000 bytes of flat
+/// {char,attr} cells). Pointer-free POD: the worker fills `cells` from
+/// `Controller.screen(...)` so server.zig never reads machine state off-worker.
+pub const MAX_SCREEN_CELLS = 80 * 25 * 2; // 4000
+pub const ScreenResult = struct {
+    cols: u16 = 0,
+    rows: u16 = 0,
+    mode: u8 = 0,
+    active_page: u8 = 0,
+    cursor_row: u16 = 0,
+    cursor_col: u16 = 0,
+    len: u32 = 0, // valid bytes in `cells` (= cols*rows*2)
+    cells: [MAX_SCREEN_CELLS]u8 = undefined,
+};
+
 pub const StatusResult = struct {
     runnable: bool,
     terminated: bool,
@@ -223,6 +243,7 @@ pub const Response = union(enum) {
     stack: StackResult,
     status: StatusResult,
     console: ConsoleResult,
+    screen: ScreenResult,
     regions: RegionsResult,
     /// A typed error. The handler maps `code` → HTTP status.
     err: ErrCode,

@@ -118,6 +118,7 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource) Respons
 
         // ---- session -------------------------------------------------------
         .console_get => consoleResp(ctrl),
+        .screen_get => screenResp(ctrl),
         .status => statusResp(ctrl),
         .reset => blk: {
             ctrl.reset() catch return .{ .err = .load_failed };
@@ -271,6 +272,23 @@ fn consoleResp(ctrl: *Controller) Response {
     @memcpy(res.bytes[0..n], out[0..n]);
     res.len = @intCast(n);
     return .{ .console = res };
+}
+
+/// Fill the full text-page cell grid (side-effect-free: `Controller.screen` peeks
+/// guest RAM via the bus peek path, never a device read handler). The `?attrs`
+/// decision is deferred to serialization (Finding 5), so the worker always copies
+/// the complete cells buffer here.
+fn screenResp(ctrl: *Controller) Response {
+    var res: q.ScreenResult = .{};
+    const view = ctrl.screen(res.cells[0..]);
+    res.cols = view.cols;
+    res.rows = view.rows;
+    res.mode = view.mode;
+    res.active_page = view.active_page;
+    res.cursor_row = view.cursor_row;
+    res.cursor_col = view.cursor_col;
+    res.len = @intCast(view.cells.len);
+    return .{ .screen = res };
 }
 
 fn statusResp(ctrl: *Controller) Response {

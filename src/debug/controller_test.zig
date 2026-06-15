@@ -329,6 +329,68 @@ test "#13 side-effect-free inspection leaves machine.snapshot() byte-identical (
     try std.testing.expectEqualSlices(u8, before_vram, m.vga.vram);
 }
 
+test "#15 screen() renders the active text page grid + cursor (BDA-driven)" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    m.post(); // initDefaults: mode 3, 80 cols, OFF_NB_ROWS=24 (80x25 color text)
+
+    // Write 'H','i' into cells (0,0),(0,1) of the color page (B8000), and set the
+    // cursor to (row=2,col=7) via the BDA cursor word at 0040:0050.
+    m.bus.writePhys8(0xB8000, 'H');
+    m.bus.writePhys8(0xB8000 + 1, 0x07);
+    m.bus.writePhys8(0xB8000 + 2, 'i');
+    m.bus.writePhys8(0xB8000 + 3, 0x1F);
+    m.bus.writePhys16(0x400 + 0x50, (2 << 8) | 7); // cursor (2,7)
+
+    var ctrl = Controller.init(m);
+    var buf: [80 * 25 * 2]u8 = undefined;
+    const view = ctrl.screen(&buf);
+
+    try std.testing.expectEqual(@as(u16, 80), view.cols);
+    try std.testing.expectEqual(@as(u16, 25), view.rows);
+    try std.testing.expectEqual(@as(u8, 0x03), view.mode);
+    try std.testing.expectEqual(@as(u16, 2), view.cursor_row);
+    try std.testing.expectEqual(@as(u16, 7), view.cursor_col);
+    try std.testing.expectEqual(@as(usize, 80 * 25 * 2), view.cells.len);
+    // The first cell's char/attr are present in the raw cells.
+    try std.testing.expectEqual(@as(u8, 'H'), view.cells[0]);
+    try std.testing.expectEqual(@as(u8, 0x07), view.cells[1]);
+    try std.testing.expectEqual(@as(u8, 'i'), view.cells[2]);
+    try std.testing.expectEqual(@as(u8, 0x1F), view.cells[3]);
+}
+
+test "#16 screen() is side-effect-free: machine.snapshot() byte-identical before/after" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    m.post();
+    loadNopProg(m);
+
+    // Dirty the text page so the peek reads real device-backed bytes.
+    m.bus.writePhys8(0xB8000, 'A');
+    m.bus.writePhys8(0xB0000, 'M');
+
+    const before = m.snapshot();
+    const before_ram = try alloc.dupe(u8, m.bus.ram);
+    defer alloc.free(before_ram);
+    const before_text = try alloc.dupe(u8, m.vga.text_vram);
+    defer alloc.free(before_text);
+    const before_text_mono = try alloc.dupe(u8, m.vga.text_vram_mono);
+    defer alloc.free(before_text_mono);
+
+    var ctrl = Controller.init(m);
+    var buf: [80 * 25 * 2]u8 = undefined;
+    _ = ctrl.screen(&buf);
+
+    const after = m.snapshot();
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&before.cpu_state), std.mem.asBytes(&after.cpu_state));
+    try std.testing.expectEqualDeep(before.vga, after.vga);
+    try std.testing.expectEqualSlices(u8, before_ram, m.bus.ram);
+    try std.testing.expectEqualSlices(u8, before_text, m.vga.text_vram);
+    try std.testing.expectEqualSlices(u8, before_text_mono, m.vga.text_vram_mono);
+}
+
 /// Counting allocator (mirrors machine/determinism_test.zig): records every
 /// alloc/free so the control path can be asserted alloc-free.
 const CountingAllocator = struct {

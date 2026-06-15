@@ -276,6 +276,14 @@ pub const Server = struct {
             // program has printed). No clear-on-read — a read never perturbs state.
             return self.submitAndRespond(req, .console_get);
         }
+        if (std.mem.eql(u8, path, "/api/screen")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            // Side-effect-free read of the VGA text page (B8000/B0000 cell grid).
+            // `?attrs=1` is parsed server-side (Finding 5): the command stays void;
+            // the flag only decides whether the JSON carries the attribute array.
+            const want_attrs = (self.queryU32(query, "attrs") orelse 0) != 0;
+            return self.submitAndRespondScreen(req, want_attrs);
+        }
         if (std.mem.eql(u8, path, "/api/memory-regions")) {
             if (method != .GET) return self.methodNotAllowed(req);
             return self.submitAndRespond(req, .mem_regions);
@@ -659,6 +667,18 @@ pub const Server = struct {
         self.serializeResponse(req, resp);
     }
 
+    /// Submit the `void` screen command and serialize with the server-parsed
+    /// `?attrs` flag (the flag is NOT part of the command — Finding 5).
+    fn submitAndRespondScreen(self: *Server, req: *http.Server.Request, want_attrs: bool) void {
+        var ctx: q.RequestCtx = .{ .cmd = .screen_get };
+        const resp = self.queue.submit(&ctx);
+        switch (resp) {
+            .screen => |sr| self.respondScreen(req, sr, want_attrs),
+            .err => |code| self.respondErrCode(req, code),
+            else => self.respondError(req, .service_unavailable, "internal", "unexpected screen response"),
+        }
+    }
+
     fn serializeResponse(self: *Server, req: *http.Server.Request, resp: q.Response) void {
         switch (resp) {
             .err => |code| self.respondErrCode(req, code),
@@ -676,6 +696,9 @@ pub const Server = struct {
             .stack => |s| self.respondStack(req, s),
             .status => |st| self.respondValue(req, .ok, st),
             .console => |cr| self.respondConsole(req, cr),
+            // Direct `.screen` responses default to no attributes; the dedicated
+            // `/api/screen` route uses `submitAndRespondScreen` to pass `?attrs`.
+            .screen => |sr| self.respondScreen(req, sr, false),
             .regions => |rg| self.respondRegions(req, rg),
         }
     }
@@ -726,6 +749,61 @@ pub const Server = struct {
         const hex = wire.hexEncode(&hex_buf, cr.bytes[0..cr.len]) catch return self.respondError(req, .service_unavailable, "internal", "encode failed");
         var w = std.Io.Writer.fixed(self.resp_buf[0..]);
         w.print("{{\"len\":{d},\"data\":\"{s}\"}}", .{ cr.len, hex }) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
+        self.respondJson(req, .ok, w.buffered());
+    }
+
+    /// Serialize a text-screen grid (§4.1). `text` = `rows` rows joined by '\n',
+    /// each row = the `cols` cell CHARACTERS (cell byte0), JSON-escaped (raw CP437
+    /// bytes survive; the consumer decodes glyphs). `attrs` (the cell byte1 array,
+    /// lowercase hex) is emitted only when `want_attrs` is set (D-TM4); otherwise
+    /// the field is null. Cursor/mode/cols/rows come straight from the BDA scalars.
+    fn respondScreen(self: *Server, req: *http.Server.Request, sr: q.ScreenResult, want_attrs: bool) void {
+        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
+        const cols = sr.cols;
+        const rows = sr.rows;
+        const ok = blk: {
+            w.print("{{\"cols\":{d},\"rows\":{d},\"mode\":{d},\"cursor\":{{\"row\":{d},\"col\":{d},\"page\":{d}}},\"text\":", .{
+                cols, rows, sr.mode, sr.cursor_row, sr.cursor_col, sr.active_page,
+            }) catch break :blk false;
+            // Build the text grid: extract each cell's char byte (even indices),
+            // newline-separate the rows, then JSON-escape the whole string.
+            var text_buf: [q.MAX_SCREEN_CELLS]u8 = undefined; // chars + newlines fit
+            var tlen: usize = 0;
+            var r: u16 = 0;
+            while (r < rows) : (r += 1) {
+                var c: u16 = 0;
+                while (c < cols) : (c += 1) {
+                    const idx = (@as(usize, r) * cols + c) * 2;
+                    if (idx < sr.len) {
+                        text_buf[tlen] = sr.cells[idx];
+                        tlen += 1;
+                    }
+                }
+                if (r + 1 < rows) {
+                    text_buf[tlen] = '\n';
+                    tlen += 1;
+                }
+            }
+            std.json.Stringify.value(text_buf[0..tlen], wire.stringify_options, &w) catch break :blk false;
+            if (want_attrs) {
+                // Parallel attribute array as lowercase hex (cell byte1, in row-major
+                // order — cols*rows bytes).
+                w.writeAll(",\"attrs\":\"") catch break :blk false;
+                var i: usize = 1;
+                while (i < sr.len) : (i += 2) {
+                    const hi = "0123456789abcdef"[sr.cells[i] >> 4];
+                    const lo = "0123456789abcdef"[sr.cells[i] & 0x0F];
+                    w.writeByte(hi) catch break :blk false;
+                    w.writeByte(lo) catch break :blk false;
+                }
+                w.writeAll("\"") catch break :blk false;
+            } else {
+                w.writeAll(",\"attrs\":null") catch break :blk false;
+            }
+            w.writeAll("}") catch break :blk false;
+            break :blk true;
+        };
+        if (!ok) return self.respondError(req, .service_unavailable, "internal", "response too large");
         self.respondJson(req, .ok, w.buffered());
     }
 

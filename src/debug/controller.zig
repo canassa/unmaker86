@@ -649,6 +649,61 @@ pub const Controller = struct {
         return self.m.dos.dev_table.con.output();
     }
 
+    /// A side-effect-free snapshot of the active text page — the cols×rows grid of
+    /// flat {char,attr} cells plus the BDA scalars. Used by `GET /api/screen`. The
+    /// `cells` buffer is filled via the pure peek path (`peekBlock` → the VGA text
+    /// handler's `peek8`), so the read NEVER perturbs the machine (determinism).
+    pub const ScreenView = struct {
+        cols: u16,
+        rows: u16,
+        mode: u8,
+        active_page: u8,
+        cursor_row: u16,
+        cursor_col: u16,
+        /// The raw cell bytes (char,attr interleaved): `cols*rows*2` bytes written
+        /// into the caller-provided `dst`. `cells` borrows that prefix.
+        cells: []const u8,
+    };
+
+    /// Read the active text page into `dst` (≥ cols*rows*2 bytes). Pure peek of the
+    /// BDA mode/cols/rows/cursor/active-page + the text-page cells at the BDA-implied
+    /// base (B8000 color, or B0000 if mode 7). Mirrors `console()` (a pure read).
+    pub fn screen(self: *const Controller, dst: []u8) ScreenView {
+        // BDA video fields (linear 0x400; offsets per src/bios/bda.zig).
+        const BDA: u32 = 0x400;
+        const mode = self.m.bus.peekPhys8(BDA + 0x49); // OFF_VIDEO_MODE
+        var cols: u16 = self.peekU16(BDA + 0x4A); // OFF_VIDEO_COLS
+        if (cols == 0) cols = 80;
+        const rows: u16 = @as(u16, self.m.bus.peekPhys8(BDA + 0x84)) + 1; // OFF_NB_ROWS+1
+        const active_page = self.m.bus.peekPhys8(BDA + 0x62); // OFF_ACTIVE_PAGE
+        const cursor_word = self.peekU16(BDA + 0x50 + @as(u32, active_page) * 2); // OFF_CURSOR_POS
+
+        // Active text base: B0000 for mode 7 (mono), else B8000 (color). One page =
+        // 0x1000 bytes (devices.vga.TEXT_PAGE_SIZE).
+        const base: u32 = if (mode == 0x07) 0xB0000 else 0xB8000;
+        const page_base = base + @as(u32, active_page) * 0x1000;
+
+        const cell_bytes: usize = @as(usize, cols) * rows * 2;
+        const n = @min(cell_bytes, dst.len);
+        self.m.bus.peekBlock(page_base, dst[0..n]);
+
+        return .{
+            .cols = cols,
+            .rows = rows,
+            .mode = mode,
+            .active_page = active_page,
+            .cursor_row = cursor_word >> 8,
+            .cursor_col = cursor_word & 0xFF,
+            .cells = dst[0..n],
+        };
+    }
+
+    inline fn peekU16(self: *const Controller, phys: u32) u16 {
+        var b: [2]u8 = undefined;
+        self.m.bus.peekBlock(phys, &b);
+        return @as(u16, b[0]) | (@as(u16, b[1]) << 8);
+    }
+
     /// Side-effect-free read of up to `out.len` 16-bit words from SS:SP upward
     /// (no SP mutation). Returns the filled prefix.
     pub fn peekStack(self: *const Controller, out: []u16) []u16 {

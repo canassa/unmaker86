@@ -315,6 +315,24 @@ pub const Session = struct {
         return self.get("/api/console", Console);
     }
 
+    /// `GET /api/screen` — the active VGA text page as a `{cols,rows,mode,cursor,
+    /// text,attrs}` object. `text` is the cols×rows grid (rows joined by '\n'),
+    /// `attrs` is null unless `?attrs=1` was requested. Pass `attrs=true` for the
+    /// attribute array (lowercase hex).
+    pub const ScreenCursor = struct { row: u16, col: u16, page: u8 };
+    pub const Screen = struct {
+        cols: u16,
+        rows: u16,
+        mode: u8,
+        cursor: ScreenCursor,
+        text: []const u8,
+        attrs: ?[]const u8 = null,
+    };
+    pub fn screen(self: *Session, attrs: bool) !Screen {
+        const path = if (attrs) "/api/screen?attrs=1" else "/api/screen";
+        return self.get(path, Screen);
+    }
+
     /// `GET /api/console`, hex-decoded into `out`; returns the decoded prefix (in
     /// `out`). The CON output as the raw bytes the guest printed.
     pub fn consoleBytes(self: *Session, out: []u8) ![]u8 {
