@@ -59,6 +59,16 @@ pub const PageKind = enum(u8) {
     mmio,
     /// No backing; reads return `unmapped_fill`, writes are dropped (B7).
     unmapped,
+    /// A debugger memory watchpoint covers this page (M1 Phase 5). The access is
+    /// a FAITHFUL PASSTHROUGH to the page's underlying kind (recorded in the bus's
+    /// parallel `watch_prior` table) — identical bytes, identical cost — then it is
+    /// range-checked against the bus's small watch table and records a read-only
+    /// hit breadcrumb. NOT on the RAM fast path: `fastRamSpan` excludes it so every
+    /// byte of a watched page is checked individually. Charges ZERO extra cycles
+    /// (the ledger is `baseFor(dec.key)` at dispatch, independent of bus routing),
+    /// so arming a watchpoint is invisible to the guest until it deliberately
+    /// stops you (the determinism prime directive — cycle-neutral by construction).
+    watched,
 };
 
 // Size locks (memory-and-performance.md §5c — lock the layout so a refactor

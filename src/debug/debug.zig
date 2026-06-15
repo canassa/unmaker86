@@ -41,5 +41,6 @@ test {
     _ = @import("controller_test.zig");
     _ = @import("stepping_test.zig");
     _ = @import("interrupt_test.zig");
+    _ = @import("watchpoint_test.zig");
     _ = @import("determinism_test.zig");
 }

@@ -29,10 +29,23 @@ const BreakpointKind = bp.BreakpointKind;
 const Breakpoint = bp.Breakpoint;
 const Error = bp.Error;
 
-const memmap = @import("bus").memmap;
+const bus_mod = @import("bus");
+const memmap = bus_mod.memmap;
+const WatchAccess = bus_mod.WatchAccess;
+const AccessKind = bp.AccessKind;
 
 const SS = @intFromEnum(Seg.ss);
 const ESP = @intFromEnum(Reg32.esp);
+
+/// Map the debug-layer `AccessKind` onto the bus `WatchAccess` (1:1 by value; the
+/// bus cannot import `debug`, so the enum is duplicated and bridged here).
+fn toWatchAccess(a: AccessKind) WatchAccess {
+    return switch (a) {
+        .read => .read,
+        .write => .write,
+        .access => .access,
+    };
+}
 
 /// The rich, debug-layer stop reason (a superset of `Machine.StopReason`). It is
 /// part of the observable, reproducible result, so its production order is fixed
@@ -123,6 +136,11 @@ pub const Controller = struct {
     m: *Machine,
     set: BreakpointSet = .{},
     last_stop: ?StopReason = null,
+    /// For each breakpoint id, the bus watch-table slot it armed (M1 Phase 5), or
+    /// null for a non-`memory` breakpoint. Lets `removeBreakpoint` clear exactly
+    /// the watch a `memory` breakpoint armed. Parallel to `set.items[]`; defined
+    /// POD (no pointers), so it is snapshot-safe like the rest.
+    watch_ids: [bp.MAX_BREAKPOINTS]?u16 = @splat(null),
 
     /// Construct a controller over an ALREADY-wired machine (pinning invariant).
     /// The controller must not outlive the machine.
@@ -156,7 +174,7 @@ pub const Controller = struct {
             // terminal machine's step is a no-op that surfaces the terminal).
             if (self.terminalReason()) |r| return self.record(r);
 
-            const seq_before = bp.deliverySeq(self.m);
+            const seq_before = bp.seqBefore(self.m);
             _ = self.m.step();
 
             if (self.terminalReason()) |r| return self.record(r);
@@ -195,7 +213,7 @@ pub const Controller = struct {
     /// this boundary; report the lowest-id match (one-shot or persistent). Returns
     /// null if nothing matched. The `active_count` gate short-circuits the common
     /// no-breakpoints case in one bool test.
-    fn scanBreakpoints(self: *Controller, seq_before: u64) ?StopReason {
+    fn scanBreakpoints(self: *Controller, seq_before: bp.SeqBefore) ?StopReason {
         if (self.set.active_count == 0) return null;
         var reported: ?StopReason = null;
         var id: u32 = 0;
@@ -226,9 +244,38 @@ pub const Controller = struct {
     // -----------------------------------------------------------------------
 
     pub fn addBreakpoint(self: *Controller, kind: BreakpointKind, one_shot: bool) Error!u32 {
-        return self.set.add(kind, one_shot);
+        const id = try self.set.add(kind, one_shot);
+        // A `memory` breakpoint arms a bus watch over its range (M1 Phase 5): the
+        // covered page(s) become `.watched` so accesses are checked per byte. We
+        // remember the watch slot to clear it exactly on removal. Mapping the
+        // debug `AccessKind` onto the bus `WatchAccess` 1:1 (same encoding).
+        if (kind == .memory) {
+            const k = kind.memory;
+            const wid = self.m.bus.setWatch(.{
+                .linear = k.linear,
+                .len = k.len,
+                .access = toWatchAccess(k.access),
+            }) catch {
+                // Bus watch table full: roll back the breakpoint slot and surface a
+                // clean error (never a panic; reachable from the M2 API). We reuse
+                // BreakpointTableFull rather than inventing a new Error variant so
+                // the public Error set stays stable (M2 maps it to a 4xx).
+                self.set.remove(id) catch unreachable;
+                return error.BreakpointTableFull;
+            };
+            self.watch_ids[id] = wid;
+        }
+        return id;
     }
     pub fn removeBreakpoint(self: *Controller, id: u32) Error!void {
+        // Clear the bus watch first (if this bp armed one), then the slot. Order
+        // matters only for the (impossible) re-entrant case; both are local.
+        if (id < bp.MAX_BREAKPOINTS) {
+            if (self.watch_ids[id]) |wid| {
+                self.m.bus.clearWatch(wid);
+                self.watch_ids[id] = null;
+            }
+        }
         return self.set.remove(id);
     }
     pub fn enableBreakpoint(self: *Controller, id: u32, on: bool) Error!void {
@@ -273,7 +320,7 @@ pub const Controller = struct {
         var i: u64 = 0;
         while (i < n) : (i += 1) {
             if (self.terminalReason()) |r| return self.record(r);
-            const seq_before = bp.deliverySeq(self.m);
+            const seq_before = bp.seqBefore(self.m);
             _ = self.m.step();
             if (self.terminalReason()) |r| return self.record(r);
             if (self.scanBreakpoints(seq_before)) |r| return self.record(r);

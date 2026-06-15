@@ -127,17 +127,29 @@ pub const BreakpointSet = struct {
     }
 };
 
+/// The freshness baselines a caller snapshots BEFORE a step, so a delivery- /
+/// hit-driven breakpoint can tell a FRESH event (this step) from a stale one.
+/// Mirrors the Phase-4 `seq_before` pattern, extended for Phase-5 watch hits.
+pub const SeqBefore = struct {
+    /// IVT-delivery sequence (interrupt breakpoints).
+    delivery: u64,
+    /// Memory-watch-hit sequence (memory breakpoints, Phase 5).
+    watch: u64,
+};
+
 /// True if `bp` matches the machine's CURRENT (post-retired-step) state, given
-/// the delivery sequence number observed BEFORE the step (`seq_before`) so an
-/// `interrupt` breakpoint can tell a FRESH delivery (this step) from a stale one.
-/// `execution_address` + `cycle` are state-only (ignore `seq_before`);
-/// `interrupt` is live from Phase 4; `memory`/`io` are `false` for now.
-/// A disabled breakpoint never matches.
+/// the sequence numbers observed BEFORE the step (`seq`) so an `interrupt`
+/// breakpoint can tell a FRESH delivery (this step) from a stale one, and a
+/// `memory` breakpoint can tell a FRESH watch hit from a stale one.
+/// `execution_address` + `cycle` are state-only; `interrupt` is live from Phase 4;
+/// `memory` is live from Phase 5 (a hit recorded by the bus's watched-page handler
+/// THIS step whose linear+access fall inside the breakpoint's range); `io` is
+/// `false` for now. A disabled breakpoint never matches.
 ///
 /// NOTE: `matches` is side-effect-free — it only READS machine state. The
 /// controller (not this function) handles tie-break, one-shot consumption, and
 /// terminal precedence.
-pub fn matches(bp: *const Breakpoint, m: *const Machine, seq_before: u64) bool {
+pub fn matches(bp: *const Breakpoint, m: *const Machine, seq: SeqBefore) bool {
     if (!bp.enabled) return false;
     switch (bp.kind) {
         .execution_address => |k| return currentLinear(m) == k.linear,
@@ -145,15 +157,33 @@ pub fn matches(bp: *const Breakpoint, m: *const Machine, seq_before: u64) bool {
         .interrupt => |k| {
             const ld = m.cpu.st.last_delivered;
             // Fresh delivery this step (seq advanced) AND the vector matches.
-            return ld.seq != seq_before and ld.vector == k.vector;
+            return ld.seq != seq.delivery and ld.vector == k.vector;
         },
-        .memory => return false, // Phase 5+
+        .memory => |k| {
+            const w = m.bus.last_mem_watch;
+            // Fresh hit this step (seq advanced)?
+            if (w.seq == seq.watch) return false;
+            // The recorded hit's address must fall inside this bp's range.
+            if (w.linear < k.linear or w.linear >= k.linear +% k.len) return false;
+            // The bp's requested access class must accept the recorded access.
+            return switch (k.access) {
+                .access => true,
+                .read => w.access == .read,
+                .write => w.access == .write,
+            };
+        },
         .io => return false, // deferred
     }
 }
 
+/// The current freshness baselines (IVT-delivery + watch-hit sequence numbers) a
+/// caller snapshots before a step.
+pub fn seqBefore(m: *const Machine) SeqBefore {
+    return .{ .delivery = m.cpu.st.last_delivered.seq, .watch = m.bus.last_mem_watch.seq };
+}
+
 /// The current IVT-delivery sequence number (the freshness baseline a caller
-/// snapshots before a step).
+/// snapshots before a step). Retained for callers that only need the delivery seq.
 pub fn deliverySeq(m: *const Machine) u64 {
     return m.cpu.st.last_delivered.seq;
 }

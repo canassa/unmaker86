@@ -45,6 +45,38 @@ pub const MemHandler = regions.MemHandler;
 pub const PortHandler = ports.PortHandler;
 pub const WidthCaps = ports.WidthCaps;
 
+/// Access classification for a memory watchpoint (M1 Phase 5). Mirrors
+/// `debug.AccessKind` by value (the bus cannot import `debug` — leaf modules never
+/// import upward — so the contract is duplicated here as a plain enum; the
+/// controller maps its `AccessKind` onto this 1:1).
+pub const WatchAccess = enum(u2) { read, write, access };
+
+/// Max simultaneous memory watch ranges (M1 Phase 5). Fixed up-front storage, NO
+/// per-op alloc; mirrors the breakpoint table cap. Each range covers an arbitrary
+/// `[linear, linear+len)` span; one bp = one entry.
+pub const max_watches: u16 = 64;
+
+/// One memory-watch range (M1 Phase 5). Plain POD, no pointers — snapshot-safe.
+pub const Watch = struct {
+    linear: u32 = 0,
+    len: u32 = 0,
+    access: WatchAccess = .access,
+};
+
+/// A read-only breadcrumb of the most recent memory-watch HIT (M1 Phase 5),
+/// modeled exactly on `cpu.State.last_delivered`. The watched-page handler sets it
+/// on a matching access; the controller reads it BETWEEN steps and compares `seq`
+/// against the pre-step value to tell a fresh hit (this step) from a stale one.
+/// `at_cycle` is intentionally absent: the bus is NOT the cycle-ledger writer (the
+/// CPU is, `machine.zig`), and the controller reports the boundary cycle value
+/// (`m.cpu.st.cycles`) for the StopReason exactly as it does for every other
+/// breakpoint kind. No pointers — round-trips byte-identical in `Bus.Snapshot`.
+pub const LastMemWatch = struct {
+    linear: u32 = 0,
+    access: WatchAccess = .read,
+    seq: u64 = 0,
+};
+
 /// Max registered MMIO/port handlers (B12 — stable IDs index these arrays). ID 0
 /// is the reserved "unmapped" slot for ports; MMIO uses a parallel scheme where
 /// only `.mmio` pages consult `page_handler_id`. 254 device handlers is ample.
@@ -91,6 +123,32 @@ pub const Bus = struct {
     /// emulated state (determinism) — purely for the API/MCP server.
     rom_write_drops: u64 = 0,
 
+    // === Memory watchpoints (M1 Phase 5) — cold; the RAM fast path never reads
+    // these. Only a `.watched` page's access consults the watch table. ===
+
+    /// The fixed watch-range table (no per-op alloc). `watch_used[i]` marks an
+    /// occupied slot. The watched-page handler scans this on a watched access.
+    watches: [max_watches]Watch = @splat(.{}),
+    watch_used: [max_watches]bool = @splat(false),
+
+    /// For each page promoted to `.watched`, the kind it replaced — so the watched
+    /// handler dispatches a FAITHFUL passthrough to the real backing (ram/rom/mmio/
+    /// unmapped) and clearing the last watch on a page restores its prior kind
+    /// exactly. Meaningful only where `page_kind[page] == .watched`. Default `.ram`
+    /// is a harmless placeholder for un-watched pages (never consulted).
+    watch_prior: [memmap.page_count]PageKind = @splat(.ram),
+
+    /// Per-page count of distinct watch ranges currently covering the page — so a
+    /// page reverts to its prior kind only when the LAST covering watch is cleared
+    /// (overlapping watches are correct). Meaningful for every page.
+    watch_page_refs: [memmap.page_count]u16 = @splat(0),
+
+    /// The most recent watch HIT breadcrumb (read-only debugger aid, M1 Phase 5).
+    /// Set by a matching watched-page access; polled by the controller between
+    /// steps via the `seq` freshness counter. Default = "no hit yet" (seq 0).
+    /// Serialized in `Snapshot` (round-trips), reset in `resetWatchHit`.
+    last_mem_watch: LastMemWatch = .{},
+
     allocator: std.mem.Allocator,
 
     comptime {
@@ -111,13 +169,14 @@ pub const Bus = struct {
         //      inspection of the accessors, none of which read the cold tables.
         //   2. A size lock so a future field add can't silently bloat the struct
         //      past its known tables (the only large members are the two ID
-        //      tables + the RAM slice header).
+        //      tables, the per-page watch tables, + the RAM slice header).
         const expected_min = 65536 // port_handler_id
             + memmap.page_count // page_kind
             + memmap.page_count; // page_handler_id
         std.debug.assert(@sizeOf(Bus) >= expected_min);
-        // Upper bound: tables + handler arrays + scalars + slack. Catches an
-        // accidental inline of a large buffer into the struct.
+        // Upper bound: tables + handler arrays + the Phase-5 watch tables
+        // (watch_prior + watch_page_refs + the watch range table) + scalars +
+        // slack. Catches an accidental inline of a large buffer into the struct.
         std.debug.assert(@sizeOf(Bus) <= expected_min + 0x4000);
         // The two ID tables are byte-keyed (dense-int-keyed, no map — B6).
         std.debug.assert(@TypeOf(@as(Bus, undefined).page_handler_id) == [memmap.page_count]u8);
@@ -197,7 +256,22 @@ pub const Bus = struct {
     pub fn readPhys8(self: *Bus, phys: u32) u8 {
         const m = a20.apply(self.a20_mask, phys);
         const page = memmap.pageIndex(m);
-        switch (self.page_kind[page]) {
+        return self.read8Kind(self.page_kind[page], page, m, false);
+    }
+    pub fn writePhys8(self: *Bus, phys: u32, v: u8) void {
+        const m = a20.apply(self.a20_mask, phys);
+        const page = memmap.pageIndex(m);
+        self.write8Kind(self.page_kind[page], page, m, v, false);
+    }
+
+    /// 8-bit read dispatched by an explicit `kind` (so the `.watched` slow path can
+    /// re-dispatch to the PRIOR kind for a faithful passthrough). `is_watched_pass`
+    /// is true only on the watched re-dispatch and prevents infinite recursion
+    /// (a `.watched` prior kind is impossible — `watch_prior` only ever holds the
+    /// real backing). For `.watched` it passes through to the prior kind then
+    /// records a read hit (M1 Phase 5). Charges ZERO cycles — cycle-neutral.
+    fn read8Kind(self: *Bus, kind: PageKind, page: u32, m: u32, comptime is_watched_pass: bool) u8 {
+        switch (kind) {
             .ram, .rom => {
                 // Bounds-check against the SLAB, not the mask (B3 OOB fix).
                 if (m < memmap.ram_total_size) return self.ram[m];
@@ -210,12 +284,18 @@ pub const Bus = struct {
                 return h.read8(m);
             },
             .unmapped => return memmap.unmapped_fill,
+            .watched => {
+                if (is_watched_pass) unreachable; // watch_prior is never .watched
+                const v = self.read8Kind(self.watch_prior[page], page, m, true);
+                self.checkWatchHit(m, .read);
+                return v;
+            },
         }
     }
-    pub fn writePhys8(self: *Bus, phys: u32, v: u8) void {
-        const m = a20.apply(self.a20_mask, phys);
-        const page = memmap.pageIndex(m);
-        switch (self.page_kind[page]) {
+    /// 8-bit write counterpart of `read8Kind`. `.watched` passes through to the
+    /// prior kind (identical bytes/drops) then records a write hit.
+    fn write8Kind(self: *Bus, kind: PageKind, page: u32, m: u32, v: u8, comptime is_watched_pass: bool) void {
+        switch (kind) {
             .ram => {
                 if (m < memmap.ram_total_size) self.ram[m] = v;
             },
@@ -229,6 +309,11 @@ pub const Bus = struct {
                 h.write8(m, v);
             },
             .unmapped => {}, // drop (B7)
+            .watched => {
+                if (is_watched_pass) unreachable; // watch_prior is never .watched
+                self.write8Kind(self.watch_prior[page], page, m, v, true);
+                self.checkWatchHit(m, .write);
+            },
         }
     }
 
@@ -285,7 +370,10 @@ pub const Bus = struct {
     // with the host-pointer fast path when available.
     fn readWideOnePage(self: *Bus, comptime T: type, m: u32) T {
         const page = memmap.pageIndex(m);
-        switch (self.page_kind[page]) {
+        return self.readWideOnePageKind(T, self.page_kind[page], page, m, false);
+    }
+    fn readWideOnePageKind(self: *Bus, comptime T: type, kind: PageKind, page: u32, m: u32, comptime is_watched_pass: bool) T {
+        switch (kind) {
             .ram, .rom => {
                 if (m + @sizeOf(T) <= memmap.ram_total_size)
                     return std.mem.readInt(T, self.ram[m..][0..@sizeOf(T)], .little);
@@ -304,11 +392,22 @@ pub const Bus = struct {
                 };
             },
             .unmapped => return @as(T, memmap.unmapped_fill),
+            .watched => {
+                if (is_watched_pass) unreachable;
+                const v = self.readWideOnePageKind(T, self.watch_prior[page], page, m, true);
+                // A wide access touches @sizeOf(T) bytes; range-check each so a
+                // watch covering only part of the access still fires (M1 Phase 5).
+                self.checkWatchHitSpan(m, @sizeOf(T), .read);
+                return v;
+            },
         }
     }
     fn writeWideOnePage(self: *Bus, comptime T: type, m: u32, v: T) void {
         const page = memmap.pageIndex(m);
-        switch (self.page_kind[page]) {
+        self.writeWideOnePageKind(T, self.page_kind[page], page, m, v, false);
+    }
+    fn writeWideOnePageKind(self: *Bus, comptime T: type, kind: PageKind, page: u32, m: u32, v: T, comptime is_watched_pass: bool) void {
+        switch (kind) {
             .ram => {
                 if (m + @sizeOf(T) <= memmap.ram_total_size)
                     std.mem.writeInt(T, self.ram[m..][0..@sizeOf(T)], v, .little);
@@ -328,6 +427,11 @@ pub const Bus = struct {
                 }
             },
             .unmapped => {},
+            .watched => {
+                if (is_watched_pass) unreachable;
+                self.writeWideOnePageKind(T, self.watch_prior[page], page, m, v, true);
+                self.checkWatchHitSpan(m, @sizeOf(T), .write);
+            },
         }
     }
 
@@ -374,36 +478,11 @@ pub const Bus = struct {
     /// router). Distinct from `readPhys8` which masks its argument.
     fn readPhys8RawMasked(self: *Bus, m: u32) u8 {
         const page = memmap.pageIndex(m);
-        switch (self.page_kind[page]) {
-            .ram, .rom => {
-                if (m < memmap.ram_total_size) return self.ram[m];
-                return memmap.unmapped_fill;
-            },
-            .mmio => {
-                const h = self.mmioHandler(page);
-                if (h.hostPtr(page)) |hp| return hp[m & (memmap.page_size - 1)];
-                return h.read8(m);
-            },
-            .unmapped => return memmap.unmapped_fill,
-        }
+        return self.read8Kind(self.page_kind[page], page, m, false);
     }
     fn writePhys8RawMasked(self: *Bus, m: u32, v: u8) void {
         const page = memmap.pageIndex(m);
-        switch (self.page_kind[page]) {
-            .ram => {
-                if (m < memmap.ram_total_size) self.ram[m] = v;
-            },
-            .rom => self.rom_write_drops +%= 1,
-            .mmio => {
-                const h = self.mmioHandler(page);
-                if (h.hostPtr(page)) |hp| {
-                    hp[m & (memmap.page_size - 1)] = v;
-                    return;
-                }
-                h.write8(m, v);
-            },
-            .unmapped => {},
-        }
+        self.write8Kind(self.page_kind[page], page, m, v, false);
     }
 
     inline fn mmioHandler(self: *Bus, page: u32) MemHandler {
@@ -572,7 +651,12 @@ pub const Bus = struct {
     pub fn peekPhys8(self: *const Bus, phys: u32) u8 {
         const m = a20.apply(self.a20_mask, phys);
         const page = memmap.pageIndex(m);
-        switch (self.page_kind[page]) {
+        // A `.watched` page peeks through to its PRIOR kind — inspection is
+        // side-effect-free and must NEVER record a watch hit (that would let an
+        // inspect perturb the breadcrumb the run depends on; determinism prime
+        // directive). `watch_prior` is never `.watched`, so this is a single hop.
+        const kind = if (self.page_kind[page] == .watched) self.watch_prior[page] else self.page_kind[page];
+        switch (kind) {
             .ram, .rom => {
                 if (m < memmap.ram_total_size) return self.ram[m];
                 return memmap.unmapped_fill;
@@ -586,6 +670,7 @@ pub const Bus = struct {
                 return h.peek8(m) orelse not_peekable_fill;
             },
             .unmapped => return memmap.unmapped_fill,
+            .watched => unreachable, // watch_prior is never .watched
         }
     }
 
@@ -626,6 +711,161 @@ pub const Bus = struct {
             self.page_kind[first + p] = memmap.defaultPageKind(first + p);
             self.page_handler_id[first + p] = 0;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Memory watchpoints (M1 Phase 5). The DEBUG layer (controller) calls
+    // `setWatch`/`clearWatch` DOWNWARD (debug→bus is allowed); the bus records a
+    // read-only HIT into `last_mem_watch` that the controller polls UP between
+    // steps. The bus NEVER imports or calls the debugger — the exact Phase-4
+    // `last_delivered` shape (downward-data / upward-poll), no fnptr, no
+    // `*anyopaque`, no type fork. Cycle-neutral by construction: the watched
+    // handler is a faithful passthrough and charges nothing (the ledger is
+    // `baseFor(dec.key)` at dispatch, independent of bus routing).
+    // -----------------------------------------------------------------------
+
+    /// The page range `[firstPage, lastPage]` covered by `[linear, linear+len)`
+    /// AFTER A20 masking the endpoints. A watch range may straddle pages; we mark
+    /// every covered page `.watched`. (linear addresses are real-mode physical.)
+    fn watchPageBounds(self: *const Bus, w: Watch) struct { first: u32, last: u32 } {
+        const start = a20.apply(self.a20_mask, w.linear);
+        const end = a20.apply(self.a20_mask, w.linear +% (w.len - 1));
+        // If A20 wrapping un-orders the endpoints, mark the whole span between the
+        // pre-mask addresses' pages conservatively (the range-check at access time
+        // is exact regardless). Use the masked endpoints' page indices.
+        const lo = @min(memmap.pageIndex(start), memmap.pageIndex(end));
+        const hi = @max(memmap.pageIndex(start), memmap.pageIndex(end));
+        return .{ .first = lo, .last = hi };
+    }
+
+    /// Promote every page in `[first,last]` to `.watched`, remembering its prior
+    /// kind on the first watch to cover it (ref-counted so overlapping watches are
+    /// correct). Idempotent per (page, this call) via the ref count.
+    fn markPagesWatched(self: *Bus, first: u32, last: u32) void {
+        var p = first;
+        while (p <= last) : (p += 1) {
+            if (self.watch_page_refs[p] == 0) {
+                // First watch to cover this page: stash its real backing kind so
+                // the watched handler passes through faithfully (and clearing the
+                // last watch restores it exactly).
+                self.watch_prior[p] = self.page_kind[p];
+                self.page_kind[p] = .watched;
+            }
+            self.watch_page_refs[p] += 1;
+        }
+    }
+
+    /// Drop a watch covering `[first,last]`: decrement each page's ref count and,
+    /// when it reaches 0, restore the page's prior kind exactly.
+    fn unmarkPagesWatched(self: *Bus, first: u32, last: u32) void {
+        var p = first;
+        while (p <= last) : (p += 1) {
+            std.debug.assert(self.watch_page_refs[p] > 0);
+            self.watch_page_refs[p] -= 1;
+            if (self.watch_page_refs[p] == 0) {
+                // Restore the exact prior kind (the fast path is restored too: a
+                // `.ram`/`.rom` page re-enters `fastRamSpan`).
+                self.page_kind[p] = self.watch_prior[p];
+                self.watch_prior[p] = .ram; // tidy placeholder (never consulted now)
+            }
+        }
+    }
+
+    /// Arm a memory watch over `[linear, linear+len)` with the given access class.
+    /// Returns the stable watch slot id, or `error.WatchTableFull`. Marks the
+    /// covered page(s) `.watched`. NO per-op alloc. `len` must be non-zero.
+    pub fn setWatch(self: *Bus, w: Watch) error{WatchTableFull}!u16 {
+        std.debug.assert(w.len != 0);
+        var id: u16 = 0;
+        while (id < max_watches) : (id += 1) {
+            if (!self.watch_used[id]) {
+                self.watches[id] = w;
+                self.watch_used[id] = true;
+                const b = self.watchPageBounds(w);
+                self.markPagesWatched(b.first, b.last);
+                return id;
+            }
+        }
+        return error.WatchTableFull;
+    }
+
+    /// Disarm the watch at `id`. Restores the covered page(s) to their prior kind
+    /// when no other watch covers them. A stale/unused id is a no-op assert-guarded
+    /// programming error from the controller side (it owns id lifetimes), so this
+    /// asserts `watch_used[id]`.
+    pub fn clearWatch(self: *Bus, id: u16) void {
+        std.debug.assert(id < max_watches and self.watch_used[id]);
+        const b = self.watchPageBounds(self.watches[id]);
+        self.unmarkPagesWatched(b.first, b.last);
+        self.watch_used[id] = false;
+        self.watches[id] = .{};
+    }
+
+    /// True if a single watch range matches a byte access at masked `m`.
+    inline fn watchMatchesByte(w: Watch, used: bool, m: u32, acc: WatchAccess) bool {
+        if (!used) return false;
+        if (m < w.linear or m >= w.linear +% w.len) return false;
+        return switch (w.access) {
+            .access => true, // read|write: any access matches
+            .read => acc == .read,
+            .write => acc == .write,
+        };
+    }
+
+    /// Record a watch HIT for a single-byte access at masked `m` if any armed watch
+    /// covers it with a matching access class. Records the LOWEST matching watch's
+    /// linear/access (deterministic) and bumps `seq` (freshness). Charges ZERO
+    /// cycles. Called only from the `.watched` slow path — never the fast path.
+    fn checkWatchHit(self: *Bus, m: u32, acc: WatchAccess) void {
+        var id: u16 = 0;
+        while (id < max_watches) : (id += 1) {
+            if (watchMatchesByte(self.watches[id], self.watch_used[id], m, acc)) {
+                self.recordWatchHit(m, acc);
+                return; // lowest matching id; one hit per access is enough
+            }
+        }
+    }
+
+    /// Record a watch HIT for a wide (`size`-byte) access starting at masked `m`:
+    /// check each byte ascending; the FIRST byte that matches records the hit (so a
+    /// watch covering only part of a wide access still fires, deterministically at
+    /// the lowest covered byte). Charges ZERO cycles.
+    fn checkWatchHitSpan(self: *Bus, m: u32, comptime size: u32, acc: WatchAccess) void {
+        var i: u32 = 0;
+        while (i < size) : (i += 1) {
+            const byte_m = m + i; // wide one-page access does not wrap a page
+            var id: u16 = 0;
+            while (id < max_watches) : (id += 1) {
+                if (watchMatchesByte(self.watches[id], self.watch_used[id], byte_m, acc)) {
+                    self.recordWatchHit(byte_m, acc);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Write the hit breadcrumb (the upward-poll field). `seq` is monotonic so the
+    /// controller can tell a fresh hit (this step) from a stale one.
+    fn recordWatchHit(self: *Bus, m: u32, acc: WatchAccess) void {
+        self.last_mem_watch = .{
+            .linear = m,
+            .access = acc,
+            .seq = self.last_mem_watch.seq +% 1,
+        };
+    }
+
+    /// The current watch-hit sequence number (the freshness baseline the
+    /// controller snapshots BEFORE a step). Mirrors `last_delivered.seq`'s use.
+    pub fn watchHitSeq(self: *const Bus) u64 {
+        return self.last_mem_watch.seq;
+    }
+
+    /// Reset the per-run watch-hit breadcrumb (seq back to 0). Called by
+    /// `Machine.reset` for reproducibility — like `cpu.reset` clears
+    /// `last_delivered`. The armed watch table + `.watched` page markers persist
+    /// (breakpoints outlive a reset).
+    pub fn resetWatchHit(self: *Bus) void {
+        self.last_mem_watch = .{};
     }
 
     /// Register a port handler at a single port (B6). Double registration of a
@@ -682,6 +922,14 @@ pub const Bus = struct {
         page_kind: [memmap.page_count]PageKind,
         page_handler_id: [memmap.page_count]u8,
         port_handler_id: [65536]u8,
+        // Memory-watchpoint state (M1 Phase 5): the page_kind table above can hold
+        // `.watched` markers, so the watch tables + breadcrumb must round-trip with
+        // it for a consistent restore. All POD, no pointers.
+        watches: [max_watches]Watch,
+        watch_used: [max_watches]bool,
+        watch_prior: [memmap.page_count]PageKind,
+        watch_page_refs: [memmap.page_count]u16,
+        last_mem_watch: LastMemWatch,
         // RAM is captured separately (it is large) via `writeSnapshotRam` /
         // restored via the `ram` field below — but for a self-contained test we
         // also expose a slab copy. Callers may prefer streaming the RAM.
@@ -695,6 +943,11 @@ pub const Bus = struct {
             .page_kind = self.page_kind,
             .page_handler_id = self.page_handler_id,
             .port_handler_id = self.port_handler_id,
+            .watches = self.watches,
+            .watch_used = self.watch_used,
+            .watch_prior = self.watch_prior,
+            .watch_page_refs = self.watch_page_refs,
+            .last_mem_watch = self.last_mem_watch,
         };
     }
 
@@ -707,6 +960,11 @@ pub const Bus = struct {
         self.page_kind = snap.page_kind;
         self.page_handler_id = snap.page_handler_id;
         self.port_handler_id = snap.port_handler_id;
+        self.watches = snap.watches;
+        self.watch_used = snap.watch_used;
+        self.watch_prior = snap.watch_prior;
+        self.watch_page_refs = snap.watch_page_refs;
+        self.last_mem_watch = snap.last_mem_watch;
     }
 };
 

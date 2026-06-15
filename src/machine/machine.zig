@@ -338,6 +338,10 @@ pub const Machine = struct {
         self.cpu.reset(); // 386 power-on (EIP=0xFFF0, CS base 0xFFFF0000, ...)
         self.bus.setA20(false); // A20 disabled at power-on (BIOS POST enables it)
         @memset(self.bus.ram, 0); // re-zero RAM for reproducibility
+        self.bus.resetWatchHit(); // clear the per-run memory-watch breadcrumb (M1
+        // Phase 5) — like cpu.reset clears last_delivered. The armed watch table +
+        // `.watched` page markers PERSIST (a debug session's breakpoints outlive a
+        // machine reset, mirroring the controller's surviving breakpoint set).
         self.pic.reset();
         self.pit.reset();
         self.speaker.reset(); // port_61_data=0; lowers ch2 gate (needs pit reset first)

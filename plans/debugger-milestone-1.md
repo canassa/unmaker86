@@ -636,41 +636,84 @@ pub fn memoryRegions(self: *const Controller) []const Region; // RAM size, VRAM,
 - [x] `matches` for `interrupt{vector}`; add to `expectStateEqual` coverage.
 - [x] Test: `interrupt{0x21}` fires on a DOS call in a corpus program; freshness correct.
 
-### Phase 5 — (optional; may defer to M2) memory watchpoints — **STOPPED for human decision**
-- [ ] Decide mechanism: comptime `Options.DebugHook` (`cpu.zig:60-64`, zero-cost
-      `NullDebugHook`) vs. page-kind `.mmio` trap. **Recommend page-kind trap** (single `Cpu`
-      type; hot path untouched for unwatched pages — verified `bus.zig:185-233`).
-- [ ] Implement watched-page accesses through the trap; consult the controller's `memory`
-      bps mid-instruction.
-- [ ] Tests: a write watchpoint fires mid-instruction at the right cycle; **cycle-cost
-      neutrality** (watched vs unwatched run reach byte-identical state+ledger); disabled
-      path byte-identical + alloc-free.
+### Phase 5 — memory watchpoints — **DECIDED: runtime page-kind trap, Phase-4 pattern**
 
-> **STOP / decision needed (M1 implementer).** Neither mechanism is clean within
-> M1's locked architecture (controller owns the loop; NO `*anyopaque` thunk on the
-> machine — the exact pattern Phase 0 *removed*; single `Cpu`/`Machine` type):
+> **Decision (locked).** Use a **runtime** watched-page mechanism modeled exactly on
+> Phase 4's `last_delivered` field. NO comptime gating (the debugger is a core feature,
+> always built in — there is no "release build without it" to optimize for; a
+> compile-time enable/disable solves a non-problem). NO `*anyopaque`/fnptr seam and NO
+> leaf→`debug` import: the bus records a watch *hit* into a read-only field; the
+> controller reads it between steps — the same downward-data / upward-poll shape Phase 4
+> already proved. Watchpoints are set/cleared **live at runtime** via the controller.
 >
-> 1. **Page-kind `.mmio` trap.** A watched RAM page must consult the controller's
->    `memory` breakpoints *mid-instruction*, but the trap handler lives in the
->    bus/devices layer, which **cannot import `debug`** (module graph). Wiring it
->    up needs a runtime callback hook on the bus access path — re-introducing the
->    `*anyopaque` + `*const fn` indirect-call seam Phase 0 deleted, *and* a leaf
->    module calling **up** into `debug`. Cycle cost is neutral (the base charge at
->    `dispatch.zig:88` is routing-independent), but the seam itself violates the
->    v2 inversion decision.
-> 2. **Comptime `Options.DebugHook`.** Zero-cost when disabled, but a *non-Null*
->    hook **forks the `Cpu` type** → a second `Machine` specialization. Every
->    build/test path (machine, dos, bios, oracle, debug) would need to choose or
->    duplicate the specialization. That is the "balloons scope" case.
+> **Why this is clean (resolves the v1 STOP):** the objection to a runtime callback was
+> that it sat on the *hot path* (every access). Here it does not. Unwatched memory keeps
+> its exact current fast path (the per-access `page_kind` dispatch already exists,
+> `bus.zig:197-233`); only accesses to a watched page take a slow path, and that slow
+> path needs no callback at all — it just consults a small **watch table the bus owns**
+> (set via a downward `bus.setWatch`/`clearWatch` API, debug→bus, which is allowed) and
+> records a hit. No indirect call, no type fork.
 >
-> The `memory`/`io` `BreakpointKind` arms are **already declared** (ids/handles/
-> serialization stable) and `matches` returns `false` for them, so adding the
-> mechanism later is purely additive — no API churn. Per the M1 scope note I did
-> **not** ship a half-measure that risks the cycle ledger or forks the type graph.
-> **Recommendation:** defer memory watchpoints to a focused follow-up that first
-> decides the hook policy (likely the comptime `DebugHook` with a build-option
-> gate, kept Null in the default machine), so determinism + cycle-cost neutrality
-> can be asserted without a runtime up-call from a leaf module.
+> **Why it's deterministic (cycle-neutral by construction):** the cycle ledger is charged
+> once per instruction from the decoded form (`baseFor(dec.key)`, `dispatch.zig:88`) and
+> is **independent of which bus path serviced an access**. Rerouting a watched access
+> therefore cannot move the ledger. The watched handler is a *faithful passthrough* —
+> it reads/writes the real RAM bytes identically and charges nothing — so the guest
+> cannot observe that a page is watched. Arming a watchpoint is invisible to the run
+> until it deliberately stops you. (Test below pins this and future-proofs it against any
+> later bus-derived cycle cost.)
+
+- [x] Add a small watch table to the bus: fixed array of `{ linear: u32, len: u32,
+      access: AccessKind }` + count (no per-op alloc), with downward `setWatch`/`clearWatch`
+      called by the controller. Adding a watch marks the covering page(s) with a **watched
+      page-kind** (a new kind, e.g. `.watched`, distinct from `.mmio` — it still reads/writes
+      the RAM slab, it just also checks the table); clearing the last watch on a page restores
+      its prior kind. Watched pages must be excluded from the `fastRamSpan` fast path
+      (`bus.zig:185-194`) so accesses are checked individually.
+      *(Done. `bus.zig`: `Watch`/`max_watches`/`watches[]`+`watch_used[]`, plus per-page
+      `watch_prior` (the kind a `.watched` page replaced, for faithful passthrough + exact
+      restore) and `watch_page_refs` (so overlapping watches revert a page only on the LAST
+      clear). New `PageKind.watched` in `memmap.zig`; `defaultPageKind` never returns it (set
+      only at runtime). `fastRamSpan` already excludes it — `kind != .ram and kind != .rom`.)*
+- [x] Watched-page read/write handler: **faithful RAM passthrough** (identical bytes,
+      identical to the normal path), then range-check against the watch table; on a matching
+      access (address in `[linear,linear+len)` and access kind matches), record a hit into a
+      **read-only `last_mem_watch: ?{ linear, access, at_cycle, seq }`** field (on `State` or
+      `Bus`, serialized + reset like `last_delivered`). The `seq` counter gives the controller
+      freshness (hit happened *this* step) — mirrors Phase 4. **Charge zero cycles.**
+      *(Done. `read8Kind`/`write8Kind` + the wide one-page `*Kind` variants re-dispatch a
+      `.watched` page to `watch_prior` then `checkWatchHit`/`checkWatchHitSpan`, charging
+      nothing. The breadcrumb `last_mem_watch: { linear, access, seq }` lives on `Bus` (it owns
+      the watch table); `at_cycle` is OMITTED because the bus is NOT the ledger writer — the
+      controller reports the boundary `cycles` value for the StopReason exactly as every other
+      bp kind does. Serialized in `Bus.Snapshot`, reset via `resetWatchHit` from
+      `Machine.reset`. The peek path passes through `.watched` to the prior kind and NEVER
+      records a hit — inspection stays side-effect-free.)*
+- [x] `matches` for `memory{linear,len,access}`: between steps, the controller checks
+      `last_mem_watch` freshness and whether a `memory` breakpoint covers the hit (kind +
+      range). Detected mid-instruction, **reported at the instruction boundary** (the
+      controller stops after the instruction that touched the watched address — deterministic,
+      no mid-instruction unwind). Wire add/remove of a `memory` breakpoint to `setWatch`/
+      `clearWatch` so arming a bp marks its pages.
+      *(Done. `breakpoints.matches` gained a `.memory` arm; the Phase-4 `seq_before: u64` was
+      generalized to `SeqBefore{ delivery, watch }` (via `seqBefore(m)`) so freshness covers
+      both interrupt deliveries and watch hits. `controller.addBreakpoint`/`removeBreakpoint`
+      arm/clear the bus watch and track the slot in `watch_ids[]`; a bus-watch-table-full
+      rolls back the bp slot and returns a clean error.)*
+- [x] Tests: (a) a write watchpoint fires at the right deterministic cycle on a corpus
+      program; a read watchpoint likewise; access=`access` catches both. (b) **Cycle-cost
+      neutrality (the determinism lock):** run a program to cycle N with a watchpoint armed on
+      a page it touches, and to cycle N with none — assert **byte-identical CPU state + RAM +
+      ledger** (`expectStateEqual` + RAM `expectEqualSlices`). (c) Setting/clearing a watch
+      restores the page kind and the fast path; alloc-free; grep audit still passes. (d) The
+      watched-handler passthrough returns/stores the same bytes as the normal path.
+      *(Done in `src/debug/watchpoint_test.zig`: (a) write/read/access firing at deterministic
+      cycles + an out-of-range watch that never fires; (b) the watched-vs-unwatched byte-
+      identical cpu_state+RAM at cycle N, plus a `seq>0` assert proving the watch was actually
+      on the slow path; (c) setWatch→`.watched`/clearWatch→restore with ref-counted overlap,
+      removeBreakpoint clears the watch, and a CountingAllocator alloc-free run; (d) 8/16/32
+      passthrough byte-identical to the unwatched slab + a partly-covered wide access still
+      fires. The grep audit covers the production sources unchanged.)*
 
 ### Phase 6 — runner integration (optional; keeps `main.zig` thin)
 - [x] Opt-in flag (e.g. `--break-cycle N`) in `src/main.zig` constructing a `Controller`,
@@ -722,10 +765,12 @@ The M2 HTTP/JSON server layers on **without touching `controller.zig`**:
 2. **`stepOver` coverage.** v2 handles direct `CALL`/`INT` with an SP-guarded return bp and
    **explicitly reports** fallback-to-step-into for indirect/REP/unclassified cases (no
    silent degrade). Accept this scope for M1? (Full coverage needs the decoder from #1.)
-3. **Memory-watchpoint mechanism (Phase 5).** Recommend the page-kind `.mmio` trap (single
-   `Cpu` type; unwatched hot path untouched). The hard requirement: arming a watchpoint must
-   be **cycle-cost-neutral** (asserted by a test) or it perturbs the trajectory it observes.
-   Decide before Phase 5.
+3. **Memory-watchpoint mechanism (Phase 5) — RESOLVED.** Runtime watched-page trap modeled on
+   Phase 4's `last_delivered` (bus owns a watch table set downward by the controller; records a
+   read-only hit field; controller polls it between steps). No comptime gating, no
+   `*anyopaque` seam, no leaf→`debug` import. Cycle-neutral by construction (charge is
+   `baseFor(dec.key)`, routing-independent) and pinned by a watched-vs-unwatched byte-identical
+   test. See the rewritten Phase 5 checklist.
 4. **`interrupt`-bp needs a read-only `State.last_delivered` field** (`interrupts.zig:102`) —
    a 1-field change in a low module, determinism-neutral and serialized (must be in
    `cpu.State`, reset in `cpu.reset`, covered by `expectStateEqual`). Acceptable?
