@@ -82,6 +82,9 @@ DOS-extender/DPMI target needs them; structure the code so they can be slotted i
 
 ## Conventions
 
+- **`plans/ROADMAP.md` is the source of truth for project status.** Read it first to see what's
+  built and what's next. **Keep it current:** add/update an entry whenever a milestone or phase
+  lands, or a goal/decision changes. It's a short index — detailed plans stay in `plans/`.
 - **Use the `zig-developer` skill** for all Zig work. Don't write Zig from memory (0.16 ≠ ≤0.15);
   `references/zig/lib/std/` is the gold standard.
 - **Memory discipline (also a determinism concern):** no per-op alloc/free; allocate up front;
