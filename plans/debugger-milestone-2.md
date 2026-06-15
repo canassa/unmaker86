@@ -992,11 +992,11 @@ request*, not determinism — determinism is proved by tests 1-9 below the socke
       literal-zero) + #7 (typed `code` per `Controller.Error` + the `server.zig` status map) + #9
       (breakpoint list ascending-id golden).
 
- HTTP routing + net listener (`server.zig`), real sockets
-- [ ] Route table: method+path → handler, parsing path params (`{id}`, `{vector}`) and query
+### Phase 4 — HTTP routing + net listener (`server.zig`), real sockets
+- [x] Route table: method+path → handler, parsing path params (`{id}`, `{vector}`) and query
       (`?phys=&len=`). Fallthrough → 404; known-path/bad-method → 405. Include `DELETE
       /api/breakpoints` (clear-all) and `POST /api/load` (G5/G16).
-- [ ] Per-connection loop, **one connection at a time, keep-alive OFF** (one request per connection,
+- [x] Per-connection loop, **one connection at a time, keep-alive OFF** (one request per connection,
       R1): `net.Server.accept(io)` (`Io/net.zig:1442`) → declare **named locals** `var sr =
       stream.reader(io,&rbuf); var sw = stream.writer(io,&wbuf);` (return-by-value; must outlive the
       http.Server — §0.3 UB rule; size `rbuf` ≥ max header block) → `http.Server.init(&sr.interface,
@@ -1007,20 +1007,20 @@ request*, not determinism — determinism is proved by tests 1-9 below the socke
       reading** → route → `request.respond(json, .{.status=..., .keep_alive=false,
       .extra_headers=&content_type_json})` (`:323`). Each handler builds a `Command`, `submit`s it,
       serializes the `Response`. Content-type guard → 415; malformed JSON → 400 (§B.8).
-- [ ] `IpAddress` bind (CORRECTED): `const addr: net.IpAddress = .{ .ip4 = .loopback(port) };
+- [x] `IpAddress` bind (CORRECTED): `const addr: net.IpAddress = .{ .ip4 = .loopback(port) };
       const server = try addr.listen(io, .{});` (`listen` takes `*const IpAddress` `Io/net.zig:246`;
       `Ip4Address.loopback` returns a bare `Ip4Address` `:349`). Bind address configurable (optional
       host arg, e.g. `IpAddress.parseLiteral` `:73`).
-- [ ] Clean shutdown (CORRECTED — no `socket.shutdown`): wrap the server socket in a `net.Stream`
+- [x] Clean shutdown (CORRECTED — no `socket.shutdown`): wrap the server socket in a `net.Stream`
       (`const s: net.Stream = .{ .socket = server.socket };`) and `s.shutdown(io, .recv)`
       (`Io/net.zig:1252`), or `server.deinit(io)` (`:1406`) — `accept` then returns
       `error.SocketNotListening` → join the worker thread.
-- [ ] `GET /api/health` answered on the listener thread WITHOUT enqueuing and reading **zero**
+- [x] `GET /api/health` answered on the listener thread WITHOUT enqueuing and reading **zero**
       machine state (compile-time-constant body — §A.3a/B.1). All other handlers go through `submit()`.
-- [ ] Test: §D #4 (capped-run reproducibility through the handler path, in-process) + the single
+- [x] Test: §D #4 (capped-run reproducibility through the handler path, in-process) + the single
       opt-in real-socket integration test (its own `test-api-integration` step, not in `test`).
 
-### Phase 5 — runner integration (`main.zig`) + the determinism audit
+ runner integration (`main.zig`) + the determinism audit
 - [ ] `--serve PORT` branch in the arg parse (`main.zig:44-58`), mutually exclusive with
       `--break-cycle`; construct `api.Server` over the `Controller` (`main.zig:114` construction) +
       `init.io`/`init.gpa`; run the accept loop; default no-flag path unchanged (`main.zig:158`).

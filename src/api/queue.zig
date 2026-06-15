@@ -164,6 +164,14 @@ pub const StepOverResult = struct {
 
 pub const IvtResult = struct { vector: u8, ip: u16, cs: u16 };
 
+/// The static peekable region table, copied inline so server.zig never reads
+/// `ctrl.memoryRegions()` off-worker (keeps the §A.3a off-worker grep clean).
+pub const MAX_REGIONS = 8;
+pub const RegionsResult = struct {
+    count: u8 = 0,
+    items: [MAX_REGIONS]Region = undefined,
+};
+
 pub const Response = union(enum) {
     /// `{"ok":true}` — reset/load/enable/remove/clear (clear carries a count).
     ok: void,
@@ -179,7 +187,7 @@ pub const Response = union(enum) {
     ivt: IvtResult,
     stack: StackResult,
     status: StatusResult,
-    regions: void, // memoryRegions answered from the static table at the handler
+    regions: RegionsResult,
     /// A typed error. The handler maps `code` → HTTP status.
     err: ErrCode,
 };

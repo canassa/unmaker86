@@ -102,7 +102,7 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx) Response {
             break :blk .ok;
         },
         .load => |c| loadResp(ctrl, c),
-        .mem_regions => .{ .regions = {} }, // serialized from the static table at the handler
+        .mem_regions => regionsResp(ctrl),
 
         .shutdown_worker => .ok,
     };
@@ -222,6 +222,17 @@ fn statusResp(ctrl: *Controller) Response {
         .cycles = s.cycles,
         .last_stop = s.last_stop,
     } };
+}
+
+/// Copy the static region table inline into the response (so server.zig never
+/// reads controller state off-worker — keeps the §A.3a grep clean).
+fn regionsResp(ctrl: *Controller) Response {
+    var res: q.RegionsResult = .{};
+    for (ctrl.memoryRegions()) |r| {
+        res.items[res.count] = r;
+        res.count += 1;
+    }
+    return .{ .regions = res };
 }
 
 /// Re-apply the server-held load recipe (drive/file/cmdtail carried in the
