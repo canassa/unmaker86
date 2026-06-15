@@ -144,6 +144,13 @@ pub const Vga = struct {
     /// at mode-set (int10_modes.cpp:1580). Power-on 0.
     misc_output: u8 = 0,
 
+    /// Back-pointer to the single time source `cpu.st.cycles` (the u64 CPU cycle
+    /// counter), wired by the machine at `wire()` and re-bound on restore — mirrors
+    /// `Pit.cycles` (src/devices/pit.zig:146). The Input Status Register #1
+    /// (0x3DA/0x3BA) retrace + display-enable bits are derived from it. NOT
+    /// snapshotted (a host pointer; re-bound by the machine, like the PIT/speaker).
+    cycles: ?*const u64 = null,
+
     /// Allocate the fixed VRAM block. Must be called once before `wire`.
     pub fn init(self: *Vga, allocator: std.mem.Allocator) !void {
         const vram = try allocator.alloc(u8, VRAM_SIZE);
@@ -177,6 +184,14 @@ pub const Vga = struct {
     /// their own palette, so we leave the DAC as-is and let the guest drive it).
     pub fn clearVram(self: *Vga) void {
         @memset(self.vram, 0);
+    }
+
+    /// The current CPU cycle counter (the single time source), read through the
+    /// back-pointer wired by the machine. Mirrors `Pit.cyclesNow`
+    /// (src/devices/pit.zig:154-156). Returns 0 if unwired (pre-`wire` / a bare
+    /// test `Vga` that never set `.cycles`).
+    fn cyclesNow(self: *const Vga) u64 {
+        return (self.cycles orelse return 0).*;
     }
 
     // -----------------------------------------------------------------------

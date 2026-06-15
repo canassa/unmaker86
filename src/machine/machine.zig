@@ -238,6 +238,10 @@ pub const Machine = struct {
         //      time). Re-bound on restore exactly like the PIT's pointers.
         self.speaker.pit = &self.pit;
         self.speaker.cycles = &self.cpu.st.cycles;
+        // (d1b) VGA cycle back-pointer: the Input Status Register #1 (0x3DA/0x3BA)
+        //       retrace + display-enable bits are derived from the cycle ledger,
+        //       not host time. Re-bound on restore exactly like the PIT/speaker.
+        self.vga.cycles = &self.cpu.st.cycles;
         // (d2) 8042 keyboard controller back-pointer: it asserts IRQ1 through the
         //      PIC (the same `picRaiseThunk` the PIT uses for IRQ0). Re-bound on
         //      restore exactly like the PIT/speaker pointers.
