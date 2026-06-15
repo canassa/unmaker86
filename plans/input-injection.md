@@ -1332,7 +1332,7 @@ blocking loop) is deferred to after Phase 1·0** because it needs the new emitte
   `bios_keyboard.cpp` struct `:21-26` + table `:34-157`, e.g. index 30 'A' =
   `{0x1e61,0x1e41,0x1e01,0x1e00}` `:66`; spice86 `ScanCode1.cs`). Test: a `[I/O-phase]`
   translation-conformance oracle (`io-oracle.md §2.3`) over a representative key set.
-- [ ] **1c — INT 09h ISR + shift-flag state machine.** `src/bios/int09.zig`,
+- [x] **1c — INT 09h ISR + shift-flag state machine.** `src/bios/int09.zig`,
   host-serviced with an `iret_eoi_pic1` tail (like INT 08h at `bios.zig:69`): read
   0x60, run the **shift-flag state machine of §5.1a** (update FLAGS1 0040:0017 / FLAGS2
   0040:0018, **add the new FLAGS3 0040:0096 and alt-keypad accumulator 0040:0019 BDA

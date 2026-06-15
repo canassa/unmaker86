@@ -18,6 +18,7 @@ pub const Bda = bda_mod.Bda;
 /// switches on AH (the IndexBasedDispatcher shape, D7).
 pub const BiosInt = enum {
     int08, // IRQ0 timer tick
+    int09, // IRQ1 keyboard
     int10, // video
     int11, // equipment list
     int12, // conventional memory size
@@ -37,6 +38,7 @@ pub fn Bios(comptime Cpu: type) type {
     const int16 = @import("int16.zig").Int16(Cpu);
     const int1a = @import("int1a.zig").Int1a(Cpu);
     const int08 = @import("int08.zig").Int08(Cpu);
+    const int09 = @import("int09.zig").Int09(Cpu);
     const int1112 = @import("int11_12.zig").Int1112(Cpu);
     const int15 = @import("int15.zig").Int15(Cpu);
 
@@ -67,6 +69,7 @@ pub fn Bios(comptime Cpu: type) type {
         ) void {
             inline for (.{
                 .{ BiosInt.int08, bridge_mod.CbType.iret_eoi_pic1 },
+                .{ BiosInt.int09, bridge_mod.CbType.iret_eoi_pic1 },
                 .{ BiosInt.int10, bridge_mod.CbType.iret },
                 .{ BiosInt.int11, bridge_mod.CbType.iret },
                 .{ BiosInt.int12, bridge_mod.CbType.iret },
@@ -78,7 +81,7 @@ pub fn Bios(comptime Cpu: type) type {
                 .{ BiosInt.unhandled, bridge_mod.CbType.iret },
             }) |pair| {
                 const kind: bridge_mod.Kind = switch (pair[0]) {
-                    .int08, .int1c => .irq,
+                    .int08, .int09, .int1c => .irq,
                     .int13 => .unsupported,
                     else => .dispatch,
                 };
@@ -102,6 +105,7 @@ pub fn Bios(comptime Cpu: type) type {
         pub fn dispatch(self: *Self, id: u8, cpu: *Cpu, br: *Bridge) void {
             switch (self.which(id)) {
                 .int08 => int08.handle(self, cpu, br),
+                .int09 => int09.handle(self, cpu, br),
                 .int10 => int10.handle(self, cpu, br),
                 .int11 => int1112.handle11(self, cpu, br),
                 .int12 => int1112.handle12(self, cpu, br),
@@ -190,6 +194,9 @@ pub fn Bios(comptime Cpu: type) type {
             }
             // Serviced vectors.
             br.setRealVec(self.ids.get(.int08), 0x08);
+            // INT 09h is guest-overridable: a guest may install its own keyboard
+            // ISR by writing IVT[9] (AH=25h), which then takes over (§4.0 / §5.1).
+            br.setRealVec(self.ids.get(.int09), 0x09);
             br.setRealVec(self.ids.get(.int10), 0x10);
             br.setRealVec(self.ids.get(.int11), 0x11);
             br.setRealVec(self.ids.get(.int12), 0x12);

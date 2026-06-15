@@ -151,6 +151,12 @@ pub const Keyboard = struct {
     /// Pop the head byte (the value a port-0x60 read returns). When the buffer
     /// empties, OBF clears. On an empty buffer returns the last response (a real
     /// 8042 returns the stale latch); this is deterministic.
+    ///
+    /// IRQ1 follows the OBF LEVEL on a real 8042: as long as a byte remains in the
+    /// output buffer after a read, the controller re-asserts IRQ1 so the ISR is
+    /// re-entered to drain the rest (e.g. the 0xE0 prefix + its scancode arrive as
+    /// two bytes the ISR reads across two IRQ1 invocations). Without this, a
+    /// multi-byte sequence injected before the ISR runs would strand the tail bytes.
     fn popByte(self: *Keyboard) u8 {
         if (self.fifo_count == 0) {
             self.status &= ~ST_OBF;
@@ -159,7 +165,12 @@ pub const Keyboard = struct {
         const b = self.fifo[self.fifo_head];
         self.fifo_head = (self.fifo_head + 1) % FIFO_LEN;
         self.fifo_count -= 1;
-        if (self.fifo_count == 0) self.status &= ~ST_OBF;
+        if (self.fifo_count == 0) {
+            self.status &= ~ST_OBF;
+        } else if ((self.config & CFG_KBD_IRQ) != 0 and (self.config & CFG_KBD_DISABLE) == 0) {
+            // Bytes remain (OBF still high): re-assert IRQ1 (level-triggered OBF).
+            self.raiseIrq1();
+        }
         return b;
     }
 

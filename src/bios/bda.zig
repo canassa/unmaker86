@@ -11,8 +11,9 @@ pub const BDA_PHYS: u32 = 0x0400;
 // Field offsets within the BDA segment (public spec).
 pub const OFF_EQUIPMENT: u16 = 0x10; // equipment word
 pub const OFF_MEMSIZE_KB: u16 = 0x13; // conventional memory size in KiB
-pub const OFF_KB_FLAG0: u16 = 0x17; // keyboard shift flags 0
-pub const OFF_KB_FLAG1: u16 = 0x18; // keyboard shift flags 1
+pub const OFF_KB_FLAG0: u16 = 0x17; // keyboard shift flags 1 (FLAGS1)
+pub const OFF_KB_FLAG1: u16 = 0x18; // keyboard shift flags 2 (FLAGS2)
+pub const OFF_KB_ALT_KEYPAD: u16 = 0x19; // Alt-numpad numeric accumulator (§5.1a)
 pub const OFF_KB_BUF_HEAD: u16 = 0x1A; // keyboard buffer head pointer
 pub const OFF_KB_BUF_TAIL: u16 = 0x1C; // keyboard buffer tail pointer
 pub const OFF_KB_BUF: u16 = 0x1E; // keyboard buffer ring (16 words)
@@ -31,6 +32,7 @@ pub const OFF_NB_ROWS: u16 = 0x84; // text rows - 1 (EGA/VGA)
 pub const OFF_CHAR_HEIGHT: u16 = 0x85; // character cell height (word)
 pub const OFF_VIDEO_CTL: u16 = 0x87; // EGA/VGA video control flags
 pub const OFF_DCC_INDEX: u16 = 0x8A; // display combination code index
+pub const OFF_KB_FLAG2: u16 = 0x96; // keyboard enhanced flags (FLAGS3, §5.1a)
 pub const OFF_TICK_COUNT: u16 = 0x6C; // timer tick count (dword)
 pub const OFF_TICK_OVERFLOW: u16 = 0x70; // 24h rollover flag
 pub const OFF_RESET_FLAG: u16 = 0x72;
@@ -96,6 +98,8 @@ pub fn Bda(comptime Cpu: type) type {
             self.wr16(OFF_MEMSIZE_KB, 640); // 640 KiB conventional
             self.wr8(OFF_KB_FLAG0, 0);
             self.wr8(OFF_KB_FLAG1, 0);
+            self.wr8(OFF_KB_ALT_KEYPAD, 0);
+            self.wr8(OFF_KB_FLAG2, 0x10); // FLAGS3: bit4 = 101/102-key MF2 installed
             // Keyboard ring: head == tail == ring start (empty).
             self.wr16(OFF_KB_BUF_HEAD, KB_BUF_LO);
             self.wr16(OFF_KB_BUF_TAIL, KB_BUF_LO);
@@ -180,6 +184,32 @@ pub fn Bda(comptime Cpu: type) type {
         }
         pub fn kbShiftFlags(self: Self) u8 {
             return self.rd8(OFF_KB_FLAG0);
+        }
+        pub fn setKbShiftFlags(self: Self, v: u8) void {
+            self.wr8(OFF_KB_FLAG0, v);
+        }
+        /// FLAGS2 (0040:0018) — pressed-vs-latched lock state + Pause/SysReq (§5.1a).
+        pub fn kbFlags2(self: Self) u8 {
+            return self.rd8(OFF_KB_FLAG1);
+        }
+        pub fn setKbFlags2(self: Self, v: u8) void {
+            self.wr8(OFF_KB_FLAG1, v);
+        }
+        /// FLAGS3 (0040:0096) — enhanced-keyboard flags: right-Ctrl/right-Alt held +
+        /// the E0/E1 prefix latches the ISR uses to disambiguate extended keys.
+        pub fn kbFlags3(self: Self) u8 {
+            return self.rd8(OFF_KB_FLAG2);
+        }
+        pub fn setKbFlags3(self: Self, v: u8) void {
+            self.wr8(OFF_KB_FLAG2, v);
+        }
+        /// Alt-numpad numeric accumulator (0040:0019): digits typed on the numpad
+        /// while Alt is held; emitted as one keystroke on Alt-release.
+        pub fn kbAltKeypad(self: Self) u8 {
+            return self.rd8(OFF_KB_ALT_KEYPAD);
+        }
+        pub fn setKbAltKeypad(self: Self, v: u8) void {
+            self.wr8(OFF_KB_ALT_KEYPAD, v);
         }
     };
 }

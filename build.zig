@@ -338,6 +338,7 @@ pub fn build(b: *std.Build) void {
     bridge_test_step.dependOn(&bridge_rt.step);
 
     const bios_unit = MachineTest.add(b, target, optimize, "src/bios/bios_test.zig", &dosbios_imports);
+    const bios_int09 = MachineTest.add(b, target, optimize, "src/bios/int09_test.zig", &dosbios_imports);
     const bios_determinism = MachineTest.add(b, target, optimize, "src/bios/determinism_test.zig", &dosbios_imports);
     // Scancode set-1 tables (input Phase 1b): a pure leaf (std only), so it builds
     // as a standalone test artifact with its in-file translation-conformance tests.
@@ -352,6 +353,7 @@ pub fn build(b: *std.Build) void {
     const bios_test_step = b.step("test-bios", "Run the BIOS tests");
     bios_test_step.dependOn(&bridge_unit.step);
     bios_test_step.dependOn(&bios_unit.step);
+    bios_test_step.dependOn(&bios_int09.step);
     bios_test_step.dependOn(&bios_determinism.step);
     bios_test_step.dependOn(&run_bios_scancodes.step);
 
@@ -499,6 +501,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&bridge_unit.step);
     test_step.dependOn(&bridge_rt.step);
     test_step.dependOn(&bios_unit.step);
+    test_step.dependOn(&bios_int09.step);
     test_step.dependOn(&bios_determinism.step);
     test_step.dependOn(&run_bios_scancodes.step);
     test_step.dependOn(&dos_unit.step);

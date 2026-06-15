@@ -18,6 +18,7 @@ const bios_sources = [_][]const u8{
     @embedFile("bios.zig"),
     @embedFile("bda.zig"),
     @embedFile("int08.zig"),
+    @embedFile("int09.zig"),
     @embedFile("int10.zig"),
     @embedFile("int11_12.zig"),
     @embedFile("int15.zig"),
