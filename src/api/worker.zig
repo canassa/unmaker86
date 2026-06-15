@@ -117,6 +117,7 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource) Respons
         },
 
         // ---- session -------------------------------------------------------
+        .console_get => consoleResp(ctrl),
         .status => statusResp(ctrl),
         .reset => blk: {
             ctrl.reset() catch return .{ .err = .load_failed };
@@ -256,6 +257,20 @@ fn stackGet(ctrl: *Controller, count: u16) Response {
     var res: q.StackResult = .{ .count = count };
     _ = ctrl.peekStack(res.words[0..count]);
     return .{ .stack = res };
+}
+
+/// Copy the guest's accumulated CON output into the response POD (side-effect-free:
+/// `Controller.console()` reads the device buffer without mutating it, so a read
+/// never perturbs the machine — the determinism prime directive). Truncates to the
+/// fixed result capacity (the device buffer is the same size, so no truncation in
+/// practice).
+fn consoleResp(ctrl: *Controller) Response {
+    const out = ctrl.console();
+    var res: q.ConsoleResult = .{};
+    const n = @min(out.len, res.bytes.len);
+    @memcpy(res.bytes[0..n], out[0..n]);
+    res.len = @intCast(n);
+    return .{ .console = res };
 }
 
 fn statusResp(ctrl: *Controller) Response {

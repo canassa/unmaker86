@@ -270,6 +270,12 @@ pub const Server = struct {
             if (method != .GET) return self.methodNotAllowed(req);
             return self.submitAndRespond(req, .status);
         }
+        if (std.mem.eql(u8, path, "/api/console")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            // Side-effect-free read of the guest's accumulated CON output (what the
+            // program has printed). No clear-on-read — a read never perturbs state.
+            return self.submitAndRespond(req, .console_get);
+        }
         if (std.mem.eql(u8, path, "/api/memory-regions")) {
             if (method != .GET) return self.methodNotAllowed(req);
             return self.submitAndRespond(req, .mem_regions);
@@ -669,6 +675,7 @@ pub const Server = struct {
             .ivt => |i| self.respondValue(req, .ok, .{ .vector = i.vector, .ip = i.ip, .cs = i.cs }),
             .stack => |s| self.respondStack(req, s),
             .status => |st| self.respondValue(req, .ok, st),
+            .console => |cr| self.respondConsole(req, cr),
             .regions => |rg| self.respondRegions(req, rg),
         }
     }
@@ -709,6 +716,16 @@ pub const Server = struct {
         const hex = wire.hexEncode(&hex_buf, mr.bytes[0..mr.len]) catch return self.respondError(req, .service_unavailable, "internal", "encode failed");
         var w = std.Io.Writer.fixed(self.resp_buf[0..]);
         w.print("{{\"phys\":{d},\"len\":{d},\"data\":\"{s}\"}}", .{ mr.phys, mr.len, hex }) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
+        self.respondJson(req, .ok, w.buffered());
+    }
+
+    fn respondConsole(self: *Server, req: *http.Server.Request, cr: q.ConsoleResult) void {
+        // {"len":N,"data":"<hex>"} — hex so arbitrary CON bytes (control chars, NULs)
+        // survive JSON intact (mirrors the /api/mem encoding).
+        var hex_buf: [q.MAX_CONSOLE * 2]u8 = undefined;
+        const hex = wire.hexEncode(&hex_buf, cr.bytes[0..cr.len]) catch return self.respondError(req, .service_unavailable, "internal", "encode failed");
+        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
+        w.print("{{\"len\":{d},\"data\":\"{s}\"}}", .{ cr.len, hex }) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
         self.respondJson(req, .ok, w.buffered());
     }
 

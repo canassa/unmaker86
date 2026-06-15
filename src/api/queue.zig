@@ -102,6 +102,10 @@ pub const Command = union(enum) {
     /// carries the fully-resolved `MouseInject` (absolute x/y, relative dx/dy,
     /// buttons, each gated by a `set_*` flag).
     input_mouse: debug.MouseInject,
+    /// Read the guest's accumulated CON (stdout/stderr) output — what the program
+    /// has printed so far. Side-effect-free (no clear-on-read); the worker copies the
+    /// device buffer into the response POD.
+    console_get: void,
     status: void,
     reset: void,
     load: LoadCmd,
@@ -170,6 +174,16 @@ pub const BpListResult = struct {
     items: [debug.MAX_BREAKPOINTS]json_wire.WireBreakpoint = undefined,
 };
 
+/// The guest's accumulated CON output, copied inline (the CON device's capture
+/// buffer is 4096 bytes — `src/dos/devices.zig` `CharDevice.out_buf`). Pointer-free
+/// POD: the worker copies the device buffer here so server.zig never reads machine
+/// state off-worker (§A.3a).
+pub const MAX_CONSOLE = 4096;
+pub const ConsoleResult = struct {
+    len: u32 = 0,
+    bytes: [MAX_CONSOLE]u8 = undefined,
+};
+
 pub const StatusResult = struct {
     runnable: bool,
     terminated: bool,
@@ -208,6 +222,7 @@ pub const Response = union(enum) {
     ivt: IvtResult,
     stack: StackResult,
     status: StatusResult,
+    console: ConsoleResult,
     regions: RegionsResult,
     /// A typed error. The handler maps `code` → HTTP status.
     err: ErrCode,

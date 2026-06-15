@@ -638,6 +638,17 @@ pub const Controller = struct {
         return .{ .ip = ip, .cs = cs };
     }
 
+    /// Side-effect-free read of the guest's accumulated CON (stdout/stderr) output —
+    /// the bytes the program has written to the console device so far. This is a pure
+    /// debugger observation: it reads the DOS CON device's capture buffer WITHOUT
+    /// mutating it (no clear-on-read), so repeated reads return the same prefix and a
+    /// read never perturbs the machine (the determinism prime directive). The returned
+    /// slice borrows the device's internal buffer and is valid until the next
+    /// `run`/`step` advances the guest; the worker copies it out before responding.
+    pub fn console(self: *const Controller) []const u8 {
+        return self.m.dos.dev_table.con.output();
+    }
+
     /// Side-effect-free read of up to `out.len` 16-bit words from SS:SP upward
     /// (no SP mutation). Returns the filled prefix.
     pub fn peekStack(self: *const Controller, out: []u16) []u16 {
