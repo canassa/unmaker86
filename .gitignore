@@ -25,3 +25,7 @@ examples/dos-src/CODE.TXT
 examples/dos-src/IN.TXT
 examples/dos-src/SCRATCH.DAT
 examples/dos-src/LV.TXT
+# The I/O-oracle binary blob a VGA program writes at mint/test time (the COMMITTED
+# golden is <STEM>.expected; VGAOUT.BIN is the transient capture, copied-then-
+# deleted by tools/oracle-io.sh and the zdos harness — never committed).
+examples/dos-src/VGAOUT.BIN

@@ -44,6 +44,7 @@ pub const run_loop = @import("run_loop.zig");
 const Bus = bus_mod.Bus;
 const Pic = devices.Pic;
 const Pit = devices.Pit;
+const Vga = devices.Vga;
 const Scheduler = scheduler.Scheduler;
 const EventKind = scheduler.EventKind;
 
@@ -127,6 +128,7 @@ pub const Machine = struct {
     bus: Bus,
     pic: Pic = .{},
     pit: Pit = .{},
+    vga: Vga = .{},
     sched: Scheduler = .{},
     cpu: Cpu = undefined,
     /// The host-serviced BIOS + DOS + the CallbackSink aggregate (D2/D12).
@@ -179,6 +181,11 @@ pub const Machine = struct {
     /// BIOS is a later module; for tests pass an empty slice).
     pub fn init(self: *Machine, allocator: std.mem.Allocator, bios_image: []const u8) !void {
         self.* = .{ .bus = try Bus.init(allocator) };
+        // The VGA owns a large fixed VRAM block; allocate it up-front (no per-op
+        // alloc). On a Bus.init failure the bus frees itself; on a VGA failure we
+        // free the bus to avoid a leak.
+        errdefer self.bus.deinit();
+        try self.vga.init(allocator);
         if (bios_image.len != 0) {
             self.bus.loadRom(bus_mod.memmap.bios_rom_start, bios_image);
         }
@@ -197,6 +204,14 @@ pub const Machine = struct {
         _ = self.bus.registerPort(0xA1, self.pic.portHandler());
         // (c) bus PortHandler.ctx = &self.pit (PIT ports 0x40-0x43).
         _ = self.bus.registerPortRange(0x40, 4, self.pit.portHandler());
+        // (c2) bus PortHandler.ctx = &self.vga: the DAC + pixel-mask ports
+        //      (0x3C6-0x3C9), the misc-output write (0x3C2) and its read alias
+        //      (0x3CC). VRAM (A0000-AFFFF) is registered as RAM-like MMIO so guest
+        //      writes hit the bus host-pointer fast path (no trap, no cycle hole).
+        _ = self.bus.registerPort(0x3C2, self.vga.portHandler());
+        _ = self.bus.registerPortRange(0x3C6, 4, self.vga.portHandler()); // 0x3C6-0x3C9
+        _ = self.bus.registerPort(0x3CC, self.vga.portHandler());
+        _ = self.bus.mapMmio(devices.vga.VRAM_PHYS, devices.vga.VRAM_WINDOW_LEN, self.vga.memHandler());
         // (d) scheduler-callback binding: PIT raise -> &self.pic; PIT schedule/
         //     cancel -> &self (the machine, which owns the scheduler).
         self.pit.cycles = &self.cpu.st.cycles;
@@ -284,6 +299,7 @@ pub const Machine = struct {
     }
 
     pub fn deinit(self: *Machine) void {
+        self.vga.deinit(self.bus.allocator);
         self.bus.deinit();
         self.* = undefined;
     }
@@ -317,6 +333,7 @@ pub const Machine = struct {
         @memset(self.bus.ram, 0); // re-zero RAM for reproducibility
         self.pic.reset();
         self.pit.reset();
+        self.vga.reset(); // zero VRAM + DAC + indices (deterministic power-on)
         self.sched.reset();
         self.shutdown = false;
         // Re-init the host-serviced state (the callback ids + routing are re-
@@ -423,6 +440,10 @@ pub const Machine = struct {
         bus: Bus.Snapshot,
         pic: Pic.Snapshot,
         pit: Pit.Snapshot,
+        /// VGA device-state subset (DAC + registers). VRAM bytes are large and
+        /// captured separately (like the bus RAM slab) — the caller copies
+        /// `machine.vga.vram` and restores it into the re-init'd machine's VRAM.
+        vga: Vga.Snapshot,
         sched: Scheduler.Snapshot,
         shutdown: bool,
     };
@@ -433,6 +454,7 @@ pub const Machine = struct {
             .bus = self.bus.snapshot(),
             .pic = self.pic.snapshot(),
             .pit = self.pit.snapshot(),
+            .vga = self.vga.snapshot(),
             .sched = self.sched.snapshot(),
             .shutdown = self.shutdown,
         };
@@ -445,6 +467,7 @@ pub const Machine = struct {
         self.bus.restore(snap.bus);
         self.pic.restore(snap.pic);
         self.pit.restore(snap.pit);
+        self.vga.restore(snap.vga);
         self.sched.restore(snap.sched);
         self.shutdown = snap.shutdown;
     }

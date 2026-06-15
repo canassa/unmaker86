@@ -5,9 +5,11 @@
 
 pub const pic = @import("pic.zig");
 pub const pit = @import("pit.zig");
+pub const vga = @import("vga.zig");
 
 pub const Pic = pic.Pic;
 pub const Pit = pit.Pit;
+pub const Vga = vga.Vga;
 
 test {
     @import("std").testing.refAllDeclsRecursive(@This());

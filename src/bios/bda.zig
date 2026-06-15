@@ -24,6 +24,13 @@ pub const OFF_VIDEO_PAGE_SIZE: u16 = 0x4C; // page size in bytes
 pub const OFF_CURSOR_POS: u16 = 0x50; // cursor positions (8 pages, word each)
 pub const OFF_CURSOR_SHAPE: u16 = 0x60; // cursor shape
 pub const OFF_ACTIVE_PAGE: u16 = 0x62; // active display page
+// Video fields the VGA mode-set fills (dosbox-x int10.h BIOSMEM_* offsets,
+// written by FinishSetMode, int10_modes.cpp:942-985).
+pub const OFF_CRTC_ADDRESS: u16 = 0x63; // CRTC port base (0x3D4 color / 0x3B4 mono)
+pub const OFF_NB_ROWS: u16 = 0x84; // text rows - 1 (EGA/VGA)
+pub const OFF_CHAR_HEIGHT: u16 = 0x85; // character cell height (word)
+pub const OFF_VIDEO_CTL: u16 = 0x87; // EGA/VGA video control flags
+pub const OFF_DCC_INDEX: u16 = 0x8A; // display combination code index
 pub const OFF_TICK_COUNT: u16 = 0x6C; // timer tick count (dword)
 pub const OFF_TICK_OVERFLOW: u16 = 0x70; // 24h rollover flag
 pub const OFF_RESET_FLAG: u16 = 0x72;

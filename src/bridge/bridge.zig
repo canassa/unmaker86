@@ -53,6 +53,8 @@ const OP_STI: u8 = 0xFB;
 const OP_MOV_AL_IMM: u8 = 0xB0;
 const OP_OUT_IMM_AL: u8 = 0xE6;
 const OP_INT_IMM: u8 = 0xCD;
+const OP_PUSH_AX: u8 = 0x50; // preserve the interrupted AX across the EOI sequence
+const OP_POP_AX: u8 = 0x58;
 const EOI: u8 = 0x20; // OCW2 non-specific EOI
 const PIC1_CMD: u8 = 0x20;
 const PIC2_CMD: u8 = 0xA0;
@@ -68,8 +70,9 @@ pub const CB_BASE_PHYS: u32 = (@as(u32, CB_SEG) << 4) + CB_OFFSET;
 /// zdos's OWN slot size (D1 — a deliberate divergence from DOSBox's CB_SIZE=32 /
 /// 2-byte id). A slot is the 3-byte trap stub `0xFE 0x38 <id>` plus the largest
 /// return tail. The largest tail is `iret_eoi_pic2` =
-/// MOV AL,imm (2) + OUT 0xA0,AL (2) + OUT 0x20,AL (2) + IRET (1) = 7 bytes.
-/// 3 + 7 = 10; round up to 16 so a slot is paragraph-aligned (seg:off math is
+/// PUSH AX (1) + MOV AL,imm (2) + OUT 0xA0,AL (2) + OUT 0x20,AL (2) + POP AX (1)
+/// + IRET (1) = 9 bytes (PUSH/POP preserve the interrupted AX across the EOI).
+/// 3 + 9 = 12; round up to 16 so a slot is paragraph-aligned (seg:off math is
 /// clean and a future tail can grow without re-laying-out the table).
 pub const CB_SLOT_SIZE: u16 = 16;
 
@@ -85,7 +88,7 @@ pub const TRAMP_OFF: u16 = 0x0600;
 
 comptime {
     // The largest tail must fit the slot (the by-construction layout guard, 0b).
-    std.debug.assert(3 + 7 <= CB_SLOT_SIZE);
+    std.debug.assert(3 + 9 <= CB_SLOT_SIZE);
     // The whole table must fit inside the BIOS ROM window (0xF0000..0xFFFFF).
     std.debug.assert(CB_BASE_PHYS + @as(u32, CB_MAX) * CB_SLOT_SIZE <= 0x100000);
 }
@@ -209,19 +212,28 @@ pub fn Bridge(comptime Cpu: type) type {
                     w.byte(OP_IRET);
                 },
                 .iret_eoi_pic1 => {
+                    // PUSH AX / ... / POP AX so the EOI's `MOV AL,0x20` does NOT
+                    // clobber the interrupted guest's AL (a real BIOS IRQ handler
+                    // preserves the register frame). Without this, an IRQ0 landing
+                    // between a guest `MOV AL,x` and a following INT corrupts AL to
+                    // 0x20 — observed as scattered 0x20 pixels in the VGA oracle.
+                    w.byte(OP_PUSH_AX);
                     w.byte(OP_MOV_AL_IMM);
                     w.byte(EOI);
                     w.byte(OP_OUT_IMM_AL);
                     w.byte(PIC1_CMD);
+                    w.byte(OP_POP_AX);
                     w.byte(OP_IRET);
                 },
                 .iret_eoi_pic2 => {
+                    w.byte(OP_PUSH_AX);
                     w.byte(OP_MOV_AL_IMM);
                     w.byte(EOI);
                     w.byte(OP_OUT_IMM_AL);
                     w.byte(PIC2_CMD);
                     w.byte(OP_OUT_IMM_AL);
                     w.byte(PIC1_CMD);
+                    w.byte(OP_POP_AX);
                     w.byte(OP_IRET);
                 },
             }

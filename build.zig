@@ -241,6 +241,10 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bus", .mod = bus_mod },
         .{ .name = "timing", .mod = timing_mod },
     });
+    const vga_tests = MachineTest.add(b, target, optimize, "src/devices/vga_test.zig", &.{
+        .{ .name = "devices", .mod = devices_mod },
+        .{ .name = "bus", .mod = bus_mod },
+    });
     const machine_unit = MachineTest.add(b, target, optimize, "src/machine/machine_test.zig", &.{
         .{ .name = "machine", .mod = machine_mod },
         .{ .name = "cpu", .mod = cpu_mod },
@@ -267,6 +271,7 @@ pub fn build(b: *std.Build) void {
     machine_test_step.dependOn(&run_sched_tests.step);
     machine_test_step.dependOn(&pic_tests.step);
     machine_test_step.dependOn(&pit_tests.step);
+    machine_test_step.dependOn(&vga_tests.step);
     machine_test_step.dependOn(&machine_unit.step);
     machine_test_step.dependOn(&machine_determinism.step);
     machine_test_step.dependOn(&machine_integration.step);
@@ -334,6 +339,23 @@ pub fn build(b: *std.Build) void {
     const oracle_test_step = b.step("test-oracle", "Run the dosbox-x external-oracle conformance suite");
     oracle_test_step.dependOn(&dos_oracle.step);
 
+    // The I/O-phase BINARY device-blob oracle: for each VGA corpus `.EXE`, run it
+    // on zdos and assert the device-state blob it wrote (mode-13h VRAM + 6-bit DAC
+    // + BDA mode) == the committed dosbox-x-minted `.expected` binary golden
+    // (offline; minted by tools/oracle-io.sh, machine=vgaonly).
+    const io_oracle_t = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dos/io_oracle_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    for (dosbios_imports) |imp| io_oracle_t.root_module.addImport(imp.name, imp.mod);
+    io_oracle_t.root_module.addOptions("build_options", opts);
+    const io_oracle = b.addRunArtifact(io_oracle_t);
+    const io_oracle_test_step = b.step("test-io-oracle", "Run the dosbox-x I/O binary-blob oracle suite (VGA)");
+    io_oracle_test_step.dependOn(&io_oracle.step);
+
     const dos_test_step = b.step("test-dos", "Run the DOS kernel + loader + EMS tests");
     dos_test_step.dependOn(&dos_unit.step);
     dos_test_step.dependOn(&dos_int21.step);
@@ -352,6 +374,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_sched_tests.step);
     test_step.dependOn(&pic_tests.step);
     test_step.dependOn(&pit_tests.step);
+    test_step.dependOn(&vga_tests.step);
     test_step.dependOn(&machine_unit.step);
     test_step.dependOn(&machine_determinism.step);
     test_step.dependOn(&machine_integration.step);
@@ -365,6 +388,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&dos_integration.step);
     test_step.dependOn(&dos_borland.step);
     test_step.dependOn(&dos_oracle.step);
+    test_step.dependOn(&io_oracle.step);
 
     // Dedicated full-conformance sweep: runs ALL vendored 80386 real-mode
     // vectors and reports per-opcode pass/fail/revoked counts. Separate from
