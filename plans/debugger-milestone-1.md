@@ -591,23 +591,23 @@ pub fn memoryRegions(self: *const Controller) []const Region; // RAM size, VRAM,
       no-pointer-fields check (part of #14).
 
 ### Phase 2 — controller facade + `runUntilEvent`
-- [ ] `src/debug/controller.zig`: `Controller{ m, set, last_stop }`, `init` (post-`wire`).
-- [ ] `runUntilEvent(cycle_cap)`: own loop over `run_loop.step`; **step-at-least-once**
+- [x] `src/debug/controller.zig`: `Controller{ m, set, last_stop }`, `init` (post-`wire`).
+- [x] `runUntilEvent(cycle_cap)`: own loop over `run_loop.step`; **step-at-least-once**
       resume rule; per-boundary **terminal precedence** then **lowest-id breakpoint** scan
       then budget (§3); set/clear `last_stop`; all-matching one-shot consumption.
-- [ ] `addBreakpoint/removeBreakpoint/enableBreakpoint/getBreakpoint/forEachBreakpoint`
+- [x] `addBreakpoint/removeBreakpoint/enableBreakpoint/getBreakpoint/forEachBreakpoint`
       (delegate; recompute `active_count`).
-- [ ] Inspect: `cpuSnapshot` (field-by-field, `Reg32` order), `status`, `memoryRegions`.
+- [x] Inspect: `cpuSnapshot` (field-by-field, `Reg32` order), `status`, `memoryRegions`.
       *(peek path lands in Phase 2b so this phase can compile against RAM-only first if
       needed — but prefer doing 2b together.)*
-- [ ] Tests: #1, #3, #6, #7, #8, #9, #10, #11, #12, #14.
+- [x] Tests: #1, #3, #6, #7, #8, #9, #10, #11, #12, #14.
 
 ### Phase 2b — side-effect-free peek path
-- [ ] Add `peek8` to the `MemHandler` contract (`src/bus/`/`src/devices/`); implement for
+- [x] Add `peek8` to the `MemHandler` contract (`src/bus/`/`src/devices/`); implement for
       RAM/ROM/hostPtr (direct) and for device MMIO as a pure snapshot (PIT peek without phase
       advance, `pit.zig`). `bus.peekBlock`.
-- [ ] Controller `peekMem`/`peekIvtEntry`/`peekStack`; raw-bytes-at-CS:IP via `peekMem`.
-- [ ] Test #13 (inspection leaves `machine.snapshot()` byte-identical over a device region).
+- [x] Controller `peekMem`/`peekIvtEntry`/`peekStack`; raw-bytes-at-CS:IP via `peekMem`.
+- [x] Test #13 (inspection leaves `machine.snapshot()` byte-identical over a device region).
 
 ### Phase 3 — mutate + stepping & run-to (one-shot breakpoints)
 - [ ] Mutate: `setReg32/16/8` (explicit `Reg16`/`Reg8` enums → `u3`), `setSegment`,

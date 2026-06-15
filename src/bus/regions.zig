@@ -49,6 +49,16 @@ pub const MemHandler = struct {
         /// the given guest page's backing bytes if this handler is RAM-like, so
         /// the bus can index it directly; null → use the per-width methods.
         getHostPtr: ?*const fn (ctx: *anyopaque, page: u32) ?[*]u8 = null,
+        /// Optional SIDE-EFFECT-FREE inspection read (the debugger peek path).
+        /// MUST NOT mutate any device state (no latch advance, no phase flip):
+        /// it returns the value a pure observer would see WITHOUT perturbing the
+        /// machine (determinism prime directive — inspection must never feed back
+        /// into emulation). Returns null when this address genuinely cannot be
+        /// read without a side effect ("not peekable"); the bus surfaces that as
+        /// a deterministic not-peekable fill rather than faking a value (ground
+        /// rule). RAM-like handlers that expose `getHostPtr` do NOT need `peek8`
+        /// — the bus peeks their backing pointer directly.
+        peek8: ?*const fn (ctx: *anyopaque, phys: u32) ?u8 = null,
     };
 
     // --- Per-width dispatch with the byte-decompose fallback (B11). ---
@@ -84,6 +94,11 @@ pub const MemHandler = struct {
     }
     pub inline fn hostPtr(self: MemHandler, page: u32) ?[*]u8 {
         if (self.vtable.getHostPtr) |f| return f(self.ctx, page);
+        return null;
+    }
+    /// SIDE-EFFECT-FREE inspection read. Returns null when not peekable.
+    pub inline fn peek8(self: MemHandler, phys: u32) ?u8 {
+        if (self.vtable.peek8) |f| return f(self.ctx, phys);
         return null;
     }
 };

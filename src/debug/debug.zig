@@ -23,9 +23,21 @@ pub const Error = breakpoints.Error;
 pub const MAX_BREAKPOINTS = breakpoints.MAX_BREAKPOINTS;
 pub const default_kind = breakpoints.default_kind;
 
-// The controller facade (Phase 2+) is re-exported here as its file lands.
+const controller = @import("controller.zig");
+
+// ---- controller facade (Phase 2+) ----
+pub const Controller = controller.Controller;
+pub const StopReason = controller.StopReason;
+pub const StepOverResult = controller.StepOverResult;
+pub const CpuSnapshot = controller.CpuSnapshot;
+pub const Reg16 = controller.Reg16;
+pub const Reg8 = controller.Reg8;
+pub const Region = controller.Region;
 
 test {
     _ = breakpoints;
+    _ = controller;
     _ = @import("breakpoints_test.zig");
+    _ = @import("controller_test.zig");
+    _ = @import("determinism_test.zig");
 }

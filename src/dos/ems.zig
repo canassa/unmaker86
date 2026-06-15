@@ -109,6 +109,9 @@ pub fn Ems(comptime Cpu: type) type {
             .read8 = read8,
             .write8 = write8,
             .getHostPtr = getHostPtr,
+            // EMS frame reads are pure (a backing-store index); the debugger peek
+            // path matches read8 exactly. An unmapped frame slot reads 0 here too.
+            .peek8 = peek8,
         };
 
         /// Return a host pointer into the backing store for a mapped frame page, so
@@ -142,6 +145,17 @@ pub fn Ems(comptime Cpu: type) type {
             const within = window_off % PAGE_SIZE;
             const logical = self.frame_map[slot] orelse return;
             self.backing[@as(u32, logical) * PAGE_SIZE + within] = v;
+        }
+        /// Side-effect-free inspection read (debugger peek path). A pure backing-
+        /// store index; an unmapped frame slot reads 0 (same as read8), mutating
+        /// nothing.
+        fn peek8(ctx: *anyopaque, phys: u32) ?u8 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const window_off = phys - FRAME_PHYS;
+            const slot = window_off / PAGE_SIZE;
+            const within = window_off % PAGE_SIZE;
+            const logical = self.frame_map[slot] orelse return 0;
+            return self.backing[@as(u32, logical) * PAGE_SIZE + within];
         }
 
         // -------------------------------------------------------------------

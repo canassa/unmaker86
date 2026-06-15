@@ -147,6 +147,10 @@ pub const Vga = struct {
         .read8 = memRead8,
         .write8 = memWrite8,
         .getHostPtr = memGetHostPtr,
+        // VRAM reads are already pure (a plain slab index); the debugger peek
+        // path is identical to read8. getHostPtr also covers it for the bus fast
+        // path, but provide peek8 too so a peek never depends on hostPtr.
+        .peek8 = memPeek8,
     };
 
     /// The linear offset into VRAM for a guest physical address in the A000 window.
@@ -168,6 +172,12 @@ pub const Vga = struct {
     fn memWrite8(ctx: *anyopaque, phys: u32, v: u8) void {
         const self: *Vga = @ptrCast(@alignCast(ctx));
         self.vram[vramOffset(phys)] = v;
+    }
+    /// Side-effect-free inspection read (debugger peek path). A pure VRAM index;
+    /// identical to read8 but contractually guaranteed to mutate nothing.
+    fn memPeek8(ctx: *anyopaque, phys: u32) ?u8 {
+        const self: *Vga = @ptrCast(@alignCast(ctx));
+        return self.vram[vramOffset(phys)];
     }
 
     // -----------------------------------------------------------------------

@@ -113,8 +113,8 @@ pub const Bus = struct {
         //      past its known tables (the only large members are the two ID
         //      tables + the RAM slice header).
         const expected_min = 65536 // port_handler_id
-        + memmap.page_count // page_kind
-        + memmap.page_count; // page_handler_id
+            + memmap.page_count // page_kind
+            + memmap.page_count; // page_handler_id
         std.debug.assert(@sizeOf(Bus) >= expected_min);
         // Upper bound: tables + handler arrays + scalars + slack. Catches an
         // accidental inline of a large buffer into the struct.
@@ -547,6 +547,53 @@ pub const Bus = struct {
             return;
         }
         for (dst, 0..) |*b, i| b.* = self.readPhys8(phys +% @as(u32, @intCast(i)));
+    }
+
+    // -----------------------------------------------------------------------
+    // SIDE-EFFECT-FREE inspection (the debugger peek path). NEVER routes through
+    // a device READ handler (those mutate device state — e.g. the PIT latch
+    // phase). RAM/ROM read straight from the slab; host-pointer-backed MMIO (VGA
+    // VRAM, mapped EMS frame pages) read straight from the backing pointer;
+    // non-hostPtr device MMIO uses the handler's pure `peek8`; an address that is
+    // genuinely not peekable yields the deterministic `not_peekable_fill`.
+    // Determinism prime directive: a peek leaves `machine.snapshot()` byte-
+    // identical (CLAUDE #5/#6).
+    // -----------------------------------------------------------------------
+
+    /// The deterministic fill for an address that cannot be read without a side
+    /// effect (a device whose `peek8` returns null). Distinct, well-defined value
+    /// so the caller can tell a real 0 from a not-peekable region if it cares; the
+    /// important property is that it is CONSTANT (no garbage, no host state).
+    pub const not_peekable_fill: u8 = 0xFF;
+
+    /// Side-effect-free 8-bit inspection read of an ALREADY-UNMASKED physical
+    /// address (we A20-mask here, once). Pure: reads no device latch, advances no
+    /// phase, mutates nothing.
+    pub fn peekPhys8(self: *const Bus, phys: u32) u8 {
+        const m = a20.apply(self.a20_mask, phys);
+        const page = memmap.pageIndex(m);
+        switch (self.page_kind[page]) {
+            .ram, .rom => {
+                if (m < memmap.ram_total_size) return self.ram[m];
+                return memmap.unmapped_fill;
+            },
+            .mmio => {
+                const id = self.page_handler_id[page];
+                const h = self.mem_handlers[id].?;
+                // RAM-like MMIO: read the backing pointer directly (no handler).
+                if (h.hostPtr(page)) |hp| return hp[m & (memmap.page_size - 1)];
+                // Non-hostPtr device MMIO: the pure peek, or not-peekable fill.
+                return h.peek8(m) orelse not_peekable_fill;
+            },
+            .unmapped => return memmap.unmapped_fill,
+        }
+    }
+
+    /// Side-effect-free bulk inspection read of `dst.len` bytes from guest
+    /// physical `phys`. Mirror of `readGuestBlock` but on the peek path. A20 is
+    /// re-applied per byte (matches the wide-access semantics).
+    pub fn peekBlock(self: *const Bus, phys: u32, dst: []u8) void {
+        for (dst, 0..) |*b, i| b.* = self.peekPhys8(phys +% @as(u32, @intCast(i)));
     }
 
     /// If `[phys, phys+len)` A20-masks to a contiguous run that stays within the
