@@ -20,6 +20,17 @@ fn freeVga(alloc: std.mem.Allocator, v: *Vga) void {
     alloc.destroy(v);
 }
 
+test "retrace timing constants resolve to the canonical 70.086 Hz frame" {
+    // The constants are comptime-pinned in vga.zig; assert they are reachable via
+    // `devices.Vga.*` (no new test-module import) and match the canonical figures.
+    try std.testing.expectEqual(@as(u64, 204_293), Vga.FRAME_CYCLES);
+    try std.testing.expectEqual(@as(u64, 454), Vga.LINE_CYCLES);
+    try std.testing.expectEqual(@as(u64, 181), Vga.HDE_CYCLES);
+    // Effective refresh: 14_318_184 / 204_293 = 70.086 Hz (integer hundredths = 7008).
+    const timing = @import("timing");
+    try std.testing.expectEqual(@as(u64, 7008), timing.CPU_CLOCK_HZ * 100 / Vga.FRAME_CYCLES);
+}
+
 test "DAC: write a single entry via 0x3C8 + three 0x3C9, read it back via 0x3C7" {
     const alloc = std.testing.allocator;
     const v = try makeVga(alloc);

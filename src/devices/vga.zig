@@ -37,6 +37,7 @@
 
 const std = @import("std");
 const bus_mod = @import("bus");
+const timing = @import("timing");
 
 const PortHandler = bus_mod.PortHandler;
 const MemHandler = bus_mod.MemHandler;
@@ -66,6 +67,51 @@ pub const DacState = enum(u8) { read, write };
 pub const DacRgb = extern struct { red: u8 = 0, green: u8 = 0, blue: u8 = 0 };
 
 pub const Vga = struct {
+    // -----------------------------------------------------------------------
+    // Input Status Register #1 (0x3DA / 0x3BA) — deterministic vertical-retrace
+    // / display-enable timing (plans/vga-retrace.md). The retrace/display-enable
+    // bits are a PURE FUNCTION of the CPU cycle counter (CLAUDE prime directive
+    // #2/#3) — integer math only, NO host clock, NO float, NO RNG. See
+    // `statusReg1`. Exposed `pub const` on the struct so tests read
+    // `devices.Vga.FRAME_CYCLES` with no new test-module import.
+    //
+    // Canonical mode-13h / standard-VGA 70 Hz timing (also mode 03h text — same
+    // CRTC family). The geometry is the canonical hardware triple; cycles are
+    // derived from the pinned CPU clock (timing.CPU_CLOCK_HZ = 14_318_184) at
+    // comptime via Zig integer `/` (FLOOR / truncating division — byte-stable).
+    //   pixel (dot) clock      = 25_175_000 Hz  (dosbox Vga640PixelClockHz, vga.h:140)
+    //   horizontal total       = 800 dots/line  (8 dots/char × 100 char-clocks;
+    //                                             the BIOS table htot=100 is in CHARS)
+    //   vertical total         = 449 lines/frame
+    //   => vertical refresh    = 25_175_000 / (800*449) = 70.086 Hz (canonical)
+    //   horizontal display end = 320 dots (active pixels per line, mode 13h)
+    //   vertical display end   = 400 lines (double-scanned 200); v-retrace ~412..414
+    pub const DOT_CLOCK_HZ: u64 = 25_175_000;
+    pub const HTOTAL_DOTS: u64 = 800; // 8 dots/char × 100 char-clocks (table htot=100 is chars)
+    pub const VTOTAL_LINES: u64 = 449;
+    pub const HDE_DOTS: u64 = 320; // active pixels per line (display-enable high region)
+    pub const VDE_LINES: u64 = 400; // last active scanline (display end)
+    pub const VRSTART_LINE: u64 = 412; // vertical retrace pulse start (lines)
+    pub const VREND_LINE: u64 = 414; // vertical retrace pulse end
+
+    /// Frame period in CPU cycles: CPU_CLOCK_HZ * HTOTAL_DOTS * VTOTAL_LINES / DOT_CLOCK_HZ.
+    pub const FRAME_CYCLES: u64 = timing.CPU_CLOCK_HZ * HTOTAL_DOTS * VTOTAL_LINES / DOT_CLOCK_HZ;
+    /// One scanline in CPU cycles: FRAME_CYCLES / VTOTAL_LINES (floor).
+    pub const LINE_CYCLES: u64 = FRAME_CYCLES / VTOTAL_LINES;
+    /// The active (display-enable high) span of a scanline, in CPU cycles.
+    pub const HDE_CYCLES: u64 = timing.CPU_CLOCK_HZ * HDE_DOTS / DOT_CLOCK_HZ;
+
+    comptime {
+        // Pin against the CANONICAL target, not a re-derivation that could
+        // rubber-stamp a wrong input (mirrors src/abi/timing.zig:45-50). A future
+        // edit to the geometry above that drifts off the 70.086 Hz frame fails here.
+        std.debug.assert(FRAME_CYCLES == 204_293);
+        std.debug.assert(LINE_CYCLES == 454);
+        std.debug.assert(HDE_CYCLES == 181);
+        // Effective refresh ≈ 70.08 Hz: 14_318_184 * 100 / 204_293 = 7008.
+        std.debug.assert(timing.CPU_CLOCK_HZ * 100 / FRAME_CYCLES == 7008);
+    }
+
     /// The one fixed VRAM block. Heap-allocated up-front (it is large) and freed
     /// at deinit, zero-filled at reset (determinism). NOT inlined into the struct.
     vram: []u8 = &.{},
