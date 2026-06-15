@@ -1,0 +1,19 @@
+exit_code: 0
+--- output ---
+peek1 empty=0 scan=1E ascii=61
+peek2 empty=0 scan=1E ascii=61
+read1 scan=1E ascii=61
+read2 scan=30 ascii=62
+read3 scan=1C ascii=0D
+peek_empty empty=1 ax=010C
+wrap1 scan=48 ascii=37
+wrap2 scan=50 ascii=38
+wrap3 scan=4D ascii=39 head=0020
+shift al=42
+enh_read00 scan=1E ascii=61
+enh_read10a scan=85 ascii=00
+enh_read10b scan=1E ascii=61
+enh_peek11 empty=0 scan=85 ascii=00
+enh_peek01 empty=0 scan=1E ascii=61
+f0_peek11 empty=0 ax=8400
+f0_read10 ax=8400

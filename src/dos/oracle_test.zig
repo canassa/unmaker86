@@ -254,6 +254,27 @@ const PASSING = [_]Program{
     // Proven deterministic by a triple-mint byte-identical diff; every created
     // file is removed before exit so the committed corpus stays byte-identical.
     .{ .exe = "FCBIO.EXE" },
+    // INT 16h BIOS keyboard ring band (I/O band K1): the keyboard services driven
+    // through a PROGRAM-SEEDED BDA ring (plans/io-oracle.md §2.2 — no real key
+    // injection; dosbox-x AUTOTYPE is timing-based and was rejected). KBRING.EXE
+    // writes known scancode:ascii words directly into the BDA ring (0040:001E...,
+    // advancing the tail at 0040:001C exactly as IRQ1 would), then reads them back
+    // through INT 16h and prints the (scancode,ascii)/peek/empty/shift results.
+    // It exercises AH=01 peek (non-empty + same-word-on-re-peek, then ZF=1 on the
+    // drained ring — AX left UNCHANGED on the empty branch, matching dosbox's
+    // reg_ax untouched), AH=00 read (drain in order), the ring WRAP across END
+    // (seeded near 0x3A so a push wraps to START 0x1E and the dequeue follows),
+    // AH=02 shift flags (seed 0040:0017=0x42, read back), and the AH=10/11 enhanced
+    // vs AH=00/01 normal split: an enhanced F11 (0x8500, scancode 0x85>0x84) is
+    // SKIPPED by AH=00/01 but RETURNED by AH=10/11, and the low-byte==0xF0 enhanced
+    // transform (0x84F0 -> 0x8400) is applied by AH=10/11. Semantics matched
+    // verbatim to bios_keyboard.cpp INT16_Handler/IsEnhancedKey/get_key/check_key.
+    // All printed values are oracle-able (the pairs, booleans, the shift byte, the
+    // wrapped head pointer); proven deterministic by a triple-mint byte-identical
+    // diff. The program creates no files, so the committed corpus stays byte-
+    // identical. The empty-ring blocking seam (AH=00/10 on an empty ring) is the
+    // carried determinism seam (dos-coverage-gaps.md §3.1) and is never hit here.
+    .{ .exe = "KBRING.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented
