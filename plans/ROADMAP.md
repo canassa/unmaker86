@@ -18,10 +18,11 @@ in-process *and* black-box (real-binary-over-HTTP) test suites.
 5. **Debugger M2 — HTTP/JSON API** (~21 endpoints over the core; one-command-in-flight worker, determinism-preserving). Audited PASS. → `plans/debugger-milestone-2.md`
 6. **Black-box test harness** (Zig `Session`, spawns the real binary, drives HTTP).
 7. **Input injection** (design v3): keyboard polling+blocking (8042 → IRQ1 → INT 09h → BDA ring → INT 16h) + mouse polling (INT 33h) over the API, deterministic; bridge primitives (`runGuestFarCall`, poll-loop emitter); black-box **KEYECHO.EXE** echo+ESC test. Bonus: INT 08h→INT 1Ch timer chaining fixed. → `plans/input-injection.md`, `[[input-injection]]`
+8. **VGA 0x3DA Input Status Register #1** — deterministic, cycle-derived vertical-retrace (bit 3) + display-enable (bit 0) status (0x3DA / 0x3BA), integer-only `f(cpu.st.cycles)`, no host clock/float. Unblocks retrace-polling guests (Borland `putch` snow-avoid, mode-13h vsync) that previously spun on the unmapped 0xFF. Excluded from cross-emulator goldens (oracle-non-determinism boundary). → `plans/vga-retrace.md`. **NOTE (surfaced by the KEYECHO recon):** real Borland `putch()` no longer hangs, but its echo goes to text-mode video RAM (B800:0000) via direct video + INT 10h cursor calls, which zdos does not model — see the text-video backlog item below.
 
 ## Decisions / next goals
 - **[next] Input Phase 3** — mouse AH=0Ch event callback (via `runGuestFarCall`). Last *core* input feature.
-- **[backlog] VGA 0x3DA vertical-retrace status bits** — without them, `putch`/retrace-polling VGA programs spin forever. Deterministic cycle-derived toggle.
+- **[backlog] VGA text-mode video (B8000) + console mirror** — surfaced by the 0x3DA/KEYECHO recon: BCC `putch()` echoes via direct writes to the text page B800:0000 (+ INT 10h AH=03/02 cursor) and INT 10h AH=0Eh teletype, NONE of which zdos models (only mode-13h A000 graphics VRAM exists; `/api/console` mirrors only the DOS CON device). So real-`putch()`/teletype output is currently unobservable. Modeling a VGA text device + mirroring it (and/or INT 10h AH=0Eh) into the console capture would let direct-video DOS programs be black-box tested. Larger feature; flagged not faked.
 - **[optional] Input Phase 4/5** — INT 21h-stdin blocking (`waiting_for_input`); cycle-scheduled injection (Model B).
 - **[later] M3 — MCP layer** — thin adapter over the HTTP API (dispatch already transport-independent).
 - **[later] 386 disassembler** — the API exposes raw instruction bytes only today.

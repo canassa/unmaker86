@@ -578,7 +578,7 @@ float / `std.time` / RNG-free.
 
 Each box ≈ one focused commit; gates (`zig build test`) stay green throughout.
 
-- [ ] **P1 — `timing` import + timing constants + comptime pin.** `vga.zig` imports only `std`+`bus`
+- [x] **P1 — `timing` import + timing constants + comptime pin.** `vga.zig` imports only `std`+`bus`
       today; add `const timing = @import("timing");` (the `timing` module is already wired into
       `devices_mod` in `build.zig:68`, as `speaker.zig:48` does) — without it the constants won't
       compile. Then add the mode-13h timing constants as `pub const` (`FRAME_CYCLES`, `LINE_CYCLES`,
@@ -587,18 +587,18 @@ Each box ≈ one focused commit; gates (`zig build test`) stay green throughout.
       `FRAME_CYCLES == 204_293` / `LINE_CYCLES == 454` / `HDE_CYCLES == 181` against the canonical
       ~70.086 Hz target (mirror `src/abi/timing.zig:45-50`). No behaviour change yet; unit-test the
       constants resolve to 70.086 Hz and read via `devices.Vga.FRAME_CYCLES`.
-- [ ] **P2 — VGA cycle back-pointer.** Add `cycles: ?*const u64` + `cyclesNow()` to `Vga`
+- [x] **P2 — VGA cycle back-pointer.** Add `cycles: ?*const u64` + `cyclesNow()` to `Vga`
       (`src/devices/vga.zig`, mirror `src/devices/pit.zig:146,154-156`); wire
       `self.vga.cycles = &self.cpu.st.cycles;` in `machine.wire()` near `src/machine/machine.zig:240`.
       Re-bound on restore (it already is, via re-`wire`). No port change yet.
-- [ ] **P3 — `statusReg1` + 0x3DA/0x3BA read.** Implement `statusReg1()` (§3.1/§3.3) and add the
+- [x] **P3 — `statusReg1` + 0x3DA/0x3BA read.** Implement `statusReg1()` (§3.1/§3.3) and add the
       `0x3DA`/`0x3BA` arms to `Vga.portIn8` (`src/devices/vga.zig:266-276`); register both ports in
       `machine.wire()` after `:224`. Add the §5.1 device unit tests (bits, duty, alias, purity).
-- [ ] **P4 — Attribute flip-flop field (D-RT3).** Add `attr_flip_flop_is_index: bool = true`; set it
+- [x] **P4 — Attribute flip-flop field (D-RT3).** Add `attr_flip_flop_is_index: bool = true`; set it
       `true` on the `0x3DA`/`0x3BA` read; add to `Vga.reset`, `Vga.Snapshot`, `snapshot`/`restore`
       (`src/devices/vga.zig:115-125,302-334`). Unit-test the reset side effect + snapshot round-trip.
       Add a `// TODO/flag` that the `0x3C0` write path is not yet modeled (assert-or-document).
-- [ ] **P5 — Determinism regression + grep-gate.** Machine-level test (§5.2): **Shape A** (wide bit-3
+- [x] **P5 — Determinism regression + grep-gate.** Machine-level test (§5.2): **Shape A** (wide bit-3
       retrace poll) AND **Shape B** (narrow bit-0 `in al,0x3DA; ror al,1; jc $-5`) both **terminate**
       (reach a sentinel, not the cycle cap); assert **two-run byte-identity** of the first bit-3
       transition cycle and final state (NOT an external golden), mirroring
@@ -607,13 +607,22 @@ Each box ≈ one focused commit; gates (`zig build test`) stay green throughout.
       dependency on the deferred PRM cost pass (`src/cpu/cycles.zig:81-86`). **Also add
       `@embedFile("vga.zig")` to the determinism grep-gate `sources` array
       (`src/devices/pit_test.zig:53-58`)** — vga.zig is not currently covered (§5.5).
-- [ ] **P6 — KEYECHO `putch` black-box (THE acceptance gate).** Getting `examples/dos-src/KEYECHO.C`
-      to run end-to-end with the **REAL Borland `putch()`** (the snow-avoidance path that polls
-      `0x3DA` and currently hangs) **is THE acceptance gate for this feature.** Switch KEYECHO from its
-      `bdos(2,...)` workaround back to real `putch()`, recompile via `tools/bcc.sh`, and confirm the
-      black-box test passes: keys echoed, ESC terminates, no hang, byte-identical CON output across
-      two processes (`tests/blackbox/keyecho_test.zig`).
-- [ ] **P7 — Docs / oracle boundary.** Update the stale `src/devices/vga.zig:24-27` scope note; add
+- [~] **P6 — KEYECHO `putch` black-box (THE acceptance gate) — PARTIAL: 0x3DA goal MET, echo
+      unobservable (structural gap, flagged).** Switching KEYECHO to real Borland `putch()` and
+      tracing it under the new 0x3DA model PROVES the feature works: `putch()` **no longer hangs** —
+      the program blocks on bioskey, unblocks on an injected key, and **terminates cleanly on ESC
+      (ret 0)**. The retrace poll that previously spun on the unmapped `0xFF` now makes deterministic
+      progress. **BUT** the gate's "keys echoed → console" assertion cannot pass with real `putch()`:
+      BCC-3.1 `putch()` emits the character by reading/setting the cursor via INT 10h (AH=03/AH=02)
+      and writing the byte **DIRECTLY to text-mode video RAM at B800:0000** — NOT via INT 21h, NOT via
+      INT 10h AH=0Eh teletype. zdos models mode-13h graphics VRAM (A000) but not the text-mode page
+      (B8000), and `/api/console` mirrors only the DOS CON device, so the echoed byte lands in
+      unmodeled memory and is lost. Making the echo observable needs a **VGA text device + console
+      mirror** — a separate, larger feature (new backlog item in `plans/ROADMAP.md`), flagged not
+      faked per CLAUDE ground rules. KEYECHO therefore KEEPS the `bdos(2,..)` INT-21h path (observable
+      + green); its comment now documents the diagnosed gap. The hermetic `test` and `test-blackbox`
+      gates stay green.
+- [x] **P7 — Docs / oracle boundary.** Update the stale `src/devices/vga.zig:24-27` scope note; add
       the 0x3DA cycle-derived / not-a-golden line to `plans/io-oracle.md` §1.5 and to the
       `oracle-non-determinism-boundaries` memory note. Flip the ROADMAP backlog item
       (`plans/ROADMAP.md:24`) to done.

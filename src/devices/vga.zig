@@ -21,10 +21,15 @@
 //! Determinism (CLAUDE prime directive):
 //!   - VRAM is one fixed up-front block, zero-filled at reset (CLAUDE #5). The DAC
 //!     rgb array + index state are zero-filled at reset. No host time/RNG anywhere.
-//!   - The retrace / input-status (0x3DA) timing bits are DELIBERATELY NOT modeled
-//!     here: they are emulated-time-derived and must never enter a cross-emulator
-//!     golden (io-oracle.md §1.5). A guest that reads 0x3DA gets the floating-bus
-//!     default from the bus (unmapped), which the oracle programs never assert.
+//!   - The retrace / input-status (0x3DA / 0x3BA, Input Status Register #1) bits
+//!     ARE modeled at the device layer (statusReg1, plans/vga-retrace.md): the
+//!     vertical-retrace (bit 3) + display-enable (bit 0) status is a deterministic,
+//!     cycle-derived pure function of cpu.st.cycles — integer only, no host clock,
+//!     no float. This unblocks retrace-polling guests (Borland putch snow-avoid,
+//!     mode-13h vsync) that would otherwise spin on the unmapped 0xFF default.
+//!     These bits remain emulated-time-derived, so they are STILL excluded from
+//!     every cross-emulator golden (io-oracle.md §1.5) — modeled for internal
+//!     determinism + loop-termination, never as a golden value.
 //!   - The DAC/VRAM port + MMIO handlers are pure functions of (device state,
 //!     address/value): snapshot-serializable, deterministic on reset (B9).
 //!

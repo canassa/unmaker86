@@ -171,9 +171,12 @@ by guest writes.
 
 The one host-dependent VGA value to **exclude** from any golden: anything derived from retrace/scan
 timing (the input-status register 0x3DA retrace bits, current scanline). A program must never assert
-those — they are wall-clock-ish in dosbox-x. zdos will derive them from the cycle counter
-(emulated time = f(cycles), CLAUDE #2), so they are deterministic *in zdos*, but they are NOT a
-faithful cross-emulator oracle and must stay out of the blob.
+those — they are wall-clock-ish in dosbox-x. **zdos now models 0x3DA / 0x3BA (Input Status Register
+#1)** at the device layer: the vertical-retrace (bit 3) + display-enable (bit 0) status is derived
+from the cycle counter (emulated time = f(cycles), CLAUDE #2) via integer math — see
+`src/devices/vga.zig` `statusReg1` and `plans/vga-retrace.md`. So the bits are deterministic *in
+zdos* (a retrace-poll loop terminates reproducibly), but they are NOT a faithful cross-emulator
+oracle and must stay out of the blob.
 
 ---
 
