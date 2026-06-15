@@ -88,6 +88,7 @@ pub fn Int10(comptime Cpu: type) type {
                     cpu.st.setReg8(7, cpu.bus.readPhys8(bda_mod.BDA_PHYS + bda_mod.OFF_ACTIVE_PAGE));
                 },
                 0x10 => palette(bios, cpu, br), // palette / DAC functions
+                0x13 => writeString(cpu), // write string (teletype, useattr=true)
                 else => bios.unsupported(cpu, br, 0x10),
             }
         }
@@ -106,11 +107,59 @@ pub fn Int10(comptime Cpu: type) type {
 
             if (mode == 0x13) {
                 setModeVga13(cpu, bda, clearmem);
+            } else if (mode <= 0x03 or mode == 0x07) {
+                // Text modes 0-3 (color B8000) + 7 (mono B0000).
+                setModeText(cpu, bda, mode, clearmem);
             } else {
-                // Non-13h: record the mode in the BDA (coherent AH=0F) without the
-                // full VGA register program (out of D3 scope; not faked as 13h).
+                // Other non-text/non-13h modes: record the mode in the BDA
+                // (coherent AH=0F) without the full VGA register program (out of D3
+                // scope; not faked as 13h).
                 bda.setVideoMode(mode);
             }
+        }
+
+        /// Text modes 0-3 (color, B8000) + 7 (mono, B0000). Programs the BDA the
+        /// way FinishSetMode does for an M_TEXT entry (int10_modes.cpp:30-37) and
+        /// clears the page with a 16-bit 0x0720 word fill (space, gray-on-black)
+        /// over cols*rows cells unless the no-clear bit is set (F6 — NOT a byte
+        /// memset). OFF_NB_ROWS = rows-1 (F8). Resets cursor pages 0-7 + active page.
+        fn setModeText(cpu: *Cpu, bda: bda_mod.Bda(Cpu), mode: u8, clearmem: bool) void {
+            const bus = cpu.bus;
+            const mono = mode == 0x07;
+            // Table geometry: modes 0/1 = 40 cols / page 0x800; 2/3/7 = 80 / 0x1000.
+            const cols: u16 = if (mode <= 0x01) 40 else 80;
+            const rows: u16 = 25;
+            const page_len: u16 = if (mode <= 0x01) 0x0800 else 0x1000;
+            const crtc: u16 = if (mono) 0x3B4 else 0x3D4;
+            // Misc output: bit0 = color (1) / mono (0); bit1 always set. Mode 7 mono
+            // => 0x06; color text => 0x67 (the BIOS 80x25 value, int10_modes.cpp).
+            bus.portOut8(PORT_MISC_OUTPUT, if (mono) 0x06 else 0x67);
+
+            bda.setVideoMode(mode);
+            bus.writePhys16(bda_mod.BDA_PHYS + bda_mod.OFF_VIDEO_COLS, cols);
+            bus.writePhys16(bda_mod.BDA_PHYS + bda_mod.OFF_VIDEO_PAGE_SIZE, page_len);
+            bus.writePhys16(bda_mod.BDA_PHYS + bda_mod.OFF_CRTC_ADDRESS, crtc);
+            bus.writePhys8(bda_mod.BDA_PHYS + bda_mod.OFF_NB_ROWS, @intCast(rows - 1)); // F8
+            bus.writePhys16(bda_mod.BDA_PHYS + bda_mod.OFF_CHAR_HEIGHT, 16); // cheight
+            bus.writePhys8(bda_mod.BDA_PHYS + bda_mod.OFF_CURSOR_SHAPE, 0x07); // last scanline
+            bus.writePhys8(bda_mod.BDA_PHYS + bda_mod.OFF_CURSOR_SHAPE + 1, 0x06); // first scanline
+
+            // Clear the page with a 0x0720 (space, attr 0x07) WORD fill (F6).
+            if (clearmem) {
+                const base = if (mono) TEXT_MONO_PHYS else TEXT_COLOR_PHYS;
+                var i: u32 = 0;
+                const cells: u32 = @as(u32, cols) * rows;
+                while (i < cells) : (i += 1) {
+                    bus.writePhys16(base + i * 2, 0x0720);
+                }
+            }
+
+            // Reset cursor positions for pages 0..7 + active page (FinishSetMode).
+            var page: u16 = 0;
+            while (page < 8) : (page += 1) {
+                bus.writePhys16(bda_mod.BDA_PHYS + bda_mod.OFF_CURSOR_POS + page * 2, 0);
+            }
+            bus.writePhys8(bda_mod.BDA_PHYS + bda_mod.OFF_ACTIVE_PAGE, 0);
         }
 
         /// Mode 0x13 (M_VGA 320x200x256). Mirrors FinishSetMode for the BDA fields
@@ -339,6 +388,43 @@ pub fn Int10(comptime Cpu: type) type {
                 row -= 1;
             }
             setCursorRowCol(cpu, page, row, col);
+        }
+
+        /// AH=13 write string (INT10_WriteString, int10_char.cpp:862-886). Each
+        /// char routes through `teletype` with **useattr=true ALWAYS** (F5; the
+        /// opposite of AH=0E). DH/DL = start row/col, AL = flags: bit0 = advance
+        /// the cursor (bit0=0 ⇒ RESTORE the entry cursor afterwards), bit1 = the
+        /// string is interleaved char/attr pairs (re-read attr per char). BL = the
+        /// fixed attribute (bit1=0). ES:BP = the string. CX = char count. BEL inside
+        /// is the same silent no-op as in teletype. v1 = page 0 (BH used for page).
+        fn writeString(cpu: *Cpu) void {
+            const page = cpu.st.getReg8(7); // BH
+            const flag = cpu.st.getReg8(0); // AL
+            var attr = cpu.st.getReg8(3); // BL
+            var count = cpu.st.getReg16(@intFromEnum(Reg32.ecx)); // CX
+            const row = cpu.st.getReg8(6); // DH
+            const col = cpu.st.getReg8(2); // DL
+
+            // Save the entry cursor (restored when bit0=0).
+            const saved = cpu.bus.readPhys16(bda_mod.BDA_PHYS + bda_mod.OFF_CURSOR_POS + @as(u16, page) * 2);
+            // Position the cursor at the string start.
+            setCursorRowCol(cpu, page, row, col);
+
+            const eseg = cpu.st.selector[@intFromEnum(Seg.es)];
+            var ptr: u32 = (@as(u32, eseg) << 4) + cpu.st.getReg16(@intFromEnum(Reg32.ebp)); // ES:BP
+            while (count > 0) : (count -= 1) {
+                const chr = cpu.bus.readPhys8(ptr);
+                ptr += 1;
+                if ((flag & 2) != 0) {
+                    attr = cpu.bus.readPhys8(ptr);
+                    ptr += 1;
+                }
+                teletype(cpu, page, chr, attr, true); // useattr=true always (F5)
+            }
+            if ((flag & 1) == 0) {
+                // Restore the entry cursor (the string did not advance it).
+                cpu.bus.writePhys16(bda_mod.BDA_PHYS + bda_mod.OFF_CURSOR_POS + @as(u16, page) * 2, saved);
+            }
         }
 
         /// AH=06 (scroll up) / AH=07 (scroll down). AL=line count (0 ⇒ clear the

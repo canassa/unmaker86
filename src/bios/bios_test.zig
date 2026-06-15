@@ -320,6 +320,61 @@ test "INT 10h AH=06 scroll-up window + AH=07 clear; AH=01/03 cursor-shape round-
     try std.testing.expectEqual(@as(u16, 0x0A0B), m2.cpu.st.getReg16(1)); // CX = the set shape
 }
 
+test "INT 10h AH=00 set text mode 3 clears the page with a 0x0720 word fill (F6)" {
+    const alloc = std.testing.allocator;
+    const m = try boot(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    // Dirty a couple of cells, then AH=00 mode 3 must clear them to 0x0720.
+    m.bus.writePhys8(0xB8000, 'Z');
+    m.bus.writePhys8(0xB8000 + (24 * 80 + 79) * 2, 'E'); // last cell
+    loadCode(m, &.{ 0xB8, 0x03, 0x00, 0xCD, 0x10, 0xF4 }); // MOV AX,0x0003; INT 10h
+    run(m);
+    try std.testing.expectEqual(@as(u16, 0x0720), m.bus.readPhys16(0xB8000)); // ' ', attr 0x07
+    try std.testing.expectEqual(@as(u16, 0x0720), m.bus.readPhys16(0xB8000 + (24 * 80 + 79) * 2));
+    // BDA programmed: mode 3, 80 cols, rows-1 = 24.
+    try std.testing.expectEqual(@as(u16, 80), m.bus.readPhys16(0x400 + 0x4A));
+    try std.testing.expectEqual(@as(u8, 24), m.bus.readPhys8(0x400 + 0x84)); // OFF_NB_ROWS
+}
+
+test "INT 10h AH=13 write-string places a row; bit0=0 restores the entry cursor" {
+    const alloc = std.testing.allocator;
+    const m = try boot(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    // Put the string "Hey" at DS:0x600 (ES=DS=CODE_SEG), write it at (3,5) with
+    // attr 0x1E, AL=0 (bit0=0 => restore cursor, bit1=0 => fixed attr).
+    const str_off: u32 = 0x600;
+    const base = (@as(u32, 0x2000) << 4) + str_off;
+    m.bus.writePhys8(base + 0, 'H');
+    m.bus.writePhys8(base + 1, 'e');
+    m.bus.writePhys8(base + 2, 'y');
+    // Set an entry cursor (10,10) so we can prove bit0=0 restores it.
+    loadCode(m, &.{
+        0xB8, 0x00, 0x02, 0xBB, 0x00, 0x00, 0xBA, 0x0A, 0x0A, 0xCD, 0x10, // cursor (10,10)
+        // AH=13 AL=0 BH=0 BL=0x1E CX=3 DH=3 DL=5 ES:BP -> string
+        0xBD, 0x00, 0x06, // MOV BP,0x0600
+        0xB8, 0x00, 0x13, // MOV AX,0x1300 (AH=13, AL=0)
+        0xBB, 0x1E, 0x00, // MOV BX,0x001E (BL=attr 0x1E, BH=page 0)
+        0xB9, 0x03, 0x00, // MOV CX,3
+        0xBA, 0x05, 0x03, // MOV DX,0x0305 (DH=3 row, DL=5 col)
+        0xCD, 0x10, 0xF4,
+    });
+    run(m);
+    // Cells (3,5),(3,6),(3,7) = 'H','e','y' with attr 0x1E.
+    const c0: u32 = 0xB8000 + (3 * 80 + 5) * 2;
+    try std.testing.expectEqual(@as(u8, 'H'), m.bus.readPhys8(c0));
+    try std.testing.expectEqual(@as(u8, 0x1E), m.bus.readPhys8(c0 + 1));
+    try std.testing.expectEqual(@as(u8, 'e'), m.bus.readPhys8(c0 + 2));
+    try std.testing.expectEqual(@as(u8, 'y'), m.bus.readPhys8(c0 + 4));
+    // bit0=0 restored the entry cursor (10,10).
+    try std.testing.expectEqual(@as(u16, (10 << 8) | 10), m.bus.readPhys16(0x400 + 0x50));
+}
+
 test "no host-time / RNG / thread in the BIOS sources (grep, Phase 9)" {
     const sources = [_][]const u8{
         @embedFile("bios.zig"),
