@@ -1325,7 +1325,7 @@ blocking loop) is deferred to after Phase 1·0** because it needs the new emitte
   (§5.1b / §"Minors"). Add the device's FIFO + status + config to `Machine.Snapshot`
   (§7.3). Test: port read/write + status-byte round-trips; FIFO push pops in order;
   the §5.1b command/response pairs (0xFF→0xFA,0xAA; 0xAA→0x55; 0xF2→0xFA,0xAB,0x83).
-- [ ] **1b — scancode set-1 tables.** Re-derive from the public AT set-1 spec (NOT
+- [x] **1b — scancode set-1 tables.** Re-derive from the public AT set-1 spec (NOT
   copied from GPL dosbox) the set-1 codes (make/break/0xE0-ext) and the
   scancode→ASCII / BIOS-keycode table (4 columns: normal/shift/ctrl/alt) in the
   `(scancode<<8)|ascii` BDA-ring format (refs: dosbox `keyboard_scancodes.cpp:34-199`,

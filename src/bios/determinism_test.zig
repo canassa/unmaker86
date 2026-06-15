@@ -23,6 +23,7 @@ const bios_sources = [_][]const u8{
     @embedFile("int15.zig"),
     @embedFile("int16.zig"),
     @embedFile("int1a.zig"),
+    @embedFile("scancodes.zig"),
 };
 
 test "src/bios grep: no host time / RNG / thread / env / float" {

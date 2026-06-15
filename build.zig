@@ -339,10 +339,21 @@ pub fn build(b: *std.Build) void {
 
     const bios_unit = MachineTest.add(b, target, optimize, "src/bios/bios_test.zig", &dosbios_imports);
     const bios_determinism = MachineTest.add(b, target, optimize, "src/bios/determinism_test.zig", &dosbios_imports);
+    // Scancode set-1 tables (input Phase 1b): a pure leaf (std only), so it builds
+    // as a standalone test artifact with its in-file translation-conformance tests.
+    const bios_scancodes = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bios/scancodes.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_bios_scancodes = b.addRunArtifact(bios_scancodes);
     const bios_test_step = b.step("test-bios", "Run the BIOS tests");
     bios_test_step.dependOn(&bridge_unit.step);
     bios_test_step.dependOn(&bios_unit.step);
     bios_test_step.dependOn(&bios_determinism.step);
+    bios_test_step.dependOn(&run_bios_scancodes.step);
 
     const dos_unit = MachineTest.add(b, target, optimize, "src/dos/dos_test.zig", &dosbios_imports);
     const dos_int21 = MachineTest.add(b, target, optimize, "src/dos/int21_test.zig", &dosbios_imports);
@@ -489,6 +500,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&bridge_rt.step);
     test_step.dependOn(&bios_unit.step);
     test_step.dependOn(&bios_determinism.step);
+    test_step.dependOn(&run_bios_scancodes.step);
     test_step.dependOn(&dos_unit.step);
     test_step.dependOn(&dos_int21.step);
     test_step.dependOn(&dos_name83.step);
