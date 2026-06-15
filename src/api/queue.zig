@@ -78,6 +78,11 @@ pub const Command = union(enum) {
     /// `len` bytes to write live in `RequestCtx.scratch[0..len]` (copied there by
     /// the handler before submit). Pointer-free: the queue only carries the length.
     mem_write: struct { phys: u32, len: u32 },
+    /// Logical `seg:off` peek/write — resolved to a linear address ON THE WORKER
+    /// (reading `seg_base` off-worker would be a torn-read race; A.3a). Bytes for
+    /// the write live in `RequestCtx.scratch[0..len]`.
+    mem_peek_seg: struct { seg: Seg, off: u32, len: u32 },
+    mem_write_seg: struct { seg: Seg, off: u32, len: u32 },
     ivt_get: struct { vector: u8 },
     stack_get: struct { count: u16 },
     status: void,

@@ -976,7 +976,7 @@ request*, not determinism — determinism is proved by tests 1-9 below the socke
       across N) + a basic submit/drain on two threads returns the right response.
 
 ### Phase 3 — the worker drain loop (`worker.zig`), the 1:1 Controller dispatch
-- [ ] `drainOne(ctrl: *Controller, cmd: Command) Response`: a `switch` mapping each `Command` to
+- [x] `drainOne(ctrl: *Controller, cmd: Command) Response`: a `switch` mapping each `Command` to
       exactly one `Controller` method (table in §0.1). Translate `Error` → an error `Response`
       variant carrying the **typed `code`** (a stable string/enum, **never an HTTP status** — the
       `code → status` map lives only in `server.zig`, finding D20, so M3 MCP reuses `code`). Handle
@@ -986,13 +986,13 @@ request*, not determinism — determinism is proved by tests 1-9 below the socke
       `bootProgram` recipe (G/§B.1). Validate memory `[phys,phys+len) ⊆ [0,ram_total_size)` →
       `address_out_of_range` (G3). Reject `kind:.io` (501) and `add_bp` with unsupported kinds before
       the controller call.
-- [ ] The worker thread entry: loop `tryDequeue → drainOne → complete(signal)`; exits on a shutdown
+- [x] The worker thread entry: loop `tryDequeue → drainOne → complete(signal)`; exits on a shutdown
       sentinel command.
-- [ ] Tests: §D #1 (queue-drive == direct-call, byte-identical) + #5 (bounded/retained-capacity, not
+- [x] Tests: §D #1 (queue-drive == direct-call, byte-identical) + #5 (bounded/retained-capacity, not
       literal-zero) + #7 (typed `code` per `Controller.Error` + the `server.zig` status map) + #9
       (breakpoint list ascending-id golden).
 
-### Phase 4 — HTTP routing + net listener (`server.zig`), real sockets
+ HTTP routing + net listener (`server.zig`), real sockets
 - [ ] Route table: method+path → handler, parsing path params (`{id}`, `{vector}`) and query
       (`?phys=&len=`). Fallthrough → 404; known-path/bad-method → 405. Include `DELETE
       /api/breakpoints` (clear-all) and `POST /api/load` (G5/G16).
