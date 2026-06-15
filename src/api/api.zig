@@ -38,6 +38,7 @@ pub const Worker = worker.Worker;
 
 // ---- the HTTP server (Phase 4) ----
 pub const Server = server.Server;
+pub const LoadRecipe = server.LoadRecipe;
 
 test {
     _ = queue;

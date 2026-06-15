@@ -35,6 +35,12 @@ test "no host time / RNG / thread / env / float / hashmap / atomic in src/debug 
         // core must never feed host scheduling back into emulation ordering).
         "std.atomic",
         "@atomic",
+        // No threading primitives either (extended for M2, §D #2): the API server
+        // may use std.Thread / std.Io.Mutex / std.Io.Condition, but the
+        // single-threaded control core must never import them — that would be host
+        // scheduling feeding into emulation ordering.
+        "std.Io.Mutex",
+        "std.Io.Condition",
     };
     for (sources) |src| {
         for (forbidden) |needle| {

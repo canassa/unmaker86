@@ -1020,11 +1020,11 @@ request*, not determinism — determinism is proved by tests 1-9 below the socke
 - [x] Test: §D #4 (capped-run reproducibility through the handler path, in-process) + the single
       opt-in real-socket integration test (its own `test-api-integration` step, not in `test`).
 
- runner integration (`main.zig`) + the determinism audit
-- [ ] `--serve PORT` branch in the arg parse (`main.zig:44-58`), mutually exclusive with
+### Phase 5 — runner integration (`main.zig`) + the determinism audit
+- [x] `--serve PORT` branch in the arg parse (`main.zig:44-58`), mutually exclusive with
       `--break-cycle`; construct `api.Server` over the `Controller` (`main.zig:114` construction) +
       `init.io`/`init.gpa`; run the accept loop; default no-flag path unchanged (`main.zig:158`).
-- [ ] `src/api/determinism_test.zig`: the **extended** grep audit for `src/api/` (R4 — forbid host
+- [x] `src/api/determinism_test.zig`: the **extended** grep audit for `src/api/` (R4 — forbid host
       time/RNG/env/floats AND every clock affordance: `futexWaitTimeout`, `.fromNow`, `Timeout`,
       `Clock`, `io.sleep`, `nanoTimestamp`, `Instant`, `std.time.Timer`; ALLOW
       `Mutex`/`Condition`/`Thread`/`atomic` and the `*Uncancelable` no-timeout variants) + the
@@ -1032,7 +1032,7 @@ request*, not determinism — determinism is proved by tests 1-9 below the socke
       outside the `submit()` path (only `/health` is off-worker, and it touches none) + a reflection
       test that `Command`/`Response` have no pointer/host-time fields + a re-run of the **unchanged**
       `src/debug/` grep to prove no threading leaked down (§D #2/#2a). Fold into `test-api`.
-- [ ] `zig build test` green; `zig fmt --check src/api`.
-- [ ] Manual smoke (documented, not a CI gate): `zig build run -- --serve 8080 PROGRAM.EXE`, then
+- [x] `zig build test` green; `zig fmt --check src/api`.
+- [x] Manual smoke (documented, not a CI gate): `zig build run -- --serve 8080 PROGRAM.EXE`, then
       `curl localhost:8080/api/status`, `curl -X POST localhost:8080/api/run -d '{"cycle_cap":578}'`,
       `curl localhost:8080/api/cpu` — confirm two identical command sequences give identical state.

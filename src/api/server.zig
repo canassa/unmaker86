@@ -558,7 +558,7 @@ pub const Server = struct {
             .bp_list => |l| self.respondBpList(req, l),
             .cleared => |n| self.respondValue(req, .ok, .{ .removed = n }),
             .cpu => |snap| self.respondValue(req, .ok, snap),
-            .mem => |m| self.respondMem(req, m),
+            .mem => |mr| self.respondMem(req, mr),
             .mem_written => |w| self.respondValue(req, .ok, .{ .phys = w.phys, .len = w.len }),
             .ivt => |i| self.respondValue(req, .ok, .{ .vector = i.vector, .ip = i.ip, .cs = i.cs }),
             .stack => |s| self.respondStack(req, s),
@@ -597,12 +597,12 @@ pub const Server = struct {
         self.respondJson(req, .ok, w.buffered());
     }
 
-    fn respondMem(self: *Server, req: *http.Server.Request, m: q.MemResult) void {
+    fn respondMem(self: *Server, req: *http.Server.Request, mr: q.MemResult) void {
         // {"phys":N,"len":N,"data":"<hex>"}
         var hex_buf: [q.MAX_MEM_CHUNK * 2]u8 = undefined;
-        const hex = wire.hexEncode(&hex_buf, m.bytes[0..m.len]) catch return self.respondError(req, .service_unavailable, "internal", "encode failed");
+        const hex = wire.hexEncode(&hex_buf, mr.bytes[0..mr.len]) catch return self.respondError(req, .service_unavailable, "internal", "encode failed");
         var w = std.Io.Writer.fixed(self.resp_buf[0..]);
-        w.print("{{\"phys\":{d},\"len\":{d},\"data\":\"{s}\"}}", .{ m.phys, m.len, hex }) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
+        w.print("{{\"phys\":{d},\"len\":{d},\"data\":\"{s}\"}}", .{ mr.phys, mr.len, hex }) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
         self.respondJson(req, .ok, w.buffered());
     }
 

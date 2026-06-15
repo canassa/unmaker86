@@ -13,6 +13,7 @@
 const std = @import("std");
 const machine_mod = @import("machine");
 const debug_mod = @import("debug");
+const api_mod = @import("api");
 
 const Machine = machine_mod.Machine;
 const Controller = debug_mod.Controller;
@@ -34,11 +35,13 @@ pub fn main(init: std.process.Init) !void {
     // Controller and stops the run deterministically at the first instruction
     // boundary at/after cycle N, dumping a CPU snapshot — instead of running to
     // termination. The default path (no flag) is unchanged.
+    const usage = "usage: zig build run -- [--break-cycle N | --serve PORT] <PROGRAM.COM|PROGRAM.EXE> [args...]\n";
     var args_it: std.process.Args.Iterator = .init(init.minimal.args);
     _ = args_it.next(); // skip argv[0]
     var break_cycle: ?u64 = null;
+    var serve_port: ?u16 = null;
     var first = args_it.next() orelse {
-        try stderr.writeStreamingAll(io, "usage: zig build run -- [--break-cycle N] <PROGRAM.COM|PROGRAM.EXE> [args...]\n");
+        try stderr.writeStreamingAll(io, usage);
         std.process.exit(2);
     };
     if (std.mem.eql(u8, first, "--break-cycle")) {
@@ -51,9 +54,27 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(2);
         };
         first = args_it.next() orelse {
-            try stderr.writeStreamingAll(io, "usage: zig build run -- [--break-cycle N] <PROGRAM.COM|PROGRAM.EXE> [args...]\n");
+            try stderr.writeStreamingAll(io, usage);
             std.process.exit(2);
         };
+    } else if (std.mem.eql(u8, first, "--serve")) {
+        const p_str = args_it.next() orelse {
+            try stderr.writeStreamingAll(io, "zdos: --serve requires a port\n");
+            std.process.exit(2);
+        };
+        serve_port = std.fmt.parseInt(u16, p_str, 10) catch {
+            try stderr.writeStreamingAll(io, "zdos: --serve expects a port number (1-65535)\n");
+            std.process.exit(2);
+        };
+        first = args_it.next() orelse {
+            try stderr.writeStreamingAll(io, usage);
+            std.process.exit(2);
+        };
+        // --break-cycle and --serve are mutually exclusive (one or the other path).
+        if (std.mem.eql(u8, first, "--break-cycle")) {
+            try stderr.writeStreamingAll(io, "zdos: --serve and --break-cycle are mutually exclusive\n");
+            std.process.exit(2);
+        }
     }
     const path = first;
 
@@ -106,6 +127,31 @@ pub fn main(init: std.process.Init) !void {
         try stderr.writeStreamingAll(io, msg);
         std.process.exit(1);
     };
+
+    if (serve_port) |port| {
+        // Debugger HTTP/JSON server path (Milestone 2). Construct the Controller
+        // over the already-wired machine (same construction as --break-cycle) and
+        // run the accept loop. The server holds the load recipe captured here so a
+        // `POST /api/load` can re-run `bootProgram` after a `POST /api/reset`. The
+        // emulation core stays single-threaded — the server's worker thread is the
+        // sole owner of the Controller; the listener never touches the machine.
+        var ctrl = Controller.init(m);
+        const recipe = api_mod.LoadRecipe.init(2, file_name, cmdtail);
+        var server = api_mod.Server.init(gpa, io, &ctrl, port, recipe);
+        defer server.deinit();
+
+        var sbuf: [96]u8 = undefined;
+        const banner = std.fmt.bufPrint(&sbuf, "[zdos] serving debugger API on 127.0.0.1:{d}\n", .{port}) catch "[zdos] serving debugger API\n";
+        try stderr.writeStreamingAll(io, banner);
+
+        server.run() catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "zdos: --serve failed: {t}\n", .{err}) catch "zdos: --serve failed\n";
+            try stderr.writeStreamingAll(io, msg);
+            std.process.exit(1);
+        };
+        return;
+    }
 
     if (break_cycle) |bc| {
         // Debugger path: drive the machine via the Controller and stop at cycle N.

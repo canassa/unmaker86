@@ -10,7 +10,7 @@
 //!
 //! Cited 0.16 stdlib APIs (verified against `references/zig/lib/std/`):
 //!   - `std.Io.Mutex` (`Io.zig:1587`): `lockUncancelable(io)` (`:1623`),
-//!     `unlock(io)` (`:1641`). NO `Timeout` — there is no clock in the handoff.
+//!     `unlock(io)` (`:1641`). No time-out variant — there is no clock in the handoff.
 //!   - `std.Io.Condition` (`Io.zig:1653`): `waitUncancelable(io, &mutex)` (`:1675`),
 //!     `signal(io)` (`:1726`). The `done` flag is read/written ONLY under the mutex,
 //!     and the wait is a PREDICATE `while (!done)` loop (lost/spurious-wakeup safe).
