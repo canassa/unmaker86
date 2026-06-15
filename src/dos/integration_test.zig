@@ -337,6 +337,13 @@ test "snapshot/restore round-trips the mouse driver state (input Phase 0)" {
         .handler_seg = 0x9000,
         .handler_off = 0x0123,
         .handler_mask = 0x001F,
+        // Phase-2 relative-motion accumulators + counters (non-default).
+        .precise_mickey_x = 12345,
+        .precise_mickey_y = -6789,
+        .precise_pixel_x = 4242,
+        .precise_pixel_y = -1313,
+        .mickey_x = 77,
+        .mickey_y = -88,
     };
     const expected = m.dos.mouse; // the value we expect after restore
 
@@ -353,6 +360,9 @@ test "snapshot/restore round-trips the mouse driver state (input Phase 0)" {
     m.dos.mouse.handler_seg = 0xDEAD;
     m.dos.mouse.handler_off = 0xBEEF;
     m.dos.mouse.gran_x = 0xffff;
+    m.dos.mouse.precise_mickey_x = -1;
+    m.dos.mouse.mickey_y = 0;
+    m.dos.mouse.precise_pixel_x = 0;
     m.bus.writePhys8(0x10000, 0xFF);
 
     m.restore(snap);

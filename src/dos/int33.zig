@@ -17,18 +17,24 @@
 //!     mouse.cpp:1659).
 //!   - AX=0007/0008 define horizontal/vertical range (min<->max swap + reclamp the
 //!     live position, mouse.cpp:1732/1801).
-//!   - AX=000B read motion counters (headless -> NOT locked -> always 0; see note).
+//!   - AX=000B read motion counters (accumulate-and-zero-on-read; see note).
 //!   - AX=000C/0014 set/swap event handler far-ptr.
 //!   - AX=001A/001B set/get sensitivity (clamped 0..100 round-trip, mouse.cpp:2008).
 //!   - AX=0011 get-buttons CuteMouse identifier, AX=0024 driver version/type.
 //!
-//! Determinism: nothing reads the host pointer. POSITION is placed only via AX=0004
-//! (programmatic) and read back via AX=0003 — fully deterministic on dosbox-x AND
-//! zdos (proven by double-mint). The mickey motion counters (AX=000B) read back as
-//! 0 under headless dosbox-x because MOUSE_IsLocked() is false (no SDL capture) and
-//! mickeys ONLY accumulate from real host motion (Mouse_CursorMoved, mouse.cpp:898)
-//! — AX=0004 sets mouse.x directly and never touches mickey_x. So AX=000B is a
-//! deterministic constant 0/0 headless; we model that exactly (locked=false).
+//! Determinism: nothing reads the host pointer. POSITION is placed via AX=0004
+//! (programmatic) or `injectAbsolute`/`injectRelative` (the deterministic scripted-
+//! input seam) and read back via AX=0003 — fully deterministic on dosbox-x AND zdos
+//! (proven by double-mint). The mickey motion counters (AX=000B) accumulate ONLY
+//! from `injectRelative`'s fixed-point mickey math (input Phase 2), never the host
+//! pointer, and are returned-and-zeroed on read (dosbox case 0x0b / spice86
+//! GetMotionDistance, MouseInt33Handler.cs:624-638). With no relative motion
+//! injected the accumulator stays 0, so AX=000B reads 0/0 — identical to headless
+//! dosbox-x (MOUSE_IsLocked()=false: live mickeys only accrue from real host
+//! motion, mouse.cpp:898) and to the prior zdos behavior. The contract is now
+//! "accumulate-and-zero", not "hardcoded 0"; the difference is observable only once
+//! `dx/dy` are injected (the MOUSE1 oracle injects none, so its golden is
+//! unchanged — input-injection.md §5.2).
 
 const std = @import("std");
 const cpu_state = @import("cpu").state;
@@ -53,6 +59,36 @@ pub fn Int33(comptime Cpu: type) type {
         /// in dosbox-x). The DOS module does not import `bios`, so we read the BDA
         /// directly through the bus the way other DOS code does (e.g. dta/psp/mcb).
         const BDA_VIDEO_MODE_PHYS: u32 = 0x0449;
+
+        // -------------------------------------------------------------------
+        // Relative-motion (mickey) fixed-point constants — input Phase 2. ALL
+        // INTEGER, NO FLOAT (the `src/dos` determinism grep gate bans float
+        // types; the float pipeline the references use is exactly the non-
+        // determinism anti-pattern this project escapes). See `injectRelative`
+        // for the full derivation + exactness argument.
+        //
+        // SCALE is the common fixed-point denominator. The float pipeline is
+        //   coeff             = (tmp*tmp)/3600 + 1/3 = (tmp*tmp + 1200)/3600
+        //   pixels_per_mickey = 8 / ratio,  mickeys_per_pixel = ratio / 8
+        // with the per-axis mickey/pixel `ratio` fixed at the driver defaults
+        // (8 horizontal, 16 vertical — zdos implements no AX=000F to change
+        // them). Every increment is an EXACT integer at SCALE = 3600 * 16:
+        // 3600 is the coeff denominator; 16 = lcm(ratio_x=8, ratio_y=16) is
+        // the pixels-per-mickey denominator. So both the per-move mickey
+        // increment (rel*coeff) and the per-move cursor-pixel increment
+        // (rel*coeff*8/ratio) are integers when scaled by SCALE — exact and
+        // byte-identical across builds/hosts. (Verified against the dosbox
+        // float reference: mickey counters AND cursor position match for
+        // sensitivities 0/1/25/50/100 over randomized move sequences.)
+        const SCALE: i64 = 3600 * 16; // = 57600
+        /// 0.6-mickey flip-flop-protection threshold (mouse_common.cpp:103),
+        /// scaled. `0.6 * 57600 = 34560` is exact.
+        const ACCUM_THRESHOLD: i64 = (SCALE * 3) / 5; // 0.6 * SCALE = 34560
+        /// Per-axis mickey/pixel ratio (dosbox `set_mickey_pixel_rate` defaults,
+        /// mouseif_dos_driver.cpp:1170). zdos has no AX=000F, so these are
+        /// constants. `pixels_per_mickey = 8/ratio`, `mickeys_per_pixel = ratio/8`.
+        const RATIO_X: i64 = 8;
+        const RATIO_Y: i64 = 16;
 
         present: bool = true,
         /// Live cursor position (driver-internal, before the granularity mask).
@@ -81,6 +117,24 @@ pub fn Int33(comptime Cpu: type) type {
         handler_seg: u16 = 0,
         handler_off: u16 = 0,
         handler_mask: u16 = 0,
+
+        /// Sub-mickey remainder (dosbox `precise_mickey_counter`,
+        /// mouseif_dos_driver.cpp:1268), scaled by SCALE. Carries the
+        /// fractional mickey so repeated sub-threshold deltas accumulate
+        /// correctly (no drift, no flip-flop).
+        precise_mickey_x: i64 = 0,
+        precise_mickey_y: i64 = 0,
+        /// Sub-pixel cursor remainder, scaled by SCALE. dosbox keeps a FLOAT
+        /// PosX that carries the fraction across reads and truncates toward
+        /// zero on the int16 cast; zdos's position is an exact i16, so the
+        /// fraction lives here and whole pixels are consumed by truncation
+        /// toward zero (matching dosbox's `(int16_t)PosX`).
+        precise_pixel_x: i64 = 0,
+        precise_pixel_y: i64 = 0,
+        /// Signed mickey motion counters (dosbox `mickey_counter`,
+        /// mouseif_dos_driver.cpp:1270). Returned + zeroed by AX=000B.
+        mickey_x: i16 = 0,
+        mickey_y: i16 = 0,
 
         /// Granularity-masked position the guest observes (mouse.cpp POS_X/POS_Y).
         fn posX(self: *const Self) u16 {
@@ -132,6 +186,13 @@ pub fn Int33(comptime Cpu: type) type {
             self.handler_seg = 0;
             self.handler_off = 0;
             self.handler_mask = 0;
+            // Mouse_Reset clears the mickey counters + accumulators (mouse.cpp:1570).
+            self.mickey_x = 0;
+            self.mickey_y = 0;
+            self.precise_mickey_x = 0;
+            self.precise_mickey_y = 0;
+            self.precise_pixel_x = 0;
+            self.precise_pixel_y = 0;
         }
 
         pub fn service(self: *Self, dos: *Dos, cpu: *Cpu, br: *Bridge) void {
@@ -158,9 +219,9 @@ pub fn Int33(comptime Cpu: type) type {
                     const dx: i16 = @bitCast(cpu.st.getReg16(EDX));
                     // Signed clamp to range; the "!= POS" arms preserve the rounding
                     // quirk (a value equal to the current rounded pos is ignored).
-                    if (cx >= self.max_x) self.x = self.max_x else if (self.min_x >= cx) self.x = self.min_x else if (cx != @as(i16, @bitCast(self.posX()))) self.x = cx;
-
-                    if (dx >= self.max_y) self.y = self.max_y else if (self.min_y >= dx) self.y = self.min_y else if (dx != @as(i16, @bitCast(self.posY()))) self.y = dx;
+                    // Shared with `injectAbsolute` so the two paths can't diverge.
+                    self.setClampedX(cx);
+                    self.setClampedY(dx);
                 },
                 0x0007 => { // DEFINE HORIZONTAL RANGE (mouse.cpp:1732)
                     const cx: i16 = @bitCast(cpu.st.getReg16(ECX));
@@ -190,11 +251,20 @@ pub fn Int33(comptime Cpu: type) type {
                     if (self.y < self.min_y) self.y = self.min_y;
                 },
                 0x000B => { // READ MOTION COUNTERS (mouse.cpp:1900/1610)
-                    // Headless: MOUSE_IsLocked() is false (no SDL capture), so the
-                    // counters read back as 0/0. Mickeys only accumulate from real
-                    // host motion, which the deterministic oracle never injects.
-                    cpu.st.setReg16(ECX, 0);
-                    cpu.st.setReg16(EDX, 0);
+                    // ACCUMULATE-AND-ZERO-ON-READ (input Phase 2). Return the
+                    // signed mickey counters accumulated since the last AX=000B
+                    // call, then zero them — matching dosbox case 0x0b and spice86
+                    // GetMotionDistance (MouseInt33Handler.cs:624-638, zero at
+                    // :635) so repeated reads don't drift. The counters are driven
+                    // ONLY by `injectRelative` (the deterministic scripted-input
+                    // seam, fixed-point mickey math) — never the host pointer — so
+                    // they stay deterministic. With no relative motion injected the
+                    // accumulator is 0, so AX=000B still reads 0/0 (the MOUSE1
+                    // oracle, which injects no motion, is unaffected).
+                    cpu.st.setReg16(ECX, @bitCast(self.mickey_x));
+                    cpu.st.setReg16(EDX, @bitCast(self.mickey_y));
+                    self.mickey_x = 0;
+                    self.mickey_y = 0;
                 },
                 0x000C => { // DEFINE INTERRUPT SUBROUTINE (mouse.cpp:1904)
                     self.handler_mask = cpu.st.getReg16(ECX);
@@ -247,11 +317,147 @@ pub fn Int33(comptime Cpu: type) type {
             }
         }
 
-        /// Inject a scripted mouse event (deterministic external input seam).
-        pub fn injectMotion(self: *Self, x: i16, y: i16, buttons: u16) void {
-            self.x = x;
-            self.y = y;
-            self.buttons = buttons;
+        /// Set X to `v`, clamped to the live range with the SAME signed clamp +
+        /// "==POS rounding" quirk AX=0004 uses (mouse.cpp:1659). Shared by AX=0004
+        /// and `injectAbsolute` so injection is byte-identical to a guest set.
+        fn setClampedX(self: *Self, v: i16) void {
+            if (v >= self.max_x) self.x = self.max_x else if (self.min_x >= v) self.x = self.min_x else if (v != @as(i16, @bitCast(self.posX()))) self.x = v;
+        }
+        fn setClampedY(self: *Self, v: i16) void {
+            if (v >= self.max_y) self.y = self.max_y else if (self.min_y >= v) self.y = self.min_y else if (v != @as(i16, @bitCast(self.posY()))) self.y = v;
+        }
+
+        /// Inject an ABSOLUTE scripted mouse event (deterministic external-input
+        /// seam, input Phase 2). Each of position-x / position-y / buttons is set
+        /// only when its `set_*` flag is true, so a caller can update a subset.
+        /// Position uses the SAME AX=0004 range clamp (mouse.cpp:1659) so an
+        /// injected absolute position is read back verbatim by the guest via
+        /// AX=0003. Nothing here reads the host pointer or clock.
+        pub fn injectAbsolute(
+            self: *Self,
+            x: i16,
+            y: i16,
+            buttons: u16,
+            set_x: bool,
+            set_y: bool,
+            set_buttons: bool,
+        ) void {
+            if (set_x) self.setClampedX(x);
+            if (set_y) self.setClampedY(y);
+            if (set_buttons) self.buttons = buttons;
+        }
+
+        /// Round a SCALE-fixed-point value to the nearest whole unit, half AWAY
+        /// from zero (matching dosbox `std::round`, mouse_common.cpp:127). Returns
+        /// the whole-unit count (NOT scaled).
+        fn roundScaled(v: i64) i64 {
+            return if (v >= 0)
+                @divTrunc(2 * v + SCALE, 2 * SCALE)
+            else
+                -@divTrunc(-2 * v + SCALE, 2 * SCALE);
+        }
+        /// Truncate a SCALE-fixed-point value toward zero to whole units (matching
+        /// dosbox's `(int16_t)PosX` cast on cursor read). Returns the whole count.
+        fn truncScaled(v: i64) i64 {
+            return @divTrunc(v, SCALE); // @divTrunc rounds toward zero for both signs
+        }
+
+        /// Inject RELATIVE motion + optional buttons (deterministic external-input
+        /// seam, input Phase 2). `dx`/`dy` are the literal relative motion the
+        /// driver consumes (dosbox `x_rel`/`y_rel`, mouseif_dos_driver.cpp:1224),
+        /// in the driver's input units — NO host-OS pointer acceleration (raw input
+        /// forced) and NO host-clock sample-rate gate (§7.4). This ports dosbox's
+        /// `move_cursor_captured` + `update_mickeys_on_move` (the raw-input path) in
+        /// EXACT FIXED-POINT (the grep gate bans float types); see the SCALE
+        /// derivation above. Per axis (`ratio` = mickeys/pixel, `s` = sensitivity):
+        ///   coeff   = (min(100,s)-1)^2 / 3600 + 1/3,  s==0 -> 0       (:848-853)
+        ///   apply coeff iff |rel| > 1 OR coeff < 1 (raw forced, :1237-1239)
+        ///   cursor_px_inc = rel * coeff * (8/ratio)   (-> self.x/self.y)
+        ///   mickey_inc    = rel * coeff               (-> the AX=000B counters)
+        /// The fractional remainder of each accumulator is carried so repeated
+        /// sub-unit deltas accumulate without drift; the mickey counter only
+        /// advances once |precise| >= 0.6 (mouse_common.cpp:103). Both increments
+        /// are exact integers at SCALE, so the result is byte-identical every run.
+        pub fn injectRelative(
+            self: *Self,
+            dx: i16,
+            dy: i16,
+            buttons: u16,
+            set_dx: bool,
+            set_dy: bool,
+            set_buttons: bool,
+        ) void {
+            if (set_dx) self.applyRelAxis(dx, RATIO_X, self.senv_x_val, &self.precise_pixel_x, &self.precise_mickey_x, &self.mickey_x, true);
+            if (set_dy) self.applyRelAxis(dy, RATIO_Y, self.senv_y_val, &self.precise_pixel_y, &self.precise_mickey_y, &self.mickey_y, false);
+            if (set_buttons) self.buttons = buttons;
+        }
+
+        /// One axis of `injectRelative`. `is_x` selects which clamped-position
+        /// setter to drive when whole cursor pixels are consumed.
+        fn applyRelAxis(
+            self: *Self,
+            rel_i: i16,
+            ratio: i64,
+            sens: u16,
+            pixel_acc: *i64,
+            mickey_acc: *i64,
+            mickey_ctr: *i16,
+            comptime is_x: bool,
+        ) void {
+            const rel: i64 = rel_i;
+
+            // coeff = (tmp*tmp + 1200) / 3600, with tmp = min(100,s)-1; s==0 -> 0.
+            const s: i64 = @min(@as(i64, 100), @as(i64, sens));
+            const tmp = s - 1;
+            const coeff_num: i64 = if (sens == 0) 0 else (tmp * tmp + 1200);
+            const coeff_den: i64 = 3600;
+            // Raw input forced: apply coeff iff |rel| > 1 OR coeff < 1.
+            const coeff_lt_one = coeff_num < coeff_den;
+            const apply_coeff = (@abs(rel) > 1) or coeff_lt_one;
+
+            // mickey_inc (scaled) = rel * coeff * SCALE ; cursor_inc (scaled) =
+            // rel * coeff * (8/ratio) * SCALE. SCALE/coeff_den = 16 is exact, and
+            // multiplying by 8/ratio (ratio in {8,16}) stays integral.
+            var mickey_inc: i64 = undefined;
+            var pixel_inc: i64 = undefined;
+            if (apply_coeff) {
+                if (sens == 0) {
+                    mickey_inc = 0; // s==0 stops the cursor (coeff 0)
+                    pixel_inc = 0;
+                } else {
+                    const base = rel * coeff_num * @divExact(SCALE, coeff_den); // rel*coeff*SCALE
+                    mickey_inc = base;
+                    pixel_inc = @divTrunc(base * 8, ratio);
+                }
+            } else {
+                // No coeff: cursor px = rel*ppm = rel*8/ratio ; mickey = px*mpp = rel.
+                mickey_inc = rel * SCALE;
+                pixel_inc = @divTrunc(rel * SCALE * 8, ratio);
+            }
+
+            // Cursor: accumulate sub-pixel, consume WHOLE pixels (trunc toward 0).
+            pixel_acc.* += pixel_inc;
+            const whole_px = truncScaled(pixel_acc.*);
+            if (whole_px != 0) {
+                pixel_acc.* -= whole_px * SCALE;
+                const new_pos: i64 = @as(i64, if (is_x) self.x else self.y) + whole_px;
+                const clamped: i16 = @intCast(std.math.clamp(
+                    new_pos,
+                    @as(i64, if (is_x) self.min_x else self.min_y),
+                    @as(i64, if (is_x) self.max_x else self.max_y),
+                ));
+                if (is_x) self.x = clamped else self.y = clamped;
+            }
+
+            // Mickey counter: accumulate sub-mickey, advance once |precise| >= 0.6,
+            // rounding half away from zero (the AX=000B observable).
+            mickey_acc.* += mickey_inc;
+            if (@abs(mickey_acc.*) >= ACCUM_THRESHOLD) {
+                const consumed = roundScaled(mickey_acc.*);
+                mickey_acc.* -= consumed * SCALE;
+                const sum: i32 = @as(i32, mickey_ctr.*) + @as(i32, @intCast(consumed));
+                mickey_ctr.* = @intCast(std.math.clamp(sum, -32768, 32767));
+            }
         }
 
         // -------------------------------------------------------------------
@@ -262,9 +468,9 @@ pub fn Int33(comptime Cpu: type) type {
         // Pic/Pit/Speaker snapshot idiom (POD, byte-serializable, no pointers).
         //
         // SCOPE NOTE: this captures the fields that exist TODAY. The Phase-2
-        // relative-motion (mickey) accumulator and the Phase-3 callback
-        // re-entrancy flag are added to this Snapshot WHEN those phases introduce
-        // the fields — not forward-referenced here.
+        // relative-motion (mickey) accumulators + counters ARE captured here (the
+        // field deferred from Phase 0 — now mutable host-side state). The Phase-3
+        // callback re-entrancy flag is added WHEN that phase introduces the field.
         // -------------------------------------------------------------------
         pub const Snapshot = struct {
             present: bool,
@@ -284,6 +490,13 @@ pub fn Int33(comptime Cpu: type) type {
             handler_seg: u16,
             handler_off: u16,
             handler_mask: u16,
+            // Phase-2 relative-motion state (fixed-point, POD).
+            precise_mickey_x: i64,
+            precise_mickey_y: i64,
+            precise_pixel_x: i64,
+            precise_pixel_y: i64,
+            mickey_x: i16,
+            mickey_y: i16,
         };
 
         pub fn snapshot(self: *const Self) Snapshot {
@@ -305,6 +518,12 @@ pub fn Int33(comptime Cpu: type) type {
                 .handler_seg = self.handler_seg,
                 .handler_off = self.handler_off,
                 .handler_mask = self.handler_mask,
+                .precise_mickey_x = self.precise_mickey_x,
+                .precise_mickey_y = self.precise_mickey_y,
+                .precise_pixel_x = self.precise_pixel_x,
+                .precise_pixel_y = self.precise_pixel_y,
+                .mickey_x = self.mickey_x,
+                .mickey_y = self.mickey_y,
             };
         }
 
@@ -326,6 +545,12 @@ pub fn Int33(comptime Cpu: type) type {
             self.handler_seg = snap.handler_seg;
             self.handler_off = snap.handler_off;
             self.handler_mask = snap.handler_mask;
+            self.precise_mickey_x = snap.precise_mickey_x;
+            self.precise_mickey_y = snap.precise_mickey_y;
+            self.precise_pixel_x = snap.precise_pixel_x;
+            self.precise_pixel_y = snap.precise_pixel_y;
+            self.mickey_x = snap.mickey_x;
+            self.mickey_y = snap.mickey_y;
         }
     };
 }

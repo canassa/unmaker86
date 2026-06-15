@@ -1402,9 +1402,9 @@ dosbox (`bios_keyboard.cpp:555-556`). Test: the blocking-read round-trip (a prog
 loops AH=00 unblocks deterministically when a scancode + IRQ1 is injected, §7.1).
 
 **Phase 2 — mouse inject-while-paused (Model A, driver-state, absolute + relative).**
-- [ ] Generalize `Int33.injectMotion` → `injectAbsolute(x,y,buttons, set_x,
+- [x] Generalize `Int33.injectMotion` → `injectAbsolute(x,y,buttons, set_x,
   set_y, set_buttons)` honoring AX=0004 clamping (`int33.zig:156-168,254-259`).
-- [ ] Add `injectRelative(dx,dy,buttons,...)` porting the §5.2 mickey/sensitivity
+- [x] Add `injectRelative(dx,dy,buttons,...)` porting the §5.2 mickey/sensitivity
   formulas **in integer/fixed-point, NOT float** (dosbox
   `mouseif_dos_driver.cpp:800-815` [`pixels`=8.0], `set_sensitivity :829-857`
   [`tmp=min(100,s)-1`, `s==0→0`], accel condition `:1237-1239`; spice86
@@ -1413,10 +1413,13 @@ loops AH=00 unblocks deterministically when a scancode + IRQ1 is injected, §7.1
   `mouse_common.cpp:100-104`), force raw input, no host-OS acceleration, no host-clock
   sample gate (§7.4). The accumulator field is new mutable state — add it to
   `Int33.Snapshot` *now* (it was deferred from Phase 0).
-- [ ] **Change AX=000B to accumulate-and-zero-on-read** (§5.2): replace the hardcoded
+- [x] **Change AX=000B to accumulate-and-zero-on-read** (§5.2): replace the hardcoded
   0/0 (`int33.zig:196-202`) with "return accumulated signed mickeys, then zero", update
   the contract comment, and **re-baseline its oracle golden** (dosbox case 0x0b /
-  spice86 `MouseInt33Handler.cs` `GetMotionDistance :624-638`).
+  spice86 `MouseInt33Handler.cs` `GetMotionDistance :624-638`). [MOUSE1 golden is
+  unchanged: it injects no relative motion, so the accumulator stays 0 → AX=000B
+  reads 0/0 exactly as before; re-minted via tools/oracle.sh (double-mint diff
+  byte-identical) to confirm.]
 - [ ] `Controller.injectMouse(...)`, `Command.input_mouse`, `drainOne` arm,
   `MouseReq` wire (x/y/buttons AND dx/dy — relative ships in v1, no
   `not_implemented`), route `POST /api/input/mouse`.
