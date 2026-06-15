@@ -939,27 +939,27 @@ request*, not determinism — determinism is proved by tests 1-9 below the socke
       aggregate `test` (`build.zig:402+`). `zig build test` green (empty aggregator).
 
 ### Phase 1 — the wire format (`json_wire.zig`), pure, no threads/sockets
-- [ ] Define request structs (`RunReq`, `RunToCycleReq`, `RunToAddrReq`, `StepNReq`, `AddBpReq`,
+- [x] Define request structs (`RunReq`, `RunToCycleReq`, `RunToAddrReq`, `StepNReq`, `AddBpReq`,
       `EnableBpReq`, **`RegSetReq` as a single valid tagged union** `{reg32:{name,value},
       reg16:{name,value}, reg8:{name,value}, seg:{name,value}, eip:{value}, flags:{13 bools}}` (§B.4/G2,
       flags = the same 13-bool object `cpuSnapshot` emits), `LoadReq{drive,file,cmdtail}`, `MemPeekReq`,
       `MemWriteReq`, `IvtReq`, `StackReq`) and wire response structs
       (`WireBreakpoint{id,kind,enabled,one_shot}`, `ErrorBody{code,message}`).
-- [ ] Serialize helpers via `std.json.Stringify.value`/`valueAlloc` (`Stringify.zig:573/618`) **with
+- [x] Serialize helpers via `std.json.Stringify.value`/`valueAlloc` (`Stringify.zig:573/618`) **with
       `.{ .emit_nonportable_numbers_as_strings = true }`** (`Stringify.zig:567`) so `u64`
       `cycles`/`at_cycle` emit as strings (R6). Cover `StopReason`/`CpuSnapshot`/`WireBreakpoint`/
       `Region`/`ErrorBody`. Confirm the discriminated `{"tag":payload}` encoding for
       `StopReason`/`BreakpointKind`/`AccessKind`/`RegSetReq` (§C.2).
-- [ ] Parse helpers via **`std.json.parseFromSliceLeaky(T, arena.allocator(), body,
+- [x] Parse helpers via **`std.json.parseFromSliceLeaky(T, arena.allocator(), body,
       .{.ignore_unknown_fields=true})`** (`static.zig:88`) over a per-request `ArenaAllocator` reset
       `.retain_capacity` (NOT `parseFromSlice`, which allocs a fresh arena per call, `static.zig:108`);
       copy scalars + hex-decoded bytes out into POD before the next arena reset.
-- [ ] Hex encode/decode for `data` fields (reject odd-length/invalid → error).
-- [ ] Build a `cpu.Flags` field-by-field from the `flags` 13-bool payload (no `fromU32`, no controller
+- [x] Hex encode/decode for `data` fields (reject odd-length/invalid → error).
+- [x] Build a `cpu.Flags` field-by-field from the `flags` 13-bool payload (no `fromU32`, no controller
       change — §B.4/G1).
-- [ ] Tests: §D #6 (round-trips, golden strings incl. `u64`-as-string) + the hex edge cases.
+- [x] Tests: §D #6 (round-trips, golden strings incl. `u64`-as-string) + the hex edge cases.
 
-### Phase 2 — the command queue (`queue.zig`), threaded handoff, no sockets
+ the command queue (`queue.zig`), threaded handoff, no sockets
 - [ ] `Command`/`Response` unions (§A.2) + the fixed `[QUEUE_CAP]Command` ring with power-of-two
       masked head/tail (M1 §6 pin; `std.RingBuffer` is gone). Per-slot fixed scratch buffers
       (`MAX_MEM_CHUNK=4096`, `MAX_STACK_WORDS=256`).
