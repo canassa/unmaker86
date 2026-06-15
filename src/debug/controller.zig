@@ -127,7 +127,7 @@ pub const Reg8 = enum(u3) { al, cl, dl, bl, ah, ch, dh, bh };
 
 /// A memory region descriptor (so an M2 readMem client can validate ranges).
 pub const Region = struct {
-    kind: enum { ram, vram, ems_frame },
+    kind: enum { ram, vram, text_vram, text_vram_mono, ems_frame },
     phys_start: u32,
     len: u32,
 };
@@ -702,5 +702,10 @@ pub const Controller = struct {
 const regions_table = [_]Region{
     .{ .kind = .ram, .phys_start = 0, .len = memmap.ram_total_size },
     .{ .kind = .vram, .phys_start = 0xA0000, .len = 0x10000 },
+    // Text-mode video pages: color B8000 (modes 0-3) + mono B0000 (mode 7), each
+    // one 32 KiB segment (devices.vga.TEXT_WINDOW_LEN). Mapped permanently like
+    // the framebuffer; both reachable via the peek path for `/api/screen`.
+    .{ .kind = .text_vram, .phys_start = 0xB8000, .len = 0x8000 },
+    .{ .kind = .text_vram_mono, .phys_start = 0xB0000, .len = 0x8000 },
     .{ .kind = .ems_frame, .phys_start = 0xE0000, .len = 0x10000 },
 };

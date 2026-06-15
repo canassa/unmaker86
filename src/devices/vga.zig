@@ -56,6 +56,25 @@ pub const VRAM_WINDOW_LEN: u32 = 0x10000;
 /// exists so a faithful future planar/bank mode has real storage (no fake).
 pub const VRAM_SIZE: u32 = 0x40000;
 
+/// Color text page window (modes 0-3): B800:0000. Mono (mode 7): B000:0000. The
+/// text page is ordinary guest RAM (a backing slab, like the A0000 framebuffer):
+/// a direct `putch` write and an INT 10h text service both land here, and the
+/// debugger `/api/screen` peek reads it back. Modeled as the flat interleaved
+/// {char,attr} cell (dosbox's plane split is an internal storage detail with no
+/// guest-observable difference for the chained text mapping — D-TM1).
+pub const TEXT_COLOR_PHYS: u32 = 0xB8000;
+pub const TEXT_MONO_PHYS: u32 = 0xB0000;
+/// One real-mode segment (32 KiB) is the addressable window for each text base
+/// (dosbox MEM_SetPageHandler(VGA_PAGE_B8, 8 pages, ...) = 8 * 0x1000 = 32 KiB).
+pub const TEXT_WINDOW_LEN: u32 = 0x8000;
+/// Standard 80x25 text geometry (mode 3). The LIVE cols/rows live in the BDA
+/// (OFF_VIDEO_COLS / OFF_NB_ROWS+1); these are only the v1 mode-set defaults.
+pub const TEXT_COLS: u16 = 80;
+pub const TEXT_ROWS: u16 = 25;
+/// One display page = 0x1000 bytes (dosbox table plength for modes 2/3/7;
+/// 80*25*2 = 4000, rounded up to 0x1000).
+pub const TEXT_PAGE_SIZE: u32 = 0x1000;
+
 /// Mode 13h geometry (dosbox-x int10_modes.cpp:100 — `M_VGA 320x200`).
 pub const MODE13_WIDTH: u16 = 320;
 pub const MODE13_HEIGHT: u16 = 200;
@@ -121,6 +140,17 @@ pub const Vga = struct {
     /// at deinit, zero-filled at reset (determinism). NOT inlined into the struct.
     vram: []u8 = &.{},
 
+    /// The text-mode video pages — ordinary guest RAM, mapped (like `vram`) as
+    /// RAM-like MMIO so a direct write (Borland `putch` direct-video) hits the bus
+    /// host-pointer fast path with no trap, and a `/api/screen` peek reads it back.
+    /// `text_vram` is the color page (B8000, modes 0-3); `text_vram_mono` is the
+    /// mono page (B0000, mode 7). Each is one 32 KiB segment (TEXT_WINDOW_LEN).
+    /// Zero-filled at reset (CLAUDE #5). Like `vram`/`bus.ram` these are NOT placed
+    /// in any Snapshot struct — they are caller-copied out-of-band (§3.4); the
+    /// host pointer is re-derived by `wire()`'s `mapMmio` on restore.
+    text_vram: []u8 = &.{},
+    text_vram_mono: []u8 = &.{},
+
     // ---- DAC port state machine (vga_dac.cpp) ----
     /// 256 palette entries, each R/G/B in 0..63 (6-bit).
     dac_rgb: [256]DacRgb = @splat(.{}),
@@ -170,12 +200,20 @@ pub const Vga = struct {
     /// Allocate the fixed VRAM block. Must be called once before `wire`.
     pub fn init(self: *Vga, allocator: std.mem.Allocator) !void {
         const vram = try allocator.alloc(u8, VRAM_SIZE);
+        errdefer allocator.free(vram);
+        const tvram = try allocator.alloc(u8, TEXT_WINDOW_LEN);
+        errdefer allocator.free(tvram);
+        const tmono = try allocator.alloc(u8, TEXT_WINDOW_LEN);
         @memset(vram, 0); // deterministic zero init (CLAUDE #5)
-        self.* = .{ .vram = vram };
+        @memset(tvram, 0);
+        @memset(tmono, 0);
+        self.* = .{ .vram = vram, .text_vram = tvram, .text_vram_mono = tmono };
     }
 
     pub fn deinit(self: *Vga, allocator: std.mem.Allocator) void {
         allocator.free(self.vram);
+        allocator.free(self.text_vram);
+        allocator.free(self.text_vram_mono);
         self.* = .{};
     }
 
@@ -183,6 +221,8 @@ pub const Vga = struct {
     /// (deterministic). The allocation is preserved.
     pub fn reset(self: *Vga) void {
         @memset(self.vram, 0);
+        @memset(self.text_vram, 0); // heap slices => @memset (NOT @splat)
+        @memset(self.text_vram_mono, 0);
         self.dac_rgb = @splat(.{});
         self.dac_write_index = 0;
         self.dac_read_index = 0;
@@ -256,6 +296,73 @@ pub const Vga = struct {
     fn memPeek8(ctx: *anyopaque, phys: u32) ?u8 {
         const self: *Vga = @ptrCast(@alignCast(ctx));
         return self.vram[vramOffset(phys)];
+    }
+
+    // -----------------------------------------------------------------------
+    // Text-page MemHandlers — the B8000 (color) + B0000 (mono) text windows.
+    // RAM-like, exactly like the A0000 handler: getHostPtr is the direct-write
+    // fast path (a `mov [es:di],al` to B800 is charged as a NORMAL guest write —
+    // no trap, no ledger hole, CLAUDE #1), and peek8 is the side-effect-free
+    // debugger path `/api/screen` uses (a handler with only getHostPtr would make
+    // the peek return fill bytes, not real cells — R4: BOTH are mandatory).
+    // -----------------------------------------------------------------------
+
+    pub fn textMemHandler(self: *Vga) MemHandler {
+        return .{ .ctx = self, .vtable = &text_mem_vtable };
+    }
+    pub fn textMonoMemHandler(self: *Vga) MemHandler {
+        return .{ .ctx = self, .vtable = &text_mono_mem_vtable };
+    }
+
+    const text_mem_vtable = MemHandler.VTable{
+        .read8 = textRead8,
+        .write8 = textWrite8,
+        .getHostPtr = textGetHostPtr,
+        .peek8 = textPeek8,
+    };
+    const text_mono_mem_vtable = MemHandler.VTable{
+        .read8 = textMonoRead8,
+        .write8 = textMonoWrite8,
+        .getHostPtr = textMonoGetHostPtr,
+        .peek8 = textMonoPeek8,
+    };
+
+    fn textGetHostPtr(ctx: *anyopaque, page: u32) ?[*]u8 {
+        const self: *Vga = @ptrCast(@alignCast(ctx));
+        const phys = page * page_size;
+        if (phys < TEXT_COLOR_PHYS or phys >= TEXT_COLOR_PHYS + TEXT_WINDOW_LEN) return null;
+        return self.text_vram[phys - TEXT_COLOR_PHYS ..].ptr;
+    }
+    fn textRead8(ctx: *anyopaque, phys: u32) u8 {
+        const self: *Vga = @ptrCast(@alignCast(ctx));
+        return self.text_vram[phys - TEXT_COLOR_PHYS];
+    }
+    fn textWrite8(ctx: *anyopaque, phys: u32, v: u8) void {
+        const self: *Vga = @ptrCast(@alignCast(ctx));
+        self.text_vram[phys - TEXT_COLOR_PHYS] = v;
+    }
+    fn textPeek8(ctx: *anyopaque, phys: u32) ?u8 {
+        const self: *Vga = @ptrCast(@alignCast(ctx));
+        return self.text_vram[phys - TEXT_COLOR_PHYS];
+    }
+
+    fn textMonoGetHostPtr(ctx: *anyopaque, page: u32) ?[*]u8 {
+        const self: *Vga = @ptrCast(@alignCast(ctx));
+        const phys = page * page_size;
+        if (phys < TEXT_MONO_PHYS or phys >= TEXT_MONO_PHYS + TEXT_WINDOW_LEN) return null;
+        return self.text_vram_mono[phys - TEXT_MONO_PHYS ..].ptr;
+    }
+    fn textMonoRead8(ctx: *anyopaque, phys: u32) u8 {
+        const self: *Vga = @ptrCast(@alignCast(ctx));
+        return self.text_vram_mono[phys - TEXT_MONO_PHYS];
+    }
+    fn textMonoWrite8(ctx: *anyopaque, phys: u32, v: u8) void {
+        const self: *Vga = @ptrCast(@alignCast(ctx));
+        self.text_vram_mono[phys - TEXT_MONO_PHYS] = v;
+    }
+    fn textMonoPeek8(ctx: *anyopaque, phys: u32) ?u8 {
+        const self: *Vga = @ptrCast(@alignCast(ctx));
+        return self.text_vram_mono[phys - TEXT_MONO_PHYS];
     }
 
     // -----------------------------------------------------------------------

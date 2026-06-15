@@ -181,3 +181,94 @@ test "snapshot round-trip of a populated machine restores identically" {
     try std.testing.expectEqualDeep(snap.sched, s2.sched);
     try std.testing.expectEqual(@as(u8, 0x77), m2.bus.readPhys8(0x1234));
 }
+
+// ---------------------------------------------------------------------------
+// Text-mode video pages (B8000 color / B0000 mono) — P1/P2. Before this work
+// the UMA B-window defaulted to `.unmapped`, so a write to B800:0000 was
+// silently dropped and a read returned the 0x00 fill. Now both windows are
+// permanently mapped RAM-like MMIO (machine.wire), so a direct write round-trips.
+// ---------------------------------------------------------------------------
+
+test "text page: direct write to B800:0000 and B000:0000 reads back (was dropped before)" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+
+    // Color text page (B800:0000) — a flat {char,attr} cell.
+    m.bus.writePhys8(0xB8000, 'A');
+    m.bus.writePhys8(0xB8001, 0x1F);
+    try std.testing.expectEqual(@as(u8, 'A'), m.bus.readPhys8(0xB8000));
+    try std.testing.expectEqual(@as(u8, 0x1F), m.bus.readPhys8(0xB8001));
+    // The byte landed in the device slab (the host-pointer fast path), not RAM.
+    try std.testing.expectEqual(@as(u8, 'A'), m.vga.text_vram[0]);
+
+    // The far end of the color 32 KiB window (B8000..BFFFF) is reachable too.
+    m.bus.writePhys8(0xBFFFF, 0x7E);
+    try std.testing.expectEqual(@as(u8, 0x7E), m.bus.readPhys8(0xBFFFF));
+    try std.testing.expectEqual(@as(u8, 0x7E), m.vga.text_vram[0x7FFF]);
+
+    // Mono text page (B000:0000..B7FFF).
+    m.bus.writePhys8(0xB0000, 'M');
+    try std.testing.expectEqual(@as(u8, 'M'), m.bus.readPhys8(0xB0000));
+    try std.testing.expectEqual(@as(u8, 'M'), m.vga.text_vram_mono[0]);
+    m.bus.writePhys8(0xB7FFF, 0x3C);
+    try std.testing.expectEqual(@as(u8, 0x3C), m.vga.text_vram_mono[0x7FFF]);
+
+    // The debugger peek path (side-effect-free) sees the same bytes.
+    var buf: [2]u8 = undefined;
+    m.bus.peekBlock(0xB8000, &buf);
+    try std.testing.expectEqual(@as(u8, 'A'), buf[0]);
+    try std.testing.expectEqual(@as(u8, 0x1F), buf[1]);
+}
+
+test "text page: caller-copy snapshot round-trip (NOT a Snapshot struct field)" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+
+    // Dirty both text pages.
+    m.bus.writePhys8(0xB8000, 'Z');
+    m.bus.writePhys8(0xB8001, 0x4E);
+    m.bus.writePhys8(0xB0000, 'Q');
+
+    // Snapshot: the large text slabs are copied OUT-OF-BAND by the caller (the
+    // same discipline as `vram`/`bus.ram`), never via a Snapshot struct field.
+    const snap = m.snapshot();
+    const ram_copy = try alloc.dupe(u8, m.bus.ram);
+    defer alloc.free(ram_copy);
+    const vram_copy = try alloc.dupe(u8, m.vga.vram);
+    defer alloc.free(vram_copy);
+    const text_copy = try alloc.dupe(u8, m.vga.text_vram);
+    defer alloc.free(text_copy);
+    const text_mono_copy = try alloc.dupe(u8, m.vga.text_vram_mono);
+    defer alloc.free(text_mono_copy);
+
+    // Mutate after the snapshot.
+    m.bus.writePhys8(0xB8000, '!');
+    m.bus.writePhys8(0xB0000, '?');
+
+    // Restore into a fresh, re-wired machine (wire() re-maps the slabs → bus).
+    const m2 = try makeMachine(alloc);
+    defer {
+        m2.deinit();
+        alloc.destroy(m2);
+    }
+    m2.restore(snap);
+    @memcpy(m2.bus.ram, ram_copy);
+    @memcpy(m2.vga.vram, vram_copy);
+    @memcpy(m2.vga.text_vram, text_copy);
+    @memcpy(m2.vga.text_vram_mono, text_mono_copy);
+
+    // Byte-identical text pages, readable through the re-established mapping.
+    try std.testing.expectEqualSlices(u8, text_copy, m2.vga.text_vram);
+    try std.testing.expectEqualSlices(u8, text_mono_copy, m2.vga.text_vram_mono);
+    try std.testing.expectEqual(@as(u8, 'Z'), m2.bus.readPhys8(0xB8000));
+    try std.testing.expectEqual(@as(u8, 0x4E), m2.bus.readPhys8(0xB8001));
+    try std.testing.expectEqual(@as(u8, 'Q'), m2.bus.readPhys8(0xB0000));
+}

@@ -231,6 +231,14 @@ pub const Machine = struct {
         _ = self.bus.registerPort(0x3DA, self.vga.portHandler());
         _ = self.bus.registerPort(0x3BA, self.vga.portHandler());
         _ = self.bus.mapMmio(devices.vga.VRAM_PHYS, devices.vga.VRAM_WINDOW_LEN, self.vga.memHandler());
+        // (c1) The text-mode video pages — color B8000 (modes 0-3) + mono B0000
+        //      (mode 7). Both are permanently mapped RAM-like MMIO (like A0000):
+        //      real hardware has both windows addressable, the CRTC just scans one;
+        //      the BDA mode says which is "active". A direct `putch` write or an INT
+        //      10h text service lands in these slabs (no trap, no ledger hole), and
+        //      `/api/screen` peeks them — closing the text-mode observability gap.
+        _ = self.bus.mapMmio(devices.vga.TEXT_COLOR_PHYS, devices.vga.TEXT_WINDOW_LEN, self.vga.textMemHandler());
+        _ = self.bus.mapMmio(devices.vga.TEXT_MONO_PHYS, devices.vga.TEXT_WINDOW_LEN, self.vga.textMonoMemHandler());
         // (d) scheduler-callback binding: PIT raise -> &self.pic; PIT schedule/
         //     cancel -> &self (the machine, which owns the scheduler).
         self.pit.cycles = &self.cpu.st.cycles;
@@ -515,6 +523,10 @@ pub const Machine = struct {
         /// VGA device-state subset (DAC + registers). VRAM bytes are large and
         /// captured separately (like the bus RAM slab) — the caller copies
         /// `machine.vga.vram` and restores it into the re-init'd machine's VRAM.
+        /// The text-mode pages `machine.vga.text_vram` (B8000) and
+        /// `machine.vga.text_vram_mono` (B0000) are handled the same way: copied
+        /// out-of-band by the caller, NOT placed in any Snapshot struct; `wire()`
+        /// re-maps them on restore (§3.4 of plans/text-mode-video.md).
         vga: Vga.Snapshot,
         speaker: Speaker.Snapshot,
         /// 8042 keyboard-controller state (FIFO + status + config). The PIC raise
