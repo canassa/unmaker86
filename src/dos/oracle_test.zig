@@ -363,16 +363,13 @@ const PASSING = [_]Program{
     // page 0), AH=02 set-cursor + AH=03 get-cursor+shape round-trips (the BDA
     // cursor word at 0040:0050 and the cursor-shape word 0x0607 = the boot mode's
     // INT10_SetCursorShape(6,7), int10_modes.cpp:988). All pure BDA reads/writes
-    // (int10.zig AH=0F/02/03), deterministic and oracle-able. DETERMINISM
-    // BOUNDARY: AH=0E teletype's cursor advance is exercised but NOT asserted —
-    // dosbox-x's INT10_TeletypeOutput moves the cursor (text VRAM + wrap/scroll)
-    // while zdos defers the VGA *text* subsystem (mode 13h graphics is the modeled
-    // video path; CON text flows through INT 21h), so its AH=0E is a faithful no-op
-    // for the framebuffer and leaves the BDA cursor where AH=02 set it. VIDTEXT.EXE
-    // therefore asserts only the explicitly-SET cursor (the agreed surface), the
-    // mode triple, and the shape word — mirroring the host-mtime exclusion in the
-    // DOS-phase bands. Proven deterministic by a triple-mint byte-identical diff;
-    // the program creates no files.
+    // (int10.zig AH=0F/02/03), deterministic and oracle-able. AH=0E teletype IS
+    // now modeled (the B8000 text page + INT 10h text services, plans/text-mode-
+    // video.md): VIDTEXT.EXE teletypes "Hi!", reads it back via AH=08, and the
+    // golden asserts the cooked cells + advanced cursor (after_tty row=2 col=3
+    // cells=Hi!) — the text buffer is a valid cross-emulator golden, reproduced
+    // byte-identically against the dosbox-x mint. Proven deterministic by a
+    // triple-mint byte-identical diff; the program creates no files.
     .{ .exe = "VIDTEXT.EXE" },
     // INT 15h A20-gate band: AH=24 AL=03 query support (BX=0x0003), AL=02 status,
     // AL=01 enable, AL=00 disable, with status re-reads proving the gate toggles
