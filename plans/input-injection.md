@@ -1423,9 +1423,12 @@ loops AH=00 unblocks deterministically when a scancode + IRQ1 is injected, §7.1
 - [x] `Controller.injectMouse(...)`, `Command.input_mouse`, `drainOne` arm,
   `MouseReq` wire (x/y/buttons AND dx/dy — relative ships in v1, no
   `not_implemented`), route `POST /api/input/mouse`.
-- [ ] Tests: byte-identity (now valid thanks to Phase 0) for both absolute and
+- [x] Tests: byte-identity (now valid thanks to Phase 0) for both absolute and
   relative; black-box AX=0003 round-trip; relative-motion accumulator reproducibility
-  across two identical inject sequences.
+  across two identical inject sequences. [src/dos/integration_test.zig: absolute
+  byte-identity (POD compare x2), relative byte-identity incl. the fixed-point
+  accumulators (snapshot compare x2), and a guest INT 33h AX=0003 read-back +
+  AX=000B accumulate-and-zero round-trip via the real IVT dispatch.]
 
 **Phase 3 — mouse event callback (OPEN-B, installed-asm trampoline; needs Phase 1·0
 for `EventKind.mouse_irq` and, if used, `runGuestFarCall`).**

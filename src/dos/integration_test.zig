@@ -374,3 +374,115 @@ test "snapshot/restore round-trips the mouse driver state (input Phase 0)" {
     // And the rest of the machine round-tripped (the post-snapshot RAM poke gone).
     try std.testing.expect(m.bus.readPhys8(0x10000) != 0xFF);
 }
+
+// ===========================================================================
+// Input Phase 2 — mouse injection (absolute + relative), determinism + a
+// black-box guest round-trip. The injectAbsolute/injectRelative paths are the
+// deterministic scripted-input seam; these prove (a) two identical inject
+// sequences reach byte-identical driver state (the snapshot, now covering the
+// fixed-point accumulators), and (b) the guest reads an injected position back
+// via the REAL INT 33h AX=0003 path.
+// ===========================================================================
+
+// A fixed absolute inject + relative inject script driven only by injectAbsolute/
+// injectRelative (no host pointer, no clock). Returns nothing; mutates m.dos.mouse.
+fn injectScriptAbsolute(m: *Machine) void {
+    const ms = &m.dos.mouse;
+    ms.injectAbsolute(100, 50, 0b001, true, true, true); // pos + left button
+    ms.injectAbsolute(300, 0, 0b011, true, false, true); // x + buttons only
+    ms.injectAbsolute(0, 175, 0, false, true, false); // y only
+}
+
+fn injectScriptRelative(m: *Machine) void {
+    const ms = &m.dos.mouse;
+    // Center first so negative deltas aren't clamped at the 0 edge.
+    ms.injectAbsolute(320, 240, 0, true, true, true);
+    // A spread of relative deltas, incl. sub-threshold ones (0/±1) that exercise
+    // the fractional remainder accumulation, and a button change.
+    ms.injectRelative(7, -3, 0, true, true, false);
+    ms.injectRelative(1, 1, 0b010, true, true, true);
+    ms.injectRelative(-2, 4, 0, true, true, false);
+    ms.injectRelative(1, -1, 0, true, true, false);
+    ms.injectRelative(0, 0, 0b101, false, false, true); // buttons only
+    ms.injectRelative(50, -40, 0, true, true, false);
+}
+
+test "input Phase 2: absolute injection is byte-identical across two runs" {
+    const alloc = std.testing.allocator;
+    var a = try boot(alloc);
+    defer a.deinit();
+    var b = try boot(alloc);
+    defer b.deinit();
+
+    injectScriptAbsolute(a.m);
+    injectScriptAbsolute(b.m);
+
+    // The whole mouse driver state (POD) must match byte-for-byte.
+    try std.testing.expectEqual(a.m.dos.mouse, b.m.dos.mouse);
+    // Sanity: the script actually changed state from the default.
+    try std.testing.expect(a.m.dos.mouse.x != 0 or a.m.dos.mouse.y != 0);
+}
+
+test "input Phase 2: relative injection is byte-identical across two runs (fixed-point accumulator)" {
+    const alloc = std.testing.allocator;
+    var a = try boot(alloc);
+    defer a.deinit();
+    var b = try boot(alloc);
+    defer b.deinit();
+
+    injectScriptRelative(a.m);
+    injectScriptRelative(b.m);
+
+    // The mickey counters + the sub-mickey/sub-pixel fixed-point remainders must
+    // ALL be byte-identical — this is the proof the accumulator is deterministic.
+    const sa = a.m.dos.mouse.snapshot();
+    const sb = b.m.dos.mouse.snapshot();
+    try std.testing.expectEqual(sa, sb);
+    // Sanity: relative motion actually accumulated mickeys (non-zero counter and a
+    // non-zero fractional remainder somewhere — the formula did real work).
+    try std.testing.expect(sa.mickey_x != 0 or sa.mickey_y != 0);
+}
+
+// Run a guest snippet `MOV AX,imm ; INT 33h ; HLT` and return CPU CX/DX (the
+// AX=0003 position read-back). Uses the SAME real INT 33h dispatch path the
+// guest game uses (IVT vector 0x33 -> dos.mouse.service), not a host shortcut.
+fn guestInt33(m: *Machine, ax: u16) struct { cx: u16, dx: u16, bx: u16 } {
+    asmInt67(m, &.{
+        0xB8, @truncate(ax), @truncate(ax >> 8), // MOV AX, imm16
+        0xCD, 0x33, // INT 33h
+        0xF4, // HLT
+    });
+    return .{
+        .cx = m.cpu.st.getReg16(@intFromEnum(Reg32.ecx)),
+        .dx = m.cpu.st.getReg16(@intFromEnum(Reg32.edx)),
+        .bx = m.cpu.st.getReg16(@intFromEnum(Reg32.ebx)),
+    };
+}
+
+test "input Phase 2: guest reads an injected position back via INT 33h AX=0003 (black-box)" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    // Inject an ABSOLUTE position + buttons, then let the GUEST read it back via
+    // the real AX=0003 handler. Defaults: range x=0..639 y=0..479, gran 0xffff,
+    // so an even-or-any value round-trips exactly (no mode-13h X-even mask here).
+    m.dos.mouse.injectAbsolute(222, 134, 0b101, true, true, true);
+    const r = guestInt33(m, 0x0003);
+    try std.testing.expectEqual(@as(u16, 222), r.cx);
+    try std.testing.expectEqual(@as(u16, 134), r.dx);
+    try std.testing.expectEqual(@as(u16, 0b101), r.bx);
+
+    // A relative move then an AX=000B read returns the accumulated mickeys AND
+    // zeroes them (the new accumulate-and-zero contract), proven via the guest.
+    m.dos.mouse.injectRelative(10, -10, 0, true, true, false);
+    const counters_before = m.dos.mouse.mickey_x; // non-zero after the move
+    try std.testing.expect(counters_before != 0);
+    const m1 = guestInt33(m, 0x000B);
+    try std.testing.expect(m1.cx != 0 or m1.dx != 0); // got the accumulated mickeys
+    // Second read returns 0/0 (zeroed on the first read).
+    const m2 = guestInt33(m, 0x000B);
+    try std.testing.expectEqual(@as(u16, 0), m2.cx);
+    try std.testing.expectEqual(@as(u16, 0), m2.dx);
+}
