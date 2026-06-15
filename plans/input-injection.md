@@ -1315,7 +1315,7 @@ structural; NARROW scope).**
 IRQ1) and runs the guest chain through *existing* mechanisms. **1d (the guest-asm
 blocking loop) is deferred to after Phase 1·0** because it needs the new emitter tail.
 
-- [ ] **1a — 8042 controller device.** `src/devices/keyboard.zig`: 0x60 data /
+- [x] **1a — 8042 controller device.** `src/devices/keyboard.zig`: 0x60 data /
   0x64 status+command ports, a small scancode output FIFO, status/config bytes, the
   **command set of §5.1b** (0x60 device cmds + 0x64 controller cmds with the expected
   ACK/response bytes — getting these wrong hangs drivers, §5.1b), and IRQ1 assert.

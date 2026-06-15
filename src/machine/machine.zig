@@ -46,6 +46,7 @@ const Pic = devices.Pic;
 const Pit = devices.Pit;
 const Vga = devices.Vga;
 const Speaker = devices.Speaker;
+const Keyboard = devices.Keyboard;
 const Scheduler = scheduler.Scheduler;
 const EventKind = scheduler.EventKind;
 
@@ -132,6 +133,9 @@ pub const Machine = struct {
     vga: Vga = .{},
     /// PC-speaker / KBC port-B (port 0x61) — register-trace sound (I/O band 5).
     speaker: Speaker = .{},
+    /// 8042 keyboard controller (ports 0x60/0x64) — the keyboard hardware *fill*
+    /// path (input-injection.md §4.1). Asserts IRQ1 via the PIC.
+    kbd: Keyboard = .{},
     sched: Scheduler = .{},
     cpu: Cpu = undefined,
     /// The host-serviced BIOS + DOS + the CallbackSink aggregate (D2/D12).
@@ -206,6 +210,11 @@ pub const Machine = struct {
         //      (bit 5 read-back) — wired to the PIT below. Registered AFTER the PIT
         //      so the snapshot replay order (registerPort by ID) is stable.
         _ = self.bus.registerPort(0x61, self.speaker.portHandler());
+        // (c1b) bus PortHandler.ctx = &self.kbd: the 8042 keyboard controller
+        //       (port 0x60 data, port 0x64 status/command). Registered AFTER the
+        //       speaker so the snapshot replay order (registerPort by ID) is stable.
+        _ = self.bus.registerPort(0x60, self.kbd.portHandler());
+        _ = self.bus.registerPort(0x64, self.kbd.portHandler());
         // (c2) bus PortHandler.ctx = &self.vga: the DAC + pixel-mask ports
         //      (0x3C6-0x3C9), the misc-output write (0x3C2) and its read alias
         //      (0x3CC). VRAM (A0000-AFFFF) is registered as RAM-like MMIO so guest
@@ -229,6 +238,11 @@ pub const Machine = struct {
         //      time). Re-bound on restore exactly like the PIT's pointers.
         self.speaker.pit = &self.pit;
         self.speaker.cycles = &self.cpu.st.cycles;
+        // (d2) 8042 keyboard controller back-pointer: it asserts IRQ1 through the
+        //      PIC (the same `picRaiseThunk` the PIT uses for IRQ0). Re-bound on
+        //      restore exactly like the PIT/speaker pointers.
+        self.kbd.raise_ctx = &self.pic;
+        self.kbd.raise_fn = picRaiseThunk;
         // (e) the host-serviced BIOS + DOS + the CallbackSink aggregate (D2/D12).
         self.bios.init(&self.cpu);
         self.dos.init(&self.cpu);
@@ -376,6 +390,7 @@ pub const Machine = struct {
         self.pic.reset();
         self.pit.reset();
         self.speaker.reset(); // port_61_data=0; lowers ch2 gate (needs pit reset first)
+        self.kbd.reset(); // 8042 FIFO/status/config back to power-on (IRQ ptr kept)
         self.vga.reset(); // zero VRAM + DAC + indices (deterministic power-on)
         self.sched.reset();
         self.shutdown = false;
@@ -486,6 +501,9 @@ pub const Machine = struct {
         /// `machine.vga.vram` and restores it into the re-init'd machine's VRAM.
         vga: Vga.Snapshot,
         speaker: Speaker.Snapshot,
+        /// 8042 keyboard-controller state (FIFO + status + config). The PIC raise
+        /// back-pointer is re-bound by the machine on restore, never snapshotted.
+        kbd: Keyboard.Snapshot,
         sched: Scheduler.Snapshot,
         /// Host-side DOS input state not covered by the bus RAM slab. `Dos` field
         /// audit (input Phase 0, §7.3) — each field classified as
@@ -522,6 +540,7 @@ pub const Machine = struct {
             .pit = self.pit.snapshot(),
             .vga = self.vga.snapshot(),
             .speaker = self.speaker.snapshot(),
+            .kbd = self.kbd.snapshot(),
             .sched = self.sched.snapshot(),
             .dos_mouse = self.dos.mouse.snapshot(),
             .shutdown = self.shutdown,
@@ -537,6 +556,7 @@ pub const Machine = struct {
         self.pit.restore(snap.pit);
         self.vga.restore(snap.vga);
         self.speaker.restore(snap.speaker);
+        self.kbd.restore(snap.kbd);
         self.sched.restore(snap.sched);
         self.dos.mouse.restore(snap.dos_mouse);
         self.shutdown = snap.shutdown;

@@ -53,6 +53,7 @@ test "no host time / RNG / thread / env / float anywhere in src/devices (grep)" 
     const sources = [_][]const u8{
         @embedFile("pic.zig"),
         @embedFile("pit.zig"),
+        @embedFile("keyboard.zig"),
         @embedFile("devices.zig"),
     };
     const forbidden = [_][]const u8{
