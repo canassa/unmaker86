@@ -1382,22 +1382,33 @@ AX / MOV AL,EOI / OUT / OUT / POP AX / IRET. Phase 1·0 adds three things in tha
   installs it. [STOP-condition note: the "fixed shape as a CbType variant" framing did
   not hold for the poll-loop; resolved with the parameterized emitter, the right
   abstraction, rather than forcing it.]
-- [ ] **(b) `runGuestFarCall(seg, off)`** — a sibling of `runGuestInt`
-  (`bridge.zig:350-400`) that drives `step_one` per inner instruction (the same
-  ledger-honoring loop at `bridge.zig:384-390`), for the mouse-callback far-call. **It
-  MUST drive `step_one`** so every inner instruction charges real cycles — a host
-  re-entry that skips the ledger is FORBIDDEN (§4.2, the Spice86 ledger-hole failure).
-- [ ] **(c) The new `EventKind` variant(s) for *scheduled* delivery — scoped
+- [x] **(b) `runGuestFarCall(seg, off)`** — a sibling of `runGuestInt`
+  (`bridge.zig`) that drives `step_one` per inner instruction (the same
+  ledger-honoring loop), for the mouse-callback far-call. It pushes a 16-bit
+  far-return frame (CS then IP, real-mode far-CALL order) pointing at the
+  re-entrancy STOP-sentinel slot, sets CS:IP to the target, then steps the machine
+  until the guest `RETF` lands on the sentinel (`reentry_done`). NO new trampoline:
+  the stop slot in the ROM image + the far-return frame ARE the trampoline. **It
+  drives `step_one`** so every inner instruction charges real cycles — the host
+  re-entry that skips the ledger (§4.2, the Spice86 ledger-hole failure) is exactly
+  what it avoids. Round-trip test asserts (i) the outer CS:IP/SP seam restores and
+  (ii) inner cycles advance + are byte-identical across two runs (no hole).
+- [x] **(c) The new `EventKind` variant(s) for *scheduled* delivery — scoped
   narrowly.** Per the §4.1 IRQ1-timing DECISION, **Model A needs NONE** (it raises
   IRQ1 directly, timing-neutral). So new `EventKind`s are needed only for: **Model B**
   (Phase 5 — the cycle-scheduled key/mouse *injection* events `input_key`/`input_mouse`,
   which on fire perform the injection + raise the IRQ) and the **Phase-3 mouse callback**
   (`mouse_irq` — the scheduled IRQ12 that drives the trampoline). Extend
   `scheduler.zig:31-35` (whose comment already anticipates "kbd, mouse" at `:29-30`)
-  only when those phases land — do NOT add any for the v1 polling slice.
-- [ ] Test: emit each new tail/shape into a scratch image and assert the exact ISA
-  bytes; a `runGuestFarCall` round-trip that asserts the inner instructions charged
-  cycles (no ledger hole), mirroring the `runGuestInt` re-entry test.
+  only when those phases land — do NOT add any for the v1 polling slice. **Phase 1·0
+  ADDED NONE:** neither the INT 1Ch chain tail, the poll-loop emitter, nor
+  `runGuestFarCall` schedules anything on the ledger (they are emitted/stepped guest
+  code), so no `EventKind` is required. `scheduler.zig` is unchanged.
+- [x] Test: emit each new tail/shape into a scratch image and assert the exact ISA
+  bytes (`bridge.zig` unit tests: `plantStub int1c_chain_eoi_pic1` + `emitPollLoop`);
+  a `runGuestFarCall` round-trip that asserts the inner instructions charged cycles
+  (no ledger hole) + run-twice byte-identity (`bridge_test.zig`), mirroring the
+  `runGuestInt` re-entry test.
 
 **Phase 1d — guest-asm INT 16h blocking loop (needs Phase 1·0).** Install the guest-asm
 INT 16h handler (using the Phase-1·0 poll-loop shell) that loops `INT 09h` for the

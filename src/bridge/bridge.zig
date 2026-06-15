@@ -509,6 +509,82 @@ pub fn Bridge(comptime Cpu: type) type {
             self.reentry_done = save_done;
         }
 
+        /// Execute a guest FAR CALL into `seg:off` from host code and return when
+        /// the matching `RETF` fires (Phase 1·0b — the sibling of `runGuestInt`,
+        /// used by the Phase-3 mouse-callback far-call). Like `runGuestInt`, it
+        /// drives the MACHINE step (injected stepper) per inner instruction, so
+        /// EVERY instruction the guest handler runs charges its REAL cycle cost
+        /// through the normal ledger — there is NO separate timing path and NO
+        /// ledger hole. A host re-entry that ran the handler OUTSIDE the step loop
+        /// (the Spice86 failure §4.2) is exactly what this avoids.
+        ///
+        /// Mechanism: push a 16-bit far-return frame (CS then IP, IP on top — the
+        /// real-mode far-CALL push order, see `exec_ctrl.farCallDirect`) pointing
+        /// at the re-entrancy STOP-sentinel slot (`0xFE 0x38 <stop_id>`), then set
+        /// CS:IP to the target. The guest runs; its `RETF` pops that frame and
+        /// lands on the stop sentinel's trap, which sets `reentry_done` -> exit.
+        /// No new trampoline is needed: the stop slot already lives in the ROM
+        /// image and the far-return frame is the "trampoline" for this path.
+        pub fn runGuestFarCall(self: *Self, seg: u16, off: u16) void {
+            std.debug.assert(self.step_one != null); // stepper must be wired
+            std.debug.assert(self.depth < MAX_DEPTH); // depth guard (D3)
+            self.depth += 1;
+            defer self.depth -= 1;
+
+            const cpu = self.cpu;
+            const Reg32 = @import("cpu").state.Reg32;
+            const Seg = @import("cpu").state.Seg;
+
+            // (1) Save CS:IP/SP + the re-entry seam scratch (same rationale as
+            // runGuestInt: a nested step clobbers the outer decode scratch).
+            const save_cs = cpu.st.selector[@intFromEnum(Seg.cs)];
+            const save_cs_base = cpu.st.seg_base[@intFromEnum(Seg.cs)];
+            const save_eip = cpu.st.eip;
+            const save_sp = cpu.st.getReg16(@intFromEnum(Reg32.esp));
+            const save_dec = cpu.dec;
+            const save_start_eip = cpu.instr_start_eip;
+            const save_done = self.reentry_done;
+
+            // (2) Push the far-return frame onto SS:SP pointing at the stop
+            // sentinel slot. Real-mode far CALL pushes CS first, then IP (so IP is
+            // on top and RETF pops IP then CS). 16-bit words: default real-mode
+            // operand size, matching what the guest `RETF` (op_size .b16) pops.
+            const stop = slotSegOff(self.stop_id);
+            var sp = cpu.st.getReg16(@intFromEnum(Reg32.esp));
+            sp -%= 2;
+            cpu.segWrite16(.ss, sp, stop.seg) catch {};
+            sp -%= 2;
+            cpu.segWrite16(.ss, sp, stop.off) catch {};
+            cpu.st.setReg16(@intFromEnum(Reg32.esp), sp);
+
+            // (3) Point CS:IP at the guest target and run until the RETF lands on
+            // the stop sentinel.
+            cpu.loadSegment(.cs, seg);
+            cpu.st.eip = off;
+            self.reentry_done = false;
+
+            var guard: u64 = 0;
+            const max_steps: u64 = 5_000_000; // bounded; flag loudly if exceeded
+            while (!self.reentry_done) {
+                self.step_one.?(self.step_ctx.?);
+                guard += 1;
+                if (guard >= max_steps) {
+                    std.debug.panic("runGuestFarCall(0x{X}:0x{X}) did not return within {d} steps", .{ seg, off, max_steps });
+                }
+            }
+
+            // (4) Restore CS:IP/SP + the seam scratch. The far-return frame was
+            // already consumed by the guest RETF, but we restore SP explicitly to
+            // the pre-call value so a partial/short run can never leave it skewed.
+            cpu.st.selector[@intFromEnum(Seg.cs)] = save_cs;
+            cpu.st.seg_base[@intFromEnum(Seg.cs)] = save_cs_base;
+            cpu.st.eip = save_eip;
+            cpu.st.setReg16(@intFromEnum(Reg32.esp), save_sp);
+            cpu.dec = save_dec;
+            cpu.instr_start_eip = save_start_eip;
+            self.reentry_done = save_done;
+        }
+
         /// The stop-sentinel handler (D3): sets `reentry_done`. The CPU's Grp4 arm
         /// dispatches this through the Services sink like any callback, but the
         /// cost is `.stop_sentinel` (0, guard-exempt).
