@@ -12,8 +12,10 @@
 
 const std = @import("std");
 const machine_mod = @import("machine");
+const debug_mod = @import("debug");
 
 const Machine = machine_mod.Machine;
+const Controller = debug_mod.Controller;
 
 /// Stop the run once the initial process terminates (INT 21h AH=4C / INT 20h) or
 /// the CPU halts with no way to wake (`halted_forever` lands here via `halted`).
@@ -27,13 +29,33 @@ pub fn main(init: std.process.Init) !void {
     const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
 
-    // ---- args: argv[1] = path to the DOS program ----------------------------
+    // ---- args: [--break-cycle N] <PROGRAM> [guest args...] ------------------
+    // The optional `--break-cycle N` flag (debugger opt-in) constructs a
+    // Controller and stops the run deterministically at the first instruction
+    // boundary at/after cycle N, dumping a CPU snapshot — instead of running to
+    // termination. The default path (no flag) is unchanged.
     var args_it: std.process.Args.Iterator = .init(init.minimal.args);
     _ = args_it.next(); // skip argv[0]
-    const path = args_it.next() orelse {
-        try stderr.writeStreamingAll(io, "usage: zig build run -- <PROGRAM.COM|PROGRAM.EXE> [args...]\n");
+    var break_cycle: ?u64 = null;
+    var first = args_it.next() orelse {
+        try stderr.writeStreamingAll(io, "usage: zig build run -- [--break-cycle N] <PROGRAM.COM|PROGRAM.EXE> [args...]\n");
         std.process.exit(2);
     };
+    if (std.mem.eql(u8, first, "--break-cycle")) {
+        const n_str = args_it.next() orelse {
+            try stderr.writeStreamingAll(io, "zdos: --break-cycle requires a cycle count\n");
+            std.process.exit(2);
+        };
+        break_cycle = std.fmt.parseInt(u64, n_str, 10) catch {
+            try stderr.writeStreamingAll(io, "zdos: --break-cycle expects a non-negative integer\n");
+            std.process.exit(2);
+        };
+        first = args_it.next() orelse {
+            try stderr.writeStreamingAll(io, "usage: zig build run -- [--break-cycle N] <PROGRAM.COM|PROGRAM.EXE> [args...]\n");
+            std.process.exit(2);
+        };
+    }
+    const path = first;
 
     // Any remaining host args become the guest DOS command tail (space-joined),
     // e.g. `... -- TCC.EXE -IINCLUDE HELLO.C` runs TCC with that command line.
@@ -84,6 +106,52 @@ pub fn main(init: std.process.Init) !void {
         try stderr.writeStreamingAll(io, msg);
         std.process.exit(1);
     };
+
+    if (break_cycle) |bc| {
+        // Debugger path: drive the machine via the Controller and stop at cycle N.
+        // The Controller observes/drives the machine synchronously; it never reads
+        // host time and leaves the ledger exactly where the last retired step put
+        // it (no smear) — the determinism property zdos exists to keep.
+        var ctrl = Controller.init(m);
+        const stop = ctrl.runToCycle(bc) catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "zdos: --break-cycle failed: {t}\n", .{err}) catch "zdos: --break-cycle failed\n";
+            try stderr.writeStreamingAll(io, msg);
+            std.process.exit(1);
+        };
+
+        // Flush whatever the program printed up to the break point.
+        try stdout.writeStreamingAll(io, m.dos.dev_table.con.output());
+
+        const snap = ctrl.cpuSnapshot();
+        var sbuf: [320]u8 = undefined;
+        const status = std.fmt.bufPrint(&sbuf,
+            \\
+            \\[zdos] stopped: {s}; cycle {d}
+            \\  CS:IP {x:0>4}:{x:0>4}  EAX={x:0>8} EBX={x:0>8} ECX={x:0>8} EDX={x:0>8}
+            \\  ESP={x:0>8} EBP={x:0>8} ESI={x:0>8} EDI={x:0>8}  FLAGS: CF={d} ZF={d} SF={d} IF={d}
+            \\
+        , .{
+            @tagName(stop),
+            snap.cycles,
+            snap.cs,
+            @as(u16, @truncate(snap.eip)),
+            snap.eax,
+            snap.ebx,
+            snap.ecx,
+            snap.edx,
+            snap.esp,
+            snap.ebp,
+            snap.esi,
+            snap.edi,
+            @intFromBool(snap.cf),
+            @intFromBool(snap.zf),
+            @intFromBool(snap.sf),
+            @intFromBool(snap.iff),
+        }) catch "\n[zdos] stopped\n";
+        try stderr.writeStreamingAll(io, status);
+        return;
+    }
 
     const reason = m.runUntil(untilDone, 500_000_000);
 

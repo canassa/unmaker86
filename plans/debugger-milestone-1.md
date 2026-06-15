@@ -636,7 +636,7 @@ pub fn memoryRegions(self: *const Controller) []const Region; // RAM size, VRAM,
 - [x] `matches` for `interrupt{vector}`; add to `expectStateEqual` coverage.
 - [x] Test: `interrupt{0x21}` fires on a DOS call in a corpus program; freshness correct.
 
-### Phase 5 — (optional; may defer to M2) memory watchpoints
+### Phase 5 — (optional; may defer to M2) memory watchpoints — **STOPPED for human decision**
 - [ ] Decide mechanism: comptime `Options.DebugHook` (`cpu.zig:60-64`, zero-cost
       `NullDebugHook`) vs. page-kind `.mmio` trap. **Recommend page-kind trap** (single `Cpu`
       type; hot path untouched for unwatched pages — verified `bus.zig:185-233`).
@@ -646,10 +646,39 @@ pub fn memoryRegions(self: *const Controller) []const Region; // RAM size, VRAM,
       neutrality** (watched vs unwatched run reach byte-identical state+ledger); disabled
       path byte-identical + alloc-free.
 
+> **STOP / decision needed (M1 implementer).** Neither mechanism is clean within
+> M1's locked architecture (controller owns the loop; NO `*anyopaque` thunk on the
+> machine — the exact pattern Phase 0 *removed*; single `Cpu`/`Machine` type):
+>
+> 1. **Page-kind `.mmio` trap.** A watched RAM page must consult the controller's
+>    `memory` breakpoints *mid-instruction*, but the trap handler lives in the
+>    bus/devices layer, which **cannot import `debug`** (module graph). Wiring it
+>    up needs a runtime callback hook on the bus access path — re-introducing the
+>    `*anyopaque` + `*const fn` indirect-call seam Phase 0 deleted, *and* a leaf
+>    module calling **up** into `debug`. Cycle cost is neutral (the base charge at
+>    `dispatch.zig:88` is routing-independent), but the seam itself violates the
+>    v2 inversion decision.
+> 2. **Comptime `Options.DebugHook`.** Zero-cost when disabled, but a *non-Null*
+>    hook **forks the `Cpu` type** → a second `Machine` specialization. Every
+>    build/test path (machine, dos, bios, oracle, debug) would need to choose or
+>    duplicate the specialization. That is the "balloons scope" case.
+>
+> The `memory`/`io` `BreakpointKind` arms are **already declared** (ids/handles/
+> serialization stable) and `matches` returns `false` for them, so adding the
+> mechanism later is purely additive — no API churn. Per the M1 scope note I did
+> **not** ship a half-measure that risks the cycle ledger or forks the type graph.
+> **Recommendation:** defer memory watchpoints to a focused follow-up that first
+> decides the hook policy (likely the comptime `DebugHook` with a build-option
+> gate, kept Null in the default machine), so determinism + cycle-cost neutrality
+> can be asserted without a runtime up-call from a leaf module.
+
 ### Phase 6 — runner integration (optional; keeps `main.zig` thin)
-- [ ] Opt-in flag (e.g. `--break-cycle N`) in `src/main.zig` constructing a `Controller`,
+- [x] Opt-in flag (e.g. `--break-cycle N`) in `src/main.zig` constructing a `Controller`,
       setting one breakpoint, calling `runUntilEvent` instead of `runUntil` (`main.zig:88`).
       Default path unchanged.
+      *(Implemented as `--break-cycle N` -> `Controller.runToCycle(N)` (a one-shot cycle bp +
+      runUntilEvent), dumping a CPU snapshot at the stop. Verified: two runs byte-identical
+      output; the no-flag default path is unchanged.)*
 
 ---
 

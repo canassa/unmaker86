@@ -145,6 +145,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("machine", machine_mod);
+    exe.root_module.addImport("debug", debug_mod);
     b.installArtifact(exe);
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
