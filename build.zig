@@ -133,6 +133,11 @@ pub fn build(b: *std.Build) void {
     });
     debug_mod.addImport("cpu", cpu_mod);
     debug_mod.addImport("machine", machine_mod);
+    // controller.zig imports `bus` for the memory-watchpoint (setWatch/clearWatch)
+    // path. The exe never references that path so lazy analysis hid the dependency,
+    // but the api module's tests do — so the `debug` module must provide `bus`.
+    // (Build wiring only; no `src/debug/` source change.)
+    debug_mod.addImport("bus", bus_mod);
 
     // The HTTP/JSON API server (Milestone 2): sits ABOVE debug + machine in the
     // module graph ("observes machine; never drives timing"). The production `api`

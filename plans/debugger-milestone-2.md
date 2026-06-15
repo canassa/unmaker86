@@ -959,19 +959,19 @@ request*, not determinism — determinism is proved by tests 1-9 below the socke
       change — §B.4/G1).
 - [x] Tests: §D #6 (round-trips, golden strings incl. `u64`-as-string) + the hex edge cases.
 
- the command queue (`queue.zig`), threaded handoff, no sockets
-- [ ] `Command`/`Response` unions (§A.2) + the fixed `[QUEUE_CAP]Command` ring with power-of-two
+### Phase 2 — the command queue (`queue.zig`), threaded handoff, no sockets
+- [x] `Command`/`Response` unions (§A.2) + the fixed `[QUEUE_CAP]Command` ring with power-of-two
       masked head/tail (M1 §6 pin; `std.RingBuffer` is gone). Per-slot fixed scratch buffers
       (`MAX_MEM_CHUNK=4096`, `MAX_STACK_WORDS=256`).
-- [ ] The handoff: `std.Io.Mutex` (`lockUncancelable` `Io.zig:1623`, `unlock` `:1641`) + per-request
+- [x] The handoff: `std.Io.Mutex` (`lockUncancelable` `Io.zig:1623`, `unlock` `:1641`) + per-request
       `std.Io.Condition` (`waitUncancelable` `:1675`, `signal` `:1726`) + `done: bool` flag
       read/written **only under the mutex**. Use the **predicate `while (!ctx.done) cond.waitUncancelable(io,&mutex)`**
       loop (lost/spurious-wakeup safe — §0.3/§A.3). `submit(cmd) Response` (blocks until done) +
       `tryDequeue`/`complete` for the worker.
-- [ ] Enforce **one-in-flight as a MECHANISM** (R1): `submit()` **`assert`s the queue is empty**
+- [x] Enforce **one-in-flight as a MECHANISM** (R1): `submit()` **`assert`s the queue is empty**
       after taking the mutex (a second producer is impossible in v1, not merely blocked). Document the
       multi-client **global submit lock** (serialize whole submit→run→respond) as the additive future.
-- [ ] Tests: §D #3 (order-independent serialization, run N times) + §D #8 (adversarial: second
+- [x] Tests: §D #3 (order-independent serialization, run N times) + §D #8 (adversarial: second
       command rejected/serialized while a long capped run is in flight — by mechanism, byte-identical
       across N) + a basic submit/drain on two threads returns the right response.
 
