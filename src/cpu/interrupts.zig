@@ -206,6 +206,18 @@ pub fn deliverViaIvt(cpu: anytype, vector: u8) !void {
     // Load CS:IP from the IVT entry (real-mode far load).
     cpu.loadSegment(.cs, new_cs);
     cpu.st.eip = new_ip;
+
+    // Record the delivery breadcrumb (M1 Phase 4 — interrupt-vector breakpoints).
+    // Every IVT delivery funnels through here (software INT via exec_ctrl, hardware
+    // IRQ/NMI via serviceInterrupts, exceptions via deliverException), so this is
+    // the single faithful chokepoint. Set ONLY after a successful far load (a
+    // limit-exceeded delivery returned above before reaching here). This is a
+    // read-only debugger aid; it does not affect the execution path or cost.
+    cpu.st.last_delivered = .{
+        .vector = vector,
+        .at_cycle = cpu.st.cycles,
+        .seq = cpu.st.last_delivered.seq + 1,
+    };
 }
 
 /// Push a 16-bit word using SP (real mode stack width = 16-bit).

@@ -156,10 +156,11 @@ pub const Controller = struct {
             // terminal machine's step is a no-op that surfaces the terminal).
             if (self.terminalReason()) |r| return self.record(r);
 
+            const seq_before = bp.deliverySeq(self.m);
             _ = self.m.step();
 
             if (self.terminalReason()) |r| return self.record(r);
-            if (self.scanBreakpoints()) |r| return self.record(r);
+            if (self.scanBreakpoints(seq_before)) |r| return self.record(r);
 
             if (self.m.cpu.st.cycles >= deadline) {
                 return self.record(.{ .cycle_budget_exhausted = .{ .at_cycle = self.m.cpu.st.cycles } });
@@ -194,14 +195,14 @@ pub const Controller = struct {
     /// this boundary; report the lowest-id match (one-shot or persistent). Returns
     /// null if nothing matched. The `active_count` gate short-circuits the common
     /// no-breakpoints case in one bool test.
-    fn scanBreakpoints(self: *Controller) ?StopReason {
+    fn scanBreakpoints(self: *Controller, seq_before: u64) ?StopReason {
         if (self.set.active_count == 0) return null;
         var reported: ?StopReason = null;
         var id: u32 = 0;
         while (id < bp.MAX_BREAKPOINTS) : (id += 1) {
             if (!self.set.used[id]) continue;
             const b = &self.set.items[id];
-            if (!bp.matches(b, self.m)) continue;
+            if (!bp.matches(b, self.m, seq_before)) continue;
             // Lowest id wins (the scan is ascending, so the first match is it).
             if (reported == null) {
                 reported = .{ .breakpoint = .{ .id = id, .at_cycle = self.m.cpu.st.cycles } };
@@ -272,9 +273,10 @@ pub const Controller = struct {
         var i: u64 = 0;
         while (i < n) : (i += 1) {
             if (self.terminalReason()) |r| return self.record(r);
+            const seq_before = bp.deliverySeq(self.m);
             _ = self.m.step();
             if (self.terminalReason()) |r| return self.record(r);
-            if (self.scanBreakpoints()) |r| return self.record(r);
+            if (self.scanBreakpoints(seq_before)) |r| return self.record(r);
         }
         return self.record(.{ .step_complete = .{ .at_cycle = self.m.cpu.st.cycles } });
     }

@@ -623,13 +623,18 @@ pub fn memoryRegions(self: *const Controller) []const Region; // RAM size, VRAM,
       determinism (reset then rerun == fresh run, byte-identical).
 
 ### Phase 4 — interrupt-vector breakpoints
-- [ ] Add a read-only `last_delivered: struct { vector: u8, at_cycle: u64, seq: u64 }` to
+- [x] Add a read-only `last_delivered: struct { vector: u8, at_cycle: u64, seq: u64 }` to
       **`cpu.State`** (the serialized type, so it round-trips), set in
       `interrupts.serviceInterrupts` (`interrupts.zig:102`), reset in `cpu.reset()`. The
       `seq`/`at_cycle` lets the between-steps check tell a fresh delivery from a stale one.
       Define which classes count (software `INT`, hardware IRQ; document fault behavior).
-- [ ] `matches` for `interrupt{vector}`; add to `expectStateEqual` coverage.
-- [ ] Test: `interrupt{0x21}` fires on a DOS call in a corpus program; freshness correct.
+      *(Recorded in `deliverViaIvt` instead — the single chokepoint ALL deliveries funnel
+      through (software INT via exec_ctrl, hardware IRQ/NMI via serviceInterrupts, exceptions
+      via deliverException), so every class is captured uniformly; set only after a
+      successful far load. `State.reset()`'s `self.* = .{}` resets it. `expectStateEqual`
+      is a whole-State byte compare, so coverage is automatic.)*
+- [x] `matches` for `interrupt{vector}`; add to `expectStateEqual` coverage.
+- [x] Test: `interrupt{0x21}` fires on a DOS call in a corpus program; freshness correct.
 
 ### Phase 5 — (optional; may defer to M2) memory watchpoints
 - [ ] Decide mechanism: comptime `Options.DebugHook` (`cpu.zig:60-64`, zero-cost

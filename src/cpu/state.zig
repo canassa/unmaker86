@@ -94,6 +94,15 @@ pub const PendingFault = struct {
     error_code: ?u32 = null,
 };
 
+/// A read-only breadcrumb of the most recent IVT delivery (M1 Phase 4). `seq`
+/// starts at 0 ("no delivery yet") and increments on every delivery; the debugger
+/// compares it against the pre-step value to detect a fresh delivery.
+pub const LastDelivered = struct {
+    vector: u8 = 0,
+    at_cycle: u64 = 0,
+    seq: u64 = 0,
+};
+
 /// The complete 386 architectural state (real-mode subset). One struct, fully
 /// reset-initialized, no hidden state.
 pub const State = struct {
@@ -150,6 +159,15 @@ pub const State = struct {
     fault_nesting: u8 = 0,
     /// A fault recorded by a helper, pending delivery at the boundary (D10).
     pending_fault: ?PendingFault = null,
+
+    /// The most recent IVT delivery (any class: software INT, hardware IRQ, NMI,
+    /// or exception). Read-only architectural breadcrumb for the debugger's
+    /// interrupt-vector breakpoints (M1 Phase 4) — NOT consulted on the execution
+    /// path. `seq` is a monotonic delivery counter so a between-steps observer can
+    /// tell a fresh delivery from a stale one; `at_cycle` is the ledger value at
+    /// delivery. Serialized in `State` (round-trips), reset in `reset()`. Default
+    /// = "no delivery yet" (seq 0).
+    last_delivered: LastDelivered = .{},
 
     // ---- Determinism ledger ----
     /// Monotonic cycle counter. Pure function of (state, inputs, schedule).

@@ -65,16 +65,16 @@ test "M6: no host time / RNG / thread / env reads anywhere in src/cpu (grep-enfo
     // testing allocator) and assert none reference host time, RNG, threading, or
     // the environment. This backs the determinism constraints #2/#3 structurally.
     const sources = [_][]const u8{
-        @embedFile("cpu.zig"),       @embedFile("state.zig"),    @embedFile("flags.zig"),
-        @embedFile("bus.zig"),       @embedFile("alu.zig"),      @embedFile("decode.zig"),
-        @embedFile("dispatch.zig"),  @embedFile("exec.zig"),     @embedFile("exec_data.zig"),
-        @embedFile("exec_alu.zig"),  @embedFile("exec_shift.zig"), @embedFile("exec_muldiv.zig"),
-        @embedFile("exec_bit.zig"),  @embedFile("exec_bcd.zig"), @embedFile("exec_ctrl.zig"),
-        @embedFile("exec_string.zig"), @embedFile("exec_io.zig"), @embedFile("exec_system.zig"),
+        @embedFile("cpu.zig"),          @embedFile("state.zig"),      @embedFile("flags.zig"),
+        @embedFile("bus.zig"),          @embedFile("alu.zig"),        @embedFile("decode.zig"),
+        @embedFile("dispatch.zig"),     @embedFile("exec.zig"),       @embedFile("exec_data.zig"),
+        @embedFile("exec_alu.zig"),     @embedFile("exec_shift.zig"), @embedFile("exec_muldiv.zig"),
+        @embedFile("exec_bit.zig"),     @embedFile("exec_bcd.zig"),   @embedFile("exec_ctrl.zig"),
+        @embedFile("exec_string.zig"),  @embedFile("exec_io.zig"),    @embedFile("exec_system.zig"),
         @embedFile("segmentation.zig"), @embedFile("interrupts.zig"), @embedFile("cycles.zig"),
     };
     const forbidden = [_][]const u8{
-        "std.time",   // host wall clock
+        "std.time", // host wall clock
         "std.Random", "std.rand", // RNG
         "std.Thread", // threading
         "std.posix.getenv", "std.process.getEnv", "std.os.getenv", // environment
@@ -227,6 +227,7 @@ test "M6: full serializable State round-trips byte-identically (every mutable bo
     s.shutdown = false;
     s.fault_nesting = 1;
     s.pending_fault = .{ .vector = 13, .class = .fault, .error_code = null };
+    s.last_delivered = .{ .vector = 0x21, .at_cycle = 0xAABBCCDD, .seq = 7 };
     s.cycles = 0x1122334455667788;
 
     // Save.
@@ -244,6 +245,8 @@ test "M6: full serializable State round-trips byte-identically (every mutable bo
     try std.testing.expectEqual(false, s.shutdown);
     try std.testing.expectEqual(@as(u8, 1), s.fault_nesting);
     try std.testing.expect(s.pending_fault != null);
+    try std.testing.expectEqual(@as(u8, 0x21), s.last_delivered.vector);
+    try std.testing.expectEqual(@as(u64, 7), s.last_delivered.seq);
     try std.testing.expectEqual(@as(u64, 0x1122334455667788), s.cycles);
 
     // Audit guard: assert no NEW non-padding mutable field was added to State
@@ -251,8 +254,8 @@ test "M6: full serializable State round-trips byte-identically (every mutable bo
     // (regs, eip, eflags, seg_base, seg_limit, selector, seg_desc, cr0, cr2,
     //  cr3, dr, idtr_base, idtr_limit, gdtr_base, gdtr_limit, ldtr, tr, cpl,
     //  inhibit_irq_one_instruction, halted, shutdown, nmi_latched,
-    //  nmi_in_service, fault_nesting, pending_fault, cycles)
-    try std.testing.expectEqual(@as(usize, 26), @typeInfo(state.State).@"struct".fields.len);
+    //  nmi_in_service, fault_nesting, pending_fault, last_delivered, cycles)
+    try std.testing.expectEqual(@as(usize, 27), @typeInfo(state.State).@"struct".fields.len);
 }
 
 test "M6: deterministic to cycle N twice — byte-identical State + RAM, normal path" {

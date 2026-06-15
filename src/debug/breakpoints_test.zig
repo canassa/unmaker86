@@ -119,15 +119,15 @@ test "matches: cycle bp fires at the first boundary >= at_cycle" {
     }
     var b = bp.Breakpoint{ .kind = .{ .cycle = .{ .at_cycle = 100 } }, .enabled = true };
     m.cpu.st.cycles = 99;
-    try std.testing.expect(!bp.matches(&b, m));
+    try std.testing.expect(!bp.matches(&b, m, 0));
     m.cpu.st.cycles = 100;
-    try std.testing.expect(bp.matches(&b, m));
+    try std.testing.expect(bp.matches(&b, m, 0));
     m.cpu.st.cycles = 250;
-    try std.testing.expect(bp.matches(&b, m)); // still matches above the threshold
+    try std.testing.expect(bp.matches(&b, m, 0)); // still matches above the threshold
 
     // A disabled breakpoint never matches.
     b.enabled = false;
-    try std.testing.expect(!bp.matches(&b, m));
+    try std.testing.expect(!bp.matches(&b, m, 0));
 }
 
 test "matches: execution_address bp fires on linear(CS:IP)" {
@@ -141,11 +141,11 @@ test "matches: execution_address bp fires on linear(CS:IP)" {
     m.cpu.st.eip = 0x0234;
     const linear: u32 = 0x10000 + 0x0234;
     const b = bp.Breakpoint{ .kind = .{ .execution_address = .{ .linear = linear } }, .enabled = true };
-    try std.testing.expect(bp.matches(&b, m));
+    try std.testing.expect(bp.matches(&b, m, 0));
     try std.testing.expectEqual(linear, bp.currentLinear(m));
 
     m.cpu.st.eip = 0x0235;
-    try std.testing.expect(!bp.matches(&b, m));
+    try std.testing.expect(!bp.matches(&b, m, 0));
 }
 
 test "interrupt/memory/io kinds do not match in Phase 1" {
@@ -158,9 +158,9 @@ test "interrupt/memory/io kinds do not match in Phase 1" {
     const bi = bp.Breakpoint{ .kind = .{ .interrupt = .{ .vector = 0x21 } }, .enabled = true };
     const bm = bp.Breakpoint{ .kind = .{ .memory = .{ .linear = 0, .len = 1, .access = .write } }, .enabled = true };
     const bo = bp.Breakpoint{ .kind = .{ .io = .{ .port = 0x40, .access = .read } }, .enabled = true };
-    try std.testing.expect(!bp.matches(&bi, m));
-    try std.testing.expect(!bp.matches(&bm, m));
-    try std.testing.expect(!bp.matches(&bo, m));
+    try std.testing.expect(!bp.matches(&bi, m, 0));
+    try std.testing.expect(!bp.matches(&bm, m, 0));
+    try std.testing.expect(!bp.matches(&bo, m, 0));
 }
 
 test "POD types contain no pointer-typed fields (part of #14)" {

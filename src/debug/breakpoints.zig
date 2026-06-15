@@ -127,22 +127,35 @@ pub const BreakpointSet = struct {
     }
 };
 
-/// True if `bp` matches the machine's CURRENT (post-retired-step) state. Only
-/// `execution_address` + `cycle` are live in Phases 1-3; the others are `false`
-/// for now (filled by later phases). A disabled breakpoint never matches.
+/// True if `bp` matches the machine's CURRENT (post-retired-step) state, given
+/// the delivery sequence number observed BEFORE the step (`seq_before`) so an
+/// `interrupt` breakpoint can tell a FRESH delivery (this step) from a stale one.
+/// `execution_address` + `cycle` are state-only (ignore `seq_before`);
+/// `interrupt` is live from Phase 4; `memory`/`io` are `false` for now.
+/// A disabled breakpoint never matches.
 ///
 /// NOTE: `matches` is side-effect-free — it only READS machine state. The
 /// controller (not this function) handles tie-break, one-shot consumption, and
 /// terminal precedence.
-pub fn matches(bp: *const Breakpoint, m: *const Machine) bool {
+pub fn matches(bp: *const Breakpoint, m: *const Machine, seq_before: u64) bool {
     if (!bp.enabled) return false;
     switch (bp.kind) {
         .execution_address => |k| return currentLinear(m) == k.linear,
         .cycle => |k| return m.cpu.st.cycles >= k.at_cycle,
-        .interrupt => return false, // Phase 4
+        .interrupt => |k| {
+            const ld = m.cpu.st.last_delivered;
+            // Fresh delivery this step (seq advanced) AND the vector matches.
+            return ld.seq != seq_before and ld.vector == k.vector;
+        },
         .memory => return false, // Phase 5+
         .io => return false, // deferred
     }
+}
+
+/// The current IVT-delivery sequence number (the freshness baseline a caller
+/// snapshots before a step).
+pub fn deliverySeq(m: *const Machine) u64 {
+    return m.cpu.st.last_delivered.seq;
 }
 
 /// CS index into the segment-base array (Seg encoding: es=0, cs=1, ...).
