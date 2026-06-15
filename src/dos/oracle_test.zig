@@ -275,6 +275,37 @@ const PASSING = [_]Program{
     // identical. The empty-ring blocking seam (AH=00/10 on an empty ring) is the
     // carried determinism seam (dos-coverage-gaps.md §3.1) and is never hit here.
     .{ .exe = "KBRING.EXE" },
+    // INT 33h mouse driver DETERMINISTIC state round-trips (I/O band 4,
+    // plans/io-oracle.md §4). The faithful, deterministic mouse oracle does NOT
+    // drive a live host pointer (dosbox-x's real position depends on host pointer
+    // events = non-deterministic, rejected). MOUSE1.EXE PLACES the cursor at known
+    // coordinates via AX=0004 (Set Position) and reads it back via AX=0003 (Get
+    // Position & Buttons), and sets/reads the other driver state through documented
+    // calls — fully deterministic on BOTH dosbox-x and zdos (no host pointer).
+    // It sets mode 13h FIRST so the AX=0000 reset reads BDA 0040:0049 and derives
+    // the 320x200 defaults, then exercises: reset present/buttons (AX=0xFFFF /
+    // MOUSE_BUTTONS=3, mouse.cpp:159) + center (320,100) = ((max_x+1)/2,(max_y+1)/2)
+    // (Mouse_Reset:1570) + per-mode range x=0..639 y=0..199 and gran_x=0xfffe
+    // (X rounded to EVEN — proven by set_odd 101->100 and clamp_hi 639->638) /
+    // gran_y=0xffff (Mouse_AfterNewVideoMode:1422); AX=0004 signed clamp to range
+    // (>=max->max, <=min->min, mouse.cpp:1659); AX=0007/0008 define range with the
+    // min<->max swap + live-position reclamp (mouse.cpp:1732/1801); AX=001A/001B
+    // sensitivity set/get clamped 0..100 (mouse.cpp:2008); AX=0024 version/type
+    // (BX=0x0805, CH=0x04 PS/2; mouse.cpp:2074); AX=0021 software reset re-center.
+    // AX=000B read-motion-counters is asserted as 0/0: headless dosbox-x is NOT
+    // mouse-locked (MOUSE_IsLocked()=false, no SDL capture) and mickeys ONLY
+    // accumulate from real host motion (Mouse_CursorMoved, mouse.cpp:898) — AX=0004
+    // sets mouse.x directly and never touches mickey_x, so the counters are a
+    // deterministic constant 0 (Mouse_Read_Motion_Data, mouse.cpp:1610), NOT a
+    // host-dependent field. Show/hide (AX=0001/0002) is the `hidden` SHOW-COUNT
+    // (mouse.cpp:1627/1633); the count is not directly readable so it is exercised
+    // via show/show/hide-then-reread (position is unaffected -> stable round-trip).
+    // All printed values are oracle-able; proven deterministic by a triple-mint
+    // byte-identical diff. The program creates no files, so the committed corpus
+    // stays byte-identical. zdos's int33.zig was rewritten to match these semantics
+    // (the prior stub returned buttons=2, kept no range/granularity, and used a
+    // boolean `visible` instead of the show-count).
+    .{ .exe = "MOUSE1.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented

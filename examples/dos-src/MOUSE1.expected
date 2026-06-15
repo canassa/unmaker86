@@ -1,0 +1,20 @@
+exit_code: 0
+--- output ---
+reset present=FFFF buttons=3
+reset_pos buttons=0 x=320 y=100
+set1 x=100 y=50
+set2 x=200 y=150
+set_odd x=100 y=75
+clamp_hi x=638 y=199
+clamp_lo x=0 y=0
+rng_hi x=150 y=80
+rng_lo x=50 y=20
+rng_in x=100 y=40
+rng_swap x=120 y=40
+showhide x=60 y=30
+sens x=60 y=70 d=80
+sens_clamp x=100 y=100 d=100
+ver bx=0805 ch=04 cl=00
+motion cx=0 dx=0
+sreset present=FFFF buttons=3
+sreset_pos buttons=0 x=320 y=100
