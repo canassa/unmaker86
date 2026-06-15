@@ -235,6 +235,9 @@ pub const Session = struct {
     pub const Mem = struct { phys: u32, len: u32, data: []const u8 };
     pub const Ivt = struct { vector: u8, ip: u16, cs: u16 };
     pub const Ok = struct { ok: bool };
+    /// `GET /api/console` — the guest's accumulated CON output as a `{len, data}`
+    /// object where `data` is lowercase hex (so arbitrary CON bytes survive JSON).
+    pub const Console = struct { len: u32, data: []const u8 };
 
     pub fn status(self: *Session) !Status {
         return self.get("/api/status", Status);
@@ -276,6 +279,65 @@ pub const Session = struct {
         // `POST /api/load {}` semantics).
         return self.postEmpty("/api/load", Ok);
     }
+    // -----------------------------------------------------------------------
+    // Input injection (POST /api/input/key, /api/input/mouse) + CON readback.
+    // Each injection mutates input state at the one-command-in-flight boundary
+    // (Model A, input-injection.md §2.1); the NEXT `run`/`step` delivers it.
+    // -----------------------------------------------------------------------
+
+    /// Inject a single precise scancode EDGE (input-injection.md §5.1). `make` true
+    /// = key-down (raw set-1 code), false = key-up (break = code|0x80); `ext` = the
+    /// 0xE0 extended prefix. Pushes the byte at the 8042 + raises IRQ1; the guest
+    /// INT 09h ISR cooks it into the BDA ring on the next run.
+    pub fn injectKey(self: *Session, scancode: u8, make: bool, ext: bool) !Ok {
+        return self.post("/api/input/key", wire.KeyReq{ .scancode = scancode, .make = make, .ext = ext }, Ok);
+    }
+
+    /// Inject a full keystroke by CHARACTER (the `{"char"}` convenience): the server
+    /// resolves the char to its set-1 scancode (+ a Shift bracket when needed) over
+    /// the REAL scancode table and injects make+break as one deterministic command.
+    pub fn injectKeyChar(self: *Session, ch: u8) !Ok {
+        const s = [_]u8{ch};
+        return self.post("/api/input/key", wire.KeyReq{ .char = &s }, Ok);
+    }
+
+    /// Inject a mouse event into the INT 33h driver (input-injection.md §5.2). Any
+    /// subset of absolute position (x/y), relative motion (dx/dy), and the button
+    /// mask; a null field is left unset. Absolute and relative are mutually exclusive
+    /// per axis at the server (mixing x+dx / y+dy is a 400).
+    pub fn injectMouse(self: *Session, x: ?i16, y: ?i16, dx: ?i16, dy: ?i16, buttons: ?u16) !Ok {
+        return self.post("/api/input/mouse", wire.MouseReq{ .x = x, .y = y, .dx = dx, .dy = dy, .buttons = buttons }, Ok);
+    }
+
+    /// `GET /api/console` → the raw `{len, data(hex)}` object (side-effect-free read
+    /// of what the guest has printed to CON so far).
+    pub fn console(self: *Session) !Console {
+        return self.get("/api/console", Console);
+    }
+
+    /// `GET /api/console`, hex-decoded into `out`; returns the decoded prefix (in
+    /// `out`). The CON output as the raw bytes the guest printed.
+    pub fn consoleBytes(self: *Session, out: []u8) ![]u8 {
+        const c = try self.console();
+        if (c.data.len % 2 != 0) return error.BadConsoleHex;
+        const n = c.data.len / 2;
+        if (n > out.len) return error.ConsoleBufferTooSmall;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            out[i] = (try hexNibble(c.data[i * 2]) << 4) | try hexNibble(c.data[i * 2 + 1]);
+        }
+        return out[0..n];
+    }
+
+    fn hexNibble(ch: u8) !u8 {
+        return switch (ch) {
+            '0'...'9' => ch - '0',
+            'a'...'f' => ch - 'a' + 10,
+            'A'...'F' => ch - 'A' + 10,
+            else => error.BadConsoleHex,
+        };
+    }
+
     pub fn setReg32(self: *Session, name: []const u8, value: u32) !Ok {
         const req = wire.RegSetReq{ .reg32 = .{ .name = name, .value = value } };
         const payload = try std.json.Stringify.valueAlloc(self.arena.allocator(), req, .{});

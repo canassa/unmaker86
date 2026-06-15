@@ -15,6 +15,12 @@
 const std = @import("std");
 const Session = @import("session.zig").Session;
 
+// Pull the input-injection black-box tests (KEYECHO + MOUSERB) into this same
+// `test-blackbox` step (they live in their own file for focus).
+test {
+    _ = @import("keyecho_test.zig");
+}
+
 const FIXTURE = "examples/HELLO.EXE";
 
 // Golden constants for HELLO.EXE, captured from the running API and asserted exactly.
