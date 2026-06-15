@@ -55,14 +55,22 @@ test "no host time / RNG / thread / env / float anywhere in src/devices (grep)" 
         @embedFile("pit.zig"),
         @embedFile("keyboard.zig"),
         @embedFile("devices.zig"),
+        // The VGA 0x3DA retrace/display-enable timing is integer-only and must stay
+        // float / host-clock / RNG free (the temptation to write an f64 "70.086 Hz"
+        // is real — both reference emulators use double/fmod). plans/vga-retrace.md §5.5.
+        @embedFile("vga.zig"),
     };
     const forbidden = [_][]const u8{
         "std.time",
-        "std.Random", "std.rand",
+        "std.Random",
+        "std.rand",
         "std.Thread",
-        "std.posix.getenv", "std.process.getEnv", "std.os.getenv",
+        "std.posix.getenv",
+        "std.process.getEnv",
+        "std.os.getenv",
         // No floats in the scheduling/timing path (M-D2).
-        "f32", "f64",
+        "f32",
+        "f64",
     };
     for (sources) |src| {
         for (forbidden) |needle| {

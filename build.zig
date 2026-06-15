@@ -306,6 +306,13 @@ pub fn build(b: *std.Build) void {
         .{ .name = "devices", .mod = devices_mod },
         .{ .name = "timing", .mod = timing_mod },
     });
+    const machine_vga_retrace = MachineTest.add(b, target, optimize, "src/machine/vga_retrace_test.zig", &.{
+        .{ .name = "machine", .mod = machine_mod },
+        .{ .name = "cpu", .mod = cpu_mod },
+        .{ .name = "bus", .mod = bus_mod },
+        .{ .name = "devices", .mod = devices_mod },
+        .{ .name = "timing", .mod = timing_mod },
+    });
 
     machine_test_step.dependOn(&run_timing_tests.step);
     machine_test_step.dependOn(&run_sched_tests.step);
@@ -316,6 +323,7 @@ pub fn build(b: *std.Build) void {
     machine_test_step.dependOn(&machine_unit.step);
     machine_test_step.dependOn(&machine_determinism.step);
     machine_test_step.dependOn(&machine_integration.step);
+    machine_test_step.dependOn(&machine_vga_retrace.step);
 
     // ---- Bridge / BIOS / DOS tests (test-bridge / test-bios / test-dos) ----
     const dosbios_imports = [_]Imp{
@@ -515,6 +523,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&machine_unit.step);
     test_step.dependOn(&machine_determinism.step);
     test_step.dependOn(&machine_integration.step);
+    test_step.dependOn(&machine_vga_retrace.step);
     test_step.dependOn(&bridge_unit.step);
     test_step.dependOn(&bridge_rt.step);
     test_step.dependOn(&bios_unit.step);
