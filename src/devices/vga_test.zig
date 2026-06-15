@@ -31,6 +31,113 @@ test "retrace timing constants resolve to the canonical 70.086 Hz frame" {
     try std.testing.expectEqual(@as(u64, 7008), timing.CPU_CLOCK_HZ * 100 / Vga.FRAME_CYCLES);
 }
 
+// ---------------------------------------------------------------------------
+// Input Status Register #1 (0x3DA / 0x3BA) — cycle-derived retrace / display-enable
+// (plans/vga-retrace.md §5.1). The retrace tests need a controllable cycle source:
+// give the test `Vga` a local u64 and point `v.cycles = &cycles` (the test-harness
+// analog of machine.wire). All asserts are at hand-computed cycles.
+// ---------------------------------------------------------------------------
+
+test "0x3DA bit 3 (vertical retrace) toggles deterministically across a frame" {
+    const alloc = std.testing.allocator;
+    const v = try makeVga(alloc);
+    defer freeVga(alloc, v);
+    var cycles: u64 = 0;
+    v.cycles = &cycles;
+
+    // Scanline 0 (top of frame): not in v-retrace -> bit 3 == 0.
+    cycles = 0; // into_frame=0, scanline=0
+    try std.testing.expectEqual(@as(u8, 0), v.in8(0x3DA) & 0x08);
+
+    // A scanline inside [VRSTART_LINE, VREND_LINE) -> bit 3 == 1.
+    cycles = Vga.VRSTART_LINE * Vga.LINE_CYCLES; // scanline == 412
+    try std.testing.expectEqual(@as(u8, 0x08), v.in8(0x3DA) & 0x08);
+    cycles = (Vga.VREND_LINE - 1) * Vga.LINE_CYCLES; // scanline == 413
+    try std.testing.expectEqual(@as(u8, 0x08), v.in8(0x3DA) & 0x08);
+
+    // The line at VREND_LINE is past the retrace pulse -> bit 3 == 0 again.
+    cycles = Vga.VREND_LINE * Vga.LINE_CYCLES; // scanline == 414
+    try std.testing.expectEqual(@as(u8, 0), v.in8(0x3DA) & 0x08);
+}
+
+test "0x3DA bit 0 (display-enable complement) duty: active vs hblank vs vblank" {
+    const alloc = std.testing.allocator;
+    const v = try makeVga(alloc);
+    defer freeVga(alloc, v);
+    var cycles: u64 = 0;
+    v.cycles = &cycles;
+
+    // A display line (scanline 0), within the active span (into_line < HDE_CYCLES)
+    // -> displaying -> bit 0 == 0.
+    cycles = 0;
+    try std.testing.expectEqual(@as(u8, 0), v.in8(0x3DA) & 0x01);
+    cycles = Vga.HDE_CYCLES - 1; // still active
+    try std.testing.expectEqual(@as(u8, 0), v.in8(0x3DA) & 0x01);
+
+    // Same display line, past the active span (into_line >= HDE_CYCLES) -> hblank
+    // -> bit 0 == 1.
+    cycles = Vga.HDE_CYCLES; // first hblank cycle of scanline 0
+    try std.testing.expectEqual(@as(u8, 0x01), v.in8(0x3DA) & 0x01);
+
+    // Any scanline past the vertical display end -> vblank -> bit 0 == 1 regardless
+    // of into_line.
+    cycles = Vga.VDE_LINES * Vga.LINE_CYCLES; // scanline == 400, into_line == 0
+    try std.testing.expectEqual(@as(u8, 0x01), v.in8(0x3DA) & 0x01);
+}
+
+test "0x3DA bit 2 always 1; bits 1,4-7 always 0 (D-RT2)" {
+    const alloc = std.testing.allocator;
+    const v = try makeVga(alloc);
+    defer freeVga(alloc, v);
+    var cycles: u64 = 0;
+    v.cycles = &cycles;
+
+    // Sweep a range of cycles; bit 2 must always be set and bits 1,4-7 always clear.
+    var c: u64 = 0;
+    while (c < Vga.FRAME_CYCLES * 2) : (c += 137) {
+        cycles = c;
+        const b = v.in8(0x3DA);
+        try std.testing.expectEqual(@as(u8, 0x04), b & 0x04); // bit 2 set
+        try std.testing.expectEqual(@as(u8, 0), b & 0b1111_0010); // bits 1,4-7 clear
+    }
+}
+
+test "0x3BA mono alias returns the same byte as 0x3DA at the same cycle" {
+    const alloc = std.testing.allocator;
+    const v = try makeVga(alloc);
+    defer freeVga(alloc, v);
+    var cycles: u64 = 0;
+    v.cycles = &cycles;
+
+    var c: u64 = 0;
+    while (c < Vga.FRAME_CYCLES) : (c += 251) {
+        cycles = c;
+        try std.testing.expectEqual(v.in8(0x3DA), v.in8(0x3BA));
+    }
+}
+
+test "0x3DA is a pure function of the cycle counter: two reads at same cycle equal" {
+    const alloc = std.testing.allocator;
+    const v = try makeVga(alloc);
+    defer freeVga(alloc, v);
+    var cycles: u64 = 0;
+    v.cycles = &cycles;
+
+    cycles = 12_345;
+    const a = v.in8(0x3DA);
+    const b = v.in8(0x3DA);
+    try std.testing.expectEqual(a, b);
+}
+
+test "0x3DA unwired cycle source reads as the deterministic cycle-0 status (no UB)" {
+    const alloc = std.testing.allocator;
+    const v = try makeVga(alloc);
+    defer freeVga(alloc, v);
+    // No v.cycles wired -> cyclesNow() returns 0 -> the cycle-0 status byte (active,
+    // not retrace) = bit2 only = 0x04. Never the unmapped 0xFF.
+    try std.testing.expectEqual(@as(u8, 0x04), v.in8(0x3DA));
+}
+
 test "DAC: write a single entry via 0x3C8 + three 0x3C9, read it back via 0x3C7" {
     const alloc = std.testing.allocator;
     const v = try makeVga(alloc);

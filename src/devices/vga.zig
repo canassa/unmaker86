@@ -324,6 +324,42 @@ pub const Vga = struct {
         }
     }
 
+    /// Input Status Register #1 (0x3DA / 0x3BA) — the deterministic, cycle-derived
+    /// vertical-retrace + display-enable status (plans/vga-retrace.md §3.1/§3.3).
+    /// Models a free-running CRT beam whose position is a PURE FUNCTION of the CPU
+    /// cycle counter (`cpu.st.cycles`, via `cyclesNow`): integer `%`/`/` only — NO
+    /// host clock, NO float, NO RNG. Mirrors the shape of `Pit.liveCounter`/
+    /// `Pit.outBit` (src/devices/pit.zig:119-138, :398-423): `into = elapsed %
+    /// period; bit = window-test`. Because each guest poll iteration burns cycles,
+    /// `into_frame` advances and the bits flip at a deterministic cycle, so a
+    /// retrace-poll loop terminates reproducibly (byte-identical across runs).
+    ///
+    /// Assembled low byte = `0x04 (bit2) | (bit3? 0x08) | (bit0? 0x01)`:
+    ///   bit 0 = display-enable complement (1 = in horizontal OR vertical blank)
+    ///   bit 2 = 1 (dosbox sets it unconditionally, "needed by Blues Brothers",
+    ///           vga_misc.cpp:21 — D-RT2)
+    ///   bit 3 = vertical retrace (1 = in v-retrace)
+    /// Bits 1, 4-7 read 0 (light-pen obsolete on VGA; reserved bits low).
+    fn statusReg1(self: *Vga) u8 {
+        const now = self.cyclesNow();
+        const into_frame = now % FRAME_CYCLES; // 0 .. FRAME_CYCLES-1 (anchored at cycle 0)
+        const scanline = into_frame / LINE_CYCLES; // 0 .. 449 (449 is harmless, see §3.2)
+        const into_line = into_frame % LINE_CYCLES; // 0 .. LINE_CYCLES-1
+
+        var status: u8 = 0x04; // bit 2 always set (D-RT2)
+
+        // bit 3 — vertical retrace pulse.
+        if (scanline >= VRSTART_LINE and scanline < VREND_LINE) status |= 0x08;
+
+        // bit 0 — display-enable complement: 1 while NOT actively displaying, i.e.
+        // in vertical blank (scanline past the display end) OR in horizontal blank
+        // (past the active span of a display line).
+        const displaying = scanline < VDE_LINES and into_line < HDE_CYCLES;
+        if (!displaying) status |= 0x01;
+
+        return status;
+    }
+
     fn portIn8(ctx: *anyopaque, port: u16) u8 {
         const self: *Vga = @ptrCast(@alignCast(ctx));
         return switch (port) {
@@ -332,6 +368,11 @@ pub const Vga = struct {
             0x3C8 => self.dac_write_index, // read_p3c8 (vga_dac.cpp:294)
             0x3C9 => self.read3c9(),
             0x3CC => self.misc_output, // misc output read-back (vga_misc.cpp)
+            // Input Status Register #1 (colour 0x3DA / mono alias 0x3BA): the
+            // cycle-derived retrace + display-enable status. 0x3BA returns the same
+            // byte (zdos's VGA-only mode-13h target is always colour; both ports
+            // map to one handler — see machine.wire / plans/vga-retrace.md §3.5).
+            0x3DA, 0x3BA => self.statusReg1(),
             else => 0xFF,
         };
     }

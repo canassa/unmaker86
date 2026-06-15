@@ -222,6 +222,14 @@ pub const Machine = struct {
         _ = self.bus.registerPort(0x3C2, self.vga.portHandler());
         _ = self.bus.registerPortRange(0x3C6, 4, self.vga.portHandler()); // 0x3C6-0x3C9
         _ = self.bus.registerPort(0x3CC, self.vga.portHandler());
+        // (c2a) Input Status Register #1 — colour base 0x3DA + mono alias 0x3BA.
+        //       The cycle-derived vertical-retrace / display-enable status so that
+        //       retrace-polling guests (Borland putch snow-avoid, mode-13h vsync)
+        //       make progress instead of spinning on the unmapped 0xFF default.
+        //       Registered AFTER the other VGA ports so the snapshot replay order
+        //       (registerPort by ID) stays stable (plans/vga-retrace.md §3.5).
+        _ = self.bus.registerPort(0x3DA, self.vga.portHandler());
+        _ = self.bus.registerPort(0x3BA, self.vga.portHandler());
         _ = self.bus.mapMmio(devices.vga.VRAM_PHYS, devices.vga.VRAM_WINDOW_LEN, self.vga.memHandler());
         // (d) scheduler-callback binding: PIT raise -> &self.pic; PIT schedule/
         //     cancel -> &self (the machine, which owns the scheduler).
