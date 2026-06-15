@@ -87,6 +87,19 @@ pub const PitChannel = struct {
     new_mode: bool = false, // a control word was written; counter not yet loaded
     output: bool = false, // OUT pin state (mode-dependent)
 
+    /// GATE input level (8254 pin). Channel 0's gate is wired HIGH on the PC, so
+    /// it powers up true and is never lowered. Channel 2's gate is driven by KBC
+    /// port-B bit 0 (port 0x61) — the PC-speaker timer-2 gate. When the gate is
+    /// LOW the counter is FROZEN (modes 2/3/4/5 stop counting; dosbox-x
+    /// `read_counter`: `if (!gate ...) return last_counter`, timer.cpp:331), and
+    /// the OUT pin is forced HIGH for the rate/square modes (counter_output's
+    /// gate-frozen result). We model this faithfully so a gated-off ch2 reports a
+    /// stable counter rather than a free-running one.
+    gate: bool = true,
+    /// Absolute cycle at which the gate last went LOW; the frozen counter is the
+    /// live value computed at this instant (a pure function of the ledger).
+    gate_off_cycle: u64 = 0,
+
     /// Absolute cycle at which this channel's current count began (M-D8). The
     /// live counter is derived from `cyclesNow - last_arm_cycle`.
     last_arm_cycle: u64 = 0,
@@ -106,7 +119,10 @@ pub const PitChannel = struct {
     pub fn liveCounter(self: *const PitChannel, cycles_now: u64) u16 {
         const period = self.reloadTicks();
         if (period == 0) return 0;
-        const elapsed_cycles = cycles_now -% self.last_arm_cycle;
+        // A LOW gate freezes the counter (8254): time stops advancing the count
+        // at the instant the gate dropped (timer.cpp read_counter:331).
+        const ref = if (self.gate) cycles_now else self.gate_off_cycle;
+        const elapsed_cycles = ref -% self.last_arm_cycle;
         const elapsed_ticks = timing.cyclesToTicks(elapsed_cycles);
         switch (self.mode) {
             .mode2, .mode3 => {
@@ -179,6 +195,38 @@ pub const Pit = struct {
             .mode2, .mode3 => self.armCh0(fire_cycle), // periodic: re-arm
             else => {}, // mode0/4 one-shot: do not re-arm
         }
+    }
+
+    /// Drive channel 2's GATE pin (the PC-speaker timer-2 gate, KBC port-B bit 0,
+    /// port 0x61). Modeled faithfully after dosbox-x `set_gate` (timer.cpp:216):
+    ///   - gate HIGH->LOW: freeze the counter (record the drop cycle; `liveCounter`
+    ///     and `outBit` then stop advancing time — modes 2/3 hold OUT high).
+    ///   - gate LOW->HIGH: retrigger — restart the count from the reload at the
+    ///     current cycle (mode 3 square-wave restarts on a rising gate).
+    /// Only the level CHANGE acts (an idempotent write of the same level is inert),
+    /// matching the `if (gate != on)` guard. ch2 OUT/count are read-back-only state
+    /// (never an IRQ source — IRQ0 is ch0), so this charges no cycles and schedules
+    /// no event. The asserted oracle bits (port 0x61 low nibble, the read-back
+    /// STATUS mode/access/null bits) do NOT depend on the gate; the gate is modeled
+    /// for device fidelity of the EXCLUDED time-derived OUT bit (port 0x61 bit 5).
+    pub fn setGate2(self: *Pit, on: bool) void {
+        const ch = &self.channels[2];
+        if (ch.gate == on) return;
+        if (!on) {
+            ch.gate_off_cycle = self.cyclesNow();
+        } else {
+            // Rising gate retriggers the count from the reload at "now".
+            ch.last_arm_cycle = self.cyclesNow();
+        }
+        ch.gate = on;
+    }
+
+    /// Channel 2's OUT pin level (for KBC port-B bit 5 read-back). A pure function
+    /// of the cycle ledger (or frozen while the gate is low) — deterministic in
+    /// zdos, but EXCLUDED from cross-emulator goldens (it is emulated-time derived,
+    /// io-oracle.md §3.3 / §7 retrace-timing caveat).
+    pub fn out2Bit(self: *Pit) bool {
+        return self.outBit(2);
     }
 
     // -----------------------------------------------------------------------
@@ -352,7 +400,12 @@ pub const Pit = struct {
         if (ch.mode == .inactive) return false;
         const period = ch.reloadTicks();
         if (period == 0) return ch.output;
-        const elapsed_ticks = timing.cyclesToTicks(self.cyclesNow() -% ch.last_arm_cycle);
+        // A LOW gate forces OUT HIGH on the rate/square modes (the counter is
+        // frozen and the speaker AND-gate sees a steady level); freeze the
+        // elapsed time at the gate-drop cycle so OUT is stable while gated off.
+        if (!ch.gate and (ch.mode == .mode2 or ch.mode == .mode3)) return true;
+        const ref = if (ch.gate) self.cyclesNow() else ch.gate_off_cycle;
+        const elapsed_ticks = timing.cyclesToTicks(ref -% ch.last_arm_cycle);
         switch (ch.mode) {
             .mode3 => {
                 // High for the first half of the period, low for the second.

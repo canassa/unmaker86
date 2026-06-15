@@ -1,0 +1,8 @@
+exit_code: 0
+--- output ---
+p61_before=00
+status_newmode=76 null=1
+status_loaded=36 null=0
+p61_on=03 gate=1 data=1
+p61_off=00 gate=0 data=0
+divisor=04A9 freq=1000

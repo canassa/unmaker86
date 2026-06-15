@@ -306,6 +306,41 @@ const PASSING = [_]Program{
     // (the prior stub returned buttons=2, kept no range/granularity, and used a
     // boolean `visible` instead of the show-count).
     .{ .exe = "MOUSE1.EXE" },
+    // PC-speaker / PIT channel-2 register-trace band (I/O band 5,
+    // plans/io-oracle.md §3.1a). The v1 sound contract is REGISTER-TRACE ONLY
+    // (USER DECISION D2: no sample/FM synthesis). SND1.EXE programs PIT channel 2
+    // exactly as a DOS beep routine does — OUT 0x43=0xB6 (ch2, lohi, mode 3 square
+    // wave), then the 16-bit divisor lo/hi to 0x42 — enables the speaker via port
+    // 0x61 bits 0 (timer-2 gate) + 1 (speaker data), then silences it, and reads
+    // back the DETERMINISTIC register state at each step. What is asserted (and
+    // why it is host-independent):
+    //   - the 8254 read-back STATUS byte (OUT 0x43=0xE8: read-back, latch status,
+    //     select ch2): mode field (bits1-3=3), access field (bits4-5=lohi=3), and
+    //     the NULL-count bit (bit6) — which is 1 after the control word but BEFORE
+    //     a counter is loaded, then 0 after, a PURE-LOGIC transition (timer.cpp
+    //     status_latch:461 / new_mode write_latch:681). The OUT pin (bit7) is
+    //     EXCLUDED via masking (status & 0x7F): it tracks the divided clock =
+    //     emulated-time-derived (counter_output:301).
+    //   - port 0x61 GATE/DATA bits: inp(0x61) & 0x0F — what was written. dosbox's
+    //     read_p61 (keyboard.cpp:724) also returns bit5 (timer-2 OUT, or gate-off)
+    //     and bit4 (a wall-clock refresh toggle); BOTH are EXCLUDED by the &0x0F
+    //     mask (io-oracle.md §3.3/§7). For machine=vgaonly bits6-7 read as 0.
+    //   - the derived frequency 1193182/divisor (a pure integer function of the
+    //     programmed divisor — not a device read-back, a determinism check).
+    // The VOLATILE LIVE COUNT is deliberately NOT asserted: the 8254 counter
+    // decrements as a function of elapsed time, which dosbox-x derives from
+    // PIC_FullIndex() = emulated-time tied to the host run under cycles=max, so the
+    // exact latched value differs run-to-run = NON-oracle-able (the same boundary
+    // discipline that EXCLUDES host-mtime in the DOS phase). Proven deterministic
+    // by a TRIPLE-mint byte-identical diff (the masked status/access/mode/null bits
+    // and the 0x61 low nibble are stable; the raw count is not, so it is excluded).
+    // zdos models port 0x61 in src/devices/speaker.zig (KBC port-B: stores the
+    // written byte, drives ch2's gate on bit0, derives bits4/5 from the cycle
+    // ledger — never host time) and the PIT read-back STATUS + gate already in
+    // src/devices/pit.zig (statusByte + setGate2). The program creates no files, so
+    // the committed corpus stays byte-identical. This CLOSES the last I/O oracle
+    // modality — video/keyboard/mouse/sound are all now proven against dosbox-x.
+    .{ .exe = "SND1.EXE" },
 };
 
 /// Programs that DIVERGE from the dosbox-x golden today — the documented

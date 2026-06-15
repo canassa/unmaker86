@@ -45,6 +45,7 @@ const Bus = bus_mod.Bus;
 const Pic = devices.Pic;
 const Pit = devices.Pit;
 const Vga = devices.Vga;
+const Speaker = devices.Speaker;
 const Scheduler = scheduler.Scheduler;
 const EventKind = scheduler.EventKind;
 
@@ -129,6 +130,8 @@ pub const Machine = struct {
     pic: Pic = .{},
     pit: Pit = .{},
     vga: Vga = .{},
+    /// PC-speaker / KBC port-B (port 0x61) — register-trace sound (I/O band 5).
+    speaker: Speaker = .{},
     sched: Scheduler = .{},
     cpu: Cpu = undefined,
     /// The host-serviced BIOS + DOS + the CallbackSink aggregate (D2/D12).
@@ -204,6 +207,11 @@ pub const Machine = struct {
         _ = self.bus.registerPort(0xA1, self.pic.portHandler());
         // (c) bus PortHandler.ctx = &self.pit (PIT ports 0x40-0x43).
         _ = self.bus.registerPortRange(0x40, 4, self.pit.portHandler());
+        // (c1) bus PortHandler.ctx = &self.speaker: KBC port-B / PC-speaker control
+        //      (port 0x61). It drives PIT ch2's gate (bit 0) and samples ch2 OUT
+        //      (bit 5 read-back) — wired to the PIT below. Registered AFTER the PIT
+        //      so the snapshot replay order (registerPort by ID) is stable.
+        _ = self.bus.registerPort(0x61, self.speaker.portHandler());
         // (c2) bus PortHandler.ctx = &self.vga: the DAC + pixel-mask ports
         //      (0x3C6-0x3C9), the misc-output write (0x3C2) and its read alias
         //      (0x3CC). VRAM (A0000-AFFFF) is registered as RAM-like MMIO so guest
@@ -222,6 +230,11 @@ pub const Machine = struct {
             .schedule = schedThunk,
             .cancel = cancelThunk,
         };
+        // (d1) PC-speaker back-pointers: the PIT (ch2 gate set + OUT read) and the
+        //      cycle counter (the refresh bit is derived from the ledger, not host
+        //      time). Re-bound on restore exactly like the PIT's pointers.
+        self.speaker.pit = &self.pit;
+        self.speaker.cycles = &self.cpu.st.cycles;
         // (e) the host-serviced BIOS + DOS + the CallbackSink aggregate (D2/D12).
         self.bios.init(&self.cpu);
         self.dos.init(&self.cpu);
@@ -333,6 +346,7 @@ pub const Machine = struct {
         @memset(self.bus.ram, 0); // re-zero RAM for reproducibility
         self.pic.reset();
         self.pit.reset();
+        self.speaker.reset(); // port_61_data=0; lowers ch2 gate (needs pit reset first)
         self.vga.reset(); // zero VRAM + DAC + indices (deterministic power-on)
         self.sched.reset();
         self.shutdown = false;
@@ -444,6 +458,7 @@ pub const Machine = struct {
         /// captured separately (like the bus RAM slab) — the caller copies
         /// `machine.vga.vram` and restores it into the re-init'd machine's VRAM.
         vga: Vga.Snapshot,
+        speaker: Speaker.Snapshot,
         sched: Scheduler.Snapshot,
         shutdown: bool,
     };
@@ -455,6 +470,7 @@ pub const Machine = struct {
             .pic = self.pic.snapshot(),
             .pit = self.pit.snapshot(),
             .vga = self.vga.snapshot(),
+            .speaker = self.speaker.snapshot(),
             .sched = self.sched.snapshot(),
             .shutdown = self.shutdown,
         };
@@ -468,6 +484,7 @@ pub const Machine = struct {
         self.pic.restore(snap.pic);
         self.pit.restore(snap.pit);
         self.vga.restore(snap.vga);
+        self.speaker.restore(snap.speaker);
         self.sched.restore(snap.sched);
         self.shutdown = snap.shutdown;
     }
