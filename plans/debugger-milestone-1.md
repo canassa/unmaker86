@@ -579,14 +579,14 @@ pub fn memoryRegions(self: *const Controller) []const Region; // RAM size, VRAM,
 - [x] `zig build test` — green (nothing referenced the removed symbols).
 
 ### Phase 1 — breakpoint data model
-- [ ] `src/debug/breakpoints.zig`: `AccessKind`, `BreakpointKind` (+ `default_kind`),
+- [x] `src/debug/breakpoints.zig`: `AccessKind`, `BreakpointKind` (+ `default_kind`),
       `Breakpoint`, `BreakpointSet` (`items: @splat(.{})`, `used`, `active_count`), `Error`.
       **No alloc; defined POD.**
-- [ ] `add` (lowest free slot → id, `error.BreakpointTableFull` when full),
+- [x] `add` (lowest free slot → id, `error.BreakpointTableFull` when full),
       `remove`/`enable`/`get` (`error.NoSuchBreakpoint`), `forEachBreakpoint` (skips
       `!used`), `recomputeActive`.
-- [ ] `matches(bp, m) bool` for `execution_address` + `cycle` (others `false` for now).
-- [ ] `src/debug/breakpoints_test.zig`: stable ids across add/remove; gate flips; `matches`
+- [x] `matches(bp, m) bool` for `execution_address` + `cycle` (others `false` for now).
+- [x] `src/debug/breakpoints_test.zig`: stable ids across add/remove; gate flips; `matches`
       fires on the right cycle/address; **error paths (test #12 subset)**; reflection
       no-pointer-fields check (part of #14).
 

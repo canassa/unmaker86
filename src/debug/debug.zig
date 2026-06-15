@@ -12,9 +12,20 @@
 //! state inspect/mutate facade, in-process and synchronous. NO HTTP/JSON server
 //! (that is Milestone 2, which layers on top of this facade with zero rework).
 
-// Phase 0: module skeleton only. The breakpoint data model (Phase 1) and the
-// controller facade (Phase 2+) are added below as their files land.
+const breakpoints = @import("breakpoints.zig");
+
+// ---- breakpoint data model (Phase 1) ----
+pub const AccessKind = breakpoints.AccessKind;
+pub const BreakpointKind = breakpoints.BreakpointKind;
+pub const Breakpoint = breakpoints.Breakpoint;
+pub const BreakpointSet = breakpoints.BreakpointSet;
+pub const Error = breakpoints.Error;
+pub const MAX_BREAKPOINTS = breakpoints.MAX_BREAKPOINTS;
+pub const default_kind = breakpoints.default_kind;
+
+// The controller facade (Phase 2+) is re-exported here as its file lands.
 
 test {
-    // Empty in Phase 0; the submodule tests are pulled in as they land.
+    _ = breakpoints;
+    _ = @import("breakpoints_test.zig");
 }
