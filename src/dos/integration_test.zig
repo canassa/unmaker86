@@ -302,3 +302,65 @@ test "snapshot/restore round-trips a populated machine byte-identically" {
     try std.testing.expectEqual(seg_before, m.cpu.st.getReg16(0));
     try std.testing.expect(m.bus.readPhys8(0x10000) != 0xFF);
 }
+
+// ---------------------------------------------------------------------------
+// Snapshot the MOUSE driver state (input Phase 0 — the snapshot-hole closer).
+// The test above NEVER touches `dos.mouse`, so it false-passes the mouse path.
+// This one mutates `dos.mouse` to a non-default state, snapshots, mutates AGAIN,
+// restores, and asserts the restored mouse state byte-matches the snapshotted
+// state (and the rest of the machine round-trips). Without the `Int33.Snapshot`
+// wiring this would FAIL (the post-snapshot mutation would survive restore).
+// ---------------------------------------------------------------------------
+test "snapshot/restore round-trips the mouse driver state (input Phase 0)" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    // Mutate the mouse driver to a fully non-default state across EVERY field so
+    // the round-trip exercises the whole Snapshot, not just position.
+    m.dos.mouse = .{
+        .present = true,
+        .x = 123,
+        .y = -45,
+        .buttons = 0b101, // left+middle down
+        .hidden = 3, // hidden-count, not the default 1
+        .min_x = -10,
+        .max_x = 511,
+        .min_y = -20,
+        .max_y = 383,
+        .gran_x = 0xfffe,
+        .gran_y = 0xfff8,
+        .senv_x_val = 77,
+        .senv_y_val = 12,
+        .dspeed_val = 99,
+        .handler_seg = 0x9000,
+        .handler_off = 0x0123,
+        .handler_mask = 0x001F,
+    };
+    const expected = m.dos.mouse; // the value we expect after restore
+
+    const snap = m.snapshot();
+    const ram_copy = try alloc.alloc(u8, m.bus.ram.len);
+    defer alloc.free(ram_copy);
+    @memcpy(ram_copy, m.bus.ram);
+
+    // Mutate the mouse AGAIN (and some RAM) AFTER the snapshot — restore must
+    // discard these and bring back the snapshotted mouse state.
+    m.dos.mouse.x = -999;
+    m.dos.mouse.buttons = 0;
+    m.dos.mouse.hidden = 0;
+    m.dos.mouse.handler_seg = 0xDEAD;
+    m.dos.mouse.handler_off = 0xBEEF;
+    m.dos.mouse.gran_x = 0xffff;
+    m.bus.writePhys8(0x10000, 0xFF);
+
+    m.restore(snap);
+    @memcpy(m.bus.ram, ram_copy);
+
+    // Byte-equal the whole restored mouse driver state to the snapshotted value.
+    // `Int33` is a POD struct (no pointers), so a value compare is a byte compare.
+    try std.testing.expectEqual(expected, m.dos.mouse);
+    // And the rest of the machine round-tripped (the post-snapshot RAM poke gone).
+    try std.testing.expect(m.bus.readPhys8(0x10000) != 0xFF);
+}

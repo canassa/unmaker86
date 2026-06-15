@@ -487,6 +487,30 @@ pub const Machine = struct {
         vga: Vga.Snapshot,
         speaker: Speaker.Snapshot,
         sched: Scheduler.Snapshot,
+        /// Host-side DOS input state not covered by the bus RAM slab. `Dos` field
+        /// audit (input Phase 0, §7.3) — each field classified as
+        /// (a) guest-RAM-covered, (b) immutable/config, or (c) mutable-host-side:
+        ///   - ids: (b) callback-ID table; re-bound by stable ID on restore.
+        ///   - current_psp/current_drive/dta_seg/dta_off/arena_first_mcb/strategy/
+        ///     ret_code/ret_type/last_error/breakcheck/sysvars_seg: (c) host-side
+        ///     kernel state — pre-existing snapshot gap, NOT input state, OUT OF
+        ///     Phase 0 scope (Phase 0 is narrowly the uncovered *input* state).
+        ///   - cwd/cwd_len/search_dir*/fcb_search_*: (c) host-side, also a
+        ///     pre-existing non-input gap (out of Phase 0 scope).
+        ///   - sft/dev_table/drives/ems: (c) host-side device/VFS/EMS state, NOT
+        ///     input state (out of Phase 0 scope). NOTE: `dev_table`'s CON
+        ///     `CharDevice.in_buf`/`in_pos`/`in_len` (the stdin cursor,
+        ///     devices.zig:33-35) IS mutable-host-side input state, but nothing in
+        ///     input Phase 0–3 exercises the INT 21h-stdin injection path — it only
+        ///     becomes injection-relevant if Phase 4 lands. DEFERRED-COVERAGE
+        ///     ITEM, flagged here deliberately (not silently skipped); it gets
+        ///     added to the snapshot if/when Phase 4 wires that path.
+        ///   - mouse: (c) mutable-host-side INPUT state, NOT in guest RAM — the
+        ///     known Phase 0 case. INCLUDED below.
+        ///   - last_unsupported/terminated: (c) host-side, not input state.
+        /// The keyboard ring lives in guest BDA RAM (bda.zig:18) and is already
+        /// covered by the bus RAM-slab snapshot — needs no field here.
+        dos_mouse: @TypeOf(@as(Dos, undefined).mouse).Snapshot,
         shutdown: bool,
     };
 
@@ -499,6 +523,7 @@ pub const Machine = struct {
             .vga = self.vga.snapshot(),
             .speaker = self.speaker.snapshot(),
             .sched = self.sched.snapshot(),
+            .dos_mouse = self.dos.mouse.snapshot(),
             .shutdown = self.shutdown,
         };
     }
@@ -513,6 +538,7 @@ pub const Machine = struct {
         self.vga.restore(snap.vga);
         self.speaker.restore(snap.speaker);
         self.sched.restore(snap.sched);
+        self.dos.mouse.restore(snap.dos_mouse);
         self.shutdown = snap.shutdown;
     }
 };

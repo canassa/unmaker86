@@ -158,13 +158,9 @@ pub fn Int33(comptime Cpu: type) type {
                     const dx: i16 = @bitCast(cpu.st.getReg16(EDX));
                     // Signed clamp to range; the "!= POS" arms preserve the rounding
                     // quirk (a value equal to the current rounded pos is ignored).
-                    if (cx >= self.max_x) self.x = self.max_x
-                    else if (self.min_x >= cx) self.x = self.min_x
-                    else if (cx != @as(i16, @bitCast(self.posX()))) self.x = cx;
+                    if (cx >= self.max_x) self.x = self.max_x else if (self.min_x >= cx) self.x = self.min_x else if (cx != @as(i16, @bitCast(self.posX()))) self.x = cx;
 
-                    if (dx >= self.max_y) self.y = self.max_y
-                    else if (self.min_y >= dx) self.y = self.min_y
-                    else if (dx != @as(i16, @bitCast(self.posY()))) self.y = dx;
+                    if (dx >= self.max_y) self.y = self.max_y else if (self.min_y >= dx) self.y = self.min_y else if (dx != @as(i16, @bitCast(self.posY()))) self.y = dx;
                 },
                 0x0007 => { // DEFINE HORIZONTAL RANGE (mouse.cpp:1732)
                     const cx: i16 = @bitCast(cpu.st.getReg16(ECX));
@@ -256,6 +252,80 @@ pub fn Int33(comptime Cpu: type) type {
             self.x = x;
             self.y = y;
             self.buttons = buttons;
+        }
+
+        // -------------------------------------------------------------------
+        // Snapshot / restore (D14, the mouse-driver state hole closed in input
+        // Phase 0). A POD by-value copy of EVERY mutable driver field that lives
+        // host-side (NOT in guest RAM): the driver carries no guest-RAM-backed
+        // state, so all of it must be captured here. This mirrors the
+        // Pic/Pit/Speaker snapshot idiom (POD, byte-serializable, no pointers).
+        //
+        // SCOPE NOTE: this captures the fields that exist TODAY. The Phase-2
+        // relative-motion (mickey) accumulator and the Phase-3 callback
+        // re-entrancy flag are added to this Snapshot WHEN those phases introduce
+        // the fields — not forward-referenced here.
+        // -------------------------------------------------------------------
+        pub const Snapshot = struct {
+            present: bool,
+            x: i16,
+            y: i16,
+            buttons: u16,
+            hidden: u16,
+            min_x: i16,
+            max_x: i16,
+            min_y: i16,
+            max_y: i16,
+            gran_x: u16,
+            gran_y: u16,
+            senv_x_val: u16,
+            senv_y_val: u16,
+            dspeed_val: u16,
+            handler_seg: u16,
+            handler_off: u16,
+            handler_mask: u16,
+        };
+
+        pub fn snapshot(self: *const Self) Snapshot {
+            return .{
+                .present = self.present,
+                .x = self.x,
+                .y = self.y,
+                .buttons = self.buttons,
+                .hidden = self.hidden,
+                .min_x = self.min_x,
+                .max_x = self.max_x,
+                .min_y = self.min_y,
+                .max_y = self.max_y,
+                .gran_x = self.gran_x,
+                .gran_y = self.gran_y,
+                .senv_x_val = self.senv_x_val,
+                .senv_y_val = self.senv_y_val,
+                .dspeed_val = self.dspeed_val,
+                .handler_seg = self.handler_seg,
+                .handler_off = self.handler_off,
+                .handler_mask = self.handler_mask,
+            };
+        }
+
+        pub fn restore(self: *Self, snap: Snapshot) void {
+            self.present = snap.present;
+            self.x = snap.x;
+            self.y = snap.y;
+            self.buttons = snap.buttons;
+            self.hidden = snap.hidden;
+            self.min_x = snap.min_x;
+            self.max_x = snap.max_x;
+            self.min_y = snap.min_y;
+            self.max_y = snap.max_y;
+            self.gran_x = snap.gran_x;
+            self.gran_y = snap.gran_y;
+            self.senv_x_val = snap.senv_x_val;
+            self.senv_y_val = snap.senv_y_val;
+            self.dspeed_val = snap.dspeed_val;
+            self.handler_seg = snap.handler_seg;
+            self.handler_off = snap.handler_off;
+            self.handler_mask = snap.handler_mask;
         }
     };
 }

@@ -333,15 +333,18 @@ pub fn build(b: *std.Build) void {
     bridge_test_step.dependOn(&bridge_rt.step);
 
     const bios_unit = MachineTest.add(b, target, optimize, "src/bios/bios_test.zig", &dosbios_imports);
+    const bios_determinism = MachineTest.add(b, target, optimize, "src/bios/determinism_test.zig", &dosbios_imports);
     const bios_test_step = b.step("test-bios", "Run the BIOS tests");
     bios_test_step.dependOn(&bridge_unit.step);
     bios_test_step.dependOn(&bios_unit.step);
+    bios_test_step.dependOn(&bios_determinism.step);
 
     const dos_unit = MachineTest.add(b, target, optimize, "src/dos/dos_test.zig", &dosbios_imports);
     const dos_int21 = MachineTest.add(b, target, optimize, "src/dos/int21_test.zig", &dosbios_imports);
     const dos_name83 = MachineTest.add(b, target, optimize, "src/dos/name83_test.zig", &dosbios_imports);
     const dos_loader = MachineTest.add(b, target, optimize, "src/dos/loader_test.zig", &dosbios_imports);
     const dos_integration = MachineTest.add(b, target, optimize, "src/dos/integration_test.zig", &dosbios_imports);
+    const dos_determinism = MachineTest.add(b, target, optimize, "src/dos/determinism_test.zig", &dosbios_imports);
     // The real-CRT regression: load + run the committed Borland C++ 3.1 HELLO.EXE
     // through the full machine and assert its CON output + exit code (needs the
     // examples-dir path via build_options).
@@ -396,6 +399,7 @@ pub fn build(b: *std.Build) void {
     dos_test_step.dependOn(&dos_name83.step);
     dos_test_step.dependOn(&dos_loader.step);
     dos_test_step.dependOn(&dos_integration.step);
+    dos_test_step.dependOn(&dos_determinism.step);
     dos_test_step.dependOn(&dos_borland.step);
     dos_test_step.dependOn(&dos_oracle.step);
 
@@ -478,11 +482,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&bridge_unit.step);
     test_step.dependOn(&bridge_rt.step);
     test_step.dependOn(&bios_unit.step);
+    test_step.dependOn(&bios_determinism.step);
     test_step.dependOn(&dos_unit.step);
     test_step.dependOn(&dos_int21.step);
     test_step.dependOn(&dos_name83.step);
     test_step.dependOn(&dos_loader.step);
     test_step.dependOn(&dos_integration.step);
+    test_step.dependOn(&dos_determinism.step);
     test_step.dependOn(&dos_borland.step);
     test_step.dependOn(&dos_oracle.step);
     test_step.dependOn(&io_oracle.step);

@@ -1289,7 +1289,7 @@ callback, needs Phase 1·0) → Phase 4/5 (optional/later).
 
 **Phase 0 — close the snapshot hole + determinism grep-gates (prerequisite,
 structural; NARROW scope).**
-- [ ] Add the uncovered *mutable host-side* DOS input state — the known case is
+- [x] Add the uncovered *mutable host-side* DOS input state — the known case is
   `dos.mouse: Int33` (the **currently-existing** fields: position, buttons, ranges,
   sensitivity, handler ptr/mask — `int33.zig:57-83`) — to `Machine.Snapshot` +
   `snapshot()` + `restore()` (`src/machine/machine.zig:479-517`). Add an
@@ -1304,7 +1304,7 @@ structural; NARROW scope).**
   deliberate exclusions. Test: snapshot→**mutate mouse**→restore→byte-equal (the
   existing snapshot test at `integration_test.zig:280` never touches mouse, so it
   false-passes — the new test MUST mutate `dos.mouse`).
-- [ ] **Add `src/dos/determinism_test.zig` + `src/bios/determinism_test.zig`** grep
+- [x] **Add `src/dos/determinism_test.zig` + `src/bios/determinism_test.zig`** grep
   gates (none exist today — only api/bus/cpu/debug/machine, §7.1) mirroring
   `machine/determinism_test.zig:12-40`: ban `f32`/`f64` in the mickey/sensitivity/
   accumulator math (§5.2), no host clock / RNG / threads. Scaffold them in Phase 0 so
