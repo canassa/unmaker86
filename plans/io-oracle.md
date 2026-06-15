@@ -1,6 +1,9 @@
 # I/O-phase oracle strategy (VGA / keyboard / sound / mouse)
 
-Status: design. Deliverable for the I/O phase that follows the DOS-layer oracle loop
+Status: Band V1 IMPLEMENTED (VGA mode-13h device + INT 10h + binary-blob oracle harness landed;
+VGAINIT + VGABIOS reproduce byte-identically — `zig build test-io-oracle` green). USER DECISIONS
+D1/D2/D3 RESOLVED (see §7). Remaining bands (V2 palette/fade, K1 keyboard ring, mouse, sound) are
+still design. Deliverable for the I/O phase that follows the DOS-layer oracle loop
 (`plans/dos-oracle-report.md`, 40-program corpus green via `zig build test-oracle`). This
 doc tells the next agent how dosbox-x becomes the truth source for the **non-console-diffable**
 devices — graphics, keyboard, sound, mouse — **without abandoning the existing oracle discipline**
@@ -90,13 +93,11 @@ Two integration options:
 - Alternative: teach `oracle.sh` to *also* grab a `<STEM>.bin` if the program produced one. This
   couples two golden formats in one script; the separate script is cleaner.
 
-**Pin one extra `-set` for video:** the oracle must fix the SVGA card so register read-backs are
-stable. dosbox-x defaults `machine=svga_s3` (`src/dosbox.cpp:1755`). Pin `machine=svga_s3`
-explicitly (or `vgaonly` if we decide BaK never touches S3 extensions — BaK is plain VGA, so
-`vgaonly` is the more faithful pin for the BaK target and removes S3 register surface we will
-never implement). **USER DECISION D1** (see §7): `machine=vgaonly` vs `svga_s3` for the video
-oracle. Recommendation: `vgaonly` — it matches BaK's plain-VGA scope and shrinks the register
-surface zdos's VGA device must reproduce.
+**Pin one extra `-set` for video:** the oracle must fix the VGA card so register read-backs are
+stable. dosbox-x defaults `machine=svga_s3` (`src/dosbox.cpp:1755`). **USER DECISION D1 — RESOLVED:
+`machine=vgaonly`** (plain IBM VGA, no S3): it matches BaK's plain-VGA scope and shrinks the
+register surface zdos's VGA device must reproduce. PINNED in `tools/oracle-io.sh`
+(`-set "machine=vgaonly"`).
 
 The DAC is 6-bit by default (`vga.dac.bits=6`, `src/hardware/vga_dac.cpp:444`), so palette
 read-backs are 0..63 — zdos's VGA DAC must store/return 6-bit values, not scale to 8-bit.
@@ -375,15 +376,18 @@ layer with no harness changes.
 
 ## 7. Open risks & USER DECISIONS
 
-- **D1 — VGA oracle machine type.** Pin `machine=vgaonly` (faithful to BaK's plain-VGA scope,
-  smaller register surface) vs `svga_s3` (dosbox-x default). Recommendation: `vgaonly`. Decide
-  before minting the first `.vga` golden — it changes the register snapshot bytes.
-- **D2 — Sound sample-accuracy scope for v1.** Recommendation: defer; v1 sound contract is the
-  register-write trace + PIT read-back oracle, NOT synthesized FM/PCM samples. Confirm sound can be
-  deferred for the BaK v1 acceptance run.
-- **D3 — VRAM golden size.** Full 64000-byte VRAM per video golden (preferred, exact + diffable)
-  vs hash + sampled spans (smaller). Recommendation: full bytes; revisit only if the corpus grows
-  large.
+- **D1 — VGA oracle machine type. RESOLVED: `machine=vgaonly`** (faithful to BaK's plain-VGA scope,
+  smaller register surface; no S3). PINNED in `tools/oracle-io.sh` (`-set "machine=vgaonly"`). The
+  VGA device (`src/devices/vga.zig`) implements the plain-IBM-VGA mode-13h subset only — the S3
+  register surface is never modeled.
+- **D2 — Sound sample-accuracy scope for v1. RESOLVED: DEFERRED** — v1 sound is REGISTER-TRACE ONLY
+  (no synthesis). `tools/oracle-io.sh` builds/pins nothing for audio; sample-accurate FM/PCM is a
+  post-v1 band with its own sample-hash oracle.
+- **D3 — VGA mode scope for v1. RESOLVED: MODE 13h ONLY** (320x200x256 linear, A000:0000, 64000
+  bytes). No BaK recon performed; mode 13h is the v1 video target. The VGA device + INT 10h
+  mode-set/pixel/DAC path are built for 13h only; any other mode records a coherent BDA but is not
+  given the full register/VRAM program (flagged, not faked). VRAM goldens are FULL 64000 bytes (the
+  exact, trivially-diffable artifact).
 - **BaK recon gap.** There is currently **no BaK reconnaissance in the repo** (no
   `betrayal-at-krondor/`, no c-recon). The VGA scope here is from BaK's documented hardware profile,
   not from disassembly. Before locking mode/feature scope beyond mode 13h, a recon pass on a BaK EXE
