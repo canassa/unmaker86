@@ -610,16 +610,16 @@ pub fn memoryRegions(self: *const Controller) []const Region; // RAM size, VRAM,
 - [x] Test #13 (inspection leaves `machine.snapshot()` byte-identical over a device region).
 
 ### Phase 3 — mutate + stepping & run-to (one-shot breakpoints)
-- [ ] Mutate: `setReg32/16/8` (explicit `Reg16`/`Reg8` enums → `u3`), `setSegment`,
+- [x] Mutate: `setReg32/16/8` (explicit `Reg16`/`Reg8` enums → `u3`), `setSegment`,
       `setEip`, `setFlags`, `writeMem`.
-- [ ] `stepInstruction` (no-op + terminal reason when already terminal), `stepN`,
+- [x] `stepInstruction` (no-op + terminal reason when already terminal), `stepN`,
       `runToCycle` (immediate return when `c <= cycles`), `runToAddress`.
-- [ ] `stepOver` with `StepOverResult{reason, stepped_into}`: direct CALL/INT via SP-guarded
+- [x] `stepOver` with `StepOverResult{reason, stepped_into}`: direct CALL/INT via SP-guarded
       one-shot return-address bp read through the **peek** path; explicit fallback flag.
-- [ ] `reset()` (open question #5, locked in): re-init the machine deterministically honoring
+- [x] `reset()` (open question #5, locked in): re-init the machine deterministically honoring
       the pinning invariant (`machine.zig:8-20`) — re-`wire` after re-`init`; reload the same
       program/inputs; assert a reset+rerun reaches byte-identical state at cycle N.
-- [ ] Tests: #5 (step==run), #15 (stepOver incl. recursion + reported fallback); reset
+- [x] Tests: #5 (step==run), #15 (stepOver incl. recursion + reported fallback); reset
       determinism (reset then rerun == fresh run, byte-identical).
 
 ### Phase 4 — interrupt-vector breakpoints

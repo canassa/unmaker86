@@ -39,5 +39,6 @@ test {
     _ = controller;
     _ = @import("breakpoints_test.zig");
     _ = @import("controller_test.zig");
+    _ = @import("stepping_test.zig");
     _ = @import("determinism_test.zig");
 }

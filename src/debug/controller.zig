@@ -23,6 +23,7 @@ const bp = @import("breakpoints.zig");
 const Machine = machine_mod.Machine;
 const Reg32 = cpu_mod.Reg32;
 const Seg = cpu_mod.Seg;
+const Flags = cpu_mod.Flags;
 const BreakpointSet = bp.BreakpointSet;
 const BreakpointKind = bp.BreakpointKind;
 const Breakpoint = bp.Breakpoint;
@@ -241,6 +242,212 @@ pub const Controller = struct {
         comptime f: fn (@TypeOf(ctx), u32, *const Breakpoint) void,
     ) void {
         self.set.forEach(ctx, f);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stepping & run-to (Phase 3) — built on one-shot breakpoints + run_loop.step.
+    // -----------------------------------------------------------------------
+
+    /// Execute exactly ONE retired instruction. If the machine is ALREADY terminal
+    /// (shutdown / program_terminated / permanent-HLT) it does NOT step — it
+    /// returns the terminal reason (you cannot step a terminal machine; a shutdown
+    /// CPU's `step` is a 0-cycle no-op, which would punch a hole in the ledger
+    /// semantics). Otherwise charges exactly the instruction's real cycles (one
+    /// `run_loop.step`) and returns `step_complete`.
+    pub fn stepInstruction(self: *Controller) StopReason {
+        self.last_stop = null;
+        if (self.terminalReason()) |r| return self.record(r);
+        _ = self.m.step();
+        // A step may itself reach a terminal (e.g. the instruction was HLT with no
+        // events, or it triple-faulted) — surface that, else step_complete.
+        if (self.terminalReason()) |r| return self.record(r);
+        return self.record(.{ .step_complete = .{ .at_cycle = self.m.cpu.st.cycles } });
+    }
+
+    /// `n`× `stepInstruction`, stopping early on any fired persistent/one-shot
+    /// breakpoint or terminal. Returns the reason of the stop (`step_complete` if
+    /// all `n` retired without an event).
+    pub fn stepN(self: *Controller, n: u64) StopReason {
+        self.last_stop = null;
+        var i: u64 = 0;
+        while (i < n) : (i += 1) {
+            if (self.terminalReason()) |r| return self.record(r);
+            _ = self.m.step();
+            if (self.terminalReason()) |r| return self.record(r);
+            if (self.scanBreakpoints()) |r| return self.record(r);
+        }
+        return self.record(.{ .step_complete = .{ .at_cycle = self.m.cpu.st.cycles } });
+    }
+
+    /// Set a one-shot cycle breakpoint at `c`, then `runUntilEvent`. If `c <=`
+    /// current cycles, returns IMMEDIATELY (no step) with
+    /// `cycle_budget_exhausted{at_cycle = current}` — documented (the requested
+    /// cycle is already in the past).
+    pub fn runToCycle(self: *Controller, c: u64) Error!StopReason {
+        if (c <= self.m.cpu.st.cycles) {
+            return self.record(.{ .cycle_budget_exhausted = .{ .at_cycle = self.m.cpu.st.cycles } });
+        }
+        const id = try self.set.add(.{ .cycle = .{ .at_cycle = c } }, true);
+        defer self.discardOneShot(id);
+        return self.runUntilEvent(std.math.maxInt(u64));
+    }
+
+    /// Set a one-shot `execution_address` breakpoint at `linear`, then
+    /// `runUntilEvent`.
+    pub fn runToAddress(self: *Controller, linear: u32) Error!StopReason {
+        const id = try self.set.add(.{ .execution_address = .{ .linear = linear } }, true);
+        defer self.discardOneShot(id);
+        return self.runUntilEvent(std.math.maxInt(u64));
+    }
+
+    /// Remove a transient one-shot used by run-to/step-over (idempotent: it may
+    /// already have been consumed+disabled, but the slot is still `used`).
+    fn discardOneShot(self: *Controller, id: u32) void {
+        self.set.remove(id) catch {};
+    }
+
+    /// Step OVER a direct CALL/INT by running to its return; otherwise == step
+    /// into. Returns `StepOverResult{reason, stepped_into}` — the `stepped_into`
+    /// flag reports a fallback to step-into (never a silent degrade, ground rule).
+    ///
+    /// We classify only the opcodes we can size cheaply from the FIRST byte at
+    /// CS:IP (read via the side-effect-free peek path): `0xE8` near `CALL rel`,
+    /// `0x9A` far `CALL ptr`, `0xCD` `INT imm8`. For these we execute the call/INT
+    /// itself (one step), then set a one-shot `execution_address` bp at the pushed
+    /// return linear address, SP-GUARDED so recursion is correct (a deeper re-entry
+    /// to the same address does not trip it). Everything else (indirect CALL, REP,
+    /// prefixed, far RET sizing) falls back to `stepInstruction` with
+    /// `stepped_into = true`.
+    pub fn stepOver(self: *Controller) StepOverResult {
+        self.last_stop = null;
+        if (self.terminalReason()) |r| return .{ .reason = self.record(r), .stepped_into = false };
+
+        const cs_base = self.m.cpu.st.seg_base[@intFromEnum(Seg.cs)];
+        const ip_linear = cs_base +% self.m.cpu.st.eip;
+        const opcode = self.m.bus.peekPhys8(ip_linear);
+        const direct_call = opcode == 0xE8 or opcode == 0x9A or opcode == 0xCD;
+        if (!direct_call) {
+            // Fall back to step-into (reported).
+            return .{ .reason = self.stepInstruction(), .stepped_into = true };
+        }
+
+        // A far CALL (0x9A) and INT (0xCD) push CS too, so the return CS is the
+        // pushed value; a near CALL (0xE8) pushes only IP and returns in the
+        // current CS. We classified this from the opcode BEFORE stepping.
+        const is_far = opcode == 0x9A or opcode == 0xCD;
+
+        // The return CS:IP and SP-at-return are known only AFTER the call/INT
+        // executes (it pushes them). Execute the call itself (one step), then read
+        // the pushed return address off the stack via the peek path and the new SP.
+        _ = self.m.step();
+        // The call may itself terminate (an INT that triple-faults, etc).
+        if (self.terminalReason()) |r| return .{ .reason = self.record(r), .stepped_into = false };
+
+        const ret_linear = self.returnSiteAfterCall(is_far);
+        const guard_sp = self.m.cpu.st.getReg16(ESP); // SP just after the push(es)
+        const id = self.set.add(
+            .{ .execution_address = .{ .linear = ret_linear } },
+            true,
+        ) catch {
+            // Table full: degrade to step-into rather than panic (ground rule).
+            return .{ .reason = self.record(.{ .step_complete = .{ .at_cycle = self.m.cpu.st.cycles } }), .stepped_into = true };
+        };
+        defer self.discardOneShot(id);
+
+        // Run to the return, but the one-shot must only fire when SS:SP has unwound
+        // back to (>=) the guard SP — so a recursive re-entry to the same linear at
+        // a deeper SP does not trip it. We loop runUntilEvent and re-arm until the
+        // SP guard is satisfied (or a different event/terminal fires).
+        while (true) {
+            const r = self.runUntilEvent(std.math.maxInt(u64));
+            switch (r) {
+                .breakpoint => |hit| {
+                    if (hit.id != id) return .{ .reason = r, .stepped_into = false }; // some OTHER user bp
+                    // Our return bp fired. Honor the SP guard: only accept it once
+                    // the stack has unwound to or above the post-call SP.
+                    if (self.m.cpu.st.getReg16(ESP) >= guard_sp) {
+                        return .{ .reason = self.record(.{ .step_complete = .{ .at_cycle = self.m.cpu.st.cycles } }), .stepped_into = false };
+                    }
+                    // Recursive re-entry at a deeper SP: re-arm the one-shot and
+                    // keep running (the address matched but the guard rejects it).
+                    self.set.items[id].enabled = true;
+                    self.set.recomputeActive();
+                },
+                else => return .{ .reason = r, .stepped_into = false }, // terminal / budget
+            }
+        }
+    }
+
+    /// The linear return address pushed by the just-executed direct CALL/INT,
+    /// read SIDE-EFFECT-FREE from the top of the SS stack. Real-mode pushes are
+    /// 16-bit; IP is at [SS:SP] (the lowest word). For a near CALL the return runs
+    /// in the CURRENT CS (unchanged); for a far CALL / INT the caller CS was pushed
+    /// at [SS:SP+2], so the return runs there. `is_far` selects which.
+    fn returnSiteAfterCall(self: *const Controller, is_far: bool) u32 {
+        const ss_base = self.m.cpu.st.seg_base[SS];
+        const sp = self.m.cpu.st.getReg16(ESP);
+        var w: [4]u8 = undefined;
+        self.m.bus.peekBlock(ss_base +% sp, &w);
+        const ret_ip = @as(u16, w[0]) | (@as(u16, w[1]) << 8);
+        const ret_cs = @as(u16, w[2]) | (@as(u16, w[3]) << 8);
+        const cs_base = if (is_far)
+            @as(u32, ret_cs) << 4
+        else
+            self.m.cpu.st.seg_base[@intFromEnum(Seg.cs)];
+        return cs_base +% ret_ip;
+    }
+
+    // -----------------------------------------------------------------------
+    // Mutate (Phase 3). A debugger write is a deliberate new INPUT; the
+    // determinism guarantee is "same binary + SAME INPUTS". The core never
+    // mutates implicitly — only on an explicit set*/writeMem. Writes go through
+    // the real bus write path.
+    // -----------------------------------------------------------------------
+
+    pub fn setReg32(self: *Controller, r: Reg32, v: u32) void {
+        self.m.cpu.writeReg32(r, v);
+    }
+    pub fn setReg16(self: *Controller, r: Reg16, v: u16) void {
+        self.m.cpu.st.setReg16(@intFromEnum(r), v);
+    }
+    pub fn setReg8(self: *Controller, r: Reg8, v: u8) void {
+        self.m.cpu.st.setReg8(@intFromEnum(r), v);
+    }
+    pub fn setSegment(self: *Controller, s: Seg, sel: u16) void {
+        self.m.cpu.loadSegment(s, sel); // recomputes the base (real-mode sel<<4)
+    }
+    pub fn setEip(self: *Controller, v: u32) void {
+        self.m.cpu.patchEip(v);
+    }
+    pub fn setFlags(self: *Controller, f: Flags) void {
+        self.m.cpu.st.eflags = f;
+    }
+    /// Write `src` to a logical `seg:off` view (through the real bus write path).
+    pub fn writeMem(self: *Controller, seg: Seg, off: u32, src: []const u8) void {
+        const linear = self.m.cpu.st.seg_base[@intFromEnum(seg)] +% off;
+        self.m.bus.writeGuestBlock(linear, src);
+    }
+    /// Write `src` to a guest physical address (through the real bus write path).
+    pub fn writeMemPhys(self: *Controller, phys: u32, src: []const u8) void {
+        self.m.bus.writeGuestBlock(phys, src);
+    }
+
+    // -----------------------------------------------------------------------
+    // Session reset (Phase 3, open question #5 resolved: included in M1).
+    // -----------------------------------------------------------------------
+
+    /// Re-initialize the machine deterministically to power-on state. Honors the
+    /// pinning invariant (`Machine.reset` re-establishes the callback routing /
+    /// re-wires `svc`; it does NOT move the machine). RAM is re-zeroed and every
+    /// device is reset, so a reset reaches byte-identical power-on state every
+    /// time. NOTE: the caller is responsible for re-loading the same program /
+    /// inputs afterward (exactly as `main.zig` does post()+bootProgram()) — the
+    /// controller does not own the program-load recipe, and faking one here would
+    /// violate the ground rule. Clears `last_stop`; the breakpoint set survives
+    /// (a debug session's breakpoints outlive a machine reset).
+    pub fn reset(self: *Controller) !void {
+        self.m.reset();
+        self.last_stop = null;
     }
 
     // -----------------------------------------------------------------------
