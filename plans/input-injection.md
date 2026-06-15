@@ -1410,7 +1410,7 @@ AX / MOV AL,EOI / OUT / OUT / POP AX / IRET. Phase 1·0 adds three things in tha
   (no ledger hole) + run-twice byte-identity (`bridge_test.zig`), mirroring the
   `runGuestInt` re-entry test.
 
-**Phase 1d — guest-asm INT 16h blocking loop (needs Phase 1·0).** Install the guest-asm
+- [x] **Phase 1d — guest-asm INT 16h blocking loop (needs Phase 1·0).** Install the guest-asm
 INT 16h handler (using the Phase-1·0 poll-loop shell) that loops `INT 09h` for the
 blocking **AH=00/10** path (spice86 `KeyboardInt16Handler.cs:168-206`): `CMP AH,00` →
 have-key→dequeue+IRET → else `INT 09h` → `JMP back`. **AH=01/02/05/11/12 fall through
@@ -1420,6 +1420,30 @@ dispatch charge; the `int16.zig:36-44`/`:101-102` return-AX=0 seam is deleted) �
 a deliberate, documented golden move (§4.1). Force IF on the AH=01 host path to match
 dosbox (`bios_keyboard.cpp:555-556`). Test: the blocking-read round-trip (a program that
 loops AH=00 unblocks deterministically when a scancode + IRQ1 is injected, §7.1).
+  - IMPLEMENTED. The hybrid is a single guest-asm block (`Bridge.emitInt16Hybrid`,
+    placed at `INT16_HYBRID_PHYS` just after the slot table) the INT 16h vector points
+    at: a 14-byte AH-branch preamble (`CMP AH,0`/`CMP AH,0x10` → JZ into the embedded
+    poll loop; else `0xFE 0x38 <int16 host id>; IRET`) followed by the Phase-1·0
+    `emitPollLoop` shell. Two new BIOS callbacks (`int16_has_key`/`int16_dequeue`,
+    `.trivial` cost) drive the loop: `hasKey` sets the LIVE ZF (`cpu.st.eflags.zf` — the
+    poll-loop trap is INLINE, not an interrupt, so there is no IRET FLAGS frame to
+    patch), `dequeue` pops the cooked word into AX; both read the preserved AH to apply
+    the AH=00-folds-enhanced vs AH=10-keeps-enhanced split (same `classifyKey`/transform
+    as the host path). The old empty-ring "return AX=0" seam (`int16.zig`) is DELETED;
+    AH=01 now `setGuestIF(true)` on its IRET (dosbox `bios_keyboard.cpp:555-556`).
+  - DETERMINISM: the wait is REAL guest code through the normal fetch/execute loop with
+    IF=1, so emulated time ADVANCES (cycles climb, IRQ0/the BDA tick fires, the injected
+    IRQ1→INT 09h delivers the key) — proven by the "advances emulated time while waiting"
+    test (cycles + BDA tick both moved, program still blocked, not frozen, no fake AX=0)
+    and byte-identity across two identical inject sequences incl. the exit cycle
+    (`src/bios/input_determinism_test.zig`).
+  - K1 ORACLE RE-BASELINE: the KBRING golden (`examples/dos-src/KBRING.expected`) is
+    OUTPUT+exit-code only (no cycle counts), and KBRING always pre-seeds the ring before
+    every AH=00/10 read — so the poll loop finds a key on the first has-key check and the
+    output is byte-IDENTICAL. The golden does NOT move. Double-minted via
+    `tools/oracle.sh` (dosbox-x) → committed == mint1 == mint2, byte-identical; the
+    plan's "the K1 golden MUST move" assumed a cycle-sensitive golden, which zdos's
+    KBRING golden is not. `test-oracle` passes against the unchanged golden.
 
 **Phase 2 — mouse inject-while-paused (Model A, driver-state, absolute + relative).**
 - [x] Generalize `Int33.injectMotion` → `injectAbsolute(x,y,buttons, set_x,

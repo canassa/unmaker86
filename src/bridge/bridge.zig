@@ -76,6 +76,12 @@ const OP_JZ_REL8: u8 = 0x74; // Jcc cc=0100 (ZF==1)
 const OP_JNZ_REL8: u8 = 0x75; // Jcc cc=0101 (ZF==0)
 const OP_JMP_REL8: u8 = 0xEB; // unconditional short JMP
 const INT_KBD_ISR: u8 = 0x09; // IRQ1 keyboard ISR the blocking loop drives
+// CMP AH, imm8 = 0x80 /7 ib. ModR/M 0xFC = mod=11 (reg-direct) reg=/7 rm=100 (AH,
+// the 8-bit register #4). Used by the INT 16h hybrid preamble to branch on AH.
+const OP_CMP_RM8_IMM8: u8 = 0x80;
+const MODRM_CMP_AH: u8 = 0xFC;
+const AH_GET_KEYSTROKE: u8 = 0x00; // AH=00 — blocking GET (folds enhanced keys)
+const AH_GET_ENHANCED: u8 = 0x10; // AH=10 — blocking enhanced GET (keeps them)
 
 /// The BIOS-ROM segment the callback area lives in (DOSBox places the callback
 /// area at F000:1000; we mirror the PLACEMENT, not its CB_SIZE=32 offset math).
@@ -348,6 +354,100 @@ pub fn Bridge(comptime Cpu: type) type {
             // off 13 — IRET (return to the INT 16h caller)
             w.byte(OP_IRET);
             std.debug.assert(w.pos - pos == POLL_LOOP_LEN);
+        }
+
+        /// The total byte length of the INT 16h hybrid preamble that precedes the
+        /// poll loop (`emitInt16Hybrid`). The preamble branches on AH: AH=00/10 fall
+        /// through to the embedded poll loop, every other AH traps the host
+        /// `int16.handle` and IRETs.
+        pub const INT16_PREAMBLE_LEN: u16 = 14;
+        /// The total byte length of the whole INT 16h hybrid block (preamble + the
+        /// embedded poll loop). The INT 16h IVT vector points at the START of this.
+        pub const INT16_HYBRID_LEN: u16 = INT16_PREAMBLE_LEN + POLL_LOOP_LEN;
+
+        /// Physical address of the INT 16h hybrid block within the BIOS ROM image —
+        /// placed immediately AFTER the callback-slot table (which spans
+        /// `CB_BASE_PHYS .. CB_BASE_PHYS + CB_MAX*CB_SLOT_SIZE`). It is a fixed,
+        /// paragraph-aligned region of real guest code the INT 16h vector targets.
+        pub const INT16_HYBRID_PHYS: u32 = CB_BASE_PHYS + @as(u32, CB_MAX) * CB_SLOT_SIZE;
+
+        comptime {
+            // The hybrid block must fit inside the BIOS ROM window after the slots.
+            std.debug.assert(INT16_HYBRID_PHYS >= CB_BASE_PHYS + @as(u32, CB_MAX) * CB_SLOT_SIZE);
+            std.debug.assert(INT16_HYBRID_PHYS + INT16_HYBRID_LEN <= 0x100000);
+        }
+
+        /// The seg:off of the INT 16h hybrid block (the INT 16h vector target).
+        pub fn int16HybridSegOff() struct { seg: u16, off: u16 } {
+            return .{ .seg = CB_SEG, .off = @intCast(INT16_HYBRID_PHYS - (@as(u32, CB_SEG) << 4)) };
+        }
+
+        /// Parameters for the INT 16h host/guest-asm HYBRID block (Phase 1d).
+        pub const Int16Hybrid = struct {
+            /// Callback id of the host `int16.handle` (the AH=01/02/05/11/12/... path).
+            host_id: u8,
+            /// Callback id whose handler sets the LIVE ZF (`cpu.st.eflags.zf`) — 0
+            /// when a key is available, 1 when the ring is empty (poll-loop has-key).
+            has_key_id: u8,
+            /// Callback id whose handler dequeues the cooked word into AX (poll-loop).
+            dequeue_id: u8,
+        };
+
+        /// Emit the INT 16h host/guest-asm HYBRID block into `image` at byte offset
+        /// `pos` (relative to the start of `image`). The INT 16h IVT vector points
+        /// at `pos`; on a real guest `INT 16h` the CPU has already pushed the
+        /// FLAGS/CS/IP frame and AH holds the requested service. The preamble
+        /// branches on AH (spice86 `KeyboardInt16Handler.cs:168-206` splits exactly
+        /// this way: AH=00/10 run the guest-asm `INT 09h` loop, AH=01/02/05/11
+        /// are host actions):
+        ///
+        ///   INT16_ENTRY:
+        ///     CMP AH, 0x00          ; 80 FC 00 — blocking GET KEYSTROKE
+        ///     JZ  L_GET_KEY         ; 74 09    — -> the embedded poll loop
+        ///     CMP AH, 0x10          ; 80 FC 10 — blocking enhanced GET
+        ///     JZ  L_GET_KEY         ; 74 04
+        ///     <trap host_id>        ; FE 38 id — AH=01/02/05/11/12/... -> int16.handle
+        ///     IRET                  ; CF       — (host sets regs/ZF/IF on the frame)
+        ///   L_GET_KEY:              ; <- the poll loop (STI; has-key; JNZ; INT 09h;
+        ///     <emitPollLoop>        ;    JMP back; dequeue; IRET) from emitPollLoop
+        ///
+        /// The poll loop is embedded so the AH=00/10 path is a straight fall-through
+        /// (no extra jump). The whole block is REAL guest code through the normal
+        /// fetch/execute loop — the blocking AH=00/10 wait advances emulated time
+        /// (IRQ0/INT 1Ch tick, the injected IRQ1→INT 09h delivers the key), charged
+        /// cycle-for-cycle, no ledger hole.
+        pub fn emitInt16Hybrid(image: []u8, pos: u32, p: Int16Hybrid) void {
+            var w = Emit{ .image = image, .pos = pos };
+            // off 0  — CMP AH, 0x00
+            w.byte(OP_CMP_RM8_IMM8);
+            w.byte(MODRM_CMP_AH);
+            w.byte(AH_GET_KEYSTROKE);
+            // off 3  — JZ L_GET_KEY. disp @4, next instr @5, poll loop @14:
+            //          rel8 = 14 - 5 = 9.
+            w.byte(OP_JZ_REL8);
+            w.byte(9);
+            // off 5  — CMP AH, 0x10
+            w.byte(OP_CMP_RM8_IMM8);
+            w.byte(MODRM_CMP_AH);
+            w.byte(AH_GET_ENHANCED);
+            // off 8  — JZ L_GET_KEY. disp @9, next instr @10, poll loop @14:
+            //          rel8 = 14 - 10 = 4.
+            w.byte(OP_JZ_REL8);
+            w.byte(4);
+            // off 10 — trap host int16.handle (AH=01/02/05/11/12/... path)
+            w.byte(OP_TRAP0);
+            w.byte(OP_TRAP1);
+            w.byte(p.host_id);
+            // off 13 — IRET (return to the INT 16h caller; the host handler patched
+            //          the FLAGS image — e.g. ZF for AH=01, IF for the poll path)
+            w.byte(OP_IRET);
+            std.debug.assert(w.pos - pos == INT16_PREAMBLE_LEN);
+            // off 14 — L_GET_KEY: the embedded poll loop (AH=00/10 fall through here).
+            emitPollLoop(image, pos + INT16_PREAMBLE_LEN, .{
+                .has_key_id = p.has_key_id,
+                .dequeue_id = p.dequeue_id,
+            });
+            std.debug.assert(w.pos + POLL_LOOP_LEN - pos == INT16_HYBRID_LEN);
         }
 
         /// Plant ALL allocated stubs into `image` (the BIOS ROM image). Call once
@@ -685,4 +785,41 @@ test "emitPollLoop: INT 16h blocking shell emits the exact STI/has-key/INT09/JMP
     // Bytes outside the emitted window are untouched (no over-write).
     try std.testing.expectEqual(@as(u8, 0), image[6]);
     try std.testing.expectEqual(@as(u8, 0), image[7 + want.len]);
+}
+
+test "emitInt16Hybrid: AH-branch preamble + embedded poll loop emit the exact bytes" {
+    var image = std.mem.zeroes([64]u8);
+    const host: u8 = 0x33;
+    const has_key: u8 = 0x11;
+    const dequeue: u8 = 0x22;
+    TestBridge.emitInt16Hybrid(&image, 5, .{
+        .host_id = host,
+        .has_key_id = has_key,
+        .dequeue_id = dequeue,
+    });
+
+    const want = [_]u8{
+        // --- preamble (AH branch) ---
+        0x80, 0xFC, 0x00, // CMP AH,0x00
+        0x74, 0x09, // JZ L_GET_KEY (+9)
+        0x80, 0xFC, 0x10, // CMP AH,0x10
+        0x74, 0x04, // JZ L_GET_KEY (+4)
+        0xFE, 0x38, host, // trap int16.handle (AH=01/02/05/11/...)
+        0xCF, // IRET
+        // --- L_GET_KEY: embedded poll loop ---
+        0xFB, // STI
+        0xFE, 0x38, has_key, // trap has-key (ZF=0 if key present)
+        0x75, 0x04, // JNZ have_key (+4)
+        0xCD, 0x09, // INT 09h
+        0xEB, 0xF6, // JMP L_GET_KEY (-10)
+        0xFE, 0x38, dequeue, // have_key: trap dequeue -> AX
+        0xCF, // IRET
+    };
+    try std.testing.expectEqual(TestBridge.INT16_HYBRID_LEN, @as(u16, want.len));
+    try std.testing.expectEqualSlices(u8, &want, image[5 .. 5 + want.len]);
+    // The JZ at the AH=00 arm lands exactly on L_GET_KEY (the poll-loop STI).
+    try std.testing.expectEqual(@as(u8, 0xFB), image[5 + TestBridge.INT16_PREAMBLE_LEN]);
+    // Bytes outside the window are untouched.
+    try std.testing.expectEqual(@as(u8, 0), image[4]);
+    try std.testing.expectEqual(@as(u8, 0), image[5 + want.len]);
 }

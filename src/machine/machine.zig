@@ -297,6 +297,10 @@ pub const Machine = struct {
         // load it so the bytes are real guest code at the vectors (D4).
         @memset(&self.bios_image, 0);
         br.plantAll(&self.bios_image);
+        // Emit the INT 16h host/guest-asm HYBRID block (preamble + poll loop) into
+        // the BIOS image AFTER the slot table (Phase 1d). INT 16h's IVT vector is
+        // pointed at it in `bios.post`/initIvt, not at the bare int16 slot.
+        self.bios.emitInt16Hybrid(&self.bios_image);
         self.bus.loadRom(Bridge.IMAGE_BASE, &self.bios_image);
         // The re-entrancy trampoline lives in conventional RAM (writable; its INT
         // immediate is patched per runGuestInt). Plant it after reset zeroed RAM.

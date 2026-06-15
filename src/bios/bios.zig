@@ -27,7 +27,13 @@ pub const BiosInt = enum {
     int12, // conventional memory size
     int13, // disk (deferred-by-default, D11)
     int15, // system services
-    int16, // keyboard
+    int16, // keyboard (host path: AH=01/02/05/11/12; AH=00/10 -> the poll loop)
+    // The two INLINE-trap callbacks the INT 16h hybrid poll loop drives for the
+    // blocking AH=00/10 path (input-injection.md §4.1 / Phase 1d). They are NOT
+    // interrupt-vectored stubs — the poll loop's `0xFE 0x38 <id>` references them
+    // by id — so they carry no real IVT vector; their slot bytes are inert.
+    int16_has_key, // poll-loop has-key: sets live ZF per ring availability
+    int16_dequeue, // poll-loop dequeue: pops the cooked word into AX
     int1a, // time of day
     int1c, // user timer tick (default IRET stub)
     unhandled, // catch-all for unserviced hardware/unused vectors
@@ -62,6 +68,20 @@ pub fn Bios(comptime Cpu: type) type {
             return Bda(Cpu).init(self.cpu);
         }
 
+        /// Emit the INT 16h host/guest-asm HYBRID block (preamble + poll loop) into
+        /// the BIOS ROM `image` (Phase 1d). Called by the machine AFTER `plantAll`
+        /// and BEFORE `loadRom` so the block is real guest code at the fixed
+        /// `Bridge.INT16_HYBRID_PHYS`. The INT 16h vector is pointed at it in POST.
+        /// PRECONDITION: `registerCallbacks` has assigned the three ids.
+        pub fn emitInt16Hybrid(self: *Self, image: []u8) void {
+            const pos = Bridge.INT16_HYBRID_PHYS - Bridge.IMAGE_BASE;
+            Bridge.emitInt16Hybrid(image, pos, .{
+                .host_id = self.ids.get(.int16),
+                .has_key_id = self.ids.get(.int16_has_key),
+                .dequeue_id = self.ids.get(.int16_dequeue),
+            });
+        }
+
         /// Allocate + record one callback id for `which` and tell the sink this id
         /// is BIOS-owned. `setOwner` is a closure over the machine's Services.
         pub fn registerCallbacks(
@@ -79,6 +99,11 @@ pub fn Bios(comptime Cpu: type) type {
                 .{ BiosInt.int13, bridge_mod.CbType.iret },
                 .{ BiosInt.int15, bridge_mod.CbType.iret },
                 .{ BiosInt.int16, bridge_mod.CbType.iret },
+                // The poll-loop callbacks: cb_type is inert (their slot bytes are
+                // never executed — the poll loop traps them inline by id), so `.iret`
+                // is an arbitrary harmless choice.
+                .{ BiosInt.int16_has_key, bridge_mod.CbType.iret },
+                .{ BiosInt.int16_dequeue, bridge_mod.CbType.iret },
                 .{ BiosInt.int1a, bridge_mod.CbType.iret },
                 .{ BiosInt.int1c, bridge_mod.CbType.iret },
                 .{ BiosInt.unhandled, bridge_mod.CbType.iret },
@@ -86,6 +111,11 @@ pub fn Bios(comptime Cpu: type) type {
                 const kind: bridge_mod.Kind = switch (pair[0]) {
                     .int08, .int09, .int1c => .irq,
                     .int13 => .unsupported,
+                    // The poll-loop has-key/dequeue traps are trivial register-in/
+                    // register-out services (peek/pop the BDA ring) — each charges
+                    // the small `.trivial` synthetic cost per loop iteration, so the
+                    // blocking wait advances the ledger deterministically (no hole).
+                    .int16_has_key, .int16_dequeue => .trivial,
                     else => .dispatch,
                 };
                 const id = br.allocCallback(pair[1], kind);
@@ -115,6 +145,8 @@ pub fn Bios(comptime Cpu: type) type {
                 .int13 => self.unsupported(cpu, br, 0x13),
                 .int15 => int15.handle(self, cpu, br),
                 .int16 => int16.handle(self, cpu, br),
+                .int16_has_key => int16.hasKey(self, cpu, br),
+                .int16_dequeue => int16.dequeue(self, cpu, br),
                 .int1a => int1a.handle(self, cpu, br),
                 .int1c => {}, // default user-timer-tick stub: IRET (do nothing)
                 .unhandled => self.unsupportedVec(cpu, br),
@@ -205,7 +237,14 @@ pub fn Bios(comptime Cpu: type) type {
             br.setRealVec(self.ids.get(.int12), 0x12);
             br.setRealVec(self.ids.get(.int13), 0x13);
             br.setRealVec(self.ids.get(.int15), 0x15);
-            br.setRealVec(self.ids.get(.int16), 0x16);
+            // INT 16h points at the HYBRID block (preamble + poll loop), NOT the
+            // bare int16 slot (Phase 1d): the preamble branches AH=00/10 into the
+            // guest-asm blocking poll loop and traps the int16 slot for every other
+            // AH. Like INT 09h, IVT[0x16] is guest-overridable (a guest may rewrite
+            // it via AH=25h) — the IVT is the single source of truth.
+            const h = Bridge.int16HybridSegOff();
+            self.cpu.bus.writePhys16(0x16 * 4, h.off);
+            self.cpu.bus.writePhys16(0x16 * 4 + 2, h.seg);
             br.setRealVec(self.ids.get(.int1a), 0x1A);
             br.setRealVec(self.ids.get(.int1c), 0x1C);
         }
