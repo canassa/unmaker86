@@ -340,6 +340,19 @@ pub fn build(b: *std.Build) void {
 
     const bios_unit = MachineTest.add(b, target, optimize, "src/bios/bios_test.zig", &dosbios_imports);
     const bios_int09 = MachineTest.add(b, target, optimize, "src/bios/int09_test.zig", &dosbios_imports);
+    // Input-injection determinism (Phase 1f) — uses the debug Controller for the
+    // real injection path, so it needs `debug` on top of the dosbios set.
+    const bios_input_det = MachineTest.add(b, target, optimize, "src/bios/input_determinism_test.zig", &.{
+        .{ .name = "cpu", .mod = cpu_mod },
+        .{ .name = "bus", .mod = bus_mod },
+        .{ .name = "devices", .mod = devices_mod },
+        .{ .name = "timing", .mod = timing_mod },
+        .{ .name = "bridge", .mod = bridge_mod },
+        .{ .name = "bios", .mod = bios_mod },
+        .{ .name = "dos", .mod = dos_mod },
+        .{ .name = "machine", .mod = machine_mod },
+        .{ .name = "debug", .mod = debug_mod },
+    });
     const bios_determinism = MachineTest.add(b, target, optimize, "src/bios/determinism_test.zig", &dosbios_imports);
     // Scancode set-1 tables (input Phase 1b): a pure leaf (std only), so it builds
     // as a standalone test artifact with its in-file translation-conformance tests.
@@ -355,6 +368,7 @@ pub fn build(b: *std.Build) void {
     bios_test_step.dependOn(&bridge_unit.step);
     bios_test_step.dependOn(&bios_unit.step);
     bios_test_step.dependOn(&bios_int09.step);
+    bios_test_step.dependOn(&bios_input_det.step);
     bios_test_step.dependOn(&bios_determinism.step);
     bios_test_step.dependOn(&run_bios_scancodes.step);
 
@@ -504,6 +518,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&bridge_rt.step);
     test_step.dependOn(&bios_unit.step);
     test_step.dependOn(&bios_int09.step);
+    test_step.dependOn(&bios_input_det.step);
     test_step.dependOn(&bios_determinism.step);
     test_step.dependOn(&run_bios_scancodes.step);
     test_step.dependOn(&dos_unit.step);

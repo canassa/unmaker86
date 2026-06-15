@@ -1354,7 +1354,7 @@ blocking loop) is deferred to after Phase 1·0** because it needs the new emitte
   table at the handler; route `POST /api/input/key` (`src/api/json_wire.zig`,
   `src/api/server.zig:262+`); `input_buffer_full` → **503** (the `breakpoint_table_full`
   idiom, `server.zig:654`).
-- [ ] **1f — determinism tests (polling path).** In-process same-sequence
+- [x] **1f — determinism tests (polling path).** In-process same-sequence
   byte-identity (inject + run-to-cycle byte-identical across two runs); 8042-FIFO-full
   error; black-box INT 16h read-back via the AH=01/02 host path; grep audit (the new
   `src/dos`/`src/bios` gates from Phase 0). *(The blocking-read round-trip moves to
