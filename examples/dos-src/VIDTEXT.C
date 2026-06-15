@@ -19,20 +19,16 @@
  *     int10_char.cpp:1216). zdos returns DX from the BDA cursor word and CX=0x0607
  *     (int10.zig AH=03), matching that boot shape.
  *
- * DETERMINISM BOUNDARY — AH=0E teletype cursor advance is NOT asserted. dosbox-x's
- * AH=0E (INT10_TeletypeOutput) writes the glyph to text VRAM and ADVANCES the
- * cursor (with line-wrap/scroll); zdos defers the VGA *text* subsystem entirely
- * (mode 13h graphics is the modeled video path; CON text flows through INT 21h),
- * so its AH=0E is a faithful no-op for the framebuffer and does NOT move the BDA
- * cursor (int10.zig AH=0E). Asserting the post-teletype cursor column would pin a
- * text-subsystem behavior zdos does not model — so we exercise AH=0E (proving it
- * neither errors nor corrupts the explicitly-set cursor) but assert only the
- * cursor value we SET via AH=02, mirroring the host-mtime exclusion discipline in
- * the DOS-phase bands. The teletype glyph output itself reaches the (uncaptured)
- * text screen, never OUT.TXT, so it does not affect the golden either way.
+ * AH=0E teletype is NOW MODELED (zdos models the B8000 text page + the INT 10h
+ * text services). dosbox-x's AH=0E (INT10_TeletypeOutput) writes the glyph to text
+ * VRAM and ADVANCES the cursor; zdos does the same (writeCharCell + cursor advance,
+ * int10.zig). So this program now ASSERTS the teletype result: it sets a known
+ * cursor, teletypes "Hi!", reads the three cells back via AH=08 (read char+attr at
+ * cursor) and prints them, and prints the advanced cursor column — all of which are
+ * deterministic guest-observable BDA + text-cell values, oracle-able on both.
  *
  * Only oracle-able values are printed (the mode triple, the cursor round-trips,
- * the shape word). No files are created.
+ * the shape word, the teletyped chars + advanced cursor). No files are created.
  */
 #include <stdio.h>
 #include <dos.h>
@@ -71,7 +67,8 @@ static void get_cursor(unsigned *row, unsigned *col, unsigned *shape)
     *shape = r.x.cx;
 }
 
-/* AH=0E teletype one char (page 0). Output goes to the text screen, not CON. */
+/* AH=0E teletype one char (page 0). Writes the glyph to the B800 text page and
+ * advances the cursor (zdos now models this). */
 static void teletype(unsigned char ch)
 {
     union REGS r;
@@ -80,6 +77,17 @@ static void teletype(unsigned char ch)
     r.h.bh = 0x00;          /* page 0 */
     r.h.bl = 0x07;          /* attribute (graphics modes only) */
     int86(0x10, &r, &r);
+}
+
+/* AH=08 read the character at cursor (page 0) -> the char byte (AL). */
+static unsigned char read_char_at(unsigned char row, unsigned char col)
+{
+    union REGS r;
+    set_cursor(row, col);
+    r.h.ah = 0x08;
+    r.h.bh = 0x00;          /* page 0 */
+    int86(0x10, &r, &r);
+    return r.h.al;
 }
 
 int main(void)
@@ -102,17 +110,20 @@ int main(void)
     printf("cur2 row=%u col=%u shape=%04X match=%d\n",
            row, col, shape, (row == 20 && col == 40) ? 1 : 0);
 
-    /* Exercise AH=0E teletype (a few chars). Its glyph output goes to the text
-     * screen (not CON), and its cursor advance is a deferred text-subsystem
-     * behavior NOT asserted here (see the boundary note in the header). We set a
-     * KNOWN cursor first, teletype, and re-read: zdos leaves the cursor where we
-     * set it (no text device); we therefore assert the SET value, not an advance. */
+    /* Teletype "Hi!" from a known cursor (2,0): the glyphs land in the B800 text
+     * page and the cursor advances by 3. Read the three cells back via AH=08 and
+     * print them, plus the advanced cursor — all deterministic, oracle-able. */
     set_cursor(2, 0);
     teletype('H');
     teletype('i');
     teletype('!');
     get_cursor(&row, &col, &shape);
-    printf("after_tty row=%u (col not asserted: deferred text-subsystem)\n", row);
+    {
+        unsigned char c0 = read_char_at(2, 0);
+        unsigned char c1 = read_char_at(2, 1);
+        unsigned char c2 = read_char_at(2, 2);
+        printf("after_tty row=%u col=%u cells=%c%c%c\n", row, col, c0, c1, c2);
+    }
 
     return 0;
 }

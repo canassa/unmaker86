@@ -375,6 +375,48 @@ test "INT 10h AH=13 write-string places a row; bit0=0 restores the entry cursor"
     try std.testing.expectEqual(@as(u16, (10 << 8) | 10), m.bus.readPhys16(0x400 + 0x50));
 }
 
+test "text-video DETERMINISM: same INT 10h sequence -> byte-identical text page (two fresh machines)" {
+    const alloc = std.testing.allocator;
+    // A fixed INT 10h text sequence: set mode 3 (clears page), set cursor, AH=13
+    // write-string "Hi", AH=09 write a char, teletype a CR/LF + char, scroll.
+    const prog = [_]u8{
+        0xB8, 0x03, 0x00, 0xCD, 0x10, // AH=00 mode 3 (clear to 0x0720)
+        0xB8, 0x00, 0x02, 0xBB, 0x00, 0x00, 0xBA, 0x05, 0x01, 0xCD, 0x10, // cursor (1,5)
+        0xB8, 0x21, 0x09, 0xBB, 0x4F, 0x00, 0xB9, 0x02, 0x00, 0xCD, 0x10, // AH=09 '!' attr 0x4F x2
+        0xB8, 0x41, 0x0E, 0xCD, 0x10, // teletype 'A'
+        0xB8, 0x0D, 0x0E, 0xCD, 0x10, // CR
+        0xB8, 0x0A, 0x0E, 0xCD, 0x10, // LF
+        0xB8, 0x42, 0x0E, 0xCD, 0x10, // teletype 'B'
+        // AH=06 scroll the top 3-row window up by 1 (fill attr 0x17).
+        0xB8, 0x01, 0x06, 0xBB, 0x00,
+        0x17, 0xB9, 0x00, 0x00, 0xBA,
+        0x00, 0x02, 0xCD, 0x10, 0xF4,
+    };
+
+    const m1 = try boot(alloc);
+    defer {
+        m1.deinit();
+        alloc.destroy(m1);
+    }
+    loadCode(m1, &prog);
+    run(m1);
+
+    const m2 = try boot(alloc);
+    defer {
+        m2.deinit();
+        alloc.destroy(m2);
+    }
+    loadCode(m2, &prog);
+    run(m2);
+
+    // The text page (color B8000) is byte-identical across the two fresh machines.
+    try std.testing.expectEqualSlices(u8, m1.vga.text_vram, m2.vga.text_vram);
+    try std.testing.expectEqualSlices(u8, m1.vga.text_vram_mono, m2.vga.text_vram_mono);
+    // And the BDA video state (mode/cols/rows/cursor) matches too.
+    try std.testing.expectEqual(m1.bus.readPhys16(0x400 + 0x50), m2.bus.readPhys16(0x400 + 0x50));
+    try std.testing.expectEqual(m1.bus.readPhys8(0x400 + 0x49), m2.bus.readPhys8(0x400 + 0x49));
+}
+
 test "no host-time / RNG / thread in the BIOS sources (grep, Phase 9)" {
     const sources = [_][]const u8{
         @embedFile("bios.zig"),

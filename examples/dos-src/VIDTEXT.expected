@@ -3,4 +3,4 @@ exit_code: 0
 mode=03 cols=80 page=0
 cur1 row=5 col=10 shape=0607 match=1
 cur2 row=20 col=40 shape=0607 match=1
-after_tty row=2 (col not asserted: deferred text-subsystem)
+after_tty row=2 col=3 cells=Hi!
