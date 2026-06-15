@@ -1343,7 +1343,7 @@ blocking loop) is deferred to after Phase 1·0** because it needs the new emitte
   `bios_keyboard.cpp:262-495` (`IRQ1_Handler`); spice86 `BiosKeyboardInt9Handler.cs:321`
   (`UpdateKeyboardFlagsByInterpretingScanCode`). Test: inject a scancode via 1a + raise
   IRQ1, step, assert the cooked word lands in the BDA ring and FLAGS1/2/3 update.
-- [ ] **1e — controller-level injection + API.** `Controller.injectScancode(code,
+- [x] **1e — controller-level injection + API.** `Controller.injectScancode(code,
   make, ext) bool` (false = 8042 FIFO full): push the make (or break = `code|0x80`,
   with the 0xE0 prefix when `ext`) into the 8042 and **`pic.raiseIrq(1)` DIRECTLY**
   (Model A, §4.1 DECISION — no scheduler/`EventKind` needed; the IRR set is timing-

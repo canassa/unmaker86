@@ -153,6 +153,7 @@ pub fn build(b: *std.Build) void {
     api_mod.addImport("debug", debug_mod);
     api_mod.addImport("cpu", cpu_mod);
     api_mod.addImport("machine", machine_mod);
+    api_mod.addImport("bios", bios_mod); // for the {"char"} scancode reverse map (§5.1e)
 
     // The headless runner frontend: loads a real-mode DOS program through the
     // emulated loader, runs it, and dumps its CON output. `zig build run -- prog`.
@@ -454,6 +455,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bus", .mod = bus_mod },
         .{ .name = "devices", .mod = devices_mod },
         .{ .name = "timing", .mod = timing_mod },
+        .{ .name = "bios", .mod = bios_mod }, // server.zig resolves {"char"} via scancodes
     };
     const api_tests = MachineTest.add(b, target, optimize, "src/api/api.zig", &api_imports);
     const api_test_step = b.step("test-api", "Run the HTTP/JSON API-server tests");

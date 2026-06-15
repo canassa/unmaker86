@@ -481,6 +481,28 @@ pub const Controller = struct {
         self.m.bus.writeGuestBlock(phys, src);
     }
 
+    /// Inject a keyboard scancode at the 8042 controller and raise IRQ1 directly
+    /// (Model A, input-injection.md §4.1). A debugger key injection is a deliberate
+    /// new INPUT (the "same binary + SAME INPUTS" category, like setReg/writeMem):
+    /// it mutates the 8042 output buffer at the current cycle-exact boundary, and
+    /// the guest INT 09h ISR delivers it on the NEXT `run`/`step`. Setting the PIC
+    /// IRR via `pushScancode` is timing-neutral (M-D6) — no scheduler entry, no
+    /// ledger hole; the ISR's cost is charged by the normal fetch/execute loop.
+    ///
+    /// `make` false pushes a key-up (break = `scancode|0x80`); `ext` true prepends
+    /// the 0xE0 extended prefix. Returns false if the 8042 output FIFO is full (the
+    /// caller surfaces `input_buffer_full`); never silently drops (ground rule).
+    pub fn injectScancode(self: *Controller, scancode: u8, make: bool, ext: bool) bool {
+        const code = if (make) scancode else scancode | 0x80;
+        if (ext) {
+            // The 0xE0 prefix + the code are two output-buffer bytes; require room
+            // for BOTH so a half-injected extended key never strands a lone prefix.
+            if (self.m.kbd.fifoFree() < 2) return false;
+            _ = self.m.kbd.pushScancode(0xE0);
+        }
+        return self.m.kbd.pushScancode(code);
+    }
+
     // -----------------------------------------------------------------------
     // Session reset (Phase 3, open question #5 resolved: included in M1).
     // -----------------------------------------------------------------------

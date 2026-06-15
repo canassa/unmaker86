@@ -67,6 +67,22 @@ pub const MemWriteSegReq = struct { seg: []const u8, off: u32, data: []const u8 
 pub const IvtReq = struct { vector: u8 };
 pub const StackReq = struct { count: u16 };
 
+/// `POST /api/input/key` — inject a keyboard key (input-injection.md §5.1e). Two
+/// request shapes (§5.1):
+///   - precise: `{"scancode": N, "make": true|false, "ext": false}` — push the raw
+///     set-1 scancode (make) or break (`code|0x80`), with the 0xE0 prefix when
+///     `ext`, then raise IRQ1.
+///   - convenience: `{"char": "a"}` — the handler resolves the char to its make
+///     scancode + shift requirement over the REAL set-1 table (scancodes.zig), not
+///     a fabricated map; a char with no single set-1 key is a `400`.
+/// At most one of `scancode`/`char` is given. `make` defaults true (key-down).
+pub const KeyReq = struct {
+    scancode: ?u8 = null,
+    make: bool = true,
+    ext: bool = false,
+    char: ?[]const u8 = null,
+};
+
 /// `PATCH /api/cpu/reg` — a single valid `std.json` tagged union (§B.4/G2). One
 /// key names which thing to set; its payload carries the target name + value. The
 /// `flags` arm is the SAME 13-bool object `cpuSnapshot` emits (symmetric read/write).

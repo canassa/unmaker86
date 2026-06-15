@@ -191,6 +191,69 @@ test "#9b clear_bp removes all and reports the count" {
     try std.testing.expectEqual(@as(u32, 0), drain(&c, .list_bp).bp_list.count);
 }
 
+test "input_key command injects a scancode at the 8042 and raises IRQ1 (Model A)" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    var c = Controller.init(m);
+
+    const r = drain(&c, .{ .input_key = .{ .scancode = 0x1E, .make = true, .ext = false, .press = false, .shift = false } });
+    try std.testing.expect(r == .ok);
+    // The make scancode is in the 8042 output buffer and IRQ1 (master IRR bit1) is set.
+    try std.testing.expectEqual(@as(u8, 0x1E), m.kbd.in8(0x60));
+    try std.testing.expectEqual(@as(u8, 0x02), m.pic.master.irr & 0x02);
+}
+
+test "input_key break edge encodes scancode|0x80" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    var c = Controller.init(m);
+    _ = drain(&c, .{ .input_key = .{ .scancode = 0x1E, .make = false, .ext = false, .press = false, .shift = false } });
+    try std.testing.expectEqual(@as(u8, 0x9E), m.kbd.in8(0x60)); // 0x1E | 0x80
+}
+
+test "input_key ext prepends the 0xE0 prefix" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    var c = Controller.init(m);
+    _ = drain(&c, .{ .input_key = .{ .scancode = 0x48, .make = true, .ext = true, .press = false, .shift = false } });
+    try std.testing.expectEqual(@as(u8, 0xE0), m.kbd.in8(0x60));
+    try std.testing.expectEqual(@as(u8, 0x48), m.kbd.in8(0x60));
+}
+
+test "input_key press+shift injects shift make, key make+break, shift break" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    var c = Controller.init(m);
+    // The {"char":"A"} convenience resolves to scancode 0x1E with shift.
+    _ = drain(&c, .{ .input_key = .{ .scancode = 0x1E, .make = true, .ext = false, .press = true, .shift = true } });
+    try std.testing.expectEqual(@as(u8, 0x2A), m.kbd.in8(0x60)); // LShift make
+    try std.testing.expectEqual(@as(u8, 0x1E), m.kbd.in8(0x60)); // 'a' make
+    try std.testing.expectEqual(@as(u8, 0x9E), m.kbd.in8(0x60)); // 'a' break
+    try std.testing.expectEqual(@as(u8, 0xAA), m.kbd.in8(0x60)); // LShift break
+}
+
+test "input_buffer_full when the 8042 output FIFO is full (no silent drop)" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    var c = Controller.init(m);
+    // Fill the FIFO with single-edge injects; some bytes drain as IRQ1 re-asserts
+    // are level-only (no reads here), so the FIFO fills and the next inject errors.
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const r = drain(&c, .{ .input_key = .{ .scancode = 0x1E, .make = true, .ext = false, .press = false, .shift = false } });
+        if (r == .err) {
+            try std.testing.expectEqual(q.ErrCode.input_buffer_full, r.err);
+            return; // got the full error -> pass
+        }
+    }
+    return error.ExpectedBufferFull;
+}
+
 test "#5 bounded/retained-capacity: the queue ring + scratch do zero allocations after init" {
     // The ring is a fixed [QUEUE_CAP]?*RequestCtx and each RequestCtx carries a
     // fixed scratch buffer — both pre-sized. Driving a burst of commands through

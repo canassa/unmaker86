@@ -13,6 +13,9 @@ const bridge_mod = @import("bridge");
 const bda_mod = @import("bda.zig");
 
 pub const Bda = bda_mod.Bda;
+/// Scancode set-1 + BIOS-keycode tables (input Phase 1b). Re-exported so the API
+/// layer can resolve the `{"char"}` convenience over the REAL table (§5.1e).
+pub const scancodes = @import("scancodes.zig");
 
 /// The set of BIOS INTs zdos services. Each maps to one callback id; the handler
 /// switches on AH (the IndexBasedDispatcher shape, D7).

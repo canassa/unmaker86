@@ -197,6 +197,11 @@ pub const Keyboard = struct {
         return self.fifo_count < FIFO_LEN;
     }
 
+    /// Free slots in the output FIFO (an extended key needs 2: prefix + code).
+    pub fn fifoFree(self: *const Keyboard) u8 {
+        return FIFO_LEN - self.fifo_count;
+    }
+
     // -----------------------------------------------------------------------
     // Port 0x60 (data) write — a device command OR a pending parameter byte.
     // -----------------------------------------------------------------------

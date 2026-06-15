@@ -106,6 +106,9 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource) Respons
         },
         .stack_get => |c| stackGet(ctrl, c.count),
 
+        // ---- input ---------------------------------------------------------
+        .input_key => |c| inputKey(ctrl, c),
+
         // ---- session -------------------------------------------------------
         .status => statusResp(ctrl),
         .reset => blk: {
@@ -117,6 +120,31 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource) Respons
 
         .shutdown_worker => .ok,
     };
+}
+
+/// Left-Shift make scancode (set-1) — used to bracket a shifted-char keystroke.
+const SC_LSHIFT: u8 = 0x2A;
+
+/// Inject a key at the 8042 + raise IRQ1 (Model A). A full output FIFO is a
+/// transient resource limit -> input_buffer_full (HTTP 503); never a silent drop
+/// (ground rule). For the `{"char"}` convenience (`press`), inject the full
+/// make+break (and a Shift bracket when `shift`) as one deterministic command.
+fn inputKey(ctrl: *Controller, c: anytype) Response {
+    if (!c.press) {
+        // A single precise edge.
+        if (ctrl.injectScancode(c.scancode, c.make, c.ext)) return .ok;
+        return .{ .err = .input_buffer_full };
+    }
+    // A full keystroke: shift-make? ; key-make ; key-break ; shift-break?
+    if (c.shift) {
+        if (!ctrl.injectScancode(SC_LSHIFT, true, false)) return .{ .err = .input_buffer_full };
+    }
+    if (!ctrl.injectScancode(c.scancode, true, c.ext)) return .{ .err = .input_buffer_full };
+    if (!ctrl.injectScancode(c.scancode, false, c.ext)) return .{ .err = .input_buffer_full };
+    if (c.shift) {
+        if (!ctrl.injectScancode(SC_LSHIFT, false, false)) return .{ .err = .input_buffer_full };
+    }
+    return .ok;
 }
 
 fn errResp(e: debug.Error) Response {

@@ -85,6 +85,17 @@ pub const Command = union(enum) {
     mem_write_seg: struct { seg: Seg, off: u32, len: u32 },
     ivt_get: struct { vector: u8 },
     stack_get: struct { count: u16 },
+    /// Inject a keyboard scancode at the 8042 controller + raise IRQ1 (Model A,
+    /// input-injection.md §4.1). Pointer-free POD: the `char`→scancode(s)
+    /// resolution over the real set-1 table is done at the HANDLER, so the queue
+    /// carries only the resolved make scancode + flags.
+    ///   - precise edge: `press=false` injects a single edge — `make` true = key-
+    ///     down (raw code), false = key-up (break = code|0x80); `ext` = 0xE0 prefix.
+    ///   - full keystroke: `press=true` (the `{"char"}` convenience) injects the
+    ///     make THEN the break as one deterministic command; `shift` brackets it
+    ///     with a left-Shift make/break (the resolved "scancode(s)" of a shifted
+    ///     char). All edges go through the controller in one worker step.
+    input_key: struct { scancode: u8, make: bool, ext: bool, press: bool, shift: bool },
     status: void,
     reset: void,
     load: LoadCmd,
@@ -131,6 +142,10 @@ pub const ErrCode = enum {
     bad_request,
     not_implemented,
     load_failed,
+    /// The 8042 output FIFO is full — a transient resource limit (input-injection.md
+    /// §5.1b). Surfaced as HTTP 503 (the `breakpoint_table_full` idiom); the client
+    /// can `run` to let the INT 09h ISR drain the controller, then retry.
+    input_buffer_full,
 };
 
 pub const MemResult = struct {

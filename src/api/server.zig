@@ -31,6 +31,7 @@ const cpu_mod = @import("cpu");
 const q = @import("queue.zig");
 const worker_mod = @import("worker.zig");
 const wire = @import("json_wire.zig");
+const scancodes = @import("bios").scancodes;
 
 const Io = std.Io;
 const http = std.http;
@@ -366,6 +367,12 @@ pub const Server = struct {
             return self.handleStack(req, query);
         }
 
+        // --- input injection ---
+        if (std.mem.eql(u8, path, "/api/input/key")) {
+            if (method != .POST) return self.methodNotAllowed(req);
+            return self.handleInputKey(req, body, is_json);
+        }
+
         // --- deferred, honestly reported ---
         if (std.mem.eql(u8, path, "/api/disasm")) {
             return self.respondError(req, .not_implemented, "not_implemented", "disassembly is deferred to a later milestone");
@@ -420,6 +427,42 @@ pub const Server = struct {
         if (!self.requireJson(req, is_json, body)) return;
         const r = self.parseBody(wire.StepNReq, body) orelse return self.badJson(req);
         self.submitAndRespond(req, .{ .step_n = .{ .n = r.n } });
+    }
+
+    fn handleInputKey(self: *Server, req: *http.Server.Request, body: []const u8, is_json: bool) void {
+        if (!self.requireJson(req, is_json, body)) return;
+        const r = self.parseBody(wire.KeyReq, body) orelse return self.badJson(req);
+        // Exactly one of scancode / char (§5.1).
+        if (r.scancode != null and r.char != null) {
+            return self.respondError(req, .bad_request, "bad_request", "give either scancode or char, not both");
+        }
+        if (r.scancode) |sc| {
+            // Precise path: a single raw scancode edge.
+            return self.submitAndRespond(req, .{ .input_key = .{
+                .scancode = sc,
+                .make = r.make,
+                .ext = r.ext,
+                .press = false,
+                .shift = false,
+            } });
+        }
+        if (r.char) |ch| {
+            if (ch.len != 1) {
+                return self.respondError(req, .bad_request, "bad_request", "char must be a single ASCII character");
+            }
+            // Resolve over the REAL set-1 table (not a fabricated map). A char with
+            // no single set-1 key is a 400 (documented, §5.1) — never invented.
+            const res = scancodes.resolveChar(ch[0]) orelse
+                return self.respondError(req, .bad_request, "bad_request", "no single set-1 scancode for that char");
+            return self.submitAndRespond(req, .{ .input_key = .{
+                .scancode = res.scancode,
+                .make = true,
+                .ext = false,
+                .press = true,
+                .shift = res.shift,
+            } });
+        }
+        self.respondError(req, .bad_request, "bad_request", "provide scancode or char");
     }
 
     fn handleAddBp(self: *Server, req: *http.Server.Request, body: []const u8, is_json: bool) void {
@@ -658,6 +701,10 @@ pub const Server = struct {
             .bad_request => .{ .bad_request, "bad_request", "malformed request" },
             .not_implemented => .{ .not_implemented, "not_implemented", "operation not implemented" },
             .load_failed => .{ .service_unavailable, "load_failed", "failed to load the program" },
+            // A full 8042 output FIFO is a transient resource limit -> 503 (the
+            // breakpoint_table_full idiom, input-injection.md §5.1b); `run` to drain
+            // the controller via INT 09h, then retry.
+            .input_buffer_full => .{ .service_unavailable, "input_buffer_full", "the 8042 keyboard output buffer is full" },
         };
         self.respondError(req, status, code_str, msg);
     }
