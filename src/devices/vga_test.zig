@@ -138,6 +138,39 @@ test "0x3DA unwired cycle source reads as the deterministic cycle-0 status (no U
     try std.testing.expectEqual(@as(u8, 0x04), v.in8(0x3DA));
 }
 
+test "0x3DA read resets the attribute-controller flip-flop to index phase (D-RT3)" {
+    const alloc = std.testing.allocator;
+    const v = try makeVga(alloc);
+    defer freeVga(alloc, v);
+    var cycles: u64 = 0;
+    v.cycles = &cycles;
+
+    v.attr_flip_flop_is_index = false; // pretend a 0x3C0 access left it in data phase
+    _ = v.in8(0x3DA);
+    try std.testing.expect(v.attr_flip_flop_is_index); // reset to index phase
+
+    // 0x3BA (mono alias) does the same.
+    v.attr_flip_flop_is_index = false;
+    _ = v.in8(0x3BA);
+    try std.testing.expect(v.attr_flip_flop_is_index);
+}
+
+test "attr flip-flop is power-on index, reset-stable, and snapshot round-trips" {
+    const alloc = std.testing.allocator;
+    const v = try makeVga(alloc);
+    defer freeVga(alloc, v);
+
+    try std.testing.expect(v.attr_flip_flop_is_index); // power-on index phase
+    v.attr_flip_flop_is_index = false;
+    const snap = v.snapshot();
+
+    v.reset();
+    try std.testing.expect(v.attr_flip_flop_is_index); // reset -> index phase
+
+    v.restore(snap);
+    try std.testing.expect(!v.attr_flip_flop_is_index); // restored data phase
+}
+
 test "DAC: write a single entry via 0x3C8 + three 0x3C9, read it back via 0x3C7" {
     const alloc = std.testing.allocator;
     const v = try makeVga(alloc);

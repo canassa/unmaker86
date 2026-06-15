@@ -151,6 +151,17 @@ pub const Vga = struct {
     /// snapshotted (a host pointer; re-bound by the machine, like the PIT/speaker).
     cycles: ?*const u64 = null,
 
+    /// Attribute-controller (port 0x3C0) address/data flip-flop, in the *index*
+    /// (address) phase when `true` (D-RT3). Reading 0x3DA/0x3BA resets it to the
+    /// index phase — a real, deterministic, guest-visible side effect (both refs do
+    /// it: dosbox `vga.attr.is_address_mode = true` vga_misc.cpp:24; spice86
+    /// `_attributeDataMode = false`). Programs read 0x3DA precisely to guarantee the
+    /// next 0x3C0 write is an index, not data. Power-on index phase => default true.
+    /// Snapshotted (guest-visible, mutated by the read). The full 0x3C0 address/data
+    /// state machine is NOT modeled until a guest needs it; this field is exactly the
+    /// latch it will require — no rework (D-RT3).
+    attr_flip_flop_is_index: bool = true,
+
     /// Allocate the fixed VRAM block. Must be called once before `wire`.
     pub fn init(self: *Vga, allocator: std.mem.Allocator) !void {
         const vram = try allocator.alloc(u8, VRAM_SIZE);
@@ -175,6 +186,7 @@ pub const Vga = struct {
         self.dac_tmp = .{ 0, 0, 0 };
         self.pel_mask = 0xFF;
         self.misc_output = 0;
+        self.attr_flip_flop_is_index = true; // power-on index phase (D-RT3)
     }
 
     /// Clear only the VRAM (the BIOS mode-set memory-clear — FinishSetMode's
@@ -341,6 +353,10 @@ pub const Vga = struct {
     ///   bit 3 = vertical retrace (1 = in v-retrace)
     /// Bits 1, 4-7 read 0 (light-pen obsolete on VGA; reserved bits low).
     fn statusReg1(self: *Vga) u8 {
+        // Documented read side effect: reset the attribute-controller (0x3C0)
+        // flip-flop to the index/address phase (D-RT3, §3.4). Idempotent at true.
+        self.attr_flip_flop_is_index = true;
+
         const now = self.cyclesNow();
         const into_frame = now % FRAME_CYCLES; // 0 .. FRAME_CYCLES-1 (anchored at cycle 0)
         const scanline = into_frame / LINE_CYCLES; // 0 .. 449 (449 is harmless, see §3.2)
@@ -384,6 +400,14 @@ pub const Vga = struct {
             0x3C7 => self.write3c7(v),
             0x3C8 => self.write3c8(v),
             0x3C9 => self.write3c9(v),
+            // Attribute-controller write (0x3C0): NOT MODELED. This is a LOUD flag,
+            // never a silent no-op (D-RT3 / CLAUDE assert-don't-fake — mirrors the
+            // PIT's BCD-bit assert, src/devices/pit.zig:260). The full 0x3C0
+            // address/data state machine (palette/mode/overscan registers, toggling
+            // `attr_flip_flop_is_index`) is deferred: BaK/oracle let the BIOS program
+            // the palette via INT 10h, not raw 0x3C0. If a guest actually drives
+            // 0x3C0, build the AC state machine — do not silently drop the write.
+            0x3C0 => std.debug.assert(false), // VGA attribute controller (0x3C0) not modeled
             else => {},
         }
     }
@@ -410,6 +434,7 @@ pub const Vga = struct {
         dac_tmp: [3]u8,
         pel_mask: u8,
         misc_output: u8,
+        attr_flip_flop_is_index: bool,
     };
 
     pub fn snapshot(self: *const Vga) Snapshot {
@@ -422,6 +447,7 @@ pub const Vga = struct {
             .dac_tmp = self.dac_tmp,
             .pel_mask = self.pel_mask,
             .misc_output = self.misc_output,
+            .attr_flip_flop_is_index = self.attr_flip_flop_is_index,
         };
     }
     pub fn restore(self: *Vga, snap: Snapshot) void {
@@ -433,5 +459,6 @@ pub const Vga = struct {
         self.dac_tmp = snap.dac_tmp;
         self.pel_mask = snap.pel_mask;
         self.misc_output = snap.misc_output;
+        self.attr_flip_flop_is_index = snap.attr_flip_flop_is_index;
     }
 };
