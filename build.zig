@@ -442,6 +442,26 @@ pub fn build(b: *std.Build) void {
     const api_integration_step = b.step("test-api-integration", "Run the real-socket API integration test (opt-in)");
     api_integration_step.dependOn(&api_integration.step);
 
+    // ---- Black-box API tests (test-blackbox) ----
+    // A TRUE black box: each test SPAWNS the built `./zig-out/bin/zdos --serve 0`
+    // child and drives it over a real localhost socket via `std.http.Client`. It
+    // imports only `api` (for the wire request structs) + `debug` (for the
+    // `CpuSnapshot`/`BreakpointKind` types it parses into) so a wire-format change
+    // fails to COMPILE here — but it touches NO emulator internals at runtime.
+    // Because it uses real sockets + child processes it gets its OWN step, NOT folded
+    // into the default `test` aggregate (mirrors `test-api-integration`), so the
+    // default gate stays hermetic. It depends on the installed exe (it execs the
+    // binary), so `zig build test-blackbox` builds + installs the binary first.
+    const blackbox_imports = [_]Imp{
+        .{ .name = "api", .mod = api_mod },
+        .{ .name = "debug", .mod = debug_mod },
+        .{ .name = "cpu", .mod = cpu_mod },
+    };
+    const blackbox = MachineTest.add(b, target, optimize, "tests/blackbox/blackbox_test.zig", &blackbox_imports);
+    blackbox.step.dependOn(b.getInstallStep()); // build + install ./zig-out/bin/zdos first
+    const blackbox_step = b.step("test-blackbox", "Run the black-box HTTP-API tests (spawns the real server)");
+    blackbox_step.dependOn(&blackbox.step);
+
     // Top-level test step aggregates the CPU + bus + machine tests.
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_cpu_tests.step);
