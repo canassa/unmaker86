@@ -233,6 +233,17 @@ pub const Machine = struct {
         self.bios.init(&self.cpu);
         self.dos.init(&self.cpu);
         self.svc.wire(&self.cpu, &self.bios, &self.dos); // also sets cpu.cb = &svc
+        // (e1) The EMS page-frame MMIO window (D15/B8) — FIXED power-on hardware like
+        //      VRAM, so it is mapped here at WIRE time (after `dos.init` set up
+        //      `self.dos.ems`), NOT in `post()`. Rationale: mapping it in `post()`
+        //      made `post()` non-re-runnable after a `reset()` — `reset()` re-zeroes
+        //      the EMS device state but does NOT release the bus MMIO claim, so a
+        //      second `post()` tripped `mapMmio`'s "page already claimed" assert (and
+        //      leaked a bus mem-handler each call). The handler ctx (`&self.dos.ems`)
+        //      is pinned, so the mapping survives a reset's `dos.init` re-init. This
+        //      makes `post()` cleanly re-runnable — what the `--serve` reset→load path
+        //      needs to reproduce a fresh launch byte-identically.
+        _ = self.bus.mapMmio(dos_mod.ems_frame_phys, dos_mod.ems_frame_len, self.dos.ems.memHandler());
         // Inject the machine's one-step primitive for the bridge's re-entrancy
         // (D3): runGuestInt drives `stepOnceThunk` (fireDue + cpu.step + HLT FF).
         self.svc.bridge.setStepper(self, stepOnceThunk);
@@ -282,8 +293,9 @@ pub const Machine = struct {
         // DOS memory; place the first MCB at segment 0x0800 (32 KiB) and let it run
         // up to 0x9000 (just below the UMA), ~0x8800 paragraphs.
         self.dos.dosInit(br, 0x0800, 0x8800);
-        // Register the EMS MMIO page-frame device on the bus (D15/B8).
-        _ = self.bus.mapMmio(dos_mod.ems_frame_phys, dos_mod.ems_frame_len, self.dos.ems.memHandler());
+        // NOTE: the EMS page-frame MMIO window is mapped in `wire()` (fixed power-on
+        // hardware, like VRAM), NOT here — so `post()` stays re-runnable after a
+        // `reset()` (the `--serve` reset→load path re-runs `post()`). See `wire` (e1).
     }
 
     /// Load a program from a mounted drive and start it (the v1 boot path). The
@@ -291,6 +303,25 @@ pub const Machine = struct {
     /// initial process, then runs.
     pub fn bootProgram(self: *Machine, drive: u8, host_name: []const u8, cmdtail: []const u8) !void {
         _ = try Dos.LoaderType.loadProgram(&self.dos, &self.cpu, drive, host_name, cmdtail, .load_and_run);
+    }
+
+    /// The complete deterministic fresh-launch boot sequence, factored out so the
+    /// `--serve` initial launch AND a `POST /api/load` (after a `POST /api/reset`)
+    /// drive the EXACT same path → byte-identical state. It runs the BIOS POST + DOS
+    /// init (`post`), (re)mounts the host directory as the DOS drive, selects it, and
+    /// loads+starts the program. This is required because `reset()` re-zeroes RAM and
+    /// re-runs `bios.init`/`dos.init` (the latter wipes the mounted drives via
+    /// `dos.init`'s `drives = @splat(null)`) but does NOT re-run `post()` — so after a
+    /// reset the machine has no callbacks planted, no DOS arena/IVT, and no mount.
+    /// Calling `boot` re-establishes all of it. PRECONDITION: the machine is at the
+    /// post-`wire`/post-`reset` state (RAM zeroed, bridge allocator fresh) — `post`'s
+    /// `registerCallbacks` allocates ids from a fresh bridge, which `reset`/`wire`
+    /// guarantee. Mirrors what `main.zig` did inline before this method existed.
+    pub fn boot(self: *Machine, drive: u8, dir: std.Io.Dir, io: std.Io, host_name: []const u8, cmdtail: []const u8) !void {
+        self.post();
+        self.dos.mountDrive(drive, dir, io);
+        self.dos.current_drive = drive;
+        try self.bootProgram(drive, host_name, cmdtail);
     }
 
     /// Debug-only self-check (M-D1): trips LOUDLY if the machine moved after wire.

@@ -35,6 +35,7 @@ pub const wire = json_wire;
 // ---- the worker drain loop (Phase 3) ----
 pub const drainOne = worker.drainOne;
 pub const Worker = worker.Worker;
+pub const MountSource = worker.MountSource;
 
 // ---- the HTTP server (Phase 4) ----
 pub const Server = server.Server;

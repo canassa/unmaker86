@@ -88,6 +88,10 @@ pub const Server = struct {
     ctrl: *Controller,
     port: u16,
     recipe: LoadRecipe,
+    /// The host directory mounted as the DOS drive (`recipe.drive`). Held so the
+    /// worker can RE-mount it on `POST /api/load` — `reset()` wipes the mount via
+    /// `dos.init` (G16 / the reset→load bug). Re-mount runs on the worker thread.
+    mount_dir: Io.Dir,
 
     queue: q.CommandQueue,
     worker_thread: ?std.Thread = null,
@@ -99,13 +103,14 @@ pub const Server = struct {
     body_buf: [MAX_BODY]u8 = undefined,
     read_scratch: [MAX_BODY]u8 = undefined,
 
-    pub fn init(gpa: std.mem.Allocator, io: Io, ctrl: *Controller, port: u16, recipe: LoadRecipe) Server {
+    pub fn init(gpa: std.mem.Allocator, io: Io, ctrl: *Controller, port: u16, recipe: LoadRecipe, mount_dir: Io.Dir) Server {
         return .{
             .gpa = gpa,
             .io = io,
             .ctrl = ctrl,
             .port = port,
             .recipe = recipe,
+            .mount_dir = mount_dir,
             .queue = q.CommandQueue.init(io),
             .arena = std.heap.ArenaAllocator.init(gpa),
         };
@@ -115,16 +120,38 @@ pub const Server = struct {
         self.arena.deinit();
     }
 
-    /// Bind, spawn the worker, and run the accept loop until shutdown. The worker
-    /// (sole owner of `ctrl`) drains the queue; the listener (this thread) does all
-    /// socket/HTTP/JSON work.
+    /// Bind, spawn the worker, and run the accept loop until shutdown (= `bind` then
+    /// `serve`). The worker (sole owner of `ctrl`) drains the queue; the listener
+    /// (this thread) does all socket/HTTP/JSON work.
     pub fn run(self: *Server) !void {
-        const w: worker_mod.Worker = .{ .queue = &self.queue, .ctrl = self.ctrl };
+        try self.bind();
+        try self.serve();
+    }
+
+    /// Spawn the worker and bind the listening socket. After this, `boundPort()`
+    /// returns the OS-assigned port — which is the request's `port` unless it was 0
+    /// (ephemeral), in which case `listen` resolves it via `getsockname` and stores
+    /// it in `Socket.address` (`Io/net.zig:1054`, filled by `netListenIpPosix`'s
+    /// `getsockname`, `Io/Threaded.zig:11828`). Split out of `run` so a caller (the
+    /// `--serve 0` path) can PRINT the resolved port BEFORE the blocking accept loop.
+    pub fn bind(self: *Server) !void {
+        const w: worker_mod.Worker = .{ .queue = &self.queue, .ctrl = self.ctrl, .mount_dir = self.mount_dir, .io = self.io };
         self.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
 
         const addr: net.IpAddress = .{ .ip4 = .loopback(self.port) };
         self.net_server = try addr.listen(self.io, .{ .reuse_address = true });
+        // Record the resolved (possibly ephemeral) port for `boundPort()`.
+        self.port = self.net_server.?.socket.address.getPort();
+    }
 
+    /// The OS-assigned listening port. Valid only AFTER `bind`/`run` has listened
+    /// (for `--serve 0` it is the ephemeral port `getsockname` resolved).
+    pub fn boundPort(self: *const Server) u16 {
+        return self.port;
+    }
+
+    /// Run the accept loop until shutdown. `bind` MUST have been called first.
+    pub fn serve(self: *Server) !void {
         while (true) {
             var stream = self.net_server.?.accept(self.io) catch |err| switch (err) {
                 error.SocketNotListening => break, // clean shutdown signaled

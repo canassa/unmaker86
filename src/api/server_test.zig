@@ -59,7 +59,7 @@ const TestServer = struct {
         const io = threaded.io();
         const m = try makeMachine(alloc);
         const srv = try alloc.create(Server);
-        srv.* = Server.init(alloc, io, undefined, 0, server_mod.LoadRecipe.init(2, "PROG.COM", ""));
+        srv.* = Server.init(alloc, io, undefined, 0, server_mod.LoadRecipe.init(2, "PROG.COM", ""), std.Io.Dir.cwd());
         // The Controller lives inline in the returned struct; `start()` binds
         // `srv.ctrl` to its FINAL address (after the caller stores the struct), so
         // the worker thread sees the stable Controller.

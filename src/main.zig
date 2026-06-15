@@ -116,12 +116,12 @@ pub fn main(init: std.process.Init) !void {
     }
     try m.init(gpa, &.{}); // empty BIOS image -> POST stand-in
     m.wire();
-    m.post();
-    m.dos.mountDrive(2, dir, io); // C:
-    m.dos.current_drive = 2;
 
     // ---- load + run ----------------------------------------------------------
-    m.bootProgram(2, file_name, cmdtail) catch |err| {
+    // The full fresh-launch boot sequence (post + mount C: + bootProgram). The
+    // `--serve` path re-uses the SAME `Machine.boot` on `POST /api/load` after a
+    // `POST /api/reset`, so reset→load→run reproduces this launch byte-identically.
+    m.boot(2, dir, io, file_name, cmdtail) catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "zdos: cannot load '{s}': {t}\n", .{ file_name, err }) catch "zdos: cannot load program\n";
         try stderr.writeStreamingAll(io, msg);
@@ -137,14 +137,29 @@ pub fn main(init: std.process.Init) !void {
         // sole owner of the Controller; the listener never touches the machine.
         var ctrl = Controller.init(m);
         const recipe = api_mod.LoadRecipe.init(2, file_name, cmdtail);
-        var server = api_mod.Server.init(gpa, io, &ctrl, port, recipe);
+        // The server holds the host mount `dir` (+ `io`) so a `POST /api/load` after
+        // a `POST /api/reset` can re-establish the C: mount and re-run the full boot
+        // (reset wipes the mount via `dos.init`). Re-mount happens server-side on the
+        // worker thread (the sole owner of machine state) — see worker.zig loadResp.
+        var server = api_mod.Server.init(gpa, io, &ctrl, port, recipe, dir);
         defer server.deinit();
 
+        // Bind first so we can print the OS-RESOLVED port (when `--serve 0` was
+        // given, the kernel picks an ephemeral port). The banner line is in a
+        // STABLE, parseable format the black-box test harness greps for to learn
+        // which port to connect to: `\n[zdos] listening 127.0.0.1:<PORT>\n`.
+        server.bind() catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "zdos: --serve bind failed: {t}\n", .{err}) catch "zdos: --serve bind failed\n";
+            try stderr.writeStreamingAll(io, msg);
+            std.process.exit(1);
+        };
+
         var sbuf: [96]u8 = undefined;
-        const banner = std.fmt.bufPrint(&sbuf, "[zdos] serving debugger API on 127.0.0.1:{d}\n", .{port}) catch "[zdos] serving debugger API\n";
+        const banner = std.fmt.bufPrint(&sbuf, "\n[zdos] listening 127.0.0.1:{d}\n", .{server.boundPort()}) catch "\n[zdos] listening\n";
         try stderr.writeStreamingAll(io, banner);
 
-        server.run() catch |err| {
+        server.serve() catch |err| {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "zdos: --serve failed: {t}\n", .{err}) catch "zdos: --serve failed\n";
             try stderr.writeStreamingAll(io, msg);

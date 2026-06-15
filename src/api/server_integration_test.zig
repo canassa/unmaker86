@@ -52,7 +52,8 @@ test "real socket: GET /api/status returns valid JSON" {
     loadNopProg(m);
     var ctrl = Controller.init(m);
 
-    var srv = Server.init(alloc, io, &ctrl, PORT, server_mod.LoadRecipe.init(2, "PROG.COM", ""));
+    // This test never drives `POST /api/load`; pass cwd as the (unused) mount dir.
+    var srv = Server.init(alloc, io, &ctrl, PORT, server_mod.LoadRecipe.init(2, "PROG.COM", ""), std.Io.Dir.cwd());
     defer srv.deinit();
 
     const listener = try std.Thread.spawn(.{}, runServer, .{&srv});

@@ -24,6 +24,17 @@ const Command = q.Command;
 const Response = q.Response;
 const RequestCtx = q.RequestCtx;
 const ErrCode = q.ErrCode;
+const Io = std.Io;
+
+/// The host mount source for `POST /api/load` re-mounts. Held by the server (set at
+/// `--serve` startup, never changed), passed to the worker, and used ONLY when
+/// servicing a `load` command. `dir` is the host directory mounted as the DOS drive;
+/// `io` is needed by `mountDrive`. When `dir` is null (in-process tests that never
+/// drive `load`) a `load` command fails with `load_failed` rather than faking a mount.
+pub const MountSource = struct {
+    dir: ?Io.Dir = null,
+    io: ?Io = null,
+};
 
 /// The addressable guest RAM slab size — the bound for memory containment checks
 /// (§B.5/G3). The bus is host-OOB-safe regardless; this returns a clean
@@ -48,7 +59,7 @@ fn inSlab(ctrl: *const Controller, start: u32, len: u32) bool {
 /// Dispatch exactly one command to one `Controller` method. Pure mapping; the only
 /// state it touches is via `ctrl` (the worker owns it) and `ctx.scratch` (the
 /// mem_write bytes, copied in by the handler before submit).
-pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx) Response {
+pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource) Response {
     return switch (ctx.cmd) {
         // ---- run / step ----------------------------------------------------
         .run => |c| .{ .stop = ctrl.runUntilEvent(c.cycle_cap) },
@@ -101,7 +112,7 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx) Response {
             ctrl.reset() catch return .{ .err = .load_failed };
             break :blk .ok;
         },
-        .load => |c| loadResp(ctrl, c),
+        .load => |c| loadResp(ctrl, c, mount),
         .mem_regions => regionsResp(ctrl),
 
         .shutdown_worker => .ok,
@@ -236,15 +247,23 @@ fn regionsResp(ctrl: *Controller) Response {
 }
 
 /// Re-apply the server-held load recipe (drive/file/cmdtail carried in the
-/// command) via `Machine.bootProgram` — the only way to get a runnable machine
-/// after `reset()` (§B.1/G16). NOT a controller change: the server re-drives
-/// `bootProgram` exactly as `main.zig` does.
-fn loadResp(ctrl: *Controller, c: q.LoadCmd) Response {
-    ctrl.m.bootProgram(c.drive, c.file[0..c.file_len], c.cmdtail[0..c.cmdtail_len]) catch
+/// command) via `Machine.boot` — the only way to get a runnable machine after
+/// `reset()` (§B.1/G16). NOT a controller change: the server re-drives the EXACT
+/// fresh-launch boot sequence `main.zig` uses (`Machine.boot` = post + mount +
+/// bootProgram), so `reset → load {} → run` reaches byte-identical state vs. a
+/// fresh launch. The re-MOUNT is the bug fix: `reset()` wipes the drive table via
+/// `dos.init` (`drives = @splat(null)`); `bootProgram` alone would then fail to find
+/// the file because drive C: is no longer mounted. `boot` re-establishes the mount
+/// (host `dir` + `io` from the server-held `MountSource`) before loading.
+fn loadResp(ctrl: *Controller, c: q.LoadCmd, mount: MountSource) Response {
+    // The mount source MUST be present to re-establish the drive (no fake mount).
+    const dir = mount.dir orelse return .{ .err = .load_failed };
+    const io = mount.io orelse return .{ .err = .load_failed };
+    ctrl.m.boot(c.drive, dir, io, c.file[0..c.file_len], c.cmdtail[0..c.cmdtail_len]) catch
         return .{ .err = .load_failed };
     // A fresh load invalidates any prior stop; mirror reset's clear so status is
-    // coherent. (bootProgram does not own last_stop; clearing it is the server's
-    // job — done here on the worker, the sole owner of controller state.)
+    // coherent. (boot does not own last_stop; clearing it is the server's job —
+    // done here on the worker, the sole owner of controller state.)
     ctrl.last_stop = null;
     return .ok;
 }
@@ -257,15 +276,19 @@ fn loadResp(ctrl: *Controller, c: q.LoadCmd) Response {
 pub const Worker = struct {
     queue: *q.CommandQueue,
     ctrl: *Controller,
+    /// The host mount source for `load` re-mounts (set by the server at startup).
+    mount_dir: ?Io.Dir = null,
+    io: ?Io = null,
 
     pub fn run(self: Worker) void {
+        const mount: MountSource = .{ .dir = self.mount_dir, .io = self.io };
         while (true) {
             const ctx = self.queue.waitDequeue();
             if (ctx.cmd == .shutdown_worker) {
                 self.queue.complete(ctx, .ok);
                 return;
             }
-            const resp = drainOne(self.ctrl, ctx);
+            const resp = drainOne(self.ctrl, ctx, mount);
             self.queue.complete(ctx, resp);
         }
     }
