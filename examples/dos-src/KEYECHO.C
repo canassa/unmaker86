@@ -12,17 +12,21 @@
  * INT 21h AH=02 (direct console output, DL=char). The bytes land in the CON capture
  * buffer the debugger exposes at GET /api/console.
  *
- *   IMPORTANT — why bdos(2,...) and NOT putch(): Borland's conio putch() in text
- *   mode writes DIRECTLY to video RAM and busy-waits on the VGA vertical-retrace
- *   bit at port 0x3DA before each write (to avoid CGA snow). zdos deliberately does
- *   NOT model 0x3DA retrace timing (it is emulated-time-derived and is excluded
- *   from the cross-emulator goldens; see src/devices/vga.zig and io-oracle.md
- *   §1.5), so an unmapped 0x3DA read returns the constant floating-bus 0xFF and
- *   putch()'s "wait for retrace" loop spins forever. putch() output would also
- *   never reach the CON buffer (it bypasses DOS). bdos(2,...) goes straight through
- *   INT 21h to the CON device, so it both terminates and is observable. This is the
- *   one place the task brief's "putch -> INT 21h CON" premise did not hold for the
- *   BCC runtime; the DOS call achieves the same intent faithfully.
+ *   IMPORTANT — why bdos(2,...) and NOT putch(): zdos DOES now model the VGA Input
+ *   Status Register #1 (port 0x3DA, cycle-derived vertical-retrace/display-enable —
+ *   see src/devices/vga.zig statusReg1 / plans/vga-retrace.md), so Borland conio
+ *   putch() NO LONGER hangs: a build using real putch() runs end-to-end, blocks on
+ *   bioskey, unblocks on an injected key, and terminates cleanly on ESC (ret 0) —
+ *   confirmed by tracing. HOWEVER, this BCC-3.1 putch() emits the echoed character
+ *   by reading/advancing the cursor via INT 10h (AH=03/AH=02) and then writing the
+ *   character byte DIRECTLY to text-mode video RAM at B800:0000 — it does NOT use
+ *   INT 21h, nor INT 10h AH=0Eh teletype. zdos models mode-13h graphics VRAM (A000)
+ *   but NOT the text-mode video page (B8000) and exposes only the DOS CON device at
+ *   GET /api/console, so a real-putch() echo is UNOBSERVABLE (the byte lands in
+ *   unmodeled B800 memory and is lost). Making putch echo observable needs a VGA
+ *   text-device + console mirror — a separate, larger feature, flagged not faked.
+ *   So this fixture keeps bdos(2,...): it goes straight through INT 21h to the CON
+ *   device, so the echo both terminates AND is observable by the black-box harness.
  *
  * ESC (ASCII 27): print a '!' marker and return 0, so the program exits cleanly via
  * the DOS terminate path (INT 21h AH=4C, return code 0).
