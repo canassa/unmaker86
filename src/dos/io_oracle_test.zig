@@ -42,6 +42,13 @@ const VGA_PASSING = [_]Program{
     // pixel across a span, AH=0D read pixel back, AH=10 AL=12 block DAC set, AH=0F
     // get mode — so the BIOS pixel/block-DAC paths AND the device are both proven.
     .{ .exe = "VGABIOS.EXE" },
+    // Band V2: DAC palette / FADE fidelity. Program the whole 256-entry palette via
+    // INT 10h AH=10 AL=12, run a BaK-style multi-step fade-to-black (rewriting the
+    // entire palette each step), then exercise the raw OUT 0x3C8/0x3C9 path + AL=10
+    // single + the 6-bit boundary (write > 63), and read the final palette back BOTH
+    // ways (AL=17 get-block AND raw 0x3C7/0x3C9). Proves 6-bit masking, write/read
+    // index auto-advance, block set/get, and index-latch read-backs (the "VGA2" blob).
+    .{ .exe = "VGAPAL.EXE" },
 };
 
 const RunResult = struct { blob: []u8, ret_code: u16, terminated: bool };
