@@ -5,7 +5,9 @@
 //! BCC-compiled DOS fixtures:
 //!   - `KEYECHO.EXE` — blocks on bioskey(0) (INT 16h AH=00, the API-injected
 //!     keyboard path: 8042 -> IRQ1 -> INT 09h -> BDA ring -> INT 16h), echoes each
-//!     key's ASCII to CON via INT 21h AH=02, and exits on ESC.
+//!     key's ASCII to the VGA TEXT PAGE via Borland conio putch() (direct B800
+//!     video), and exits on ESC. The echo is observed at GET /api/screen — the
+//!     text-mode-video acceptance gate (real putch() output is now observable).
 //!   - `MOUSERB.EXE` — loops INT 33h AX=0003 (get position+buttons) and stores the
 //!     live driver state to a fixed address (0x500), so an injected mouse position
 //!     can be read back via GET /api/mem; exits when a button is injected.
@@ -36,14 +38,26 @@ fn spawnKeyecho(io: std.Io) !Session {
     return Session.spawn(std.testing.allocator, io, KEYECHO);
 }
 
-/// Drive KEYECHO through one full key script and return the FINAL CON bytes + the
-/// terminating stop reason. Used twice (two fresh processes) to prove determinism.
-fn driveKeyechoScript(s: *Session, con_out: []u8) !struct { con: []u8, term_stop: bool, terminated: bool, ret_code: u16 } {
+/// The first `n` characters of row 0 of the text screen (the echo lands there
+/// left-to-right). Returns the slice (in `out`).
+fn screenRow0(s: *Session, out: []u8) ![]u8 {
+    const scr = try s.screen(false);
+    // `text` is rows joined by '\n'; row 0 is the prefix up to the first newline.
+    const nl = std.mem.indexOfScalar(u8, scr.text, '\n') orelse scr.text.len;
+    const row0 = scr.text[0..nl];
+    const n = @min(row0.len, out.len);
+    @memcpy(out[0..n], row0[0..n]);
+    return out[0..n];
+}
+
+/// Drive KEYECHO through one full key script and return the echoed row-0 prefix +
+/// the terminating status. Used twice (two fresh processes) to prove determinism.
+fn driveKeyechoScript(s: *Session, row0_out: []u8) !struct { echo: []u8, term_stop: bool, terminated: bool, ret_code: u16 } {
     // Run once so the guest reaches the blocking bioskey loop (INT 16h AH=00).
     _ = try s.run(RUN_CAP);
 
     // Inject 'H' then 'I' by CHARACTER; run a bounded cap after each so bioskey
-    // unblocks, echoes (INT 21h AH=02 -> CON), and re-blocks.
+    // unblocks, echoes (putch direct video -> B800 text page), and re-blocks.
     _ = try s.injectKeyChar('H');
     _ = try s.run(RUN_CAP);
     _ = try s.injectKeyChar('I');
@@ -53,10 +67,16 @@ fn driveKeyechoScript(s: *Session, con_out: []u8) !struct { con: []u8, term_stop
     _ = try s.injectKey(SC_ESC, true, false);
     const stop = try s.run(RUN_CAP);
 
-    const con = try s.consoleBytes(con_out);
+    // The echo is on /api/screen now (putch writes the text page, not CON). The
+    // first 3 cells of row 0 are 'H','I','!' (the two keys + the ESC marker).
+    var full: [80]u8 = undefined;
+    const row0 = try screenRow0(s, &full);
+    const n = @min(@as(usize, 3), row0.len);
+    @memcpy(row0_out[0..n], row0[0..n]);
+
     const st = try s.status();
     return .{
-        .con = con,
+        .echo = row0_out[0..n],
         // The run that consumed ESC ended on the program-terminate stop reason.
         .term_stop = stop.stop.program_terminated != null,
         .terminated = st.terminated,
@@ -64,18 +84,20 @@ fn driveKeyechoScript(s: *Session, con_out: []u8) !struct { con: []u8, term_stop
     };
 }
 
-test "keyecho: inject H,I -> echoed 'HI'; ESC prints '!' and terminates (ret 0)" {
+test "keyecho: inject H,I -> echoed 'HI' on /api/screen; ESC prints '!' and terminates (ret 0)" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     var s = try spawnKeyecho(threaded.io());
     defer s.deinit();
 
-    var buf: [64]u8 = undefined;
+    var buf: [8]u8 = undefined;
     const r = try driveKeyechoScript(&s, &buf);
 
-    // Echo: the two printable keys were echoed to CON, then ESC printed the '!'
-    // marker -> the full CON output is exactly "HI!".
-    try std.testing.expectEqualStrings("HI!", r.con);
+    // Echo: the two printable keys were echoed via putch (direct B800 video) to the
+    // text page, then ESC printed the '!' marker -> row 0 starts with "HI!".
+    // THIS IS THE TEXT-MODE-VIDEO ACCEPTANCE GATE: real putch() output is observable
+    // on /api/screen.
+    try std.testing.expectEqualStrings("HI!", r.echo);
     // ESC terminated the program cleanly: the ESC run stopped on program_terminated,
     // and the final status confirms termination via INT 21h AH=4C with ret code 0.
     try std.testing.expect(r.term_stop);
@@ -83,35 +105,36 @@ test "keyecho: inject H,I -> echoed 'HI'; ESC prints '!' and terminates (ret 0)"
     try std.testing.expectEqual(@as(u16, 0), r.ret_code);
 }
 
-test "keyecho: DETERMINISM — two fresh processes produce byte-identical CON output" {
+test "keyecho: DETERMINISM — two fresh processes produce byte-identical screen echo" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
     var a = try spawnKeyecho(io);
     defer a.deinit();
-    var bufa: [64]u8 = undefined;
+    var bufa: [8]u8 = undefined;
     const ra = try driveKeyechoScript(&a, &bufa);
 
     var b = try spawnKeyecho(io);
     defer b.deinit();
-    var bufb: [64]u8 = undefined;
+    var bufb: [8]u8 = undefined;
     const rb = try driveKeyechoScript(&b, &bufb);
 
     // The same command/key script over two INDEPENDENT processes yields identical
-    // CON output AND identical termination — the input path is deterministic.
-    try std.testing.expectEqualStrings(ra.con, rb.con);
+    // screen echo AND identical termination — the input + text-video path is
+    // deterministic.
+    try std.testing.expectEqualStrings(ra.echo, rb.echo);
     try std.testing.expectEqual(ra.terminated, rb.terminated);
     try std.testing.expectEqual(ra.ret_code, rb.ret_code);
 }
 
-test "keyboard: an injected key reaches the guest's BIOS keyboard chain (CON echo)" {
+test "keyboard: an injected key reaches the guest's BIOS keyboard chain (screen echo)" {
     // The general keyboard-injection gap: inject ONE key by RAW scancode edge and
     // assert it reached the guest by observing the echo it produced. Set-1 scancode
     // 0x1E with NO Shift is 'a' (ASCII 0x61); the INT 09h ISR cooks it to the BDA
-    // word 0x1E61 and KEYECHO echoes the ASCII byte via INT 21h -> CON. This proves
-    // the raw-scancode path (8042 -> IRQ1 -> INT 09h -> BDA ring -> INT 16h) carries
-    // an injected key (distinct from the `{"char"}` convenience the flagship uses).
+    // word 0x1E61 and KEYECHO echoes the ASCII byte via putch -> the B800 text page.
+    // This proves the raw-scancode path (8042 -> IRQ1 -> INT 09h -> BDA ring -> INT
+    // 16h) carries an injected key (distinct from the `{"char"}` convenience).
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     var s = try spawnKeyecho(threaded.io());
@@ -123,9 +146,10 @@ test "keyboard: an injected key reaches the guest's BIOS keyboard chain (CON ech
     _ = try s.injectKey(0x1E, false, false); // break
     _ = try s.run(RUN_CAP);
 
-    var buf: [16]u8 = undefined;
-    const con = try s.consoleBytes(&buf);
-    try std.testing.expectEqualStrings("a", con);
+    var buf: [80]u8 = undefined;
+    const row0 = try screenRow0(&s, &buf);
+    try std.testing.expect(row0.len >= 1);
+    try std.testing.expectEqual(@as(u8, 'a'), row0[0]);
 }
 
 test "mouse: an injected position is read back by the guest (INT 33h AX=0003)" {
