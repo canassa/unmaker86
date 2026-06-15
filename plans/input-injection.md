@@ -1367,12 +1367,21 @@ this is a MODEST EXTENSION of the existing emitter, NOT a general assembler.**
 `plantStub` (`bridge.zig:200-241`) *already* composes multi-instruction tails from ISA
 bytes — see the `iret_eoi_pic2` EOI sequence (`bridge.zig:228-238`), which emits PUSH
 AX / MOV AL,EOI / OUT / OUT / POP AX / IRET. Phase 1·0 adds three things in that idiom:
-- [ ] **(a) A few more fixed emitted shapes:** a **poll-loop shell** for the guest-asm
-  INT 16h blocking loop (1d) — `CMP AH,00` → conditional dequeue+IRET → else `INT 09h`
-  → JMP back (the spice86 `KeyboardInt16Handler.cs:168-206` shape), and an **INT 1Ch
-  chain tail** for INT 08h (`<host-tick>; INT 1Ch; EOI; IRET` — the stub-level chain
-  currently deferred at `int08.zig:7-13`). These are new `CbType` tail variants beside
-  the existing `iret`/`iret_sti`/`iret_eoi_pic1`/`iret_eoi_pic2`.
+- [x] **(a) A few more fixed emitted shapes:** a **poll-loop shell** for the guest-asm
+  INT 16h blocking loop (1d) — `STI` → has-key trap → `JNZ have_key` → `INT 09h`
+  → `JMP back` → `have_key:` dequeue trap → `IRET` (the spice86
+  `KeyboardInt16Handler.cs:168-206` shape, re-modeled to zdos's trap-callback bridge),
+  and an **INT 1Ch chain tail** for INT 08h (`<host-tick>; INT 1Ch; EOI; IRET` — the
+  stub-level chain formerly deferred at `int08.zig:7-13`). The INT 1Ch tail is a clean
+  new `CbType` variant (`int1c_chain_eoi_pic1`) beside the existing
+  `iret`/`iret_sti`/`iret_eoi_pic1`/`iret_eoi_pic2`, and INT 08h is now WIRED to it.
+  The poll-loop is NOT a `CbType` variant — it needs TWO distinct callback ids
+  (has-key + dequeue), which a slot's own `0xFE 0x38 <id>` stub cannot carry — so it is
+  a parameterized emitter `emitPollLoop(image, pos, .{has_key_id, dequeue_id})` in the
+  SAME `plantStub` idiom (multi-instruction ISA-byte composition via `Emit`). Phase 1d
+  installs it. [STOP-condition note: the "fixed shape as a CbType variant" framing did
+  not hold for the poll-loop; resolved with the parameterized emitter, the right
+  abstraction, rather than forcing it.]
 - [ ] **(b) `runGuestFarCall(seg, off)`** — a sibling of `runGuestInt`
   (`bridge.zig:350-400`) that drives `step_one` per inner instruction (the same
   ledger-honoring loop at `bridge.zig:384-390`), for the mouse-callback far-call. **It

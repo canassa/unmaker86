@@ -71,7 +71,7 @@ pub fn Bios(comptime Cpu: type) type {
             setOwner: *const fn (*anyopaque, u8) void,
         ) void {
             inline for (.{
-                .{ BiosInt.int08, bridge_mod.CbType.iret_eoi_pic1 },
+                .{ BiosInt.int08, bridge_mod.CbType.int1c_chain_eoi_pic1 },
                 .{ BiosInt.int09, bridge_mod.CbType.iret_eoi_pic1 },
                 .{ BiosInt.int10, bridge_mod.CbType.iret },
                 .{ BiosInt.int11, bridge_mod.CbType.iret },

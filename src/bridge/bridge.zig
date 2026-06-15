@@ -42,6 +42,18 @@ pub const CbType = enum {
     /// `MOV AL,0x20; OUT 0xA0,AL; OUT 0x20,AL; IRET` — slave-PIC IRQ handlers
     /// (EOI to both the slave and the master cascade).
     iret_eoi_pic2,
+    /// `INT 0x1C; PUSH AX; MOV AL,0x20; OUT 0x20,AL; POP AX; IRET` — the INT 08h
+    /// timer-tick chain tail (Phase 1·0a). After the host-serviced tick trap
+    /// (the slot's `0xFE 0x38 <id>` runs `int08.handle`, incrementing the BDA
+    /// tick) this tail chains to the guest-overridable `INT 1Ch` (the user timer
+    /// tick a program may hook), THEN EOIs the master PIC and IRETs. The chain is
+    /// done at the STUB level (a real guest `INT 1Ch` through the IVT) rather than
+    /// by nested host-stepping every ~18.2 Hz tick — the faithful, no-extra-hole
+    /// path flagged at `int08.zig:7-13`. EOI is emitted AFTER the INT 1Ch returns
+    /// (matching real BIOS: the tick ISR services the user hook before signalling
+    /// end-of-interrupt). PUSH/POP AX preserve the interrupted guest's AL across
+    /// the EOI's `MOV AL,0x20` (same rationale as `iret_eoi_pic1`).
+    int1c_chain_eoi_pic1,
 };
 
 // --- ISA byte facts (re-derived, not copied) ---
@@ -58,6 +70,12 @@ const OP_POP_AX: u8 = 0x58;
 const EOI: u8 = 0x20; // OCW2 non-specific EOI
 const PIC1_CMD: u8 = 0x20;
 const PIC2_CMD: u8 = 0xA0;
+// Short relative control flow (the INT 16h poll-loop shell, Phase 1·0a). All are
+// rel8: a single signed displacement byte added to EIP AFTER the 2-byte instr.
+const OP_JZ_REL8: u8 = 0x74; // Jcc cc=0100 (ZF==1)
+const OP_JNZ_REL8: u8 = 0x75; // Jcc cc=0101 (ZF==0)
+const OP_JMP_REL8: u8 = 0xEB; // unconditional short JMP
+const INT_KBD_ISR: u8 = 0x09; // IRQ1 keyboard ISR the blocking loop drives
 
 /// The BIOS-ROM segment the callback area lives in (DOSBox places the callback
 /// area at F000:1000; we mirror the PLACEMENT, not its CB_SIZE=32 offset math).
@@ -69,11 +87,13 @@ pub const CB_BASE_PHYS: u32 = (@as(u32, CB_SEG) << 4) + CB_OFFSET;
 
 /// zdos's OWN slot size (D1 — a deliberate divergence from DOSBox's CB_SIZE=32 /
 /// 2-byte id). A slot is the 3-byte trap stub `0xFE 0x38 <id>` plus the largest
-/// return tail. The largest tail is `iret_eoi_pic2` =
+/// return tail. The largest tail is 9 bytes — both `iret_eoi_pic2` =
 /// PUSH AX (1) + MOV AL,imm (2) + OUT 0xA0,AL (2) + OUT 0x20,AL (2) + POP AX (1)
-/// + IRET (1) = 9 bytes (PUSH/POP preserve the interrupted AX across the EOI).
-/// 3 + 9 = 12; round up to 16 so a slot is paragraph-aligned (seg:off math is
-/// clean and a future tail can grow without re-laying-out the table).
+/// + IRET (1), AND `int1c_chain_eoi_pic1` = INT 1Ch (2) + PUSH AX (1) +
+/// MOV AL,imm (2) + OUT 0x20,AL (2) + POP AX (1) + IRET (1) (PUSH/POP preserve the
+/// interrupted AX across the EOI). 3 + 9 = 12; round up to 16 so a slot is
+/// paragraph-aligned (seg:off math is clean and a future tail can grow without
+/// re-laying-out the table).
 pub const CB_SLOT_SIZE: u16 = 16;
 
 /// Max callback slots (provisional / comptime-asserted cap, D14). 128 ids fit in
@@ -236,8 +256,98 @@ pub fn Bridge(comptime Cpu: type) type {
                     w.byte(OP_POP_AX);
                     w.byte(OP_IRET);
                 },
+                .int1c_chain_eoi_pic1 => {
+                    // INT 1Ch (chain to the guest-overridable user timer tick),
+                    // THEN EOI(master) + IRET. The host tick (BDA inc) already ran
+                    // in the slot's `0xFE 0x38 <id>` trap above; here we run the
+                    // guest hook through the REAL IVT, then signal end-of-interrupt.
+                    // 9 bytes — fits the 9-byte largest-tail budget (CB_SLOT_SIZE).
+                    w.byte(OP_INT_IMM);
+                    w.byte(0x1C);
+                    w.byte(OP_PUSH_AX);
+                    w.byte(OP_MOV_AL_IMM);
+                    w.byte(EOI);
+                    w.byte(OP_OUT_IMM_AL);
+                    w.byte(PIC1_CMD);
+                    w.byte(OP_POP_AX);
+                    w.byte(OP_IRET);
+                },
             }
             slot.planted = true;
+        }
+
+        /// The total byte length of the INT 16h blocking poll-loop shell
+        /// (`emitPollLoop`). A fixed shape; exposed so the installer (Phase 1d)
+        /// can size/place it.
+        pub const POLL_LOOP_LEN: u16 = 14;
+
+        /// Parameters for the INT 16h blocking poll-loop shell (Phase 1·0a).
+        /// The shape is FIXED but it cannot be a `CbType` tail variant: a slot's
+        /// `0xFE 0x38 <id>` stub carries only ITS OWN id, while the loop needs TWO
+        /// DISTINCT callback ids (has-key + dequeue) plus the keyboard-ISR INT
+        /// number. So it is a parameterized emitter in the SAME idiom as
+        /// `plantStub` (multi-instruction ISA-byte composition via `Emit`), not a
+        /// new return tail. Phase 1d allocates the two callbacks, then installs
+        /// this shape and points the AH=00/10 arm of INT 16h at it.
+        pub const PollLoop = struct {
+            /// Callback id whose handler sets ZF=0 when a key is available, ZF=1
+            /// when the ring is empty (the `CallbackHasKey` shape).
+            has_key_id: u8,
+            /// Callback id whose handler dequeues the cooked word into AX (the
+            /// `CallbackDequeueAndSetAx` shape).
+            dequeue_id: u8,
+        };
+
+        /// Emit the INT 16h blocking poll-loop shell into `image` at byte offset
+        /// `pos` (relative to the start of `image`). Re-derived from the ISA, the
+        /// spice86 `KeyboardInt16Handler.cs:168-206` AH=00/10 loop re-modeled to
+        /// zdos's trap-callback bridge:
+        ///
+        ///   L_GET_KEY:
+        ///     STI                       ; FB        — IF=1 so an injected IRQ1 is
+        ///                               ;              recognized through the
+        ///                               ;              normal fetch/execute loop
+        ///                               ;              (the whole point of the
+        ///                               ;              faithful blocking read)
+        ///     <trap has_key_id>         ; FE 38 id  — ZF=0 when a key is present
+        ///     JNZ have_key              ; 75 04
+        ///     INT 09h                   ; CD 09     — run the IRQ1 keyboard ISR
+        ///     JMP short L_GET_KEY       ; EB F6     — back to STI (rel8 = -10)
+        ///   have_key:
+        ///     <trap dequeue_id>         ; FE 38 id  — AX = cooked word
+        ///     IRET                      ; CF
+        ///
+        /// The rel8 displacements are added to EIP AFTER the displacement byte
+        /// (x86 semantics), so they are computed against the NEXT instruction.
+        /// The loop runs as REAL guest code through the normal fetch/execute loop,
+        /// so every iteration (and any IRQ0/INT 09h cycles that land mid-spin)
+        /// charges its real cycle cost — no ledger hole.
+        pub fn emitPollLoop(image: []u8, pos: u32, p: PollLoop) void {
+            var w = Emit{ .image = image, .pos = pos };
+            // off 0  — L_GET_KEY: STI
+            w.byte(OP_STI);
+            // off 1  — trap has-key (sets ZF per availability)
+            w.byte(OP_TRAP0);
+            w.byte(OP_TRAP1);
+            w.byte(p.has_key_id);
+            // off 4  — JNZ have_key. disp byte @5, next instr @6, target @10:
+            //          rel8 = 10 - 6 = 4.
+            w.byte(OP_JNZ_REL8);
+            w.byte(4);
+            // off 6  — INT 09h (the keyboard ISR that fetches/cooks a key)
+            w.byte(OP_INT_IMM);
+            w.byte(INT_KBD_ISR);
+            // off 8  — JMP short L_GET_KEY. disp byte @9, next instr @10, target
+            //          @0: rel8 = 0 - 10 = -10 (0xF6).
+            w.byte(OP_JMP_REL8);
+            w.byte(@bitCast(@as(i8, -10)));
+            // off 10 — have_key: trap dequeue (AX = cooked word)
+            w.byte(OP_TRAP0);
+            w.byte(OP_TRAP1);
+            w.byte(p.dequeue_id);
+            // off 13 — IRET (return to the INT 16h caller)
+            w.byte(OP_IRET);
+            std.debug.assert(w.pos - pos == POLL_LOOP_LEN);
         }
 
         /// Plant ALL allocated stubs into `image` (the BIOS ROM image). Call once
@@ -451,4 +561,52 @@ test "slot/trampoline layout fits the BIOS segment" {
 
 fn slotPhysFor(id: u8) u32 {
     return CB_BASE_PHYS + @as(u32, id) * CB_SLOT_SIZE;
+}
+
+// A standalone bridge (no CPU needed) for byte-emission tests: plantStub only
+// reads self.slots + writes the image; emitPollLoop is a free function.
+const cpu_mod = @import("cpu");
+const TestBridge = Bridge(cpu_mod.Cpu(cpu_mod.TestBus));
+
+test "plantStub: int1c_chain_eoi_pic1 emits INT 1Ch; EOI(master); IRET (exact bytes)" {
+    var br: TestBridge = .{};
+    // Reserve an id with the new tail (allocCallback touches no CPU).
+    const id = br.allocCallback(.int1c_chain_eoi_pic1, .irq);
+    var image = std.mem.zeroes([TestBridge.IMAGE_LEN]u8);
+    br.plantStub(&image, id);
+
+    const off: usize = @intCast(slotPhysFor(id) - TestBridge.IMAGE_BASE);
+    // 0xFE 0x38 <id> | INT 0x1C | PUSH AX | MOV AL,0x20 | OUT 0x20,AL | POP AX | IRET
+    const want = [_]u8{
+        0xFE, 0x38, id, // trap stub -> int08.handle (BDA tick)
+        0xCD, 0x1C, // INT 1Ch (guest-overridable user timer tick)
+        0x50, // PUSH AX
+        0xB0, 0x20, // MOV AL,0x20 (EOI)
+        0xE6, 0x20, // OUT 0x20,AL (master PIC EOI)
+        0x58, // POP AX
+        0xCF, // IRET
+    };
+    try std.testing.expectEqualSlices(u8, &want, image[off .. off + want.len]);
+}
+
+test "emitPollLoop: INT 16h blocking shell emits the exact STI/has-key/INT09/JMP/dequeue/IRET bytes" {
+    var image = std.mem.zeroes([64]u8);
+    const has_key: u8 = 0x11;
+    const dequeue: u8 = 0x22;
+    TestBridge.emitPollLoop(&image, 7, .{ .has_key_id = has_key, .dequeue_id = dequeue });
+
+    const want = [_]u8{
+        0xFB, // STI               (L_GET_KEY)
+        0xFE, 0x38, has_key, // trap has-key (ZF=0 if key present)
+        0x75, 0x04, // JNZ have_key (+4)
+        0xCD, 0x09, // INT 09h
+        0xEB, 0xF6, // JMP L_GET_KEY (-10)
+        0xFE, 0x38, dequeue, // have_key: trap dequeue -> AX
+        0xCF, // IRET
+    };
+    try std.testing.expectEqual(TestBridge.POLL_LOOP_LEN, @as(u16, want.len));
+    try std.testing.expectEqualSlices(u8, &want, image[7 .. 7 + want.len]);
+    // Bytes outside the emitted window are untouched (no over-write).
+    try std.testing.expectEqual(@as(u8, 0), image[6]);
+    try std.testing.expectEqual(@as(u8, 0), image[7 + want.len]);
 }
