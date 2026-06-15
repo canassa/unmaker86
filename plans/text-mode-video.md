@@ -3,6 +3,34 @@
 Status: **design plan** (implementation-ready; no source changed by this document). Fills the
 ROADMAP backlog item "VGA text-mode video (B8000) + console mirror" (`plans/ROADMAP.md:25`).
 
+> **Status: v2.** Revised after a 3-perspective review (determinism, INT 10h/VGA fidelity, Zig
+> 0.16/integration); every `file:line` re-verified against the real source. Targeted edits, structure
+> preserved. Changes by area:
+> (1) **CRITICAL false-snapshot fix.** v1 claimed `text_vram` is "snapshot-covered like `vram`" citing
+> `machine.zig:515-518` as if `vram` were a `Snapshot` struct field — it is **not**: `:515-517` is a
+> *doc comment*, and large slabs (`vram`, `bus.ram`) are copied **out-of-band by the snapshot caller**
+> (`controller_test.zig:304,329` — `alloc.dupe` + `expectEqualSlices`; `bus.zig:933-936,940` excludes
+> `ram` from `Bus.Snapshot`). §3.1/§3.4 + P2 rewritten: `text_vram` is dupe'd/restored by the caller,
+> NOT placed in any `Snapshot`; the hostPtr is correctly NOT snapshotted (re-established by `wire()`'s
+> `mapMmio` on restore).
+> (2) **INT 10h fidelity (F1–F8)** folded into §2.2/§3.2: single width source = BDA `OFF_VIDEO_COLS`
+> everywhere; AH=0E teletype `useattr=false` writes char ONLY (don't touch attr byte — reject spice86's
+> default-attr overwrite); scroll inclusive lower-right bounds; teletype end-of-screen scroll fills with
+> the attr at the cursor (not 0); AH=13 always `useattr=true` + cursor-restore when AL bit0=0; set-mode
+> writes `OFF_NB_ROWS=rows-1` and clears with a 16-bit `0x0720` word fill; cursor word `col=lo,row=hi`.
+> (3) **Determinism/grep-gate corrections:** `int10.zig` is **ALREADY** in the BIOS gate
+> (`determinism_test.zig:22`) and `controller.zig`/`src/api/*` are gated too, so the only genuine new
+> surface is keeping `vga.zig` clean in the *devices* gate; do NOT add `int10.zig` to the devices gate
+> (cross-module `@embedFile` won't compile). BEL = silent no-op in AH=13 too. peek8 + getHostPtr both
+> mandatory.
+> (4) **Zig 0.16/integration:** two `[0x8000]u8` slabs (`text_vram`@B8000 + `text_vram_mono`@B0000);
+> `@memset(slab,0)` in reset (NOT `@splat`); `?attrs=1` parsed server-side (command stays `void`);
+> `MAX_SCREEN_CELLS=4000`; `/api/screen` renders the BDA active page with BDA cols/rows.
+> (5) **Scope:** AH=08 (read char+attr) + AH=01 (set cursor shape) added to v1, and the existing AH=03
+> hardcoded `0x0607` (`int10.zig:49`) fixed to read the BDA shape.
+> (6) **Q5/D-TM5 locked:** `/api/console` (DOS CON) and `/api/screen` (B8000) stay DISTINCT for v1;
+> CON→text-page mirroring is a documented follow-up.
+
 Owner modules: `src/devices/vga.zig` (text-page backing + geometry), `src/bios/int10.zig` (text
 services), `src/bios/bda.zig` (already has the fields), `src/machine/machine.zig` (one mapping line),
 `src/debug/controller.zig` + `src/api/{queue,worker,server}.zig` (the `/api/screen` read),
@@ -67,7 +95,7 @@ path, `src/debug/controller.zig:621-622`), so it never perturbs the machine.
 | BDA video fields | **ALL present**: mode(0x49), cols(0x4A), page-size(0x4C), cursor-pos(0x50, 8 pages), shape(0x60), active-page(0x62), CRTC base(0x63), rows(0x84), char-height(0x85) | `src/bios/bda.zig:22-34` |
 | BDA boot defaults | mode=0x03, cols=80, active-page=0 (80×25 color text at boot) | `src/bios/bda.zig:108-110` |
 | Bus region mechanism | `mapMmio(phys, len, MemHandler)` sets pages `.mmio`, device exposes `read8/write8/getHostPtr/peek8` | `src/bus/bus.zig:560-575`; `src/devices/vga.zig:220-259` |
-| VRAM snapshot | VGA `Snapshot` is DAC+regs only; **VRAM bytes copied separately** (large slab), like the bus RAM slab | `src/machine/machine.zig:515-518`; `src/devices/vga.zig:433-468` |
+| VRAM snapshot | `vram` is **NOT** in any `Snapshot` struct — `Vga.Snapshot` is DAC+regs only; VRAM bytes are dupe'd by the **snapshot caller** (out-of-band, like `bus.ram`) | `src/machine/machine.zig:515-517` (doc comment only); `src/debug/controller_test.zig:304,329`; `src/bus/bus.zig:933-936,940` |
 | Debugger peek | `peekMemPhys`/`peekMem` via `bus.peekBlock` — pure, never device read handlers | `src/debug/controller.zig:619-629` |
 | Memory-regions API | `regions_table` lists ram / vram(A0000) / ems_frame | `src/debug/controller.zig:702-706` |
 | `/api/console` | mirrors the **DOS CON device** capture buffer (INT 21h stream), NOT the VGA screen | `src/debug/controller.zig:641-650`; `src/dos/devices.zig:14-32` |
@@ -113,10 +141,26 @@ if (useattr) mem_writeb(where+1, attr);
 ```
 
 So cell = `{char, attr}` at `pstart + page*page_size + (row*cols + col)*2`. Read-back is symmetric
-(`ReadCharAttr`, `:431-444`: `mem_readw(where)`).
+(`ReadCharAttr`, `:431-446`: `mem_readw(where)`).
+
+> **Finding F1 — single width source = the BDA.** `WriteChar` reads `cols` from BDA `NB_COLS`
+> (`int10_char.cpp:524`) but `INT10_ScrollWindow` reads `ncols`/`nrows` from `CurMode` geometry
+> (`twidth`/`theight`, `:196` `BIOS_NCOLS;BIOS_NROWS`). zdos has **no text `CurMode` table** — the BDA
+> is the single source of truth — so **all** zdos helpers (`writeCharCell`, `teletype`, `scrollWindow`)
+> read the *live* BDA `OFF_VIDEO_COLS` for the stride and `OFF_NB_ROWS+1` for the row count, NOT the
+> §3.1 `TEXT_COLS/TEXT_ROWS` constants. spice86 already does this uniformly (BDA `ScreenColumns`
+> everywhere). For all v1 modes BDA-cols == twidth, so this is harmless, but uniform BDA prevents a
+> shear bug on 40-col modes / scroll.
+
+> **Finding F2 — teletype attribute byte is NOT touched.** The AH=0E text-mode path is
+> `WriteChar(..., useattr=false)`: it writes the **char byte ONLY and leaves the attribute byte
+> untouched** (`int10_char.cpp:535-536`: `mem_writeb(where,chr); if (useattr) mem_writeb(where+1,attr);`)
+> — this preserves the cell's existing color. zdos copies dosbox/real-BIOS exactly: **`useattr=false`
+> ⇒ do not write `cell+1`.** Do NOT copy spice86's `WriteCharacter`, which writes `DefaultAttribute`
+> (0x07) when `!useattr` (`VgaFunctionality.cs:1103-1104`) — that would erase colored backgrounds.
 
 **Teletype (AH=0E), the load-bearing semantics** (`int10_char.cpp:743-810`, `teletype_output_attr`):
-- `chr == 7` (BEL): **busy-waits on `PIC_FullIndex()` for 333 ms** to beep (`:749-766`) —
+- `chr == 7` (BEL): **busy-waits on `PIC_FullIndex()` for 333 ms** to beep (`:752-772`) —
   **HOST-TIMING-DEPENDENT, MUST NOT COPY** (see §3 determinism lens).
 - `chr == 8` (BS): `if (cur_col>0) cur_col--`.
 - `chr == '\r'`: `cur_col = 0`.
@@ -124,22 +168,48 @@ So cell = `{char, attr}` at `pstart + page*page_size + (row*cols + col)*2`. Read
   chess game"; we copy this faithfully).
 - default: `WriteChar(cur_col,cur_row,page,chr,attr,useattr)`; `cur_col++`.
 - wrap: `if (cur_col==ncols) { cur_col=0; cur_row++; }`.
-- scroll: `if (cur_row==nrows) { fill = attr-at-cursor (text); INT10_ScrollWindow(0,0,nrows-1,ncols-1,-1,fill,page); cur_row--; }`.
-- finally `INT10_SetCursorPos(cur_row,cur_col,page)`.
+- scroll (**Finding F4**): `if (cur_row==nrows) { fill = attr-at-cursor (text); INT10_ScrollWindow(0,0,nrows-1,ncols-1,-1,fill,page); cur_row--; }`.
+  The fill attribute is the **attr byte of the cell at the current cursor**, read via `INT10_ReadCharAttr`
+  at the cursor *before* the scroll (`int10_char.cpp:798-804`: `chat=ReadCharAttr; fill=(chat>>8)`).
+  zdos copies this — the `readCharCell` helper reads the cursor cell's attr first. Do **NOT** copy
+  spice86, which fills the new bottom line with attr 0/black (`VgaFunctionality.cs:628`
+  `new CharacterPlusAttribute(' ', 0, false)`). (Note: AH=06/07 scroll fills with **BH**, a distinct
+  caller-supplied attr — keep the two fill sources separate.)
+- finally `INT10_SetCursorPos(cur_row,cur_col,page)`. The BDA cursor word is decomposed
+  **`col = word & 0xFF`, `row = word >> 8`** and re-packed `(row<<8)|col` (`int10_char.cpp:389-390`:
+  col at `CURSOR_POS+page*2`, row at `+1`; matches AH=02 DX = `(DH=row)<<8 | (DL=col)`) — **Finding F7**.
 
-**Scroll (AH=06/07 → `INT10_ScrollWindow`)** (`int10_char.cpp:193-294`): clamps the window to
-`nrows-1`/`ncols-1`; computes `base = pstart + page*page_size`; copies rows (`TEXT_CopyRow`) by
+**Scroll (AH=06/07 → `INT10_ScrollWindow`)** (`int10_char.cpp:193-294`): takes the **inclusive
+lower-right** corner — CX = upper-left (`CH=rul,CL=cul`), DX = lower-right (`DH=rlr,DL=clr`). It clamps
+`rlr` to `nrows-1` and `clr` to `ncols-1` (`:199-200`), then internally does `clr++` (`:201`) to make
+the column range exclusive; computes `base = pstart + page*page_size`; copies rows (`TEXT_CopyRow`) by
 `nlines` then fills exposed rows with `(attr<<8|' ')` (`TEXT_FillRow`). `nlines==0` ⇒ clear the whole
-window. AH=06 passes `-reg_al` (scroll up), AH=07 passes `+reg_al` (down); `reg_al==0` ⇒ clear
-(`references/dosbox-staging/src/ints/int10.cpp:96-100`).
+window (`rlr-rul+1` rows, `:233-235`). AH=06 passes `-reg_al` (scroll up), AH=07 passes `+reg_al`
+(down); `reg_al==0` ⇒ clear (`references/dosbox-staging/src/ints/int10.cpp:96-100`).
+
+> **Finding F3 — scroll bounds (spell out for the implementer):** zdos's `scrollWindow` clamps `rlr`
+> to `nrows-1` and `clr` to `ncols-1`, treats the **column range as inclusive `[cul,clr]`** (loop
+> `clr-cul+1` cells per row; dosbox's internal `clr++` is just its exclusive-loop convention), and
+> `AL=0` clears the **whole window** (`rlr-rul+1` rows). Cite `int10_char.cpp:197-236,264-295`.
 
 **Write char/attr (AH=09/0A → `INT10_WriteChar`)** (`int10.cpp:105-112`): AH=09 uses BL as the
 attribute (`useattr=true`), AH=0A ignores attr; both write CX copies at the **current cursor** without
 advancing it.
 
+**Write string (AH=13 → `INT10_WriteString`)** (`int10_char.cpp:862-886`): routes each char through
+`teletype_output_attr` with **`use_attribute = true` ALWAYS** (`:879`; distinct from F2's AH=0E
+text-mode `useattr=false`), honoring CR/LF/BS/BEL exactly like teletype. AL bit1 (`flag&2`) ⇒ the
+string is interleaved char/attr pairs (re-read per char, `:875-878`); AL bit0 ⇒ cursor advances/stays,
+and when **bit0=0** the routine **restores the cursor to its original (saved) position** (`:883-884`).
+
+> **Finding F5 — AH=13 specifics:** zdos's AH=13 saves the entry cursor, routes each char through
+> `teletype(..., useattr=true)` (always write the attr byte — opposite of AH=0E), and **restores the
+> saved cursor when AL bit0=0** (only advances/keeps when bit0=1). BEL inside the string is the same
+> deterministic silent no-op as in teletype (see D-TM-BEL). Cite `int10_char.cpp:862-886`.
+
 **INT 10h dispatch** (`references/dosbox-staging/src/ints/int10.cpp:47-135`): AH=00 SetVideoMode,
-02 SetCursorPos, 03 get cursor+shape, 06/07 ScrollWindow, 09/0A WriteChar, 0E TeletypeOutput,
-0F get videomode, 13 WriteString.
+02 SetCursorPos, 03 get cursor+shape, 06/07 ScrollWindow, 08 ReadCharAttr (`:102-103`), 09/0A
+WriteChar, 0E TeletypeOutput, 0F get videomode, 13 WriteString.
 
 **Text→display render path** (`VGA_TEXT_Draw_Line`,
 `references/dosbox-staging/src/hardware/video/vga_draw.cpp:857-895`): reads char/attr cells, looks
@@ -187,6 +257,9 @@ suited to black-box assertions than 2000 per-cell calls.
 | Aspect | dosbox-staging | spice86 | zdos decision |
 | --- | --- | --- | --- |
 | Text cell layout | flat `{char,attr}` at `pstart+page*sz+(row*cols+col)*2` | identical | **COPY** — guest RAM slab, flat cells |
+| Cell-stride width source | `WriteChar` BDA cols, `ScrollWindow` `CurMode` twidth (mixed) | BDA `ScreenColumns` everywhere | **FOLLOW spice86 (F1)** — BDA `OFF_VIDEO_COLS`/`OFF_NB_ROWS+1` uniformly (zdos has no text CurMode table) |
+| AH=0E teletype attr byte | char only; attr untouched (`:535-536` `useattr=false`) | writes `DefaultAttribute` 0x07 (`:1103-1104`) | **COPY dosbox (F2)** — `useattr=false` ⇒ never touch `cell+1` (don't erase colors) |
+| Teletype end-of-screen scroll fill | attr **at cursor** via `ReadCharAttr` (`:798-804`) | 0/black (`:628`) | **COPY dosbox (F4)** — fill with the cursor cell's attr (AH=06/07 still fill with BH) |
 | Teletype BS/CR/LF/wrap/scroll | `int10_char.cpp:743-810` | identical (`:598-625`) | **COPY** the exact control-char + scroll semantics |
 | LF does not reset column | yes (`:475` chess-game note) | (cursor.X unchanged on `\n`) | **COPY** (faithful) |
 | BEL (chr 7) | **busy-wait 333 ms on `PIC_FullIndex()`** | `//FIXME should beep` no-op | **AVOID dosbox; follow spice86's no-op** (host-timing; see §3) |
@@ -222,25 +295,41 @@ pub const TEXT_ROWS: u16 = 25;
 pub const TEXT_PAGE_SIZE: u32 = 0x1000;  // 80*25*2 = 4000, rounded to 0x1000
 ```
 
-**Backing store.** Allocate a text-page slab in the VGA device exactly like `vram`
-(`src/devices/vga.zig:122,171-175`): `text_vram: []u8 = &.{}` of `TEXT_WINDOW_LEN` bytes (or the full
-0x8000 covering both color and mono if a single base is reused; **recommend separate slabs is
-unnecessary** — one 0x8000 slab per base is the faithful window size, but for v1 a single 32 KiB
-color slab at B8000 covers mode 3; mono B0000 is a separate small slab, see D-TM3). Zero-filled at
-reset (CLAUDE #5).
+**Backing store (Finding 2 — commit to two `[0x8000]u8` slabs).** Allocate **two** text-page slabs in
+the VGA device exactly like `vram` (`src/devices/vga.zig:122,171-175`), both decl'd `[]u8 = &.{}`:
+- `text_vram: []u8 = &.{}` — color text, mapped at B8000, `len = TEXT_WINDOW_LEN = 0x8000`.
+- `text_vram_mono: []u8 = &.{}` — mono text, mapped at B0000, `len = 0x8000`.
 
-**Bus mapping.** Add a `textMemHandler()` (a second `MemHandler`, ctx=self) with `read8/write8/
-getHostPtr/peek8` indexing `text_vram` by `phys - TEXT_COLOR_PHYS` — structurally identical to the
-A0000 handler (`src/devices/vga.zig:220-259`). In `machine.wire()` after the A0000 mapping
+Each is `0x8000` (page-multiple); they are **adjacent and non-overlapping**, together covering
+B0000–BFFFF. (Mapping both is the same mechanism, so it costs nothing extra over color-only — recommend
+both; see D-TM3. If the human insists on deferring mono per Q3, map only B8000 and assert-flag a mode-7
+set-mode — but the plan picks **both**.) Zero-filled at reset (CLAUDE #5).
+
+**Init / deinit / reset (Finding 3 — Zig 0.16 idioms).** Allocate both slabs in `Vga.init` and assign
+them in the **single struct literal** (mirror `vga.zig:171-175`):
+`self.* = .{ .vram = vram, .text_vram = tvram, .text_vram_mono = tmono };`. Free **both** in `deinit`.
+In `reset`, zero both with **`@memset(self.text_vram, 0)`** / `@memset(self.text_vram_mono, 0)`
+alongside the existing `@memset(self.vram, 0)` at `vga.zig:185` — **NOT `@splat`** (`@splat` is for
+fixed arrays/vectors, not heap slices like these).
+
+**Bus mapping.** Add a `textMemHandler()` and a `textMonoMemHandler()` (two `MemHandler`s, ctx=self),
+each indexing its slab by `phys - TEXT_COLOR_PHYS` / `phys - TEXT_MONO_PHYS` — structurally identical
+to the A0000 handler (`src/devices/vga.zig:220-259`). In `machine.wire()` after the A0000 mapping
 (`src/machine/machine.zig:233`):
 
 ```zig
 _ = self.bus.mapMmio(devices.vga.TEXT_COLOR_PHYS, devices.vga.TEXT_WINDOW_LEN, self.vga.textMemHandler());
+_ = self.bus.mapMmio(devices.vga.TEXT_MONO_PHYS,  devices.vga.TEXT_WINDOW_LEN, self.vga.textMonoMemHandler());
 ```
 
-Direct guest writes (Borland `putch` direct-video) now land in `text_vram` and read back. The
-`getHostPtr` fast path means a `mov [es:di],al` to B800 is charged as a **normal guest memory write**
-(no trap, no ledger hole — CLAUDE #1), exactly as the A0000 path is (`src/devices/vga.zig:36-41`).
+> **R4 — both `getHostPtr` AND `peek8` are mandatory on each text handler.** `getHostPtr` is the
+> direct-write fast path: a `mov [es:di],al` to B800 is charged as a **normal guest memory write** (no
+> trap, no ledger hole — CLAUDE #1), exactly as the A0000 path is (`src/devices/vga.zig:36-41`). `peek8`
+> is what the debugger read path uses — `/api/screen`'s `peekBlock` → `peekPhys8` calls `h.peek8(m)` and
+> falls back to `not_peekable_fill` if it is absent (`src/bus/bus.zig:664-670`). A handler with only
+> `getHostPtr` would make `/api/screen` return fill bytes, not real cells. Implement **both** (the
+> A0000 handler already does, `:220-259` — copy the pattern). Direct guest writes (Borland `putch`
+> direct-video) now land in `text_vram` and read back.
 
 > **Decision D-TM1: model the flat char/attr slab, NOT the plane machinery.** dosbox's
 > `VGA_TEXT_PageHandler` splits writes into char/attr/font planes via `seq.map_mask`/`read_map_select`
@@ -260,12 +349,24 @@ Direct guest writes (Borland `putch` direct-video) now land in `text_vram` and r
   simpler and more faithful than dosbox's per-mode `MEM_SetPageHandler` remap and is fully
   deterministic.
 
-**Determinism / snapshot.** `text_vram` is guest memory → it must be snapshot-covered. It is **MMIO,
-not in the bus RAM slab** (the UMA window is `.unmapped` by default, claimed by `mapMmio`), so —
-exactly like `vram` — the machine copies `text_vram` bytes separately on snapshot/restore
-(`src/machine/machine.zig:515-518` documents this pattern for `vram`; add `text_vram` the same way).
-Add `text_vram` zeroing to `Vga.reset` (`src/devices/vga.zig:184-195`). Add the region to the
-debugger `regions_table` (`src/debug/controller.zig:702-706`):
+**Determinism / snapshot (CRITICAL — `text_vram` is NOT a `Snapshot` struct field).** `text_vram`
+(and `text_vram_mono`) is guest memory that must round-trip across snapshot/restore — but, **exactly
+like `vram` and `bus.ram`, it is NOT placed in any `Snapshot` struct.** Those large slabs are copied
+**out-of-band by the snapshot caller**: the caller `alloc.dupe(u8, machine.vga.vram)` before, and
+`expectEqualSlices`/restores it into the re-init'd machine's slab after (`controller_test.zig:304,329`);
+`Bus.Snapshot` deliberately excludes `ram` (`bus.zig:933-936,940`); `machine.zig:515-517` is a *doc
+comment* describing this caller-copy pattern, not a struct field. So:
+- The snapshot caller dupes `machine.vga.text_vram` (and `text_vram_mono`) **byte-for-byte** and
+  restores them into the re-init'd machine's slabs — the same treatment as `vram`/`bus.ram`. **Do NOT
+  add `text_vram` to `Vga.Snapshot` or `Machine.Snapshot`.**
+- The handler's host pointer (`getHostPtr` mapping) is **correctly NOT snapshotted**: `wire()` re-runs
+  `mapMmio` on restore, which re-establishes the slab→bus pointer. A snapshotted host pointer would be
+  a determinism hazard (CLAUDE #5); re-deriving it from `wire()` is the faithful path.
+- **Instruction:** extend the `machine.zig:515-517` doc comment to mention `text_vram`/`text_vram_mono`
+  alongside `vram` (so the caller-copy contract is documented for both).
+
+Add `text_vram`/`text_vram_mono` zeroing to `Vga.reset` (`src/devices/vga.zig:184-195`, via `@memset`).
+Add the region to the debugger `regions_table` (`src/debug/controller.zig:702-706`):
 `.{ .kind = .text_vram, .phys_start = 0xB8000, .len = 0x8000 }` (extend the `kind` enum at `:130`).
 
 ### 3.2 INT 10h text services — v1 scope, deferrals honest
@@ -279,33 +380,49 @@ only** for v1 (D-TM2). All semantics mirror `int10_char.cpp` (cited inline).
 
 | AH | Service | Semantics (mirror dosbox) | cite |
 | --- | --- | --- | --- |
-| 00 | Set mode | text modes 0–3 (color, B8000) + 7 (mono, B0000): set BDA mode/cols/page-size/rows/CRTC-base; clear the text page if `!no-clear` (fill with `0x0720` = space, gray-on-black); reset cursor pos pages 0–7 + active page | `int10_modes.cpp:30-37`, FinishSetMode |
+| 00 | Set mode | text modes 0–3 (color, B8000) + 7 (mono, B0000): set BDA mode/cols/page-size, **`OFF_NB_ROWS = rows-1`** (= 24 for 80×25, mirror `int10.zig:113`), CRTC-base; clear the text page if `!no-clear` with a **16-bit `0x0720` word fill** (space, gray-on-black) over cols*rows cells — NOT a byte memset (mode 7 uses `0x0720` too, mono attr 0x07); reset cursor pos pages 0–7 + active page | `int10_modes.cpp:30-37`, FinishSetMode |
+| 01 | Set cursor shape | **new (v1):** write CX (start/end scanlines) to BDA `OFF_CURSOR_SHAPE` | `int10.cpp` AH=01; `bda.zig:26` |
 | 02 | Set cursor pos | **already implemented** (BDA `OFF_CURSOR_POS+page*2 = DX`) | `src/bios/int10.zig:40-44`; `int10_char.cpp:384-406` |
-| 03 | Get cursor pos+shape | **already implemented** (DX from BDA, CX shape) | `src/bios/int10.zig:45-50` |
-| 06 | Scroll window up | `INT10_ScrollWindow(CH,CL,DH,DL,-AL,BH,0xFF)`; AL=0 ⇒ clear window | `int10.cpp:96-97`; `int10_char.cpp:193-294` |
+| 03 | Get cursor pos+shape | **already impl for DX; FIX shape:** read CX from BDA `OFF_CURSOR_SHAPE` instead of hardcoded `0x0607` (`int10.zig:49`) so set-then-get round-trips | `src/bios/int10.zig:45-50`; `bda.zig:26` |
+| 06 | Scroll window up | `INT10_ScrollWindow(CH,CL,DH,DL,-AL,BH,0xFF)`; inclusive lower-right (F3); AL=0 ⇒ clear window | `int10.cpp:96-97`; `int10_char.cpp:197-236,264-295` |
 | 07 | Scroll window down | `INT10_ScrollWindow(CH,CL,DH,DL,+AL,BH,0xFF)` | `int10.cpp:99-100` |
+| 08 | Read char+attr at cursor | **new (v1):** `readCharCell` at the BDA cursor → AL=char, AH=attr (one-liner reusing F4's helper) | `int10.cpp:102-103` |
 | 09 | Write char+attr at cursor ×CX | `WriteChar(col,row,page,AL,BL,useattr=true)` ×CX; cursor NOT advanced | `int10.cpp:105-108` |
-| 0A | Write char at cursor ×CX | `WriteChar(...,useattr=false)` ×CX | `int10.cpp:110-111` |
-| 0E | Teletype output AL | the full control-char + wrap + scroll path (BS/CR/LF/default+advance), attr BL in graphics only; advances + writes BDA cursor; **BEL = deterministic no-op** | `int10_char.cpp:743-810` |
+| 0A | Write char at cursor ×CX | `WriteChar(...,useattr=false)` ×CX (char only, attr untouched — F2) | `int10.cpp:110-111` |
+| 0E | Teletype output AL | the full control-char + wrap + scroll path (BS/CR/LF/default+advance), **`useattr=false`** in text mode (attr byte untouched — F2); end-of-screen scroll fills with attr-at-cursor (F4); advances + writes BDA cursor; **BEL = deterministic no-op** | `int10_char.cpp:743-810` |
 | 0F | Get mode | **already implemented** | `src/bios/int10.zig:57-61` |
-| 13 | Write string | `INT10_WriteString(DH,DL,AL,BL,ES:BP,CX,BH)` — AL bit0=advance cursor, bit1=cells carry attr; loops chars handling CR/LF/BS/BEL like teletype | `int10.cpp:594-595`; `int10_char.cpp` WriteString |
+| 13 | Write string | `INT10_WriteString(DH,DL,AL,BL,ES:BP,CX,BH)` — routes each char through teletype with **`useattr=true` ALWAYS** (F5), AL bit0=advance/keep cursor (bit0=0 ⇒ **restore original cursor**), bit1=cells carry attr; CR/LF/BS/BEL like teletype | `int10.cpp:594-595`; `int10_char.cpp:862-886` |
 
-**Shared helpers to add (mirroring dosbox's externally-callable functions):**
+**Shared helpers to add (mirroring dosbox's externally-callable functions).** **All read the LIVE BDA
+for geometry** — cols from `OFF_VIDEO_COLS`, rows from `OFF_NB_ROWS+1` (Finding F1) — NOT the §3.1
+`TEXT_COLS/TEXT_ROWS` constants (those are only the set-mode defaults):
 - `writeCharCell(cpu, page, row, col, chr, attr, useattr)` — the §2.2 cell write to
-  `pstart + page*PAGE_SIZE + (row*cols+col)*2` via `cpu.bus.writePhys8/16`. `pstart` = B8000 for a
-  color text mode, B0000 for mode 7 (from the BDA `OFF_CRTC_ADDRESS` or mode number).
-- `readCharCell(...)` — symmetric read (for the scroll fill-attr and AH=08).
+  `pstart + page*PAGE_SIZE + (row*cols+col)*2` (cols = live BDA cols) via `cpu.bus.writePhys8`.
+  `pstart` = B8000 for a color text mode, B0000 for mode 7 (from the BDA mode / `OFF_CRTC_ADDRESS`).
+  **`useattr=false` ⇒ write the char byte ONLY; do NOT touch `cell+1`** (Finding F2 — never write a
+  default attr).
+- `readCharCell(cpu, page, row, col) -> {chr, attr}` — symmetric read (used by the F4 scroll fill-attr
+  AND AH=08).
 - `scrollWindow(cpu, rul,cul,rlr,clr, nlines, attr, page)` — the copy-rows-then-fill logic
-  (`int10_char.cpp:193-294`), text-mode only for v1.
+  (`int10_char.cpp:197-236,264-295`), text-mode only for v1: clamp `rlr→rows-1`, `clr→cols-1`, inclusive
+  `[cul,clr]` columns, `nlines==0 ⇒ clear whole window` (Finding F3). Fill attr is the **caller's** arg
+  (BH for AH=06/07; attr-at-cursor for the teletype end-of-screen scroll, F4).
 - `teletype(cpu, chr, attr, useattr)` — the §2.2 control-char machine, reading/writing the BDA
-  cursor (`OFF_CURSOR_POS`), cols (`OFF_VIDEO_COLS`), rows (`OFF_NB_ROWS`+1), calling `writeCharCell`
-  + `scrollWindow`. Replaces the AH=0E no-op at `src/bios/int10.zig:53-56`.
+  cursor (`OFF_CURSOR_POS`, decomposed `col=word&0xFF`/`row=word>>8`, re-packed `(row<<8)|col` — F7),
+  cols (`OFF_VIDEO_COLS`), rows (`OFF_NB_ROWS`+1). On end-of-screen it reads the cursor cell's attr
+  (`readCharCell`) **before** scrolling and passes it as the fill (F4). **BEL = silent no-op** (cursor
+  unchanged). Calls `writeCharCell(..., useattr)` + `scrollWindow`. Replaces the AH=0E no-op at
+  `src/bios/int10.zig:53-56`. (AH=13 calls the same `teletype` with `useattr=true` always — F5.)
 
 > **Decision D-TM-BEL: BEL (chr 7) is a deterministic no-op, NOT dosbox's busy-wait.** dosbox beeps
 > by programming PIT ch2 + busy-waiting on `PIC_FullIndex()` for 333 ms
-> (`int10_char.cpp:749-766`) — a host-wall-clock dependence that violates CLAUDE #2/#3. spice86 makes
+> (`int10_char.cpp:752-772`, busy-wait loop `:760-767`) — a host-wall-clock dependence that violates
+> CLAUDE #2/#3. spice86 makes
 > it a no-op (`VgaFunctionality.cs:601-603` `//FIXME should beep`). zdos follows spice86: teletype of
-> BEL leaves the cursor unchanged and does nothing else. (A future faithful beep would program PIT
+> BEL leaves the cursor unchanged and does nothing else. **This applies to BOTH the AH=0E teletype path
+> AND the AH=13 write-string path** (write-string routes each char through the same `teletype` helper,
+> so BEL is the same silent no-op there) — never copy dosbox's `PIC_FullIndex` busy-wait in either
+> path. (A future faithful beep would program PIT
 > ch2 — which zdos already models, `src/devices/pit.zig` — and let cycle-derived emulated time gate
 > the duration; out of v1 scope, flag.)
 
@@ -313,17 +430,22 @@ only** for v1 (D-TM2). All semantics mirror `int10_char.cpp` (cited inline).
 
 > **Decision D-TM2: display pages 1–7 deferred — v1 is page 0 only.** The BDA already stores 8 cursor
 > positions and an active-page byte (`bda.zig:25,27`), and `setModeVga13` already resets all 8
-> (`int10.zig:121-125`), so the *state* is present and snapshot-covered. But v1 INT 10h services
-> operate on page 0 (BH ignored beyond 0), and `/api/screen` renders page 0. Multi-page (AH=05 set
-> active page + the page-start-address CRTC scroll) is deferred until a guest needs it (BaK is
-> graphics; the utility-UI class generally uses page 0). The cell-address helper already takes a
-> `page` param so adding page 1–7 later is a parameter change, not a rewrite.
+> (`int10.zig:121-125`), so the *state* is present and round-trips via the bus-RAM snapshot. But v1 INT
+> 10h services operate on page 0 (BH ignored beyond 0), and there is **no AH=05 set-active-page in v1**,
+> so the BDA `OFF_ACTIVE_PAGE` stays 0. `/api/screen` reads the **BDA active page** (Finding 12) — which
+> is page 0 in v1, but the read is written against the active-page byte so it is already correct when
+> AH=05 lands. Multi-page (AH=05 + the page-start-address CRTC scroll) is deferred until a guest needs
+> it (BaK is graphics; the utility-UI class generally uses page 0). The cell-address helper already takes
+> a `page` param so adding page 1–7 later is a parameter change, not a rewrite.
 
-> **Decision D-TM3: mono text (mode 7 / B0000) — minimal backing, v1 focus is color.** Map a B0000
-> slab too (real machines have both) so a mode-7 program's writes are not lost, but the v1 test
-> corpus + `/api/screen` default to the **color** page (B8000) since `initDefaults` boots mode 3 and
-> BaK/Borland conio are color. If the human prefers to defer mono entirely, drop the B0000 mapping
-> and assert-flag a mode-7 set-mode (CLAUDE assert-don't-fake) — see §7 Q3.
+> **Decision D-TM3: map BOTH text bases (color B8000 + mono B0000) — they share one mechanism.** v1
+> allocates `text_vram` (B8000) and `text_vram_mono` (B0000), each a `[0x8000]u8` slab, and maps both at
+> `wire()` (Finding 2). Mapping mono costs nothing extra over color-only (same `mapMmio` + handler
+> pattern), and real machines have both, so a mode-7 program's writes are never lost. The v1 test corpus
+> + `/api/screen` still **default to the active page** the BDA reports (mode 3 boots color B8000;
+> `initDefaults` `bda.zig:108`), but `/api/screen` reads the base implied by the BDA mode so a mode-7
+> guest renders from B0000. (If the human insists on deferring mono per Q3, drop the B0000 mapping and
+> assert-flag a mode-7 set-mode — but the plan picks **both**.)
 
 > **Deferred: graphics-mode INT 10h text (AH=0E/09 in mode 13h).** dosbox rasterizes the glyph into
 > the framebuffer via the font tables (`int10_char.cpp:526-730` non-text branch). zdos's AH=0E stays
@@ -345,8 +467,9 @@ synthetic cost, no hole (identical to the A0000 reasoning, `src/devices/vga.zig:
 
 ### 3.4 Determinism & snapshot summary
 
-- `text_vram` is guest memory: deterministic (zero-init at reset), snapshot-covered (copied
-  separately like `vram`).
+- `text_vram`/`text_vram_mono` are guest memory: deterministic (zero-init at reset), and round-trip
+  via the **caller-copy** path (dupe + restore, like `vram`/`bus.ram`) — **NOT** a `Snapshot` struct
+  field. The hostPtr is re-derived by `wire()`'s `mapMmio` on restore, so it is correctly unsnapshotted.
 - Cursor pos/shape/mode/cols/active-page are **BDA bytes** = guest RAM, already in the bus RAM slab
   snapshot, already deterministic.
 - INT 10h text services are pure host traps over guest RAM — no host time, no RNG, no float.
@@ -364,7 +487,10 @@ closes the KEYECHO real-`putch` gate.
 
 ### 4.1 Rendering format
 
-Render **page 0** of the color text page (B8000) as the 80×25 character grid. The wire shape:
+Render the **BDA active page** (`OFF_ACTIVE_PAGE`) of the active text base — color B8000 (or mono
+B0000 if the BDA mode is 7) — as the cols×rows character grid (**Finding 12**: not a hardcoded page 0;
+cols/rows read from the BDA so 40-col modes render correctly; the cell peek is `cols*rows*2` bytes).
+The wire shape:
 
 ```json
 {
@@ -382,9 +508,11 @@ Render **page 0** of the color text page (B8000) as the 80×25 character grid. T
   — recommend **raw bytes** (faithful; the test can assert exact bytes) with a documented note. CP437
   high bytes (≥ 0x80) emitted as raw bytes too (the consumer decodes if it wants glyphs).
 - `cols`/`rows`/`mode`: read from BDA (`OFF_VIDEO_COLS`, `OFF_NB_ROWS`+1, `OFF_VIDEO_MODE`).
-- `cursor`: from BDA `OFF_CURSOR_POS` (page 0).
+- `cursor`: from BDA `OFF_CURSOR_POS` at the active page (`col = word & 0xFF`, `row = word >> 8` — F7).
 - `attrs`: **optional, omitted (null) by default** (D-TM4). A `?attrs=1` query param returns a
-  parallel 2000-byte attribute array (byte1 of each cell) hex-encoded or as a second grid — see Q2.
+  parallel attribute array (byte1 of each cell) hex-encoded — see Q2. The `?attrs=1` flag is parsed
+  **server-side** (Finding 5): the worker always fills the full cells buffer (cheap); only the JSON
+  serialization decides whether to emit the attribute array.
 
 > **Decision D-TM4: plain-text rows by default; attributes opt-in.** The KEYECHO gate and the bulk of
 > black-box assertions care about *which characters appear where*, not colors. Default to the
@@ -396,26 +524,33 @@ Render **page 0** of the color text page (B8000) as the 80×25 character grid. T
 
 The screen read is **a pure observation** like `console_get`, so it reuses that exact flow:
 
-1. **Controller** (`src/debug/controller.zig`): add `pub fn screen(self, dst) ScreenView` that
-   `peekMemPhys(0xB8000 + page0_off, dst[0..cols*rows*2])` (pure peek) and reads the BDA
-   mode/cols/rows/cursor via `peekMemPhys(BDA_PHYS+off,...)`. Returns the raw cell bytes + the BDA
-   scalars; the worker/JSON layer formats the grid. Mirrors `console()` at `:641-650`.
-2. **Queue** (`src/api/queue.zig`): add `screen_get: void` to `Command` (`:108` alongside
-   `console_get`); add a `ScreenResult` POD (cols/rows/mode/cursor + a `[80*25*2]u8 cells` fixed
-   array + len) and a `screen:` arm to `Response` (`:210`). Note `MAX_CONSOLE=4096`
-   (`:181`) is enough for 80×25 chars (2000) but the cells buffer needs 4000 bytes → add a
-   `MAX_SCREEN_CELLS = 80*25*2 = 4000` constant; the result is pointer-free fixed array (the
-   project's POD discipline, `:142-184`).
-3. **Worker** (`src/api/worker.zig`): add a `screenResp(ctrl)` (mirror `consoleResp` at `:267-274`)
-   that fills `ScreenResult` from `ctrl.screen(...)`; dispatch `.screen_get => screenResp(ctrl)`
-   (`:120` alongside `console_get`).
-4. **JSON wire** (`src/api/json_wire.zig`): serialize `ScreenResult` → the §4.1 shape (decode cells
-   into the `text` string rows; include `attrs` only when requested).
-5. **Server** (`src/api/server.zig`): add the route after `/api/console` (`:273-278`):
+1. **Controller** (`src/debug/controller.zig`): add `pub fn screen(self, dst) ScreenView` that reads
+   the BDA mode/cols/rows/cursor/**active-page** via `peekMemPhys(BDA_PHYS+off,...)`, picks the base
+   (B8000, or B0000 if mode 7), then `peekMemPhys(base + active_page*page_size, dst[0..cols*rows*2])`
+   (pure peek, Finding 12). Returns the raw cell bytes + the BDA scalars; the worker/JSON layer formats
+   the grid. Mirrors `console()` at `:641-650`.
+2. **Queue** (`src/api/queue.zig`): add `screen_get: void` to `Command` (a **`void`** command — the
+   `?attrs` flag is NOT in the command; Finding 5); add a `ScreenResult` POD (cols/rows/mode/cursor +
+   active-page + a `[MAX_SCREEN_CELLS]u8 cells` fixed array + len) and a `screen:` arm to `Response`.
+   `MAX_CONSOLE=4096` (`:181`) is enough for the 80×25 char grid (2000) but the **cells** buffer needs
+   4000 bytes → add a `MAX_SCREEN_CELLS = 80*25*2 = 4000` constant next to `MAX_CONSOLE` (Finding 4);
+   the result is a pointer-free fixed array (the project's POD discipline, `queue.zig:182-185`).
+3. **Worker** (`src/api/worker.zig`): add a `screenResp(ctrl)` (mirror `consoleResp`) that **always**
+   fills the full `ScreenResult` cells from `ctrl.screen(...)` (cheap; the attrs decision is deferred to
+   serialization); dispatch `.screen_get => screenResp(ctrl)` alongside `console_get`.
+4. **JSON wire** (`src/api/json_wire.zig`): serialize `ScreenResult` → the §4.1 shape (decode cell
+   byte0 into the `text` string rows). It receives an `attrs: bool` (from the server's query parse) and
+   emits the hex attribute array only when set. **Sizing (Finding 4):** confirm `respondScreen` writes
+   into `self.resp_buf` (32 KiB, `server.zig:103` `RESPONSE_BUF`) — the grid (~2 KiB) + optional hex
+   attrs (~4 KiB) + JSON scaffolding fit comfortably.
+5. **Server** (`src/api/server.zig`): add the route after `/api/console` (`:273-278`); parse `?attrs=1`
+   from the **query** server-side (like `handleMemPeek`'s `queryU32`, `server.zig:587-589`) and pass it
+   to the serializer (the command itself stays `void`, Finding 5):
    ```zig
    if (std.mem.eql(u8, path, "/api/screen")) {
        if (method != .GET) return self.methodNotAllowed(req);
-       return self.submitAndRespond(req, .screen_get); // (attrs flag parsed from query)
+       const want_attrs = (self.queryU32(query, "attrs") orelse 0) != 0;
+       return self.submitAndRespondScreen(req, want_attrs); // void command; attrs drives serialization
    }
    ```
 
@@ -431,14 +566,25 @@ cell grid, where direct-video `putch` + INT 10h teletype land). They are **diffe
 - Real DOS CON *does* write the screen too, but zdos's CON is a capture seam (deterministic, headless)
   — see D-TM5.
 
-**Keep both surfaces.** They answer different questions and both are needed.
+**Keep both surfaces (LOCKED for v1).** They answer different questions and both are needed.
 
-> **Decision D-TM5: do NOT mirror INT 10h teletype into the CON capture (and vice-versa).** It is
-> tempting to also push teletype/`putch` output into `/api/console` so existing CON-based tests catch
-> it. Reject: that conflates two distinct architectural surfaces and would make `/api/console` lie
-> about what the DOS CON device received. The faithful design is two independent reads. (If a future
-> convenience "combined view" is wanted, add it as a third, clearly-labeled endpoint — never silently
-> merge.)
+**Consumer impact (state it bluntly).** Because zdos's CON is a *capture* device that does **not** also
+poke B8000, **`INT 21h AH=09` / `printf` output appears on `/api/console` but NOT on `/api/screen`**,
+and `putch` / INT 10h teletype output appears on `/api/screen` but NOT on `/api/console`. So a TUI that
+mixes `printf` (or `cprintf`/`puts`) with `putch`/direct-video has its output **split across the two
+surfaces** — a test asserting the full screen of such a program must read both. This is the deliberate
+v1 trade-off (faithful, deterministic capture seams over a synthesized merge).
+
+> **Decision D-TM5 (LOCKED v1): `/api/console` and `/api/screen` stay DISTINCT — no mirroring.** It is
+> tempting to push teletype/`putch` output into `/api/console` (or DOS CON output into the text page) so
+> one read catches everything. Reject for v1: that conflates two distinct architectural surfaces and
+> would make `/api/console` lie about what the DOS CON device received. The faithful v1 design is two
+> independent reads.
+>
+> **Documented follow-up (NOT v1):** mirror DOS CON output into the text page so `/api/screen` shows
+> everything a real screen would (real DOS CON *does* write the screen via the BIOS teletype). That is a
+> faithful enhancement — route the CON device's writes through the same `teletype` helper — but it is
+> out of v1 scope; flag it as a follow-up, do not silently merge the two reads.
 
 ---
 
@@ -485,8 +631,9 @@ Mirror the existing determinism discipline (`tests/blackbox/keyecho_test.zig:86-
 `src/machine/determinism_test.zig`): run the same INT 10h text sequence on two fresh
 machines/processes and assert (a) the `text_vram` bytes are byte-identical, AND (b) the `/api/screen`
 render string is identical. The text page is guest RAM + the services are pure traps, so this holds
-by construction. Add `text_vram` to whatever full-snapshot determinism test asserts VRAM
-byte-identity (it must round-trip through snapshot/restore like `vram`).
+by construction. Assert `text_vram`/`text_vram_mono` round-trip via the **caller-copy** snapshot path
+(dupe + restore + `expectEqualSlices`, exactly like the existing `vram` assertion at
+`controller_test.zig:304,329`) — **NOT** via a `Snapshot` struct field (they are not in one).
 
 ### 5.4 Oracle angle — dosbox-x CAN give a golden for the text buffer
 
@@ -509,12 +656,23 @@ artifact.
 
 ### 5.5 Determinism grep-gate
 
-`src/devices/vga.zig` is already in the float/host-clock grep gate (added by the retrace work,
-`plans/vga-retrace.md:608-609` P5; `src/devices/pit_test.zig:53-58`). The text-page code is pure
-integer/byte work, but **confirm the gate still passes** after the edits (no `std.time`/float/RNG
-creeps into the cell/teletype helpers). `src/bios/int10.zig` should be **added to the gate's
-`sources` array** too (the teletype/scroll code is determinism-critical and currently ungated) — flag
-this as a P-step.
+The new text code is determinism-critical (integer/byte work; no `std.time`/float/RNG), and the gates
+that cover it **already exist** — there is no new gate to add, only the existing ones to keep green:
+- `src/bios/int10.zig` is **ALREADY embedded in the BIOS determinism gate**
+  (`src/bios/determinism_test.zig:22`), so the new teletype/scroll/write-string helpers are
+  auto-covered the moment they land. **Do NOT add `int10.zig` to the devices gate** (`pit_test.zig`):
+  the devices gate `@embedFile`s only `src/devices/*` sources (`pit_test.zig:53-62`), and a
+  cross-module `@embedFile("../bios/int10.zig")` would not compile / is the wrong module boundary.
+- `src/devices/vga.zig` is **ALREADY** in the devices grep gate (`pit_test.zig:61`, added by the
+  retrace work). This is the **only genuine new device surface** — the `text_vram`/`text_vram_mono`
+  slabs + the two MMIO handlers — so the work just keeps `vga.zig` clean of the needles.
+- `src/debug/controller.zig` (the `/api/screen` read path) is in the debug gate
+  (`src/debug/determinism_test.zig:15`); `src/api/{queue,worker,server,json_wire}.zig` are in the api
+  gate (`src/api/determinism_test.zig:23-27`). The new `screen` read + `ScreenResult` + serialization
+  are auto-covered there.
+
+**So P8's grep step is simply: confirm the existing BIOS / devices / api / debug gates still pass with
+the new code.** No new `sources`-array entry is correct or needed.
 
 ---
 
@@ -523,40 +681,60 @@ this as a P-step.
 Each box ≈ one focused commit; `zig build test` (+ `test-blackbox`, `test-oracle`) stay green
 throughout. Ordered so each phase is independently testable.
 
-- [ ] **P1 — Text-page backing region.** Add the §3.1 geometry/cell constants + a `text_vram` slab
-      (alloc in `Vga.init`, free in `deinit`, zero in `reset`) + a `textMemHandler()` (`read8/write8/
-      getHostPtr/peek8` indexing `text_vram`) to `src/devices/vga.zig` (mirror `:122,171-259`). Map it
-      in `machine.wire()` after `src/machine/machine.zig:233`:
-      `mapMmio(TEXT_COLOR_PHYS, TEXT_WINDOW_LEN, self.vga.textMemHandler())`. Unit-test: a direct bus
-      write to B800:0000 reads back (it was dropped before). No INT 10h change yet.
-- [ ] **P2 — Snapshot coverage for `text_vram`.** Copy `text_vram` bytes separately on snapshot/
-      restore alongside `vram` (`src/machine/machine.zig:515-518` pattern). Add `.text_vram` to the
-      debugger `regions_table` (`src/debug/controller.zig:130,702-706`). Test: write B800, snapshot,
-      mutate, restore, assert bytes round-trip byte-identical (mirror `controller_test.zig:304,329`).
-- [ ] **P3 — INT 10h cell helpers + AH=09/0A write-char.** Add `writeCharCell`/`readCharCell` (§3.2)
-      and the AH=09 (attr) / AH=0A (no-attr) dispatch arms to `src/bios/int10.zig` (replace the `else`
-      fallthrough at `:63` for these AHs). Unit/black-box test: AH=09 writes a char+attr at the cursor,
-      read back via B800 + via AH=08.
-- [ ] **P4 — INT 10h AH=0E teletype + AH=06/07 scroll.** Add `scrollWindow` (§3.2,
-      `int10_char.cpp:193-294`) and the full `teletype` control-char machine (BS/CR/LF/wrap/scroll,
-      **BEL no-op**, D-TM-BEL) replacing the AH=0E no-op at `src/bios/int10.zig:53-56`. Wire AH=06/07.
-      Test: teletype a string → cells land + cursor advances + wraps + scrolls (§5.2).
+- [ ] **P1 — Text-page backing region (two slabs).** Add the §3.1 geometry/cell constants + **two**
+      `[0x8000]u8` slabs (`text_vram`@B8000, `text_vram_mono`@B0000) — alloc both in `Vga.init` (single
+      struct literal), free both in `deinit`, `@memset(...,0)` both in `reset` (NOT `@splat`) — plus
+      `textMemHandler()` / `textMonoMemHandler()` each with **both `getHostPtr` AND `peek8`** (+
+      `read8/write8`) indexing its slab (mirror `vga.zig:122,171-259`). Map both in `machine.wire()`
+      after `src/machine/machine.zig:233`:
+      `mapMmio(TEXT_COLOR_PHYS, …, textMemHandler())` + `mapMmio(TEXT_MONO_PHYS, …, textMonoMemHandler())`.
+      Unit-test: a direct bus write to B800:0000 (and B000:0000) reads back (both were dropped before).
+      No INT 10h change yet.
+- [ ] **P2 — Snapshot round-trip for `text_vram` (caller-copy, NOT a struct field).** Confirm the
+      snapshot **caller** dupes `machine.vga.text_vram`/`text_vram_mono` and restores them into the
+      re-init'd machine's slabs (the same out-of-band path as `vram`/`bus.ram`; do **NOT** add a
+      `Snapshot` struct field — see §3.1/§3.4). Extend the `machine.zig:515-517` doc comment to mention
+      `text_vram` alongside `vram`. Add `.text_vram` to the debugger `regions_table`
+      (`src/debug/controller.zig:130,702-706`). Test: write B800, snapshot (dupe slab), mutate, restore,
+      `expectEqualSlices` byte-identical — **mirror the caller-copy pattern at `controller_test.zig:304,329`**
+      (dupe + restore + `expectEqualSlices`), NOT a `Vga.Snapshot`/`Machine.Snapshot` field round-trip.
+- [ ] **P3 — INT 10h cell helpers + AH=09/0A write-char + AH=08 read.** Add `writeCharCell` (F2:
+      `useattr=false` ⇒ char only) / `readCharCell` (§3.2, live BDA cols) and the AH=09 (attr) / AH=0A
+      (no-attr) / **AH=08** (read char+attr — a one-liner on `readCharCell`) dispatch arms to
+      `src/bios/int10.zig` (replace the `else` fallthrough at `:63` for these AHs). Unit/black-box test:
+      AH=09 writes a char+attr at the cursor, read back via B800 + via AH=08.
+- [ ] **P4 — INT 10h AH=0E teletype + AH=06/07 scroll + AH=01/03 cursor shape.** Add `scrollWindow`
+      (§3.2, `int10_char.cpp:197-236,264-295`, inclusive bounds F3) and the full `teletype` control-char
+      machine (BS/CR/LF/wrap/scroll, **BEL no-op** D-TM-BEL, end-of-screen fill = attr-at-cursor F4,
+      cursor word col=lo/row=hi F7) replacing the AH=0E no-op at `src/bios/int10.zig:53-56`. Wire AH=06/07.
+      **Also: add AH=01 (write CX → BDA `OFF_CURSOR_SHAPE`) and FIX AH=03 to read the BDA shape** instead
+      of the hardcoded `0x0607` (`int10.zig:49`), so set-then-get cursor shape round-trips. Test:
+      teletype a string → cells land + cursor advances + wraps + scrolls (§5.2); AH=01 then AH=03 returns
+      the set shape.
 - [ ] **P5 — INT 10h AH=00 text mode-set + AH=13 write-string.** Extend `setMode` to handle text
-      modes 0–3 (B8000) / 7 (B0000): program BDA + clear page (fill `0x0720`) per FinishSetMode
-      (`int10_modes.cpp:30-37`). Add AH=13 WriteString. Test: set mode 3 clears the page; write-string
-      places a row.
-- [ ] **P6 — `/api/screen` read.** Add `Controller.screen` (pure peek, §4.2.1), `screen_get` Command +
-      `ScreenResult` POD (`queue.zig`), `screenResp` (`worker.zig`), JSON serialization (`json_wire.zig`,
-      §4.1 shape, `attrs` opt-in D-TM4), and the `/api/screen` route (`server.zig` after `:278`).
-      Test: write cells, `GET /api/screen`, assert the grid string + cursor; assert the read is
-      side-effect-free (snapshot unchanged before/after).
+      modes 0–3 (B8000) / 7 (B0000): program BDA mode/cols/page-size, **`OFF_NB_ROWS = rows-1`** (F8),
+      CRTC-base + clear the page with a **16-bit `0x0720` word fill** over cols*rows cells (F6 — NOT a
+      byte memset) per FinishSetMode (`int10_modes.cpp:30-37`). Add AH=13 WriteString (each char via
+      `teletype`, **`useattr=true` always** F5, restore cursor when AL bit0=0). Test: set mode 3 clears
+      the page to 0x0720; write-string places a row and bit0=0 leaves the cursor put.
+- [ ] **P6 — `/api/screen` read.** Add `Controller.screen` (pure peek of the **BDA active page** at the
+      BDA-implied base, cols/rows from BDA, §4.2.1), `screen_get` **`void`** Command + `ScreenResult`
+      POD with a `[MAX_SCREEN_CELLS=4000]u8` cells buffer (`queue.zig`), `screenResp` filling the full
+      cells (`worker.zig`), JSON serialization (`json_wire.zig`, §4.1 shape) with `attrs` driven by a
+      **server-side `?attrs=1` query parse** (D-TM4 / Finding 5), and the `/api/screen` route
+      (`server.zig` after `:278`). Test: write cells, `GET /api/screen`, assert the grid string + cursor;
+      assert the read is **side-effect-free** — snapshot before == after (mirror
+      `controller_test.zig:321-329`).
 - [ ] **P7 — KEYECHO real-`putch` acceptance gate.** Revert `examples/dos-src/KEYECHO.C:42-56` to real
       `putch()`, recompile (`tools/bcc.sh`), update `tests/blackbox/keyecho_test.zig` to assert the
       echo via `/api/screen` (§5.1). Confirm ESC still terminates (ret 0). **This green is the gate.**
-- [ ] **P8 — Determinism + grep-gate + VIDTEXT.** Two-run byte-identity of `text_vram` + `/api/screen`
-      (§5.3). Add `src/bios/int10.zig` to the float/host-clock grep gate (`pit_test.zig:53-58`, §5.5)
-      and confirm `vga.zig` still passes. Update `examples/dos-src/VIDTEXT.C` to assert teletype now
-      that it is modeled (§5.2), removing the "deferred text-subsystem" boundary note.
+- [ ] **P8 — Determinism + grep-gate + VIDTEXT.** Two-run byte-identity of `text_vram`/`text_vram_mono`
+      + `/api/screen` via the caller-copy path (§5.3). **Confirm the existing BIOS / devices / api / debug
+      grep gates still pass** with the new code (`int10.zig` is ALREADY in the BIOS gate
+      `determinism_test.zig:22`; `vga.zig` in the devices gate `pit_test.zig:61`; controller/api modules
+      gated) — **do NOT add `int10.zig` to the devices gate** (§5.5). Update `examples/dos-src/VIDTEXT.C`
+      to assert teletype now that it is modeled (§5.2), removing the "deferred text-subsystem" boundary
+      note.
 - [ ] **P9 — Docs + (optional) text oracle band.** Flip the ROADMAP backlog item
       (`plans/ROADMAP.md:25`) to done; update the `KEYECHO.C` header note (no longer "unobservable").
       Add the text-buffer-content oracle band note to `plans/io-oracle.md` §1 (§5.4 — text cells ARE a
@@ -566,11 +744,13 @@ throughout. Ordered so each phase is independently testable.
 
 ## 7. Risks / open questions for the human
 
-1. **Q1 — v1 INT 10h scope.** Proposed v1: AH=00 (text modes 0–3/7), 02/03 (done), 06/07 scroll,
-   09/0A write-char, 0E teletype, 0F (done), 13 write-string. Deferred: pages 1–7 (D-TM2),
-   graphics-mode text output, AH=11 font RAM (D-TM1/§3.2), AH=08 read-char (cheap — include it?),
-   AH=01 set cursor shape (cosmetic — include as a BDA write?). **Confirm the v1 set; is AH=08/AH=01
-   in or out?**
+1. **Q1 — v1 INT 10h scope (RESOLVED — AH=08/AH=01 are IN).** v1: AH=00 (text modes 0–3/7), 01 (set
+   cursor shape → BDA), 02 (done), **03 fixed to read BDA shape** (was hardcoded `0x0607`), 06/07
+   scroll, **08 read char+attr** (a one-liner on `readCharCell`, already needed for the F4 scroll
+   fill-attr), 09/0A write-char, 0E teletype, 0F (done), 13 write-string. Deferred: pages 1–7 (D-TM2),
+   graphics-mode text output, AH=11 font RAM (D-TM1/§3.2). **AH=08 and AH=01 are now in v1** (both are
+   nearly free; AH=01/03 also fixes a latent set-then-get-cursor-shape inconsistency the text work
+   touches). Confirm the v1 set is otherwise complete.
 
 2. **Q2 — `/api/screen` format + attributes.** Proposed: default = `text` grid (25 `\n`-joined
    80-char rows, raw bytes incl. CP437 high bytes) + cursor + mode; attributes opt-in via `?attrs=1`
@@ -589,11 +769,12 @@ throughout. Ordered so each phase is independently testable.
    graphics mode would see it always-RAM — but real text/graphics coexistence means both windows ARE
    addressable; this matches hardware. **Confirm acceptable** (it is, for the BaK + utility-UI scope).
 
-5. **Q5 — Plane/font machinery (D-TM1) and CON–screen mirroring (D-TM5).** v1 models the flat
+5. **Q5 — Plane/font machinery (D-TM1) and CON–screen mirroring (D-TM5 — LOCKED).** v1 models the flat
    char/attr slab (no `seq.map_mask` plane split, no font upload) and keeps `/api/console` and
-   `/api/screen` as separate surfaces (no mirroring). **Confirm** no v1 target needs plane-2 font
-   upload or a merged CON+screen view (flag if BaK's intro/credits use a custom font via AH=11 — a
-   recon gap, like the BaK-recon gap already noted in `plans/io-oracle.md:394-398`).
+   `/api/screen` as **separate surfaces (decided: no mirroring in v1; CON→text-page mirror is a
+   documented follow-up, §4.3)**. **Confirm** no v1 target needs plane-2 font upload (flag if BaK's
+   intro/credits use a custom font via AH=11 — a recon gap, like the BaK-recon gap already noted in
+   `plans/io-oracle.md:394-398`).
 
 6. **Q6 — BEL deterministic no-op (D-TM-BEL).** v1 teletype of chr 7 does nothing (follows spice86),
    rather than dosbox's host-timed 333 ms beep busy-wait (which violates determinism). **Confirm** a
