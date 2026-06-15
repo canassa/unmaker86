@@ -31,9 +31,26 @@ pub fn main(init: std.process.Init) !void {
     var args_it: std.process.Args.Iterator = .init(init.minimal.args);
     _ = args_it.next(); // skip argv[0]
     const path = args_it.next() orelse {
-        try stderr.writeStreamingAll(io, "usage: zig build run -- <PROGRAM.COM|PROGRAM.EXE>\n");
+        try stderr.writeStreamingAll(io, "usage: zig build run -- <PROGRAM.COM|PROGRAM.EXE> [args...]\n");
         std.process.exit(2);
     };
+
+    // Any remaining host args become the guest DOS command tail (space-joined),
+    // e.g. `... -- TCC.EXE -IINCLUDE HELLO.C` runs TCC with that command line.
+    // psp.build formats the on-disk tail (count byte + leading space) to match
+    // DOS, so the guest parses it exactly as it would under real DOS.
+    var tail_buf: [127]u8 = undefined;
+    var tail_len: usize = 0;
+    while (args_it.next()) |a| {
+        if (tail_len != 0 and tail_len < tail_buf.len) {
+            tail_buf[tail_len] = ' ';
+            tail_len += 1;
+        }
+        const n = @min(a.len, tail_buf.len - tail_len);
+        @memcpy(tail_buf[tail_len .. tail_len + n], a[0..n]);
+        tail_len += n;
+    }
+    const cmdtail = tail_buf[0..tail_len];
 
     // Split into a host directory (mounted as DOS drive C:) and the file name.
     const sep = std.mem.lastIndexOfScalar(u8, path, '/');
@@ -61,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
     m.dos.current_drive = 2;
 
     // ---- load + run ----------------------------------------------------------
-    m.bootProgram(2, file_name, "") catch |err| {
+    m.bootProgram(2, file_name, cmdtail) catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "zdos: cannot load '{s}': {t}\n", .{ file_name, err }) catch "zdos: cannot load program\n";
         try stderr.writeStreamingAll(io, msg);
