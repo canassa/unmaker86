@@ -132,6 +132,24 @@ pub const Region = struct {
     len: u32,
 };
 
+/// A fully-resolved mouse injection (input-injection.md §5.2, Phase 2). Pointer-
+/// free POD: it carries both ABSOLUTE (`x`/`y`) and RELATIVE (`dx`/`dy`) motion +
+/// a `buttons` mask, each gated by its `set_*` flag, so a caller can update any
+/// subset. The wire→this resolution (mutual-exclusion check, defaults) happens at
+/// the server; the controller just applies it.
+pub const MouseInject = struct {
+    x: i16 = 0,
+    y: i16 = 0,
+    dx: i16 = 0,
+    dy: i16 = 0,
+    buttons: u16 = 0,
+    set_x: bool = false,
+    set_y: bool = false,
+    set_dx: bool = false,
+    set_dy: bool = false,
+    set_buttons: bool = false,
+};
+
 pub const Controller = struct {
     m: *Machine,
     set: BreakpointSet = .{},
@@ -501,6 +519,31 @@ pub const Controller = struct {
             _ = self.m.kbd.pushScancode(0xE0);
         }
         return self.m.kbd.pushScancode(code);
+    }
+
+    /// Inject a mouse event into the INT 33h driver state (Model A,
+    /// input-injection.md §5.2, Phase 2). A debugger mouse injection is a
+    /// deliberate new INPUT (the "same binary + SAME INPUTS" category, like
+    /// setReg/injectScancode): it mutates `dos.mouse` driver state at the current
+    /// cycle-exact boundary, with NO host clock and NO sample-rate gate, and the
+    /// guest observes it on the next AX=0003/AX=000B (the next `run`/`step`).
+    ///
+    /// `req` carries both ABSOLUTE (x/y) and RELATIVE (dx/dy) motion plus buttons;
+    /// each is applied only when its `set_*` flag is set. Absolute and relative are
+    /// mutually exclusive per axis at the API layer (the server rejects mixing);
+    /// here we apply absolute first (verbatim range-clamped) then relative (the
+    /// fixed-point mickey path), so a caller that sets neither leaves position
+    /// untouched. Buttons are applied once (a relative call carries the same mask).
+    pub fn injectMouse(self: *Controller, req: MouseInject) void {
+        const mouse = &self.m.dos.mouse;
+        if (req.set_x or req.set_y) {
+            // Buttons ride with the absolute set if relative isn't also setting them.
+            const btn_here = req.set_buttons and !(req.set_dx or req.set_dy);
+            mouse.injectAbsolute(req.x, req.y, req.buttons, req.set_x, req.set_y, btn_here);
+        }
+        if (req.set_dx or req.set_dy or req.set_buttons) {
+            mouse.injectRelative(req.dx, req.dy, req.buttons, req.set_dx, req.set_dy, req.set_buttons);
+        }
     }
 
     // -----------------------------------------------------------------------

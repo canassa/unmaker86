@@ -372,6 +372,10 @@ pub const Server = struct {
             if (method != .POST) return self.methodNotAllowed(req);
             return self.handleInputKey(req, body, is_json);
         }
+        if (std.mem.eql(u8, path, "/api/input/mouse")) {
+            if (method != .POST) return self.methodNotAllowed(req);
+            return self.handleInputMouse(req, body, is_json);
+        }
 
         // --- deferred, honestly reported ---
         if (std.mem.eql(u8, path, "/api/disasm")) {
@@ -463,6 +467,38 @@ pub const Server = struct {
             } });
         }
         self.respondError(req, .bad_request, "bad_request", "provide scancode or char");
+    }
+
+    fn handleInputMouse(self: *Server, req: *http.Server.Request, body: []const u8, is_json: bool) void {
+        if (!self.requireJson(req, is_json, body)) return;
+        var r: wire.MouseReq = .{};
+        if (body.len > 0) r = self.parseBody(wire.MouseReq, body) orelse return self.badJson(req);
+        // Absolute vs relative are mutually exclusive PER AXIS (§5.2): mixing an
+        // absolute set with a relative delta on the SAME axis is ambiguous -> 400.
+        if (r.x != null and r.dx != null) {
+            return self.respondError(req, .bad_request, "bad_request", "give either x or dx, not both");
+        }
+        if (r.y != null and r.dy != null) {
+            return self.respondError(req, .bad_request, "bad_request", "give either y or dy, not both");
+        }
+        // Require at least one motion/button field so an empty request is a 400 (no
+        // silent no-op that a client could mistake for an applied event).
+        if (r.x == null and r.y == null and r.dx == null and r.dy == null and r.buttons == null) {
+            return self.respondError(req, .bad_request, "bad_request", "provide at least one of x/y/dx/dy/buttons");
+        }
+        _ = r.fire_callback; // Phase 3 (AX=000C event callback) — accepted, no-op here.
+        self.submitAndRespond(req, .{ .input_mouse = .{
+            .x = r.x orelse 0,
+            .y = r.y orelse 0,
+            .dx = r.dx orelse 0,
+            .dy = r.dy orelse 0,
+            .buttons = r.buttons orelse 0,
+            .set_x = r.x != null,
+            .set_y = r.y != null,
+            .set_dx = r.dx != null,
+            .set_dy = r.dy != null,
+            .set_buttons = r.buttons != null,
+        } });
     }
 
     fn handleAddBp(self: *Server, req: *http.Server.Request, body: []const u8, is_json: bool) void {

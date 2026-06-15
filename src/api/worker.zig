@@ -108,6 +108,13 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource) Respons
 
         // ---- input ---------------------------------------------------------
         .input_key => |c| inputKey(ctrl, c),
+        .input_mouse => |c| blk: {
+            // Mutate INT 33h driver state at the one-command-in-flight boundary
+            // (no host clock, no sample-rate gate). Always succeeds — driver-state
+            // injection has no FIFO to overflow (unlike the 8042 key path).
+            ctrl.injectMouse(c);
+            break :blk .ok;
+        },
 
         // ---- session -------------------------------------------------------
         .status => statusResp(ctrl),

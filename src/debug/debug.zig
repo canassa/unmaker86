@@ -33,6 +33,7 @@ pub const CpuSnapshot = controller.CpuSnapshot;
 pub const Reg16 = controller.Reg16;
 pub const Reg8 = controller.Reg8;
 pub const Region = controller.Region;
+pub const MouseInject = controller.MouseInject;
 
 test {
     _ = breakpoints;

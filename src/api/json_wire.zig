@@ -83,6 +83,29 @@ pub const KeyReq = struct {
     char: ?[]const u8 = null,
 };
 
+/// `POST /api/input/mouse` — inject a mouse event into the INT 33h driver
+/// (input-injection.md §5.2, Phase 2). Absolute position and/or relative motion
+/// and/or buttons; every field is optional, and a field is applied only when
+/// present:
+///   - `{"x": X, "y": Y}` — ABSOLUTE position, clamped to the live range like
+///     AX=0004 (read back verbatim by the guest via AX=0003).
+///   - `{"dx": DX, "dy": DY}` — RELATIVE motion (the ported fixed-point mickey /
+///     sensitivity math; raw input forced, no host clock). Drives both the cursor
+///     position AND the AX=000B mickey counters. Ships in v1 (NOT `not_implemented`).
+///   - `{"buttons": N}` — button mask, bit0 left / bit1 right / bit2 middle.
+/// Absolute and relative are MUTUALLY EXCLUSIVE PER AXIS (mixing `x` with `dx`, or
+/// `y` with `dy`, is a `400`); they may otherwise be combined (e.g. `x` + `dy`).
+/// `fire_callback` is accepted for forward-compat (the AX=000C event callback is
+/// Phase 3) and is a no-op in this phase.
+pub const MouseReq = struct {
+    x: ?i16 = null,
+    y: ?i16 = null,
+    dx: ?i16 = null,
+    dy: ?i16 = null,
+    buttons: ?u16 = null,
+    fire_callback: bool = true,
+};
+
 /// `PATCH /api/cpu/reg` — a single valid `std.json` tagged union (§B.4/G2). One
 /// key names which thing to set; its payload carries the target name + value. The
 /// `flags` arm is the SAME 13-bool object `cpuSnapshot` emits (symmetric read/write).

@@ -1420,7 +1420,7 @@ loops AH=00 unblocks deterministically when a scancode + IRQ1 is injected, §7.1
   unchanged: it injects no relative motion, so the accumulator stays 0 → AX=000B
   reads 0/0 exactly as before; re-minted via tools/oracle.sh (double-mint diff
   byte-identical) to confirm.]
-- [ ] `Controller.injectMouse(...)`, `Command.input_mouse`, `drainOne` arm,
+- [x] `Controller.injectMouse(...)`, `Command.input_mouse`, `drainOne` arm,
   `MouseReq` wire (x/y/buttons AND dx/dy — relative ships in v1, no
   `not_implemented`), route `POST /api/input/mouse`.
 - [ ] Tests: byte-identity (now valid thanks to Phase 0) for both absolute and

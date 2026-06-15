@@ -96,6 +96,12 @@ pub const Command = union(enum) {
     ///     with a left-Shift make/break (the resolved "scancode(s)" of a shifted
     ///     char). All edges go through the controller in one worker step.
     input_key: struct { scancode: u8, make: bool, ext: bool, press: bool, shift: bool },
+    /// Inject a mouse event into the INT 33h driver state (Model A,
+    /// input-injection.md §5.2). Pointer-free POD: the wire→resolved mapping
+    /// (mutual-exclusion check + defaults) is done at the HANDLER; the queue
+    /// carries the fully-resolved `MouseInject` (absolute x/y, relative dx/dy,
+    /// buttons, each gated by a `set_*` flag).
+    input_mouse: debug.MouseInject,
     status: void,
     reset: void,
     load: LoadCmd,
