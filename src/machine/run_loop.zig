@@ -98,27 +98,22 @@ fn cpuWakeable(m: *Machine) bool {
 }
 
 /// Run until the cycle budget `n` is consumed, or a terminal stop (M-D13). Returns
-/// `.cycles_reached` when the budget is hit. Breakpoint checked BETWEEN steps
-/// (M-D10) when armed. Both the per-step loop and the (breakpoint-gated-off) burst
-/// fast path produce byte-identical ledgers.
+/// `.cycles_reached` when the budget is hit. (Breakpoints are NOT a machine
+/// concern in M1 — the debug control core in `src/debug/` owns its own run loop
+/// over `step` and scans its breakpoint set between steps.)
 pub fn runCycles(m: *Machine, n: u64) StopReason {
     const target = m.cpu.st.cycles + n;
     while (m.cpu.st.cycles < target) {
         if (m.shutdown) return .shutdown;
         const out = step(m);
         if (!out.cont) return out.reason;
-        if (m.breakpoints_armed) {
-            if (m.bp_predicate) |p| {
-                if (p(m)) return .breakpoint;
-            }
-        }
     }
     return .cycles_reached;
 }
 
 /// Run until `predicate(m)` (-> .normal), the `max_cycles` budget is exhausted
-/// (-> .cycles_reached), a breakpoint fires (-> .breakpoint), or a terminal stop
-/// (M-D13). BOUNDED — never an unbounded host loop.
+/// (-> .cycles_reached), or a terminal stop (M-D13). BOUNDED — never an unbounded
+/// host loop. (Breakpoints are NOT a machine concern in M1; see `runCycles`.)
 pub fn runUntil(
     m: *Machine,
     predicate: *const fn (*Machine) bool,
@@ -131,10 +126,5 @@ pub fn runUntil(
         if (m.shutdown) return .shutdown;
         const out = step(m);
         if (!out.cont) return out.reason;
-        if (m.breakpoints_armed) {
-            if (m.bp_predicate) |p| {
-                if (p(m)) return .breakpoint;
-            }
-        }
     }
 }

@@ -122,6 +122,18 @@ pub fn build(b: *std.Build) void {
     machine_mod.addImport("bios", bios_mod);
     machine_mod.addImport("dos", dos_mod);
 
+    // The debugger control core (Milestone 1): sits ABOVE machine in the module
+    // graph. Imports cpu + machine only; nothing below it imports debug. It
+    // OBSERVES + DRIVES the machine synchronously and is never on the emulation
+    // timing path.
+    const debug_mod = b.addModule("debug", .{
+        .root_source_file = b.path("src/debug/debug.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    debug_mod.addImport("cpu", cpu_mod);
+    debug_mod.addImport("machine", machine_mod);
+
     // The headless runner frontend: loads a real-mode DOS program through the
     // emulated loader, runs it, and dumps its CON output. `zig build run -- prog`.
     const exe = b.addExecutable(.{
@@ -365,6 +377,24 @@ pub fn build(b: *std.Build) void {
     dos_test_step.dependOn(&dos_borland.step);
     dos_test_step.dependOn(&dos_oracle.step);
 
+    // ---- Debugger control-core tests (test-debug) ----
+    // The debug test root imports the debug module's own submodules (via the
+    // module root's `test {}` aggregator) plus cpu/machine/bus/devices/timing so
+    // it can build a real machine, run corpus-style programs, and inspect
+    // device-backed regions. One artifact aggregates the breakpoint-model,
+    // controller, and determinism regression tests (§4 of the M1 plan).
+    const debug_imports = [_]Imp{
+        .{ .name = "debug", .mod = debug_mod },
+        .{ .name = "machine", .mod = machine_mod },
+        .{ .name = "cpu", .mod = cpu_mod },
+        .{ .name = "bus", .mod = bus_mod },
+        .{ .name = "devices", .mod = devices_mod },
+        .{ .name = "timing", .mod = timing_mod },
+    };
+    const debug_tests = MachineTest.add(b, target, optimize, "src/debug/debug.zig", &debug_imports);
+    const debug_test_step = b.step("test-debug", "Run the debugger control-core tests");
+    debug_test_step.dependOn(&debug_tests.step);
+
     // Top-level test step aggregates the CPU + bus + machine tests.
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_cpu_tests.step);
@@ -389,6 +419,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&dos_borland.step);
     test_step.dependOn(&dos_oracle.step);
     test_step.dependOn(&io_oracle.step);
+    test_step.dependOn(&debug_tests.step);
 
     // Dedicated full-conformance sweep: runs ALL vendored 80386 real-mode
     // vectors and reports per-opcode pass/fail/revoked counts. Separate from

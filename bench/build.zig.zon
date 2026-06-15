@@ -1,0 +1,12 @@
+.{
+    .name = .zbench,
+    .version = "0.1.0",
+    .fingerprint = 0xbb819b3c2332cb91, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

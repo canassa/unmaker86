@@ -143,12 +143,6 @@ pub const Machine = struct {
 
     /// Shutdown latched by `onShutdown` (M-D12). The run loop observes it.
     shutdown: bool = false,
-    /// True if any breakpoint predicate is armed (M-D10) — gates the burst fast
-    /// path off so the debugger always uses the per-step loop.
-    breakpoints_armed: bool = false,
-    /// The registered breakpoint predicate (M-D10) — checked BETWEEN steps in the
-    /// machine, never in the CPU loop.
-    bp_predicate: ?*const fn (*Machine) bool = null,
 
     comptime {
         // Contract conformance — comptime-verified, no drift (the load-bearing
@@ -435,14 +429,12 @@ pub const Machine = struct {
     }
 
     // -----------------------------------------------------------------------
-    // Breakpoints (M-D10) — checked BETWEEN steps in the machine, never in the
-    // CPU loop. Registration toggles `breakpoints_armed` (gates off the burst
-    // fast path so the debugger is always per-step).
+    // Breakpoints: NOT a machine concern (Milestone 1). The debugger control
+    // core (`src/debug/`) owns the run loop and scans its own breakpoint set
+    // BETWEEN `run_loop.step` calls — the machine is oblivious to the debugger.
+    // (The former single-predicate stub was deleted in M1 Phase 0; it was dead
+    // scaffolding wired to nothing.)
     // -----------------------------------------------------------------------
-    pub fn setBreakpoint(self: *Machine, predicate: ?*const fn (*Machine) bool) void {
-        self.bp_predicate = predicate;
-        self.breakpoints_armed = (predicate != null);
-    }
 
     // -----------------------------------------------------------------------
     // Snapshot / restore of the whole timing subsystem (M-D11). The bus + CPU
