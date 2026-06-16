@@ -5,23 +5,26 @@ the existing device-state reader surface (`/api/devices`, `/api/io`).
 
 ## Why now — the motivating bug (Stunts 1.1 hangs)
 
-> ❌ **PREMISE DISPROVEN — AdLib does NOT unblock Stunts (verified by live trace).** The "Stunts
-> hangs polling 0x388" claim below is **FALSE for the current build**. A captured trace (an `io`
-> watchpoint on 0x388 across multiple full runs) shows Stunts `LOAD.EXE` issues **zero port I/O**
-> and does **not hang** — it **terminates** deterministically at cycle 580637 via INT 21h AH=4Ch
-> exit code 1, printing `Loading Stunts...Invalid file name (null).`, never reaching mode 13h or
-> sound autodetect. (Positive control: a 0x60 watchpoint DID fire on an injected keystroke, so the
-> non-firing of 0x388 is a true negative.) The ROADMAP's `F000:10D3` note is also stale — that
-> address is now an `iret` stub, not a loop. **The real Stunts blocker is a DOS loader failure:**
-> the Turbo-C loader builds a **NULL driver filename** while parsing `setup.dat` (the `/ssb` sound
-> config with `4 4 -1 -1 -1 -1`) and aborts via `printf("...%s", NULL)`. That is unrelated to AdLib.
->
-> **Therefore: this AdLib plan is NOT the next step for Stunts.** Keep it as a designed, correct
-> device for *gameplay sound* once a guest actually drives the OPL (it is spec-faithful and
-> determinism-correct — the reviews confirmed the design). But the "Why now / motivating bug"
-> framing below and the "proves Stunts unblocks" test framing are wrong and should be read as
-> "spec-conformance of the OPL2 timer/status model," not "the Stunts fix." The real Stunts work is
-> tracing the `setup.dat` driver-name lookup that returns NULL (oracle-diff vs DOSBox-x).
+> ✅ **PREMISE VINDICATED + PHASE 1 IMPLEMENTED — the OPL2 timer/status device unblocked Stunts.**
+> An earlier note here called the premise "disproven," but that trace was of `LOAD.EXE` run
+> DIRECTLY (no command tail) — the wrong entry point, which exits early on a NULL arg before any
+> sound code. Once the nested-EXEC debugger fix (commit `db7cab7`) made the real launcher chain
+> `ST.COM`→`STUNTS.COM`→`LOAD.EXE /u MCGA /ssb` visible, a live trace showed the `/ssb` FM driver
+> **`AD15.DRV` runs the textbook OPL2 timer probe on port 0x388** (write reg4=0x80; read status; reg2=0xFF;
+> reg4=0x21; poll until `status & 0xE0 == 0xC0`). With no OPL device, 0x388 read `0xFF` → probe failed
+> 300× → `LOAD.EXE` aborted with `exit(1)` at ~49M cycles. **Phase 1 of this plan is now implemented**
+> as `src/devices/opl.zig` (commit `259fa4e`): the faithful register-trace OPL2 (ports 0x388/0x389,
+> timers 1/2, reg2/3 reload, reg4 control, status `0x40|0x80`/`0x20|0x80` on overflow — overflow a
+> pure function of the cycle ledger, no host clock/float, snapshot-covered, port I/O charges zero
+> cycles). **Result: Stunts passes the probe and renders its intro** (DSI logo + starfield, then the
+> "Professional Driver on Closed Circuit" animation). 574 tests green; determinism byte-identical at
+> 400M. Two small deviations from this plan's letter, both fine: the device registers 2 ports
+> (0x388/0x389) not the 4-port mirror range, and the read is inherently non-mutating (flags computed
+> lazily from the ledger, cleared only by reg4 bit7) so no separate `statusPeek`/`statusRead` split
+> was needed. **Phase 2 (FM SYNTHESIS) remains DEFERRED** — the rest of this doc covers it. Below,
+> read "Why now / proves Stunts unblocks" as accurate-as-of-Phase-1; the remaining Stunts work is
+> whatever wall comes AFTER the intro renders (see `plans/stunts-milestone.md`), plus Phase 2 FM
+> synthesis here if/when audible sound is wanted.
 
 Stunts 1.1 self-decompresses, then runs its sound-hardware autodetect, which polls the
 **AdLib OPL2 status register at I/O port 0x388** waiting for the timer-overflow bits. zdos does
