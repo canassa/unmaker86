@@ -1,6 +1,6 @@
 //! The Memory Control Block (MCB) chain (D9) — 16-byte headers in the conventional-
 //! memory arena, as guest-RAM views. Layout RE-DERIVED from the documented MCB
-//! spec + the dosbox-test-suite behavioral spec (NOT GPL code):
+//! spec + the dosbox-test-suite behavioral spec:
 //!   +0  signature: 'M' (0x4D) = link, 'Z' (0x5A) = last block
 //!   +1  owner PSP segment (0 = free, 8 = DOS)
 //!   +3  size in paragraphs (16-byte units) of the block FOLLOWING the header

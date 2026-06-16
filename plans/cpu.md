@@ -865,8 +865,8 @@ suite passes and the targeted suites are green.
         frame), and a few rotate-by-CL non-1 counts (OF undefined). Each is justified; none hides a real
         bug. The defined state always matches.
   - [x] **Reuse spice86's prior art (design only, re-implemented in Zig).** The per-opcode
-        undefined-EFLAGS mask (from the public-domain `80386.csv`) and the revocation-list skip follow
-        the spice86 harness design; no spice86/DOSBox code or data was copied.
+        undefined-EFLAGS mask (from `80386.csv`) and the revocation-list skip follow
+        the spice86 harness design.
   - [x] **CONFORMANCE RESULTS (full sweep, all 941 opcodes / ~94,100 vectors):** 93,300 pass / 800 fail
         / 0 revoked = **99.15%**. 664/941 opcodes pass 100%; the 277 with residuals are all the
         documented genuinely-undefined cases above (1-27 failing vectors each, concentrated in

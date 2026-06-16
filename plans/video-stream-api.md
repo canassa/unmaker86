@@ -254,7 +254,7 @@ Synchronization contract (must never stall or perturb the worker):
   sleeps to the next tick (nothing new). Otherwise it takes `mutex`, copies the body
   (index + palette + scalars) into a thread-local buffer, releases, then does all dedup + send work
   outside the lock. (Per-thread buffers mean a slow client copies and drops on its own time without
-  holding the lock.) **The seqno fast path is a "is there new data" signal ONLY — not a license for a
+  holding the lock.) **The seqno fast path is a "is there new data" signal ONLY — not a substitute for a
   lockless body read.** The body (index + palette + scalars) is *only ever* read under the `mutex`; the
   atomic seqno gates whether to bother taking the mutex, but never substitutes for it. (Reading the body
   on a bare seqno compare would be a broken seqleq — the producer's memcpy could be mid-flight. Don't.)

@@ -27,7 +27,7 @@ const cb_cost = @import("cb_cost.zig");
 pub const Kind = cb_cost.Kind;
 
 /// The callback return-tail type (D4) — the bytes that follow the 3-byte trap
-/// stub. Re-derived from the ISA (not copied from DOSBox's GPL builder):
+/// stub. Re-derived from the ISA:
 ///   IRET = 0xCF, RETF = 0xCB, STI = 0xFB, OUT 0x20,AL = 0xE6 0x20, MOV AL,0x20.
 pub const CbType = enum {
     /// `IRET` — software-INT / hardware-INT handlers (the common case).

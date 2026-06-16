@@ -3,8 +3,7 @@
 //! MCB, builds the PSP + environment block, applies relocations, sets up registers,
 //! and transfers control. The image copy + relocation reads go through
 //! `bus.writeGuestBlock`/`readGuestBlock` + a fixed stack scratch (D19) — no
-//! per-byte loop on the warm path. Re-derived from the documented MZ format, not
-//! copied from DOSBox's GPL `dos_execute.cpp`.
+//! per-byte loop on the warm path. Re-derived from the documented MZ format.
 
 const std = @import("std");
 const Seg = @import("cpu").state.Seg;

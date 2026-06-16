@@ -3,14 +3,9 @@
 These are the public 80386 single-step conformance vectors used to validate the
 zdos CPU core (`src/cpu/`) against real-hardware-derived per-instruction state.
 
-## Source & license
+## Source
 
 - Upstream: <https://github.com/SingleStepTests/80386>
-- **License: the project's *software* is MIT; the *data files* (the `*.MOO.gz`
-  vectors, `80386.csv`, `revocation_list.txt`) are released into the PUBLIC
-  DOMAIN.** Vendoring the data into zdos is therefore license-safe — there is no
-  GPL or copyleft obligation. (Contrast: DOSBox test data is GPL-2.0 and is NOT
-  used here.)
 
 ## What is vendored here
 

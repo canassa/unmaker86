@@ -1,6 +1,5 @@
 //! 8.3 filename munging (D10) — RE-DERIVED from the documented DOS 8.3 rules and
-//! the dosbox-test-suite behavioral spec; NOT copied from DOSBox's GPL
-//! `DOS_MakeName`/`DTAExtendName`. Determinism (CLAUDE #5): the long->short `~N`
+//! the dosbox-test-suite behavioral spec. Determinism (CLAUDE #5): the long->short `~N`
 //! generation is assigned over a DETERMINISTICALLY SORTED directory listing, so
 //! the same host directory yields the same short names every run.
 

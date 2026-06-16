@@ -3,7 +3,7 @@
 //! deterministic total run (by CPU cycle), and capture a PNG screenshot at each via
 //! `GET /api/framebuffer?format=png`.
 //!
-//! Presence-gated: the TTM/BMX/PAL/OVL assets are copyrighted BaK data and are NOT
+//! Presence-gated: the TTM/BMX/PAL/OVL assets are BaK data and are NOT
 //! committed. If they are absent the test SKIPS honestly (`error.SkipZigTest`) — it
 //! never fabricates a pass or a screenshot.
 //!
@@ -47,8 +47,8 @@ const PNG_SIG = [8]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
 /// Determinism goldens. The movie is fully deterministic (no host clock in the
 /// emulated time base), so the total cycle count and EVERY captured frame are
 /// byte-identical on every run. We pin the SHA-256 of each PNG (and its size), NOT
-/// the PNG file itself: the frames are copyrighted BaK-derived pixels, so a hash is
-/// the committable, copyright-safe golden. If the emulator/rasterizer/PNG-encoder
+/// the PNG file itself: the frames are BaK-derived pixels and are not committed, so a
+/// hash is the committable golden. If the emulator/rasterizer/PNG-encoder
 /// changes intentionally, regenerate: run the test, then `sha256sum ttm-shots/*.png`.
 const TOTAL_CYCLES: u64 = 164_124_359;
 
@@ -96,7 +96,7 @@ test "TTM: play Chapter-1 movie, screenshot at 10/25/50/75/90% by cycle" {
             \\SKIP: TTM movie assets not found. Tried (relative to repo root):
             \\  - {s}
             \\  - {s}
-            \\These are copyrighted Betrayal at Krondor data and are not committed.
+            \\These are Betrayal at Krondor data and are not committed.
             \\
         , .{ ASSET_DIRS[0], ASSET_DIRS[1] });
         return error.SkipZigTest;

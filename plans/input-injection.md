@@ -229,8 +229,8 @@ The mouse injector generalizes seam (3) (`Int33.injectMotion`).
 
 A concrete comparison of the two reference emulators. Each spec below is verified
 against the cited `file:line` in `references/` and is reusable by the zdos
-implementer (re-derive tables from the public AT spec, do **not** copy GPL source
-verbatim — but the *shapes* and *formulas* are confirmed here).
+implementer (re-derive tables from the public AT spec — the *shapes* and
+*formulas* are confirmed here).
 
 **Keyboard — both emulators run the FULL hardware path.** Neither fakes the BIOS
 buffer; both run host→8042 (ports 0x60/0x64)→IRQ1→guest INT 09h ISR→BDA ring→INT
@@ -610,7 +610,7 @@ it (§1.5), and the pieces are known quantities, not a vague band:
 > 3. The **scancode set-1 table** (`keyboard_scancodes.cpp:34-199` / spice86
 >    `ScanCode1.cs`) and the **scancode→ASCII / BIOS-keycode tables** (4 columns:
 >    normal/shift/ctrl/alt, `bios_keyboard.cpp:34-157`) re-derived from the public
->    AT set-1 spec (NOT copied from GPL dosbox), with a `[I/O-phase]` translation-
+>    AT set-1 spec, with a `[I/O-phase]` translation-
 >    conformance oracle (`io-oracle.md §2.3`).
 > 4. **IRQ1 wiring** through the PIC. **DECISION (singular — resolves the v2 §4.1-vs-
 >    Phase-1e contradiction): Model A raises IRQ1 DIRECTLY at the inject boundary**
@@ -1324,8 +1324,8 @@ blocking loop) is deferred to after Phase 1·0** because it needs the new emitte
   (§5.1b / §"Minors"). Add the device's FIFO + status + config to `Machine.Snapshot`
   (§7.3). Test: port read/write + status-byte round-trips; FIFO push pops in order;
   the §5.1b command/response pairs (0xFF→0xFA,0xAA; 0xAA→0x55; 0xF2→0xFA,0xAB,0x83).
-- [x] **1b — scancode set-1 tables.** Re-derive from the public AT set-1 spec (NOT
-  copied from GPL dosbox) the set-1 codes (make/break/0xE0-ext) and the
+- [x] **1b — scancode set-1 tables.** Re-derive from the public AT set-1 spec the
+  set-1 codes (make/break/0xE0-ext) and the
   scancode→ASCII / BIOS-keycode table (4 columns: normal/shift/ctrl/alt) in the
   `(scancode<<8)|ascii` BDA-ring format (refs: dosbox `keyboard_scancodes.cpp:34-199`,
   `bios_keyboard.cpp` struct `:21-26` + table `:34-157`, e.g. index 30 'A' =

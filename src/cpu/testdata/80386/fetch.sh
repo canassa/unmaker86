@@ -3,9 +3,6 @@
 # real-mode conformance vectors + support files.
 #
 # Source: https://github.com/SingleStepTests/80386
-# LICENSE: software is MIT; the DATA FILES (the *.MOO.gz vectors, 80386.csv,
-#          revocation_list.txt) are PUBLIC DOMAIN. Vendoring them into zdos is
-#          license-safe (no GPL concern). See README.md in this directory.
 #
 # Run from this directory:  ./fetch.sh
 # It downloads:

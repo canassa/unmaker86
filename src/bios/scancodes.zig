@@ -1,8 +1,8 @@
 //! Scancode set-1 → BIOS keycode tables for the INT 09h ISR (input Phase 1b).
 //!
 //! RE-DERIVED FROM THE PUBLIC AT SCANCODE SET-1 SPEC (the IBM PC/AT keyboard
-//! technical reference and the public XT/AT make/break tables) — NOT copied from
-//! any GPL source. This mirrors the bridge's doctrine ("re-derived from the ISA").
+//! technical reference and the public XT/AT make/break tables). This mirrors the
+//! bridge's doctrine ("re-derived from the ISA").
 //! The values are verified against, but not lifted from, dosbox's
 //! `keyboard_scancodes.cpp` / `bios_keyboard.cpp` and spice86 `ScanCode1.cs`.
 //!

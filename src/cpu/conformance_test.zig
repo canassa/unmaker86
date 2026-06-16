@@ -2,7 +2,7 @@
 //!
 //! Runs a curated set of vendored 80386 real-mode opcode files end-to-end (real
 //! MOO data, real CPU) and asserts they pass at or above a pinned rate. This is
-//! a true regression guard — it uses the actual public-domain vectors, not
+//! a true regression guard — it uses the actual vectors, not
 //! fabricated results. The EXHAUSTIVE 941-opcode sweep lives in
 //! `zig build conformance` (conformance_main.zig); this keeps the unit suite
 //! fast while still catching regressions in the core ISA paths.

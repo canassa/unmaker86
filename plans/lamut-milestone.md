@@ -366,13 +366,13 @@ dims, not the exit code.)
 `zig build test` → exit 0, **476 tests** (unchanged; no emulator code touched).
 
 > **Regression-test note (P7/P8 deferred, honestly).** A committed black-box test cannot bundle the
-> inputs: `LAMUT.EXE` + `Vmcode.ovl` + `G_LAMUT.BMX/.PAL` are **copyrighted Betrayal at Krondor game
+> inputs: `LAMUT.EXE` + `Vmcode.ovl` + `G_LAMUT.BMX/.PAL` are **Betrayal at Krondor game
 > assets** (`assets.txt`: "Not committed"), and the oracle extraction (`oracle.py`) needs Python,
 > which is absent on this host. The faithful path for a permanent gate is the milestone's Risk-#6
 > option: stage the assets out-of-tree at test setup (gitignored) and gate the test on their
 > presence (skip when absent), mirroring how `run.sh` stages from `Krondor.001`. The verification
-> above is fully reproducible from the staged work dir; only the *committed CI gate* is deferred for
-> the asset-licensing reason.
+> above is fully reproducible from the staged work dir; only the *committed CI gate* is deferred
+> because the assets are not committed.
 
 ---
 

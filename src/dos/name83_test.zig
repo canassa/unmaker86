@@ -1,5 +1,5 @@
 //! 8.3 munging tests (D10) — re-derived from the documented DOS rules + the
-//! dosbox-test-suite behavioral spec (NOT copied from GPL code). Covers uppercase,
+//! dosbox-test-suite behavioral spec. Covers uppercase,
 //! name/ext split, illegal-char handling, and DETERMINISTIC ~N generation.
 
 const std = @import("std");

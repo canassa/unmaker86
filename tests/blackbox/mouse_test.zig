@@ -24,7 +24,7 @@
 //! `mouse_set_position(px,py)` does. (This is NOT a fake rescale — it is the guest's
 //! own convention; `PX_TO_DRV` documents it.)
 //!
-//! Presence-gated: MOUSE.EXE + VMCODE.OVL/POINTER.BMX/G_LAMUT.PAL are copyrighted BaK
+//! Presence-gated: MOUSE.EXE + VMCODE.OVL/POINTER.BMX/G_LAMUT.PAL are BaK
 //! data, NOT committed (assets.txt: "Not committed"). Absent → `error.SkipZigTest`.
 //!
 //! Determinism: the guest advances ONLY on explicit run-to-cycle commands, and the
@@ -172,7 +172,7 @@ fn stageFixture(io: Io, alloc: std.mem.Allocator) ![]const u8 {
             \\SKIP: MOUSE.EXE / BaK cursor assets not found. Tried (relative to repo root):
             \\  - {s}
             \\  - {s}
-            \\These are copyrighted Betrayal at Krondor data and are not committed.
+            \\These are Betrayal at Krondor data and are not committed.
             \\
         , .{ ASSET_DIRS[0], ASSET_DIRS[1] });
         return error.SkipZigTest;

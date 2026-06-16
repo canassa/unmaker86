@@ -14,7 +14,7 @@
 //! mirroring how the PIT reaches the PIC.
 //!
 //! Command set + responses (input-injection.md §5.1b — re-derived from the public
-//! AT/8042 spec, NOT copied from any GPL source). Device commands are written to
+//! AT/8042 spec). Device commands are written to
 //! port 0x60; controller commands to port 0x64. The ACK/response bytes are exact
 //! because real drivers (and many games' keyboard init) issue these and WAIT for
 //! the bytes: a missing 0xFA/0xAA after a 0xFF reset makes a driver retry 3x then

@@ -6,7 +6,7 @@
 //! This harness implements a faithful MOO chunk parser per the spec.
 //!
 //! VENDORING: the vectors + 80386.csv + revocation_list.txt are vendored under
-//! `src/cpu/testdata/80386/` (PUBLIC-DOMAIN data — license-safe). They are kept
+//! `src/cpu/testdata/80386/`. They are kept
 //! gzipped and decompressed in-harness with `std.compress.flate` — no runtime
 //! fetch (determinism / offline rule). The corpus is CYCL-stripped and capped at
 //! 100 vectors/opcode (~19 MB, all 941 opcodes); see that directory's README.
@@ -402,8 +402,7 @@ pub fn runMooBytes(allocator: std.mem.Allocator, data: []const u8) !struct { pas
 // Design (cited): this mirrors the spice86 conformance harness — a per-opcode
 // undefined-EFLAGS mask (their UndefinedFlagsTable.cs / 80386.csv) plus a
 // revocation list of known-bad vectors (their RevocationListHelper.cs). We
-// re-implement the *design* in Zig from the public-domain 80386.csv data; no
-// spice86/DOSBox code is copied.
+// re-implement the *design* in Zig from the 80386.csv data.
 // ---------------------------------------------------------------------------
 
 /// EFLAGS bit positions used to translate the CSV `o..szapc` letter columns.

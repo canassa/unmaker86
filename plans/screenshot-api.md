@@ -455,7 +455,7 @@ during implementation; sharing is fine if we frame in place.
 - [x] Update `plans/ROADMAP.md` (move "framebuffer/screenshot capture" from backlog to done;
       add an entry).
 - [ ] TTM demo script / black-box note (§7) — run-to-cycle + screenshot at a few stop-points.
-      (DEFERRED: TTM/BMX/PAL are copyrighted, out-of-tree, presence-gated BaK assets — the
+      (DEFERRED: TTM/BMX/PAL are out-of-tree, presence-gated BaK assets — the
       `?format=png` path is exercised end-to-end by the in-tree mode-13h integration test instead;
       the black-box TTM eyeball is a manual step to run when the staged assets are present.)
 
@@ -523,7 +523,7 @@ view layer over data the project already trusts as its oracle.
 - [ ] Black-box: load a real program, `POST /api/run-to-cycle {cycle:N}` then
       `GET /api/framebuffer?format=png` → save bytes → open the PNG and eyeball it. Do this for the **TTM
       Chapter-1 movie** (`../bak-scratch-area/staging/tests/ttm/`) at a few cycle stop-points
-      along its run-to-`TTM-OK`, producing `ttm_<cycle>.png`. (TTM/BMX/PAL are copyrighted BaK
+      along its run-to-`TTM-OK`, producing `ttm_<cycle>.png`. (TTM/BMX/PAL are BaK
       assets → out-of-tree, presence-gated, like the LAMUT probe — not committed. DEFERRED until
       the staged assets are present; the in-tree mode-13h integration test exercises the path.)
 - [ ] Sanity-check against `/api/framebuffer?format=index` at the same cycle: the PNG, decoded,

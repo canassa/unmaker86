@@ -97,8 +97,8 @@ Faking DOS is the precise failure mode (`CLAUDE.md` §"Ground rule") this projec
   CB_SOFFSET=0x1000, CB_SIZE, `0xfe 0x38`), `plans/spice86.md` §7 (IVT install, the F000 stub +
   callback opcode, `IndexBasedDispatcher`, BDA at 0040:0000, the per-AH dispatch). **`plans/dosbox-test-suite.md`**
   — the 8.3-name-munging (`DOS_MakeName`/`DTAExtendName`) + MCB layout tests are a **behavioral spec to
-  re-derive from, NOT copy** (DOSBox is GPL).
-- Reference sources (algorithmic detail — re-derive, do not copy GPL behavior):
+  re-derive from**.
+- Reference sources (algorithmic detail — re-derive the behavior):
   `references/dosbox-staging/src/cpu/callback.cpp` (`callback_setup_extra` emits `0xfe 0x38 <id>`
   callback.cpp:199-200; the return-sequence builders `CB_IRET`/`CB_RETF`/`CB_IRET_STI` callback.cpp:209-264;
   `CALLBACK_RunRealInt` callback.cpp:106-114 — re-entrancy; `CALLBACK_SCF/SZF/SIF` patch the FLAGS image
@@ -243,8 +243,7 @@ Do **not** write code or touch other files while working from this plan; it is t
       IP/CS/FLAGS) so `IRET` returns the right flags to the guest. **Rationale:** identical to all three
       references; "real code at the vector" is the faithfulness property that makes the host-serviced
       design indistinguishable from real DOS to the guest. **Re-derive the exact byte sequences from the
-      ISA, not by copying DOSBox's builder** (the bytes are ISA facts: `0xCF`=IRET, `0xCB`=RETF,
-      `0xFB`=STI; the GPL-licensed *builder code* is not copied).
+      ISA** (the bytes are ISA facts: `0xCF`=IRET, `0xCB`=RETF, `0xFB`=STI).
 
 - [x] **D5 — The synthetic-cycle-cost contract (FIRST-CLASS — THE zdos differentiator): every callback
       handler charges a FIXED, DOCUMENTED synthetic cycle cost (or a deterministic pure function of the
@@ -365,14 +364,14 @@ Do **not** write code or touch other files while working from this plan; it is t
       path+position (D6/D14).
 
 - [x] **D10 — 8.3 name munging: re-derive the canonicalization from the documented DOS rules + the
-      dosbox-test-suite behavioral spec; do NOT copy DOSBox's `DOS_MakeName`/`DTAExtendName` code (GPL).
+      dosbox-test-suite behavioral spec.
       DECIDED.** The behavior to reproduce (re-derived, with unit tests written from the spec, per
       `plans/dosbox-test-suite.md`): uppercase; split name (≤8) + extension (≤3) on the last dot;
       reject/translate characters illegal in 8.3; collapse a host long-name to a deterministic 8.3
       short name when enumerating a directory (the `~1` tilde-numbering generation order must be
       **deterministic** — a determinism concern, since iteration order of a host directory is not
       guaranteed: sort entries before assigning `~N`). **Rationale:** the munging is a *specification*
-      (documented DOS 8.3 rules), not DOSBox-proprietary; copying GPL code is forbidden; the
+      (documented DOS 8.3 rules); the
       determinism subtlety (stable `~N` assignment over an unordered host directory listing,
       `CLAUDE.md` #5) must be handled explicitly — **sort `Dir.iterate()` output deterministically
       before numbering.**
@@ -841,7 +840,7 @@ unsupported subfunctions flag (D11). (Per-function fixtures still exist for cycl
 - [x] **MCB chain (`mcb.zig`, D9):** 16-byte headers ('M'=link / 'Z'=last signature, owner PSP segment,
       size in paragraphs) in the arena. `alloc(paras) ?seg`, `free(seg)`, `resize(seg, paras)` — the
       AH=48/49/4A services. Re-derive the layout from the **dosbox-test-suite MCB behavioral spec**
-      (`plans/dosbox-test-suite.md`), not GPL code. First-fit/best-fit/last-fit per the AH=58 strategy
+      (`plans/dosbox-test-suite.md`). First-fit/best-fit/last-fit per the AH=58 strategy
       (default first-fit).
 - [x] **DTA (`dta.zig`, D9):** the 128-byte Disk Transfer Area; AH=1A set DTA, AH=2F get DTA; find-first/
       find-next write the found-file record into the DTA (the `DTAExtendName` name split — re-derive,
@@ -994,7 +993,7 @@ VFS open/read/write/seek/find/chdir/mkdir/rmdir against a host dir tree works, a
       root, **walking real host subdirectories** (`drive_local.cpp` + `DOS_MakeName`). `..` never
       reaches the VFS (normalized away upstream), so the path-escape guard is enforced by the
       normalizer's root-clamp. Oracle-verified by CDTEST (`..\\TOP.TXT`, `chdir ..`, `chdir \\`).
-- [x] **8.3 munging (`name83.zig`, D10 — re-derive, do NOT copy GPL):** uppercase; split name(≤8)+ext(≤3)
+- [x] **8.3 munging (`name83.zig`, D10 — re-derive):** uppercase; split name(≤8)+ext(≤3)
       on last dot; validate 8.3 charset; **deterministic long→short generation:** when a host file has a
       long name, generate `NAME~N.EXT` with **N assigned over a deterministically sorted directory
       listing** (sort `Dir.iterate()` results — host iteration order is not guaranteed, `CLAUDE.md` #5).

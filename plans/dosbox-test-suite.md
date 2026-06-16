@@ -7,11 +7,10 @@ relevant to the CPU path.
 
 **Bottom line up front:** DOSBox's test suites contain **no CPU instruction /
 flags / ModR-M / decoding tests at all**. They cover utility libraries, DOS
-filesystem/memory helpers, shell, and rendering helpers. They are all
-**GPL-2.0-or-later**, so copying their code/data is a license problem for zdos.
-The best CPU oracle is the public **SingleStepTests/ProcessorTests 386 JSON
-vectors** (already in our CPU plan), and the most useful *harness* reference is
-**spice86's Apache-2.0 SingleStepTests runner**, not DOSBox.
+filesystem/memory helpers, shell, and rendering helpers. The best CPU oracle is
+the public **SingleStepTests/ProcessorTests 386 JSON vectors** (already in our CPU
+plan), and the most useful *harness* reference is **spice86's SingleStepTests
+runner**, not DOSBox.
 
 ---
 
@@ -95,7 +94,7 @@ All DOSBox tests are C++ and link the emulator; none can run against Zig. Classi
 - **Portable data/vectors → essentially none.** No table-driven instruction or
   flag vectors exist in DOSBox. The bit/math/string tests are
   expression-by-expression assertions, not input→output tables; re-encoding them
-  as Zig data is low value and would copy GPL expression.
+  as Zig data is low value.
 
 - **Behavioral oracle (translate semantics, rewrite harness) → the best DOSBox
   category:**
@@ -150,41 +149,13 @@ vectors. Assessment:
 
 ---
 
-## 5. Licensing — FLAG (do not bypass; user decides)
-
-- **All dosbox-staging test files are `GPL-2.0-or-later`** (30/30 files carry
-  `// SPDX-License-Identifier: GPL-2.0-or-later`; project license file is
-  `references/dosbox-staging/LICENSE`). Example header:
-  `tests/dosbox_test_fixture.h:1-2`.
-- **dosbox-x test files are also `GPL-2.0-or-later`** (full GPLv2 header, e.g.
-  `references/dosbox-x/tests/dos_files_tests.cpp:1-19`).
-- **Implication, stated plainly:** copying DOSBox test *code or test data*
-  verbatim (or as a close derivative/translation) into zdos would make that
-  copied portion a derivative work under GPL-2.0-or-later, which would likely
-  impose GPL obligations on zdos. If zdos intends a non-GPL license, this is a
-  conflict. **This is a flag for the user to decide — not a final legal opinion.**
-- **License-safe alternatives:**
-  1. Use the **ProcessorTests/SingleStepTests 386 JSON vectors** directly — they
-     are distributed separately under their own (permissive) terms; confirm the
-     exact license on that repo before vendoring.
-  2. **Independently re-derive** any DOS-behavior expectations from primary docs
-     (RBIL, Intel 386 manual) or from our own runs, rather than copying DOSBox's
-     assertions.
-  3. **Write our own** tests in Zig `test {}` blocks.
-  4. spice86 is **Apache-2.0** (`references/spice86/LICENSE`) — its *harness
-     design* is permissively licensed; still, re-implement rather than
-     line-copy, and keep attribution if any code is adapted.
-
----
-
-## 6. Recommendation (CPU-first → Betrayal at Krondor)
+## 5. Recommendation (CPU-first → Betrayal at Krondor)
 
 - **CPU milestone (now): do NOT use DOSBox tests.** They contain zero
   instruction/flags/ModR-M/decode coverage. Proceed with the **ProcessorTests
-  386 JSON vectors** as planned; verify that repo's license before vendoring the
-  JSON.
-- **Steal the *design*, not the code, from spice86's `SingleStepTests/`** (it's
-  Apache-2.0): (a) JSON load + per-case run/assert loop, (b) **per-opcode
+  386 JSON vectors** as planned.
+- **Steal the *design*, not the code, from spice86's `SingleStepTests/`:**
+  (a) JSON load + per-case run/assert loop, (b) **per-opcode
   undefined-EFLAGS masking** via the upstream `80386.csv` `f_umask`
   (`UndefinedFlagsTable.cs`), (c) a **revocation list** of known-bad vectors to
   skip (`RevocationListHelper.cs`). Re-implement all of this in Zig.
@@ -195,7 +166,7 @@ vectors. Assessment:
   INT 21h file APIs / memory (MCB) management for Betrayal at Krondor,
   DOSBox-staging's `dos_files_tests.cpp` and `dos_memory_struct_tests.cpp` are
   worth reading as a **behavioral spec** — but **re-derive** expectations into
-  our own Zig tests rather than copying (GPL). spice86's `Resources/Dos*Tests/`
+  our own Zig tests rather than copying. spice86's `Resources/Dos*Tests/`
   binary fixtures are an additional reference at that stage.
 - **Skip dosbox-x's tests** — strict, older subset of staging's, no unique
   value; it also vendors a full gtest/gmock copy we don't need.
@@ -204,7 +175,7 @@ vectors. Assessment:
   harness that boots a minimal machine.
 
 ### Quick reference — top files
-- CPU oracle blueprint (Apache-2.0, reusable design): `references/spice86/tests/Spice86.Tests/CpuTests/SingleStepTests/` (`SingleStepTest.cs`, `UndefinedFlagsTable.cs`, `CpuTestAsserter.cs`, `RevocationListHelper.cs`)
-- DOS behavior spec (GPL — read, re-derive): `references/dosbox-staging/tests/dos_files_tests.cpp`, `references/dosbox-staging/tests/dos_memory_struct_tests.cpp`
+- CPU oracle blueprint (reusable design): `references/spice86/tests/Spice86.Tests/CpuTests/SingleStepTests/` (`SingleStepTest.cs`, `UndefinedFlagsTable.cs`, `CpuTestAsserter.cs`, `RevocationListHelper.cs`)
+- DOS behavior spec (read, re-derive): `references/dosbox-staging/tests/dos_files_tests.cpp`, `references/dosbox-staging/tests/dos_memory_struct_tests.cpp`
 - Fixture pattern to imitate: `references/dosbox-staging/tests/dosbox_test_fixture.h`
 - Build integration reference: `references/dosbox-staging/tests/CMakeLists.txt`

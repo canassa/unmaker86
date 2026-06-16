@@ -28,7 +28,7 @@ matching real hardware + DOSBox. One line in `src/bios/bios.zig`.)
    goes wrong.
 6. **Read the divergent state**: at the failing instruction, dump the registers + the memory the
    instruction reads. The wrong value points at the layer that's wrong (loader / CPU / bus / BIOS).
-7. **Oracle-diff** against DOSBox-x (runnable here) or the GPL `dos_execute.cpp` reference when you
+7. **Oracle-diff** against DOSBox-x (runnable here) or the `dos_execute.cpp` reference when you
    need to know which load parameter / behavior diverged.
 8. **Fix + verify with cycle-determinism**: apply the minimal faithful fix; re-run twice and confirm
    byte-identical CPU state at a fixed cycle (the core regression test). Add a self-contained
@@ -127,7 +127,7 @@ Byte-identical CPU state at a fixed cycle across two runs is the project's core 
 
 zdos's whole premise is "compare to a known-good reference." Two oracles:
 
-- **DOSBox-x** is runnable in this environment (`dosbox-x` on PATH; the GPL **source** is under
+- **DOSBox-x** is runnable in this environment (`dosbox-x` on PATH; the **source** is under
   `references/dosbox-{staging,x}/`). For loader questions, the fastest path was diffing zdos's
   `src/dos/loader.zig` against `references/dosbox-staging/src/dos/dos_execute.cpp` **line by line**
   (it's where zdos's loader was re-derived from). That's how the candidate divergences — memory
@@ -155,7 +155,7 @@ DOSBox initializes A20 **disabled** (`MEM_A20_Enable(false)`), while zdos's POST
   response diffs cleanly against `xxd` of the file.
 - **Cycle-determinism + `--break-cycle`** as a reproducer and as the regression oracle. Re-running
   to a fixed cycle and getting identical registers is a debugging superpower.
-- **`run-to-cycle` / `run` with a cap** for fast-forwarding, and **the runnable DOSBox-x + GPL
+- **`run-to-cycle` / `run` with a cap** for fast-forwarding, and **the runnable DOSBox-x +
   sources** as oracles.
 - **Headless console + framebuffer capture** (`/api/console`, `/api/framebuffer?format=png`) to see
   guest progress without a display — confirmed Stunts printed "Loading Stunts..." and set mode 13h
@@ -227,7 +227,7 @@ DOSBox initializes A20 **disabled** (`MEM_A20_Enable(false)`), while zdos's POST
    eip`** gotcha called out loudly.
 3. **The "verify the load first" discipline** — diff `/api/mem` vs. the file body and `/api/cpu` vs.
    the headers before suspecting anything deeper. Most "loader" bugs are actually downstream.
-4. **The oracle workflow** — when to run DOSBox-x vs. diff the GPL `dos_execute.cpp`/`memory.cpp`
+4. **The oracle workflow** — when to run DOSBox-x vs. diff the `dos_execute.cpp`/`memory.cpp`
    sources; and using cycle-determinism (`--break-cycle`, two runs, identical regs) as the
    regression oracle + a cycle-bisection tool.
 5. **Common DOS loader / compression pitfalls** — EXEPACK/LZEXE/PKLITE self-decompressors and the
@@ -236,4 +236,4 @@ DOSBox initializes A20 **disabled** (`MEM_A20_Enable(false)`), while zdos's POST
 6. **The tooling gaps as a checklist of workarounds** — hand-decode bytes when there's no disasm;
    `grep -aob` the file + map offsets when there's no memory search; re-derive relocated addresses
    for self-modifying/relocating stubs; reset+reload between experiments.
-7. **Staging hygiene** — uppercase 8.3 names, presence-gated copyrighted assets, headless capture.
+7. **Staging hygiene** — uppercase 8.3 names, presence-gated assets, headless capture.
