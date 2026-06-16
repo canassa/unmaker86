@@ -64,6 +64,16 @@ pub fn step(cpu: anytype) StepResult {
 
     cpu.instr_start_eip = cpu.st.eip;
     const shadow_was_set = cpu.st.inhibit_irq_one_instruction;
+    // TF as seen at the START of this instruction. The single-step #DB is a TRAP
+    // recognized only when TF was ALREADY set entering the instruction — an
+    // instruction that newly SETS TF (POPF / IRET popping a FLAGS image with TF=1,
+    // or a flag store) does NOT itself trap; the trap is deferred to the next
+    // instruction. (Intel SDM Vol 3, "Single-Step Trap": TF is checked at the
+    // instruction boundary against its value before the instruction.) Without this,
+    // a do-nothing INT 1 handler that IRETs with TF still set re-triggers #DB on
+    // its own IRET boundary forever (Stunts LOAD.EXE single-step timing loop).
+    // Mirrors DOSBox-x's `cpu.trap_skip` (core_normal.cpp:228-231).
+    const tf_at_start = cpu.st.eflags.tf;
 
     // Execute one instruction. Faults are recorded in pending_fault and surface
     // as error.Fault; the dispatcher catches and we deliver below.
@@ -78,7 +88,7 @@ pub fn step(cpu: anytype) StepResult {
     if (shadow_was_set) cpu.st.inhibit_irq_one_instruction = false;
 
     // Instruction-boundary checkpoint.
-    const stop = serviceInterrupts(cpu);
+    const stop = serviceInterrupts(cpu, tf_at_start);
 
     // By-construction guard (Phase 1a / Theme E): every executed instruction
     // charges at least its table base cost. HLT/shutdown returned earlier.
@@ -98,8 +108,10 @@ fn wakeable(cpu: anytype) bool {
 }
 
 /// The single instruction-boundary checkpoint (Theme G). Applies the fixed
-/// priority order and delivers at most one event per boundary.
-pub fn serviceInterrupts(cpu: anytype) StopReason {
+/// priority order and delivers at most one event per boundary. `tf_at_start` is
+/// the TF flag as it stood entering the just-executed instruction; the
+/// single-step #DB fires only when TF was already set then (see `step`).
+pub fn serviceInterrupts(cpu: anytype, tf_at_start: bool) StopReason {
     // 1. Pending fault from the just-executed instruction.
     if (cpu.st.pending_fault) |pf| {
         cpu.st.pending_fault = null;
@@ -115,8 +127,11 @@ pub fn serviceInterrupts(cpu: anytype) StopReason {
     // The one-instruction inhibit suppresses recognition this boundary.
     if (cpu.st.inhibit_irq_one_instruction) return .normal;
 
-    // 2. TF single-step trap (#DB) — delivered after the instruction (trap).
-    if (cpu.st.eflags.tf) {
+    // 2. TF single-step trap (#DB) — delivered after the instruction (trap), but
+    //    only if TF was set ENTERING it. An instruction that newly set TF (POPF/
+    //    IRET/flag store) defers the trap one instruction, so a TF-restoring IRET
+    //    does not immediately re-trap on its own boundary.
+    if (tf_at_start and cpu.st.eflags.tf) {
         deliverException(cpu, VEC_DB, .trap, null) catch {
             return escalate(cpu);
         };

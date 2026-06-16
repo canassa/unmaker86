@@ -127,6 +127,53 @@ test "TF single-step delivers #DB trap after the instruction" {
     try std.testing.expect(!h.cpu.st.eflags.tf); // TF cleared on delivery
 }
 
+// An instruction that NEWLY sets TF (POPF/IRET restoring a FLAGS image with TF=1)
+// must NOT itself produce a single-step #DB — the trap is deferred one instruction
+// (Intel SDM: TF is checked against its value ENTERING the instruction). A
+// do-nothing INT 1 handler that IRETs with TF still set would otherwise re-trap on
+// its own IRET boundary forever; this is the exact loop that hung Stunts LOAD.EXE's
+// single-step timing routine. Regression for the `tf_at_start` gate in step().
+test "IRET that restores TF=1 does not immediately re-trap; next instruction runs" {
+    var h: H = undefined;
+    h.init(std.testing.allocator);
+    defer h.deinit();
+
+    // INT 1 (#DB) vector -> a bare-IRET handler at 0x0500:0x0000 (the unhooked
+    // default-stub equivalent: it does nothing and returns).
+    h.ivt(interrupts.VEC_DB, 0x0500, 0x0000);
+    h.bus.writeByte(0x5000, 0xCF); // IRET at 0500:0000
+
+    // Lay an INT 1 followed by a NOP at the guest CS:IP (0000:2000). TF starts
+    // CLEAR; the INT 1 pushes a FLAGS frame with TF set so the handler's IRET
+    // restores TF=1, mimicking the guest's single-step loop entry.
+    h.lay(&.{ 0xCD, 0x01, 0x90 }); // INT 1 ; NOP
+
+    // Pre-set TF on the FLAGS image that INT 1 will push, by setting TF before the
+    // INT executes (the INT pushes current FLAGS, then clears TF on entry).
+    h.cpu.st.eflags.tf = true;
+
+    // Step 1: execute INT 1. TF was set ENTERING it, but the boundary that matters
+    // for the NEXT trap is post-delivery (TF cleared on entry). We land in the
+    // handler at 0500:0000 with TF=0.
+    _ = h.cpu.step();
+    try std.testing.expectEqual(@as(u16, 0x0500), h.cpu.readSegSelector(.cs));
+    try std.testing.expect(!h.cpu.st.eflags.tf);
+
+    // Step 2: the handler's IRET pops FLAGS (TF=1 restored), returning to the guest
+    // NOP at 0000:2002. Because TF was NOT set entering the IRET, NO #DB fires here
+    // — without the fix, #DB would re-trap on the IRET boundary and CS would jump
+    // back to 0x0500, never reaching the NOP.
+    _ = h.cpu.step();
+    try std.testing.expectEqual(@as(u16, 0x0000), h.cpu.readSegSelector(.cs));
+    try std.testing.expectEqual(@as(u32, 0x2002), h.cpu.st.eip); // at the NOP
+    try std.testing.expect(h.cpu.st.eflags.tf); // TF restored by IRET
+
+    // Step 3: NOW TF was set entering the NOP -> #DB fires AFTER it (the normal
+    // single-step cadence: one guest instruction per trap, forward progress).
+    _ = h.cpu.step();
+    try std.testing.expectEqual(@as(u16, 0x0500), h.cpu.readSegSelector(.cs));
+}
+
 test "IDTR limit exceeded during delivery escalates to #DF (not a bare #GP)" {
     var h: H = undefined;
     h.init(std.testing.allocator);
