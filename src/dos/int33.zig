@@ -45,9 +45,29 @@ const ECX = @intFromEnum(Reg32.ecx);
 const EDX = @intFromEnum(Reg32.edx);
 const EBX = @intFromEnum(Reg32.ebx);
 const EAX = @intFromEnum(Reg32.eax);
+const ESI = @intFromEnum(Reg32.esi);
+const EDI = @intFromEnum(Reg32.edi);
 
 /// dosbox-x reports a 3-button driver (MOUSE_BUTTONS, mouse.cpp:159).
 const MOUSE_BUTTONS: u16 = 3;
+
+/// INT 33h AX=0Ch event-callback CONDITION (event) mask bits — the Microsoft
+/// Mouse Programmer's Reference layout the driver builds and AND-s against the
+/// installed `handler_mask` before firing (dosbox-x `event.type`, mouse.cpp
+/// MOUSE_EventXxx + the INT74 dispatch at :2266). Bit i means "event i happened".
+const EV_MOVED: u16 = 1 << 0; // cursor position changed
+const EV_LBTN_DOWN: u16 = 1 << 1; // left button pressed
+const EV_LBTN_UP: u16 = 1 << 2; // left button released
+const EV_RBTN_DOWN: u16 = 1 << 3; // right button pressed
+const EV_RBTN_UP: u16 = 1 << 4; // right button released
+const EV_MBTN_DOWN: u16 = 1 << 5; // middle button pressed
+const EV_MBTN_UP: u16 = 1 << 6; // middle button released
+
+/// Driver button-state bit layout (shared by `self.buttons`, AX=0003, and the
+/// callback BX): bit0=left, bit1=right, bit2=middle (mouse.cpp button order).
+const BTN_LEFT: u16 = 1 << 0;
+const BTN_RIGHT: u16 = 1 << 1;
+const BTN_MIDDLE: u16 = 1 << 2;
 
 pub fn Int33(comptime Cpu: type) type {
     return struct {
@@ -117,6 +137,16 @@ pub fn Int33(comptime Cpu: type) type {
         handler_seg: u16 = 0,
         handler_off: u16 = 0,
         handler_mask: u16 = 0,
+
+        /// Re-entrancy guard for the event callback (input Phase 3). TRANSIENT,
+        /// stack-scoped: set on entry to `fireEventCallback` and cleared on exit,
+        /// so a guest handler that itself injects (or whose nested instructions
+        /// re-enter this path) cannot recursively fire the handler. It is ALWAYS
+        /// false at any command/snapshot boundary (the far-call runs to completion
+        /// synchronously on the worker before the next command), so it is NOT a
+        /// snapshot field — capturing an invariably-false flag would add nothing
+        /// and only widen the golden. See the snapshot SCOPE NOTE below.
+        firing: bool = false,
 
         /// Sub-mickey remainder (dosbox `precise_mickey_counter`,
         /// mouseif_dos_driver.cpp:1268), scaled by SCALE. Carries the
@@ -461,6 +491,126 @@ pub fn Int33(comptime Cpu: type) type {
         }
 
         // -------------------------------------------------------------------
+        // Event callback (INT 33h AX=0Ch) — input Phase 3. This is what real
+        // Betrayal at Krondor requires: BaK installs an AH=0Ch handler
+        // (KRONDOR-flat.c `mouse_install`/`mouse_event_callback`) and NEVER polls
+        // AX=03 — position/buttons reach the game ONLY through this far-call. The
+        // handler latches CX/DX/BL into its DGROUP globals and draws its own cursor.
+        // -------------------------------------------------------------------
+
+        /// Build the CONDITION (event) mask for a move-and-button-change from the
+        /// OLD button state (`old_btn`) to `self.buttons` plus whether the cursor
+        /// moved (`moved`). Bits per the Microsoft layout (EV_* above). A button
+        /// that both pressed and released between injects cannot be observed (one
+        /// inject = one transition), so press/release are mutually exclusive per
+        /// button here — exactly what dosbox derives per `MOUSE_EventXxx`.
+        fn conditionMask(old_btn: u16, new_btn: u16, moved: bool) u16 {
+            var mask: u16 = 0;
+            if (moved) mask |= EV_MOVED;
+            const pressed = new_btn & ~old_btn; // 0->1 transitions
+            const released = old_btn & ~new_btn; // 1->0 transitions
+            if (pressed & BTN_LEFT != 0) mask |= EV_LBTN_DOWN;
+            if (released & BTN_LEFT != 0) mask |= EV_LBTN_UP;
+            if (pressed & BTN_RIGHT != 0) mask |= EV_RBTN_DOWN;
+            if (released & BTN_RIGHT != 0) mask |= EV_RBTN_UP;
+            if (pressed & BTN_MIDDLE != 0) mask |= EV_MBTN_DOWN;
+            if (released & BTN_MIDDLE != 0) mask |= EV_MBTN_UP;
+            return mask;
+        }
+
+        /// Far-call the installed AX=0Ch event handler with the Microsoft callback
+        /// register ABI, charging EVERY instruction it runs through the normal
+        /// ledger (no hole — see `runGuestFarCall`). Fires ONLY when a handler is
+        /// installed AND the triggering `condition` intersects the installed
+        /// `handler_mask`. AX carries just the intersected bits (the events THIS
+        /// call is reporting, the bits the handler asked for).
+        ///
+        /// Register ABI (dosbox-x INT74_Handler, mouse.cpp:2266-2273):
+        ///   AX = condition mask (events ∩ installed mask)
+        ///   BX = button state (bit0=L,1=R,2=M in BL; BH=wheel=0)
+        ///   CX = cursor X position (granularity-masked POS_X — same units AX=03 reports)
+        ///   DX = cursor Y position (POS_Y)
+        ///   SI = signed horizontal mickey counter (mouse.mickey_x)
+        ///   DI = signed vertical mickey counter (mouse.mickey_y)
+        /// DS is left UNTOUCHED: the real driver never sets DS for the user sub
+        /// (dosbox-x pushes only sub_seg:sub_ofs, never DS), and BaK's Borland far
+        /// callback establishes its own DGROUP in its prologue — verified against
+        /// `mouse_event_callback` (KRONDOR-flat.c:20257), which reads in_CX/in_DX/
+        /// in_BL and writes DGROUP statics with no reliance on the caller's DS.
+        ///
+        /// Re-entrancy: guarded by `self.firing` (transient) so a handler that
+        /// re-enters the inject path can't recursively fire. Runs on the worker
+        /// (machine owner) at a command boundary, so the far-call completes before
+        /// the next command — `firing` is always false across snapshots.
+        fn fireEventCallback(self: *Self, cpu: *Cpu, br: *Bridge, condition: u16) void {
+            if (self.firing) return; // re-entrancy guard (Phase 3)
+            if (self.handler_seg == 0 and self.handler_off == 0) return;
+            const fire_bits = condition & self.handler_mask;
+            if (fire_bits == 0) return;
+
+            self.firing = true;
+            defer self.firing = false;
+
+            cpu.st.setReg16(EAX, fire_bits);
+            cpu.st.setReg16(EBX, self.buttons & 0x00FF); // BL=buttons, BH=wheel=0
+            cpu.st.setReg16(ECX, self.posX());
+            cpu.st.setReg16(EDX, self.posY());
+            cpu.st.setReg16(ESI, @bitCast(self.mickey_x));
+            cpu.st.setReg16(EDI, @bitCast(self.mickey_y));
+
+            br.runGuestFarCall(self.handler_seg, self.handler_off);
+        }
+
+        /// Inject an absolute/relative mouse event AND fire the AX=0Ch event
+        /// callback for the resulting transition (input Phase 3, the BaK path). The
+        /// FULL inject is applied first (so CX/DX/BL passed to the handler reflect
+        /// the final state — BaK just latches them), then ONE far-call carries the
+        /// combined condition mask. Captures the pre-inject button state + position
+        /// BEFORE mutating so the press/release/move bits are derived from the real
+        /// transition. The far-call self-charges its cycles via `runGuestFarCall`.
+        pub fn injectAndFire(
+            self: *Self,
+            cpu: *Cpu,
+            br: *Bridge,
+            req: InjectReq,
+        ) void {
+            const old_btn = self.buttons;
+            const old_x = self.x;
+            const old_y = self.y;
+
+            // Apply absolute first (verbatim range-clamped) then relative (the
+            // fixed-point mickey path) — identical ordering to Controller.injectMouse
+            // so the firing and non-firing paths can't diverge. Buttons ride with
+            // whichever path the caller selected; both write `self.buttons`.
+            if (req.set_x or req.set_y) {
+                const btn_here = req.set_buttons and !(req.set_dx or req.set_dy);
+                self.injectAbsolute(req.x, req.y, req.buttons, req.set_x, req.set_y, btn_here);
+            }
+            if (req.set_dx or req.set_dy or req.set_buttons) {
+                self.injectRelative(req.dx, req.dy, req.buttons, req.set_dx, req.set_dy, req.set_buttons);
+            }
+
+            const moved = (self.x != old_x) or (self.y != old_y);
+            const condition = conditionMask(old_btn, self.buttons, moved);
+            self.fireEventCallback(cpu, br, condition);
+        }
+
+        /// Inject request — mirrors the API `MouseInject` shape so the worker can
+        /// forward one POST /api/input/mouse straight through.
+        pub const InjectReq = struct {
+            x: i16 = 0,
+            y: i16 = 0,
+            dx: i16 = 0,
+            dy: i16 = 0,
+            buttons: u16 = 0,
+            set_x: bool = false,
+            set_y: bool = false,
+            set_dx: bool = false,
+            set_dy: bool = false,
+            set_buttons: bool = false,
+        };
+
+        // -------------------------------------------------------------------
         // Snapshot / restore (D14, the mouse-driver state hole closed in input
         // Phase 0). A POD by-value copy of EVERY mutable driver field that lives
         // host-side (NOT in guest RAM): the driver carries no guest-RAM-backed
@@ -470,7 +620,11 @@ pub fn Int33(comptime Cpu: type) type {
         // SCOPE NOTE: this captures the fields that exist TODAY. The Phase-2
         // relative-motion (mickey) accumulators + counters ARE captured here (the
         // field deferred from Phase 0 — now mutable host-side state). The Phase-3
-        // callback re-entrancy flag is added WHEN that phase introduces the field.
+        // callback re-entrancy flag (`firing`) is DELIBERATELY NOT captured: it is
+        // transient, set/cleared within a single `fireEventCallback` that runs to
+        // completion synchronously on the worker before the next command, so it is
+        // ALWAYS false at any snapshot boundary. Capturing an invariably-false flag
+        // would only widen the golden without adding observable state.
         // -------------------------------------------------------------------
         pub const Snapshot = struct {
             present: bool,

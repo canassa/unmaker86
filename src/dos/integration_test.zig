@@ -574,3 +574,188 @@ test "input Phase 2: guest reads an injected position back via INT 33h AX=0003 (
     try std.testing.expectEqual(@as(u16, 0), m2.cx);
     try std.testing.expectEqual(@as(u16, 0), m2.dx);
 }
+
+// ===========================================================================
+// Input Phase 3 — the INT 33h AX=0Ch event callback. This is what real
+// Betrayal at Krondor requires: it installs an AH=0Ch handler and NEVER polls
+// AX=03, so injected movement/clicks reach it ONLY by firing this far-call.
+// These tests plant a tiny GUEST handler in guest RAM, install it via the REAL
+// INT 33h AX=0C service, then inject and prove (a) the handler RAN with the
+// right register values (it latched them to guest RAM), and (b) the cycle
+// counter advanced by exactly the handler's instruction cost (no ledger hole).
+// ===========================================================================
+
+const HANDLER_SEG: u16 = 0x3000;
+const HANDLER_OFF: u16 = 0x0010; // handler code starts here
+// Fixed guest-RAM slots (within HANDLER_SEG) the handler latches its args into.
+const SLOT_CX: u16 = 0x0000;
+const SLOT_DX: u16 = 0x0002;
+const SLOT_BL: u16 = 0x0004;
+
+// Plant a tiny far event handler at HANDLER_SEG:HANDLER_OFF that latches the
+// callback's CX/DX/BL into fixed guest-RAM slots, then RETFs. It establishes its
+// OWN DS (`PUSH CS; POP DS`) exactly like BaK's Borland far callback — proving the
+// driver need not (and does not) set DS for the user sub.
+//   0E              PUSH CS
+//   1F              POP DS              ; DS = HANDLER_SEG (handler's own DGROUP)
+//   89 0E 00 00     MOV [SLOT_CX], CX
+//   89 16 02 00     MOV [SLOT_DX], DX
+//   88 1E 04 00     MOV [SLOT_BL], BL
+//   CB              RETF
+fn plantMouseHandler(m: *Machine) void {
+    const base = (@as(u32, HANDLER_SEG) << 4) + HANDLER_OFF;
+    const code = [_]u8{
+        0x0E, // PUSH CS
+        0x1F, // POP DS
+        0x89, 0x0E, @truncate(SLOT_CX), @truncate(SLOT_CX >> 8), // MOV [SLOT_CX],CX
+        0x89, 0x16, @truncate(SLOT_DX), @truncate(SLOT_DX >> 8), // MOV [SLOT_DX],DX
+        0x88, 0x1E, @truncate(SLOT_BL), @truncate(SLOT_BL >> 8), // MOV [SLOT_BL],BL
+        0xCB, // RETF
+    };
+    for (code, 0..) |c, i| m.bus.writePhys8(base + @as(u32, @intCast(i)), c);
+    // Zero the latch slots so a stale value can't masquerade as a fired callback.
+    const sbase = @as(u32, HANDLER_SEG) << 4;
+    m.bus.writePhys16(sbase + SLOT_CX, 0);
+    m.bus.writePhys16(sbase + SLOT_DX, 0);
+    m.bus.writePhys16(sbase + SLOT_BL, 0);
+}
+
+// Install the planted handler via the REAL INT 33h AX=0C service (guest asm:
+// MOV CX,mask ; MOV AX,HANDLER_SEG ; MOV ES,AX ; MOV DX,HANDLER_OFF ;
+// MOV AX,0x000C ; INT 33h ; HLT). Uses the same IVT 0x33 -> dos.mouse.service
+// path the game uses — no host shortcut.
+fn installMouseHandler(m: *Machine, mask: u16) void {
+    asmInt67(m, &.{
+        0xB9, @truncate(mask), @truncate(mask >> 8), // MOV CX, mask
+        0xB8, @truncate(HANDLER_SEG), @truncate(HANDLER_SEG >> 8), // MOV AX, HANDLER_SEG
+        0x8E, 0xC0, // MOV ES, AX
+        0xBA, @truncate(HANDLER_OFF), @truncate(HANDLER_OFF >> 8), // MOV DX, HANDLER_OFF
+        0xB8, 0x0C, 0x00, // MOV AX, 0x000C
+        0xCD, 0x33, // INT 33h
+        0xF4, // HLT
+    });
+}
+
+fn slot16(m: *Machine, off: u16) u16 {
+    return m.bus.readPhys16((@as(u32, HANDLER_SEG) << 4) + off);
+}
+
+test "input Phase 3: injected mouse event fires the AX=0Ch handler with the right regs (no hole)" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    plantMouseHandler(m);
+    // Install for ALL events (mask 0x7F: move + every button up/down).
+    installMouseHandler(m, 0x7F);
+    try std.testing.expectEqual(HANDLER_SEG, m.dos.mouse.handler_seg);
+    try std.testing.expectEqual(HANDLER_OFF, m.dos.mouse.handler_off);
+    try std.testing.expectEqual(@as(u16, 0x7F), m.dos.mouse.handler_mask);
+
+    // Inject an absolute move to (222,134) with the LEFT button pressed. This is a
+    // move + left-press, both in the mask, so the handler MUST fire.
+    const cyc_before = m.cpu.st.cycles;
+    m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
+        .x = 222,
+        .y = 134,
+        .buttons = 0b001,
+        .set_x = true,
+        .set_y = true,
+        .set_buttons = true,
+    });
+
+    // (a) The handler RAN: it latched the callback's CX/DX/BL into guest RAM. CX/DX
+    // are the granularity-masked position (== AX=03 read), BL the button state.
+    try std.testing.expectEqual(@as(u16, 222), slot16(m, SLOT_CX));
+    try std.testing.expectEqual(@as(u16, 134), slot16(m, SLOT_DX));
+    try std.testing.expectEqual(@as(u16, 0b001), slot16(m, SLOT_BL) & 0xFF);
+
+    // (b) NO ledger hole: the cycle counter advanced by the handler's real
+    // instruction cost (the 6 guest instructions the far-call ran). Strictly > 0.
+    try std.testing.expect(m.cpu.st.cycles > cyc_before);
+
+    // After the far-call the machine's CS:IP/SP are restored (runGuestFarCall
+    // contract): a subsequent guest INT 33h still works — read the position back.
+    const r = guestInt33(m, 0x0003);
+    try std.testing.expectEqual(@as(u16, 222), r.cx);
+    try std.testing.expectEqual(@as(u16, 134), r.dx);
+}
+
+test "input Phase 3: callback does NOT fire when the event is outside the installed mask" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    plantMouseHandler(m);
+    // Register for RIGHT-button events ONLY (bits 3|4), NOT move or left.
+    installMouseHandler(m, EV_RBTN_DOWN | EV_RBTN_UP);
+
+    const cyc_before = m.cpu.st.cycles;
+    // A pure move + left-press — none of those bits are in the installed mask.
+    m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
+        .x = 100,
+        .y = 100,
+        .buttons = 0b001,
+        .set_x = true,
+        .set_y = true,
+        .set_buttons = true,
+    });
+
+    // The handler must NOT have run: latch slots stay zero, no cycles charged.
+    try std.testing.expectEqual(@as(u16, 0), slot16(m, SLOT_CX));
+    try std.testing.expectEqual(@as(u16, 0), slot16(m, SLOT_DX));
+    try std.testing.expectEqual(cyc_before, m.cpu.st.cycles);
+
+    // Now a RIGHT-button press IS in the mask -> the handler fires.
+    m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
+        .buttons = 0b011, // keep left, add right
+        .set_buttons = true,
+    });
+    try std.testing.expectEqual(@as(u16, 0b011), slot16(m, SLOT_BL) & 0xFF);
+    try std.testing.expect(m.cpu.st.cycles > cyc_before);
+}
+
+// Mirror the EV_* bits from int33.zig (private there); used by the mask test.
+const EV_RBTN_DOWN: u16 = 1 << 3;
+const EV_RBTN_UP: u16 = 1 << 4;
+
+test "input Phase 3: firing the callback is byte-identical across two runs (determinism)" {
+    const alloc = std.testing.allocator;
+    var a = try boot(alloc);
+    defer a.deinit();
+    var b = try boot(alloc);
+    defer b.deinit();
+
+    inline for (.{ a, b }) |ctx| {
+        const m = ctx.m;
+        plantMouseHandler(m);
+        installMouseHandler(m, 0x7F);
+        m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
+            .x = 200,
+            .y = 120,
+            .buttons = 0b001,
+            .set_x = true,
+            .set_y = true,
+            .set_buttons = true,
+        });
+        m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
+            .dx = 15,
+            .dy = -7,
+            .buttons = 0b010,
+            .set_dx = true,
+            .set_dy = true,
+            .set_buttons = true,
+        });
+    }
+
+    // Same script -> byte-identical driver state, latched guest RAM, AND cycles.
+    try std.testing.expectEqual(a.m.dos.mouse, b.m.dos.mouse);
+    try std.testing.expectEqual(a.m.cpu.st.cycles, b.m.cpu.st.cycles);
+    try std.testing.expectEqual(slot16(a.m, SLOT_CX), slot16(b.m, SLOT_CX));
+    try std.testing.expectEqual(slot16(a.m, SLOT_DX), slot16(b.m, SLOT_DX));
+    try std.testing.expectEqual(slot16(a.m, SLOT_BL), slot16(b.m, SLOT_BL));
+    // Sanity: the handler actually latched the final relative-move state.
+    try std.testing.expect(slot16(a.m, SLOT_BL) & 0xFF == 0b010);
+}

@@ -165,12 +165,11 @@ IF-force behavior on the poll/check path so injected keys can arrive mid-loop.
   id, 001A/001B sensitivity, 0024 version (`int33.zig:139-249`).
 - The driver instance lives on the DOS ctx: `mouse: Int33 = .{}` (`src/dos/dos.zig:115`),
   serviced at `dos.zig:216`, vector planted at `dos.zig:239`.
-- **The event-callback far-ptr is captured but NEVER invoked.** AX=000C stores
-  `handler_seg/off/mask` (`int33.zig:203-207`); AX=0014 swaps them
-  (`int33.zig:213-223`). Nothing in the codebase ever *calls back into* that guest
-  far-ptr on a mouse event. The trampoline mechanism to do so exists
-  (`Bridge.runGuestInt`, `src/bridge/bridge.zig:350-400`) but is not wired to the
-  mouse. This is surfaced as **OPEN-B**.
+- **The event-callback far-ptr is captured AND now invoked (Phase 3, DONE).** AX=000C
+  stores `handler_seg/off/mask`; AX=0014 swaps them. On an injected mouse event the
+  driver now far-calls that guest handler via `Bridge.runGuestFarCall`
+  (`int33.zig:fireEventCallback`/`injectAndFire`) — the OPEN-B resolution. See the
+  Phase 3 checklist (§8) for the shipped ABI + no-hole mechanism.
 - **The injection seam already exists, host-side:** `Int33.injectMotion(x, y,
   buttons)` sets driver position+buttons directly (`int33.zig:254-259`). It is the
   deterministic external-input seam the io-oracle describes (`plans/io-oracle.md
@@ -1474,29 +1473,51 @@ loops AH=00 unblocks deterministically when a scancode + IRQ1 is injected, §7.1
   accumulators (snapshot compare x2), and a guest INT 33h AX=0003 read-back +
   AX=000B accumulate-and-zero round-trip via the real IVT dispatch.]
 
-**Phase 3 — mouse event callback (OPEN-B, installed-asm trampoline; needs Phase 1·0
-for `EventKind.mouse_irq` and, if used, `runGuestFarCall`).**
-- [ ] At init, install the asm trampoline in guest RAM (spice86 pattern,
-  `MouseDriver.cs:398-419`): `[before-hook callback] [hot-patchable FAR CALL operand]
-  [after-hook callback] [FAR RET]`, with a default FAR RET no-op handler. Add the
-  hot-patch helper (analogous to `InMemoryAddressSwitcher.SetAddress`,
-  `InMemoryAddressSwitcher.cs:36-54`).
-- [ ] Wire IRQ12 (INT 74h) as a cycle-scheduled event (`EventKind.mouse_irq`,
-  introduced in Phase 1·0) whose stub far-calls the trampoline (spice86
-  `BiosMouseInt74Handler.cs:41-54`, far-call `:52`, EOI `:53`). The
-  before-hook checks `LastTrigger & handler_mask`, saves regs, sets the INT 33h ABI
-  registers (§1.5: AX=mask, BX=buttons, CX=X, DX=Y, SI/DI=mickeys), and hot-patches
-  the far-call operand to the guest `handler_seg:handler_off` (or the default
-  no-op). The after-hook restores regs and clears the re-entrancy flag.
-- [ ] On inject: arm the event + schedule the IRQ12 on the ledger. The guest handler
-  then runs on the **next `run`/`step`** through the normal fetch/execute loop, so
-  every instruction is cycle-charged automatically — **no ledger hole, no
-  synchronous host re-entry, and the M2 "guest advances only in run/step" invariant
-  is preserved** (do NOT advance the guest inside the inject command). If a
-  `Bridge.runGuestFarCall` path is ever used instead, it MUST charge cycles for every
-  inner instruction or it reintroduces the hole — prefer the installed-asm pattern.
-- [ ] Tests: callback-ran determinism (counter + cycles byte-identical x2);
-  re-entrancy guard; default no-op path when no handler is armed.
+**Phase 3 — mouse event callback (OPEN-B). IMPLEMENTED** (`src/dos/int33.zig`,
+`src/debug/controller.zig:injectMouse`; tests in `src/dos/integration_test.zig`).
+
+> **Mechanism actually shipped: the `Bridge.runGuestFarCall` path, fired at the
+> inject command boundary on the worker thread.** The plan offered two faithful
+> options (installed-asm IRQ12 trampoline OR `runGuestFarCall`); we took the latter
+> because it is simpler, needs no IRQ12/INT 74h device, and matches the existing
+> `runGuestInt` re-entry idiom already used for EXEC/BIOS-calling-BIOS. The §4.2
+> "no ledger hole" HARD requirement is met: `runGuestFarCall` (`bridge.zig:628`)
+> drives `step_one` per inner instruction, so EVERY instruction the guest handler
+> runs charges its real cycle cost through the normal ledger — the test asserts the
+> cycle counter advanced. This is NOT the forbidden synchronous-skip-the-ledger
+> re-entry; it is the same `step_one`-driving loop `runGuestInt` uses.
+>
+> **Why firing at the inject boundary is sound (M2 invariant).** The inject runs on
+> the WORKER (the machine owner), between run-slices, under the submit-gate — the
+> same place a `setReg`/`writeMem` command mutates state. The far-call is part of
+> servicing THAT command and completes before the next command, so there is no
+> cross-thread feedback into emulation timing and the result is reproducible (the
+> determinism double-run test passes). A separate cycle-scheduled IRQ12 (Model B)
+> remains available later if a target needs delivery deferred to a future cycle.
+
+- [x] On an injected mouse event, after updating `x/y/buttons`, compute the
+  **condition mask** (`int33.zig:conditionMask` — bit0 move, bit1/2 L down/up,
+  bit3/4 R down/up, bit5/6 M down/up) from the OLD→NEW button transition + motion.
+- [x] **Fire only if** a handler is installed (`handler_seg/off` non-zero) AND
+  `(condition & handler_mask) != 0` (`int33.zig:fireEventCallback`).
+- [x] **Register ABI** (matched to dosbox-x `INT74_Handler`, `mouse.cpp:2266-2273`):
+  AX = condition ∩ mask, BX = button state (BL; BH=wheel=0), CX = POS_X, DX = POS_Y
+  (granularity-masked — same units AX=03 reports), SI = mickey_x, DI = mickey_y.
+  **DS is left untouched** — the real driver never sets DS for the user sub (dosbox-x
+  pushes only `sub_seg:sub_ofs`), and BaK's Borland far callback establishes its own
+  DGROUP in its prologue (`KRONDOR-flat.c:20257` `mouse_event_callback`, which reads
+  in_CX/in_DX/in_BL and writes DGROUP statics with no reliance on the caller's DS).
+- [x] Far-call the handler via `Bridge.runGuestFarCall(handler_seg, handler_off)`
+  (saves full CPU state, pushes a far-return frame onto the stop-sentinel slot, runs
+  `step_one` until the handler `RETF`s, restores CS:IP/SP).
+- [x] **Re-entrancy guard:** `Int33.firing` (transient, stack-scoped; set on entry to
+  `fireEventCallback`, cleared on exit). Always false at any snapshot boundary, so it
+  is DELIBERATELY NOT a snapshot field (capturing an invariably-false flag would only
+  widen the golden).
+- [x] Tests (`integration_test.zig`): (a) planted guest-asm AH=0Ch handler latches
+  CX/DX/BL into guest RAM — proves it RAN with the right regs; (b) cycle counter
+  advanced — no hole; (c) mask-miss does NOT fire (no cycles, no latch); (d)
+  determinism double-run (driver state + latched RAM + cycles byte-identical).
 
 **Phase 4 (OPTIONAL / LATER band) — `waiting_for_input` for INT 21h CON stdin only
 (Model C).**

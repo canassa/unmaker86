@@ -539,16 +539,27 @@ pub const Controller = struct {
     /// here we apply absolute first (verbatim range-clamped) then relative (the
     /// fixed-point mickey path), so a caller that sets neither leaves position
     /// untouched. Buttons are applied once (a relative call carries the same mask).
+    /// (Phase 3) After updating driver position/buttons, FIRE the guest's INT 33h
+    /// AX=0Ch event callback (if one is installed and the event intersects its
+    /// mask). This is what real Betrayal at Krondor requires — it is callback-only
+    /// and never polls AX=03, so injected movement/clicks reach it ONLY here. The
+    /// far-call self-charges every instruction it runs (no ledger hole; see
+    /// `Bridge.runGuestFarCall`). It runs on the worker (the machine owner) at this
+    /// command boundary, so the call completes before the next command.
     pub fn injectMouse(self: *Controller, req: MouseInject) void {
         const mouse = &self.m.dos.mouse;
-        if (req.set_x or req.set_y) {
-            // Buttons ride with the absolute set if relative isn't also setting them.
-            const btn_here = req.set_buttons and !(req.set_dx or req.set_dy);
-            mouse.injectAbsolute(req.x, req.y, req.buttons, req.set_x, req.set_y, btn_here);
-        }
-        if (req.set_dx or req.set_dy or req.set_buttons) {
-            mouse.injectRelative(req.dx, req.dy, req.buttons, req.set_dx, req.set_dy, req.set_buttons);
-        }
+        mouse.injectAndFire(&self.m.cpu, &self.m.svc.bridge, .{
+            .x = req.x,
+            .y = req.y,
+            .dx = req.dx,
+            .dy = req.dy,
+            .buttons = req.buttons,
+            .set_x = req.set_x,
+            .set_y = req.set_y,
+            .set_dx = req.set_dx,
+            .set_dy = req.set_dy,
+            .set_buttons = req.set_buttons,
+        });
     }
 
     // -----------------------------------------------------------------------
