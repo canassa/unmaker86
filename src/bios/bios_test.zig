@@ -40,15 +40,17 @@ fn run(m: *Machine) void {
     _ = m.runUntil(untilHalt, 100_000);
 }
 
-test "POST lands the IVT + BDA + A20 enabled" {
+test "POST lands the IVT + BDA + A20 left disabled" {
     const alloc = std.testing.allocator;
     const m = try boot(alloc);
     defer {
         m.deinit();
         alloc.destroy(m);
     }
-    // A20 enabled by POST.
-    try std.testing.expect(m.bus.a20Enabled());
+    // A20 is NOT enabled by POST — real PC BIOS leaves it off so real-mode code
+    // sees the 8086 1 MiB address wraparound (EXEPACK depends on this). Software
+    // enables A20 explicitly via INT 15h AX=2401 / port 92h. (dosbox parity.)
+    try std.testing.expect(!m.bus.a20Enabled());
     // INT 21h vector points at the F000 callback area (a real F000 pointer).
     const seg = m.bus.readPhys16(0x21 * 4 + 2);
     try std.testing.expectEqual(@as(u16, 0xF000), seg);

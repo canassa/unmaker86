@@ -2,8 +2,10 @@
 //!
 //! Representation: a `u32` address mask ANDed into every incoming physical
 //! address. A20 is DISABLED at power-on (real hardware powers on with A20 off;
-//! both DOSBox and spice86 model this). The BIOS/machine enables it via
-//! `setA20(true)` during POST.
+//! both DOSBox and spice86 model this) and STAYS disabled through BIOS POST —
+//! real PC BIOS does not enable A20, so real-mode code sees the 8086 1 MiB
+//! wraparound (EXEPACK's self-decompressor depends on it). Software that needs
+//! A20 enables it itself via `setA20(true)` (INT 15h AX=2401 / port 92h).
 //!
 //! Masking semantics (determinism-critical): A20-off forces **only bit 20** to
 //! zero — it does NOT clamp bits 21+. Addresses above the addressable range are

@@ -145,6 +145,54 @@ test "EXE loads, applies a relocation, prints, exits (M3)" {
     try std.testing.expectEqual(@as(u16, 5), ctx.m.dos.ret_code);
 }
 
+// Real-mode 1 MiB address-wrap regression (the EXEPACK root cause). EXEPACK's
+// self-decompressor reads its backward-overlapping source through a segment that
+// it deliberately underflows, relying on the 8086 1 MiB wraparound (A20 OFF) to
+// land back in conventional memory. A POST that wrongly enabled A20 broke that
+// wrap and made every EXEPACK'd EXE print "Packed file is corrupt". This COM
+// reproduces the exact pointer pattern at the guest level: it writes a sentinel
+// (0xB0 — the EXEPACK "run" command byte, fittingly) to ABSOLUTE phys 0x200 via
+// segment 0, then reads it back through 0xFFFF:0x210 (= phys 0x100200) which is
+// only correct if the access wraps to 0x000200 (A20 off, post-POST default).
+//   mov ax,0      ; ds=0 -> absolute addressing
+//   mov ds,ax
+//   mov byte [0x500],0xB0     ; sentinel at phys 0x500 (free DOS scratch, above BDA)
+//   mov ax,0xFFFF ; ds=0xFFFF
+//   mov ds,ax
+//   mov al,[0x510]            ; phys 0xFFFF0+0x510 = 0x100500 -> wraps to 0x500
+//   cmp al,0xB0
+//   jne fail
+//   mov ax,0x4C00 ; int21      ; exit(0)  -> wrap worked
+//   fail: mov ax,0x4CB0 ; int21 ; exit(0xB0) -> no wrap (A20 was on)
+const wrap_com = [_]u8{
+    0xB8, 0x00, 0x00, //          MOV AX,0x0000        (0x00)
+    0x8E, 0xD8, //                MOV DS,AX            (0x03)
+    0xC6, 0x06, 0x00, 0x05, 0xB0, // MOV byte [0x0500],0xB0 (0x05)
+    0xB8, 0xFF, 0xFF, //          MOV AX,0xFFFF        (0x0A)
+    0x8E, 0xD8, //                MOV DS,AX            (0x0D)
+    0xA0, 0x10, 0x05, //          MOV AL,[0x0510]      (0x0F) -> phys 0x100500
+    0x3C, 0xB0, //                CMP AL,0xB0          (0x12)
+    0x75, 0x04, //                JNE +4 (-> 0x1A)     (0x14)
+    0xB8, 0x00, 0x4C, //          MOV AX,0x4C00        (0x16) exit(0)
+    0xCD, 0x21, //                INT 0x21             (0x19) — never reached on fail
+    0xB8, 0xB0, 0x4C, //          MOV AX,0x4CB0        (0x1A) exit(0xB0)
+    0xCD, 0x21, //                INT 0x21             (0x1D)
+};
+
+test "real-mode 1 MiB wrap holds after POST (EXEPACK regression)" {
+    var ctx = try boot(std.testing.allocator);
+    defer ctx.deinit();
+    // A normal boot: POST must leave A20 OFF so the wrap below resolves.
+    try std.testing.expect(!ctx.m.bus.a20Enabled());
+    try writeHostFile(&ctx, "WRAP.COM", &wrap_com);
+    try ctx.m.bootProgram(2, "WRAP.COM", "");
+    _ = ctx.m.runUntil(untilHalt, 1_000_000);
+    try std.testing.expect(ctx.m.dos.terminated);
+    // exit(0) means the read through 0xFFFF:0x210 wrapped to phys 0x200 and saw the
+    // sentinel; exit(0xB0) would mean A20 was on (no wrap) — the original bug.
+    try std.testing.expectEqual(@as(u16, 0), ctx.m.dos.ret_code);
+}
+
 test "the COM run is byte-identical across two runs incl. cycles" {
     const alloc = std.testing.allocator;
     var res: [2]struct { out: [8]u8, out_len: usize, code: u16, cycles: u64 } = undefined;

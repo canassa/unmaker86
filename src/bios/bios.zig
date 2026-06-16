@@ -199,7 +199,14 @@ pub fn Bios(comptime Cpu: type) type {
         pub fn post(self: *Self, br: *Bridge) void {
             self.programPic();
             self.programTimer();
-            self.cpu.bus.setA20(true);
+            // A20 stays at its power-on default (DISABLED). Real PC BIOS POST does
+            // NOT enable A20 — it is left off so real-mode code sees the classic
+            // 8086 1 MiB address wraparound (e.g. EXEPACK's self-decompressor uses
+            // segment underflow + the wrap to read its backward-overlapping source;
+            // forcing A20 on here broke that and made EXEPACK'd EXEs report "Packed
+            // file is corrupt"). Software that needs A20 enables it via INT 15h
+            // AX=2401 (int15.zig) or the 8042 port-92h path. Matches dosbox-staging
+            // (memory.cpp init -> MEM_A20_Enable(false)).
             self.initIvt(br);
             self.bda().initDefaults();
             self.initFontVectors();
