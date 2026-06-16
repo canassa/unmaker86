@@ -51,4 +51,5 @@ test {
     _ = @import("worker_test.zig");
     _ = @import("server_test.zig");
     _ = @import("determinism_test.zig");
+    _ = @import("png_test.zig");
 }

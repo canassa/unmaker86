@@ -227,6 +227,12 @@ pub const FramebufferResult = struct {
     /// False => no faithful rasterizer for the current mode; the server replies 501
     /// rather than streaming a wrong frame (no fake).
     supported: bool = false,
+    /// True iff the worker filled the server-owned expanded-palette slab (the indexed-
+    /// PNG PLTE source). True whenever `supported` for the current rasterizers.
+    palette_present: bool = false,
+    /// The live VGA `pel_mask`; the indexed-PNG path applies it to each index so the
+    /// PLTE lookup matches the RGBA peek (§3.3). 0xFF for BaK/TTM (a no-op).
+    pel_mask: u8 = 0xFF,
 };
 
 pub const StatusResult = struct {

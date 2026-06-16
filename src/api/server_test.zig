@@ -432,3 +432,110 @@ test "GET /api/framebuffer in an unsupported mode -> 501 (honest, no fake frame)
     const r = get(&ts, "/api/framebuffer", &obuf);
     try std.testing.expectEqual(@as(u16, 501), r.status);
 }
+
+// ---------------------------------------------------------------------------
+// GET /api/framebuffer?format=png — the viewable screenshot (screenshot-api.md).
+// ---------------------------------------------------------------------------
+
+const png_signature = [_]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+
+/// Walk a PNG byte stream and return the first chunk of the named type.
+fn pngChunk(bytes: []const u8, want: *const [4]u8) ?[]const u8 {
+    var pos: usize = 8; // skip signature
+    while (pos + 12 <= bytes.len) {
+        const len = std.mem.readInt(u32, bytes[pos..][0..4], .big);
+        const ctype = bytes[pos + 4 ..][0..4];
+        if (std.mem.eql(u8, ctype, want)) return bytes[pos + 8 ..][0..len];
+        pos += 12 + len;
+    }
+    return null;
+}
+
+test "GET /api/framebuffer?format=png mode 13h -> 200 image/png, indexed, decodes to the laid pattern" {
+    const alloc = std.testing.allocator;
+    var ts = try TestServer.init(alloc);
+    try ts.start();
+    defer ts.deinit();
+
+    // Same known mode-13h pattern + palette the index/rgba tests use.
+    ts.m.bus.writePhys8(0x400 + 0x49, 0x13);
+    var i: u32 = 0;
+    while (i < 320 * 200) : (i += 1) ts.m.vga.vram[i] = @truncate(i * 3 + 1);
+    var k: u16 = 0;
+    while (k < 256) : (k += 1) ts.m.vga.dac_rgb[k] = .{ .red = @truncate(k & 0x3F), .green = 5, .blue = 9 };
+
+    const out = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(out);
+    const raw = ts.request("GET /api/framebuffer?format=png HTTP/1.1\r\nHost: x\r\n\r\n", out);
+
+    try std.testing.expect(std.mem.indexOf(u8, raw, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "image/png") != null);
+    try std.testing.expectEqualStrings("320", headerValue(raw, "x-frame-width").?);
+    try std.testing.expectEqualStrings("200", headerValue(raw, "x-frame-height").?);
+    try std.testing.expectEqualStrings("png-indexed", headerValue(raw, "x-frame-format").?);
+
+    const sep = std.mem.indexOf(u8, raw, "\r\n\r\n").?;
+    const body = raw[sep + 4 ..];
+    try std.testing.expectEqualSlices(u8, &png_signature, body[0..8]);
+
+    // IHDR: 320x200, bit depth 8, color type 3 (indexed).
+    const ihdr = pngChunk(body, "IHDR").?;
+    try std.testing.expectEqual(@as(u32, 320), std.mem.readInt(u32, ihdr[0..4], .big));
+    try std.testing.expectEqual(@as(u32, 200), std.mem.readInt(u32, ihdr[4..8], .big));
+    try std.testing.expectEqual(@as(u8, 8), ihdr[8]);
+    try std.testing.expectEqual(@as(u8, 3), ihdr[9]);
+
+    // PLTE present, 768 bytes; entry for vram[0]'s index has the laid DAC color, 6->8.
+    const plte = pngChunk(body, "PLTE").?;
+    try std.testing.expectEqual(@as(usize, 768), plte.len);
+
+    // Decode the IDAT, strip filter bytes, and check pixel 0 / pixel N == VRAM indices.
+    const idat = pngChunk(body, "IDAT").?;
+    var reader: std.Io.Reader = .fixed(idat);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var dec: std.compress.flate.Decompress = .init(&reader, .zlib, &window);
+    const decoded = try alloc.alloc(u8, 200 * (1 + 320));
+    defer alloc.free(decoded);
+    const n = try dec.reader.readSliceShort(decoded);
+    try std.testing.expectEqual(@as(usize, 200 * (1 + 320)), n);
+    // Row 0: filter byte then 320 indices == vram[0..320].
+    try std.testing.expectEqual(@as(u8, 0), decoded[0]);
+    try std.testing.expectEqual(ts.m.vga.vram[0], decoded[1]);
+    try std.testing.expectEqual(ts.m.vga.vram[100], decoded[1 + 100]);
+    // The PLTE entry the decoded index points at == the DAC color 6->8 expanded.
+    const idx0 = ts.m.vga.vram[0];
+    const expect_r = (@as(u8, ts.m.vga.dac_rgb[idx0].red & 0x3F) << 2) | (ts.m.vga.dac_rgb[idx0].red >> 4);
+    try std.testing.expectEqual(expect_r, plte[@as(usize, idx0) * 3 + 0]);
+}
+
+test "GET /api/framebuffer?format=png is deterministic (two captures byte-identical)" {
+    const alloc = std.testing.allocator;
+    var ts = try TestServer.init(alloc);
+    try ts.start();
+    defer ts.deinit();
+    ts.m.bus.writePhys8(0x400 + 0x49, 0x13);
+    var i: u32 = 0;
+    while (i < 320 * 200) : (i += 1) ts.m.vga.vram[i] = @truncate(i * 7 + 3);
+    var k: u16 = 0;
+    while (k < 256) : (k += 1) ts.m.vga.dac_rgb[k] = .{ .red = @truncate(k & 0x3F), .green = @truncate((k >> 1) & 0x3F), .blue = 0 };
+
+    const o1 = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(o1);
+    const o2 = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(o2);
+    const r1 = ts.request("GET /api/framebuffer?format=png HTTP/1.1\r\nHost: x\r\n\r\n", o1);
+    const r2 = ts.request("GET /api/framebuffer?format=png HTTP/1.1\r\nHost: x\r\n\r\n", o2);
+    const b1 = r1[std.mem.indexOf(u8, r1, "\r\n\r\n").? + 4 ..];
+    const b2 = r2[std.mem.indexOf(u8, r2, "\r\n\r\n").? + 4 ..];
+    try std.testing.expectEqualSlices(u8, b1, b2);
+}
+
+test "GET /api/framebuffer?format=png in an unsupported mode -> 501 (no fake frame)" {
+    const alloc = std.testing.allocator;
+    var ts = try TestServer.init(alloc);
+    try ts.start();
+    defer ts.deinit();
+    ts.m.bus.writePhys8(0x400 + 0x49, 0xFE);
+    const r = get(&ts, "/api/framebuffer?format=png", &obuf);
+    try std.testing.expectEqual(@as(u16, 501), r.status);
+}

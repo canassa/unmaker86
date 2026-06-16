@@ -17,6 +17,7 @@ const debug = @import("debug");
 const cpu_mod = @import("cpu");
 const q = @import("queue.zig");
 const json_wire = @import("json_wire.zig");
+const png = @import("png.zig");
 
 const Controller = debug.Controller;
 const Seg = cpu_mod.Seg;
@@ -47,7 +48,23 @@ pub const RenderBuffers = struct {
     index: [debug.RENDER_INDEX_CAP]u8 = undefined,
     /// RGBA image (4 bytes per pixel). 640*480*4 = 1228800 bytes.
     rgba: [debug.RENDER_RGBA_CAP]u8 = undefined,
+    /// The 256-entry expanded RGB palette (768 bytes), filled by the worker via the
+    /// pure peek (PLTE source for the indexed-PNG path, §3.6 option a). The server reads
+    /// only this slab — never the machine's DAC off-worker.
+    palette: [768]u8 = undefined,
+    /// The final PNG bytes streamed to the socket (`?format=png`). Worst case is a
+    /// 640x480 RGB frame with deflate stored-block overhead; ~1.3 MiB is safe headroom.
+    /// For mode 13h / TTM the real output is a few KiB. Streamed directly — never
+    /// through resp_buf/JSON (B1).
+    png_out: [PNG_OUT_CAP]u8 = undefined,
+    /// Scratch the PNG encoder borrows (flate window + compressed-IDAT slab). Allocated
+    /// once with the rest of the render buffers; no per-request alloc.
+    png_work: png.Workspace = .{},
 };
+
+/// The server-owned PNG output slab cap (§3.7). A frame never expands past raw RGBA's
+/// ~1.2 MiB by more than deflate stored-block + chunk overhead; 1.3 MiB covers it.
+pub const PNG_OUT_CAP: usize = 1300 * 1024;
 
 /// The addressable guest RAM slab size — the bound for memory containment checks
 /// (§B.5/G3). The bus is host-OOB-safe regardless; this returns a clean
@@ -313,7 +330,7 @@ fn screenResp(ctrl: *Controller) Response {
 /// with `load_failed` rather than faking a capture into a stack buffer.
 fn framebufferResp(ctrl: *Controller, render: ?*RenderBuffers) Response {
     const rb = render orelse return .{ .err = .load_failed };
-    const v = ctrl.framebuffer(rb.index[0..], rb.rgba[0..]);
+    const v = ctrl.framebuffer(rb.index[0..], rb.rgba[0..], rb.palette[0..]);
     return .{ .framebuffer = .{
         .kind = v.kind,
         .width = v.width,
@@ -323,6 +340,8 @@ fn framebufferResp(ctrl: *Controller, render: ?*RenderBuffers) Response {
         .double_scan = v.double_scan,
         .row_repeat = v.row_repeat,
         .supported = v.supported,
+        .palette_present = v.palette_present,
+        .pel_mask = v.pel_mask,
     } };
 }
 

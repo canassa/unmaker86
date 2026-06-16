@@ -724,6 +724,18 @@ pub const Controller = struct {
         /// True iff the current mode has a faithful rasterizer; false => the caller
         /// surfaces "no renderer for this mode" rather than streaming a wrong frame.
         supported: bool,
+        /// True iff `palette_buf` was filled with the 256 expanded RGB triples (the
+        /// indexed-PNG path needs it). All current supported kinds emit DAC indices, so
+        /// this is true whenever `supported` — but it is reported explicitly so the
+        /// screenshot serializer can pick the indexed vs. truecolor PNG by data, not by
+        /// re-deriving the mode. False for an unsupported mode (nothing written).
+        palette_present: bool,
+        /// The live VGA `pel_mask` (DAC pixel mask). The indexed-PNG path must apply it
+        /// to each index (`plte_index = idx & pel_mask`) to stay byte-identical to the
+        /// RGBA peek (`indexToRgba`, §3.3). For BaK/TTM it is 0xFF (a no-op), but reported
+        /// so the masking is correct under any program. Off-worker the server reads this
+        /// (a small POD) rather than the machine's DAC.
+        pel_mask: u8,
     };
 
     /// Capture the CURRENT VGA mode into `index_buf` (palette indices) and `rgba_buf`
@@ -737,7 +749,14 @@ pub const Controller = struct {
     /// `index_buf` must be >= width*height; `rgba_buf` >= width*height*4 (the server's
     /// fixed 640x480 buffers always satisfy this). For an unsupported mode it returns
     /// `supported=false` with zero dims and writes nothing (no fake frame).
-    pub fn framebuffer(self: *const Controller, index_buf: []u8, rgba_buf: []u8) FramebufferView {
+    ///
+    /// `palette_buf` (optional, >= 768 bytes): when non-null AND the mode is supported,
+    /// it is filled with the 256 expanded RGB triples (R,G,B per entry) the indexed-PNG
+    /// path needs — `PLTE[i] = expand6to8(dac_rgb[i].{red,green,blue})`. The DAC is read
+    /// RAW here (the same pure peek `indexToRgba` uses); `palette_present` reports
+    /// whether it was filled. This keeps the DAC read ON the worker (the controller's
+    /// machine), so the server reads only its own buffers off-worker (§3.6 option a).
+    pub fn framebuffer(self: *const Controller, index_buf: []u8, rgba_buf: []u8, palette_buf: ?[]u8) FramebufferView {
         const BDA: u32 = 0x400;
         const mode = self.m.bus.peekPhys8(BDA + 0x49); // OFF_VIDEO_MODE
         var cols: u16 = self.peekU16(BDA + 0x4A); // OFF_VIDEO_COLS
@@ -798,10 +817,26 @@ pub const Controller = struct {
                 .double_scan = false,
                 .row_repeat = 1,
                 .supported = false,
+                .palette_present = false,
+                .pel_mask = self.m.vga.pel_mask,
             };
         }
         // Second pass: index -> RGBA via the DAC (raw fields; no port mutation).
         vga_render.indexToRgba(&self.m.vga, index_buf[0..d.index_len], rgba_buf[0..d.rgba_len]);
+        // Optional third pass: the expanded 256-entry RGB palette (the indexed-PNG
+        // source). Reads the RAW `dac_rgb` via the pinned `expand6to8` — same pure path,
+        // no port mutation. Filled on the worker so the server never reads the DAC.
+        var palette_present = false;
+        if (palette_buf) |pbuf| {
+            if (pbuf.len >= 768) {
+                for (self.m.vga.dac_rgb, 0..) |entry, i| {
+                    pbuf[i * 3 + 0] = vga_render.expand6to8(entry.red);
+                    pbuf[i * 3 + 1] = vga_render.expand6to8(entry.green);
+                    pbuf[i * 3 + 2] = vga_render.expand6to8(entry.blue);
+                }
+                palette_present = true;
+            }
+        }
         return .{
             .kind = d.kind,
             .width = d.width,
@@ -811,6 +846,8 @@ pub const Controller = struct {
             .double_scan = d.double_scan,
             .row_repeat = d.row_repeat,
             .supported = true,
+            .palette_present = palette_present,
+            .pel_mask = self.m.vga.pel_mask,
         };
     }
 

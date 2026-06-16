@@ -32,6 +32,11 @@ const q = @import("queue.zig");
 const worker_mod = @import("worker.zig");
 const wire = @import("json_wire.zig");
 const scancodes = @import("bios").scancodes;
+const png = @import("png.zig");
+
+/// The three `/api/framebuffer?format=` surfaces (§3.2). `index`/`rgba` stream the raw
+/// server-owned buffer (the byte-diffable oracle); `png` is a derived, viewable artifact.
+const FramebufferFormat = enum { index, rgba, png };
 
 const Io = std.Io;
 const http = std.http;
@@ -302,11 +307,15 @@ pub const Server = struct {
             // (default index) selects which server-owned buffer to stream as a raw
             // binary body; the descriptor goes in `X-Frame-*` headers. No JSON for the
             // pixels — a frame is 64 KiB..1.2 MiB and must NOT route through resp_buf.
-            const want_rgba = blk: {
-                const fmt = queryValue(query, "format") orelse break :blk false;
-                break :blk std.mem.eql(u8, fmt, "rgba");
+            // `?format=index` (default) | `rgba` | `png`. The first two stream the raw
+            // server-owned buffer; `png` re-encodes that same peek host-side (§3.2).
+            const fmt: FramebufferFormat = blk: {
+                const f = queryValue(query, "format") orelse break :blk .index;
+                if (std.mem.eql(u8, f, "rgba")) break :blk .rgba;
+                if (std.mem.eql(u8, f, "png")) break :blk .png;
+                break :blk .index;
             };
-            return self.submitAndRespondFramebuffer(req, want_rgba);
+            return self.submitAndRespondFramebuffer(req, fmt);
         }
         if (std.mem.eql(u8, path, "/api/memory-regions")) {
             if (method != .GET) return self.methodNotAllowed(req);
@@ -709,7 +718,7 @@ pub const Server = struct {
     /// `resp_buf`/JSON. The descriptor (mode/width/height/lens/double-scan) goes in
     /// `X-Frame-*` response headers. A mode with no faithful rasterizer is a 501 (the
     /// honest deferral — never a fabricated frame).
-    fn submitAndRespondFramebuffer(self: *Server, req: *http.Server.Request, want_rgba: bool) void {
+    fn submitAndRespondFramebuffer(self: *Server, req: *http.Server.Request, fmt: FramebufferFormat) void {
         var ctx: q.RequestCtx = .{ .cmd = .framebuffer_get };
         const resp = self.queue.submit(&ctx);
         const fr = switch (resp) {
@@ -720,24 +729,35 @@ pub const Server = struct {
         if (!fr.supported) {
             return self.respondError(req, .not_implemented, "not_implemented", "no faithful rasterizer for the current video mode");
         }
-        // Select the buffer + length (the worker rendered BOTH into self.render).
-        const body: []const u8 = if (want_rgba)
-            self.render.rgba[0..fr.rgba_len]
-        else
-            self.render.index[0..fr.index_len];
 
-        // Descriptor headers (the client reads dims/kind from these; the body is raw
-        // pixels). Formatted into small fixed scratch buffers (no alloc).
+        // Build the body + content-type + format-tag. The PNG path re-encodes the same
+        // peek host-side over the server-owned snapshot (off-worker, cycle-neutral §3.6);
+        // index/rgba stream the raw buffer. Pixels never flow through resp_buf/JSON (B1).
+        var content_type: []const u8 = "application/octet-stream";
+        var fmt_str: []const u8 = "index";
+        const body: []const u8 = switch (fmt) {
+            .index => self.render.index[0..fr.index_len],
+            .rgba => blk: {
+                fmt_str = "rgba";
+                break :blk self.render.rgba[0..fr.rgba_len];
+            },
+            .png => blk: {
+                content_type = "image/png";
+                break :blk self.encodePng(req, fr) orelse return; // error response done inside
+            },
+        };
+        if (fmt == .png) fmt_str = if (fr.palette_present) "png-indexed" else "png-rgb";
+
+        // Descriptor headers (the client reads dims/kind from these). Small fixed scratch.
         var wbuf: [8]u8 = undefined;
         var hbuf: [8]u8 = undefined;
         var kbuf: [8]u8 = undefined;
         const w_str = std.fmt.bufPrint(&wbuf, "{d}", .{fr.width}) catch "0";
         const h_str = std.fmt.bufPrint(&hbuf, "{d}", .{fr.height}) catch "0";
         const kind_str = std.fmt.bufPrint(&kbuf, "{d}", .{@intFromEnum(fr.kind)}) catch "0";
-        const fmt_str: []const u8 = if (want_rgba) "rgba" else "index";
 
         const headers = [_]http.Header{
-            .{ .name = "content-type", .value = "application/octet-stream" },
+            .{ .name = "content-type", .value = content_type },
             .{ .name = "x-frame-width", .value = w_str },
             .{ .name = "x-frame-height", .value = h_str },
             .{ .name = "x-frame-kind", .value = kind_str },
@@ -748,6 +768,37 @@ pub const Server = struct {
             .keep_alive = false,
             .extra_headers = &headers,
         }) catch {};
+    }
+
+    /// Encode the just-captured frame (in the server-owned `self.render` snapshot) into
+    /// the server-owned `png_out` slab and return the PNG bytes. Indexed PNG when the
+    /// mode is paletted (the PLTE comes from the worker-filled palette slab, with
+    /// `pel_mask` applied to the indices, §3.3); truecolor RGB otherwise. On an encode
+    /// overflow it responds 500 and returns null (the caller stops). This runs on the
+    /// listener thread over an immutable snapshot — it reads NO machine state, charges
+    /// NO cycle (§3.1/§5).
+    fn encodePng(self: *Server, req: *http.Server.Request, fr: q.FramebufferResult) ?[]const u8 {
+        const rb = self.render;
+        var out: std.Io.Writer = .fixed(rb.png_out[0..]);
+        if (fr.palette_present) {
+            // Apply pel_mask to each index in place so the PLTE lookup matches the RGBA
+            // peek (`indexToRgba`: `dac_rgb[idx & mask]`). 0xFF => a no-op copy.
+            const idx = rb.index[0..fr.index_len];
+            if (fr.pel_mask != 0xFF) {
+                for (idx) |*p| p.* &= fr.pel_mask;
+            }
+            const palette: *const [256]png.Rgb = @ptrCast(&rb.palette);
+            png.encodeIndexed(&out, &rb.png_work, fr.width, fr.height, idx, palette) catch {
+                self.respondError(req, .service_unavailable, "internal", "PNG encode overflow");
+                return null;
+            };
+        } else {
+            png.encodeRgb(&out, &rb.png_work, fr.width, fr.height, rb.rgba[0..fr.rgba_len]) catch {
+                self.respondError(req, .service_unavailable, "internal", "PNG encode overflow");
+                return null;
+            };
+        }
+        return out.buffered();
     }
 
     fn serializeResponse(self: *Server, req: *http.Server.Request, resp: q.Response) void {
