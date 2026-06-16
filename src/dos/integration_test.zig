@@ -12,6 +12,7 @@
 const std = @import("std");
 const machine_mod = @import("machine");
 const cpu_mod = @import("cpu");
+const dos_mod = @import("dos");
 
 const Machine = machine_mod.Machine;
 const Reg32 = cpu_mod.state.Reg32;
@@ -246,6 +247,93 @@ test "EMS INT 67h: allocate, map, write through the frame window, remap, read ba
     // Remap page 0 back: the original 0xAB must still be there (backing persisted).
     asmInt67WithDX(m, handle, &.{ 0xB4, 0x44, 0xB0, 0x00, 0xBB, 0x00, 0x00, 0xCD, 0x67, 0xF4 });
     try std.testing.expectEqual(@as(u8, 0xAB), m.bus.readPhys8(0xE0000));
+}
+
+// ---------------------------------------------------------------------------
+// report==back regression (Krondor milestone Stage 3): the EMS manager must
+// back EVERY page it advertises. Betrayal at Krondor's `ems_init` allocates ALL
+// reported pages in one INT 67h AH=43 call (BX = REPORTED_PAGES = 956); when the
+// backing was only 128 pages that returned 0x88 (NOT_ENOUGH_PAGES) and the
+// game's memory-sufficiency gate aborted. With BACKING_PAGES == REPORTED_PAGES
+// the single big allocation now SUCCEEDS — proving zdos no longer advertises
+// more EMS than it backs (the fake this fix removes).
+// ---------------------------------------------------------------------------
+test "EMS INT 67h: allocHandle(REPORTED_PAGES) succeeds (report == backing)" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    // The advertised total == what BaK's ems_init asks for in one shot.
+    try std.testing.expectEqual(dos_mod.ems_reported_pages, dos_mod.ems_backing_pages);
+    const want = dos_mod.ems_reported_pages;
+
+    // AH=43 BX=want ; INT 67h ; HLT.  MOV AH,43h / MOV BX,imm16 / INT 67h / HLT.
+    asmInt67(m, &.{
+        0xB4, 0x43, // MOV AH, 43h
+        0xBB, @truncate(want), @truncate(want >> 8), // MOV BX, want
+        0xCD, 0x67, // INT 67h
+        0xF4, // HLT
+    });
+    // AH=0 (success), DX = the allocated handle.
+    try std.testing.expectEqual(@as(u8, 0), m.cpu.st.getReg8(4));
+    const handle = m.cpu.st.getReg16(@intFromEnum(Reg32.edx));
+    try std.testing.expect(handle != 0); // handle 0 is reserved in board mode
+
+    // The handle owns exactly `want` pages, and the free count is now 0
+    // (everything reported is allocated). AH=4C: pages-for-handle -> BX.
+    asmInt67WithDX(m, handle, &.{ 0xB4, 0x4C, 0xCD, 0x67, 0xF4 });
+    try std.testing.expectEqual(@as(u8, 0), m.cpu.st.getReg8(4));
+    try std.testing.expectEqual(want, m.cpu.st.getReg16(@intFromEnum(Reg32.ebx)));
+
+    // AH=42: free=BX, total=DX. Free must be 0 (all backed pages handed out),
+    // total still the reported figure.
+    asmInt67(m, &.{ 0xB4, 0x42, 0xCD, 0x67, 0xF4 });
+    try std.testing.expectEqual(@as(u8, 0), m.cpu.st.getReg8(4));
+    try std.testing.expectEqual(@as(u16, 0), m.cpu.st.getReg16(@intFromEnum(Reg32.ebx)));
+    try std.testing.expectEqual(want, m.cpu.st.getReg16(@intFromEnum(Reg32.edx)));
+}
+
+// ---------------------------------------------------------------------------
+// EMS backing-store snapshot round-trip. The small EMS bookkeeping rides in the
+// machine Snapshot (by value); the large ~15 MiB backing slab is copied OUT OF
+// BAND by the caller, exactly like bus.ram / vga.vram. This test allocates a
+// handle, maps + writes a marker through the frame window, snapshots (small
+// state + backing copy), clobbers both, restores, and asserts the marker byte
+// survives — i.e. the backing slab is genuinely covered.
+// ---------------------------------------------------------------------------
+test "EMS backing: out-of-band snapshot/restore preserves mapped page contents" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    // Allocate a 2-page handle, map logical page 0 into frame slot 0, write 0xAB.
+    asmInt67(m, &.{ 0xB4, 0x43, 0xBB, 0x02, 0x00, 0xCD, 0x67, 0xF4 });
+    const handle = m.cpu.st.getReg16(@intFromEnum(Reg32.edx));
+    asmInt67WithDX(m, handle, &.{ 0xB4, 0x44, 0xB0, 0x00, 0xBB, 0x00, 0x00, 0xCD, 0x67, 0xF4 });
+    m.bus.writePhys8(0xE0000, 0xAB);
+
+    // Snapshot: small machine state by value + the two large slabs out of band.
+    const snap = m.snapshot();
+    const ram_copy = try alloc.alloc(u8, m.bus.ram.len);
+    defer alloc.free(ram_copy);
+    @memcpy(ram_copy, m.bus.ram);
+    const ems_copy = try alloc.dupe(u8, m.dos.ems.backingBytes());
+    defer alloc.free(ems_copy);
+
+    // Clobber the mapped EMS page AND the small EMS state after the snapshot.
+    m.bus.writePhys8(0xE0000, 0xFF);
+    m.dos.ems.next_page = 0xFFFF;
+
+    // Restore: small state by value, then the slabs out of band.
+    m.restore(snap);
+    @memcpy(m.bus.ram, ram_copy);
+    m.dos.ems.restoreBacking(ems_copy);
+
+    // The mapped marker survived (backing snapshotted), and the small state too.
+    try std.testing.expectEqual(@as(u8, 0xAB), m.bus.readPhys8(0xE0000));
+    try std.testing.expectEqual(@as(u16, 2), m.dos.ems.next_page);
 }
 
 const CODE_SEG: u16 = 0x2000;

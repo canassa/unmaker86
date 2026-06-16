@@ -272,3 +272,51 @@ test "text page: caller-copy snapshot round-trip (NOT a Snapshot struct field)" 
     try std.testing.expectEqual(@as(u8, 0x4E), m2.bus.readPhys8(0xB8001));
     try std.testing.expectEqual(@as(u8, 'Q'), m2.bus.readPhys8(0xB0000));
 }
+
+// Krondor milestone Stage 1 (S1.2): the resident "EMMXXXX0" EMM device-driver
+// header is staged so the INT 67h vector's segment carries the presence
+// signature at offset 0x0A. BaK's `ems_detect_driver` does INT 21h AH=35h to get
+// the INT 67h vector, then compares [vector_segment:0x0A] to "EMMXXXX0"; only on
+// a match does it issue any INT 67h subfunction. Before this, [F000:000A] read
+// zeros → detection bailed → EMS reported 0 free pages → the boot memory gate
+// aborted.
+test "EMS driver signature: INT 67h vector segment + 0x0A reads EMMXXXX0" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    m.post();
+
+    // The standard EMS-driver-header name field the presence probe matches
+    // (the load-bearing magic literal BaK's `ems_detect_driver` compares).
+    const sig = [8]u8{ 'E', 'M', 'M', 'X', 'X', 'X', 'X', '0' };
+
+    // (1) Read the INT 67h vector from the live guest-RAM IVT (the SAME table
+    //     AH=35h returns): IVT[0x67] at phys 0x67*4 = {off:u16, seg:u16}.
+    const vec_off = m.bus.readPhys16(0x67 * 4);
+    const vec_seg = m.bus.readPhys16(0x67 * 4 + 2);
+    // The vector points at the EMS trap stub in the BIOS callback segment.
+    try std.testing.expectEqual(@as(u16, 0xF000), vec_seg);
+
+    // (2) [vector_segment:0x0A .. +8] must read the signature — exactly the bytes
+    //     the probe compares. This is the load-bearing assertion.
+    const name_phys: u32 = (@as(u32, vec_seg) << 4) + 0x0A;
+    var got: [8]u8 = undefined;
+    for (&got, 0..) |*b, i| b.* = m.bus.readPhys8(name_phys + @as(u32, @intCast(i)));
+    try std.testing.expectEqualSlices(u8, &sig, &got);
+
+    // (3) Sanity on the header framing: a real char-device header at the segment
+    //     base — next-ptr FFFF:FFFF, attribute word bit15 (char device) set.
+    const seg_base: u32 = @as(u32, vec_seg) << 4;
+    try std.testing.expectEqual(@as(u16, 0xFFFF), m.bus.readPhys16(seg_base + 0));
+    try std.testing.expectEqual(@as(u16, 0xFFFF), m.bus.readPhys16(seg_base + 2));
+    try std.testing.expect((m.bus.readPhys16(seg_base + 4) & 0x8000) != 0);
+
+    // (4) The vector's entry offset must still resolve to the EMS trap stub
+    //     (0xFE 0x38 <id>) — staging the header must NOT break EMS dispatch.
+    const entry_phys: u32 = seg_base + vec_off;
+    try std.testing.expectEqual(@as(u8, 0xFE), m.bus.readPhys8(entry_phys));
+    try std.testing.expectEqual(@as(u8, 0x38), m.bus.readPhys8(entry_phys + 1));
+}

@@ -6,8 +6,11 @@
 //! (devices.zig) is the documented presence probe.
 //!
 //! Determinism: synthetic D5 cost per call; deterministic backing zero-init; the
-//! remap is a pure slice swap (no host state). Snapshot: handle table + frame map
-//! + backing store (D14).
+//! remap is a pure slice swap (no host state). Snapshot: the small EMS state
+//! (handle table + frame map + bump cursor + page counts) round-trips by value
+//! in `Ems.Snapshot`; the large ~15 MiB `backing` slab is captured OUT OF BAND
+//! (`snapshotBacking`/`restoreBacking`), exactly like the bus RAM slab and VGA
+//! VRAM — it is far too large to copy into a by-value `Snapshot` struct.
 
 const std = @import("std");
 const bus_mod = @import("bus");
@@ -43,12 +46,91 @@ pub const EMS_HANDLES: u8 = 64; // provisional / comptime-asserted cap
 ///   AH=42 free = REPORTED_PAGES - (user-allocated pages).
 pub const REPORTED_PAGES: u16 = 0x03BC;
 
-/// Physical backing store, in 16 KiB pages. Sized for a generous margin of user
-/// pages (the reported total 0x3BC is virtual; only pages a program actually
-/// maps need real backing). 128 pages = 2 MiB.
-pub const BACKING_PAGES: u16 = 128;
+/// Physical backing store, in 16 KiB pages. THE INVARIANT: back every page we
+/// advertise — `BACKING_PAGES == REPORTED_PAGES` — so zdos never reports more
+/// EMS than it can actually hand out. Advertising more than is backed is a
+/// FAKE: a program (e.g. Betrayal at Krondor's `ems_init`) that allocates ALL
+/// reported pages at once (AH=43 BX=REPORTED_PAGES) would get NOT_ENOUGH_PAGES
+/// and its memory-sufficiency gate aborts — the exact "looks supported but
+/// isn't" hole CLAUDE.md forbids.
+///
+/// 0x3BC = 956 pages × 16 KiB ≈ 15 MiB. This is one fixed, up-front,
+/// zero-initialized slab in the `Ems` struct (no per-op alloc; deterministic
+/// init — CLAUDE constraint #5). It comfortably exceeds BaK's `minEMS = 1024`
+/// KiB (64 pages). The slab is large, so it is captured OUT OF BAND on snapshot
+/// (like the bus RAM slab / VGA VRAM), never inlined into the by-value
+/// `Snapshot` struct — see `snapshotBacking`/`restoreBacking` below.
+pub const BACKING_PAGES: u16 = REPORTED_PAGES;
 
 pub const EMM_VERSION: u8 = 0x40; // LIM EMS 4.0 (dosbox-x AH=46 returns AL=0x40)
+
+// ---------------------------------------------------------------------------
+// Resident EMM device-driver header (the "EMMXXXX0" presence signature).
+//
+// A real EMS driver (EMM386/QEMM/a hardware EMS board's resident) installs a
+// standard DOS character-device header whose 8-byte name field (offset 0x0A)
+// is the magic "EMMXXXX0". The documented EMS-presence probe (Phar Lap / the
+// EMS spec, and exactly what BaK's `ems_detect_driver` does) is:
+//   1. INT 21h AH=35h to fetch the INT 67h vector -> its segment S.
+//   2. compare the 8 bytes at S:0x0A to "EMMXXXX0".
+// Only on a match does the program issue any INT 67h subfunction.
+//
+// zdos already exposes `EMMXXXX0` as a named DOS character device (devices.zig
+// — the OTHER, open()-by-name probe), and its INT 67h handler set is complete;
+// the only missing piece was this resident header at the vector's segment.
+//
+// PLACEMENT (option A, per plans/krondor-milestone.md "Hole #1"): the INT 67h
+// vector lives in the BIOS-ROM callback segment 0xF000 (the trap stub at
+// F000:1160), so the vector's segment IS 0xF000. The BIOS image's first
+// paragraph (offset 0x0000..0x1000) is FREE — the callback slot table starts
+// at offset 0x1000 (Bridge.CB_OFFSET), the INT 16h hybrid + fonts + VGA save-
+// pointer tables all live higher. So a proper 18-byte char-device header is
+// staged at image offset 0x0000, putting the "EMMXXXX0" name at F000:000A
+// exactly where the probe reads it, while leaving the INT 67h vector + trap
+// stub at F000:1160 untouched. This is faithful — it is the real resident
+// header a DOS EMS driver installs, not a fake. Determinism: fixed comptime
+// data staged at POST (no host clock / RNG / float).
+//
+// Standard DOS device-header layout (18 bytes):
+//   +0x00 dword  next-device pointer (offset:segment) = FFFF:FFFF (last/only)
+//   +0x04 word   attribute = 0x8000 (bit15 = character device)
+//   +0x06 word   strategy-routine offset (within this segment)
+//   +0x08 word   interrupt-routine offset (within this segment)
+//   +0x0A 8      device name = "EMMXXXX0"
+
+/// The 8-byte EMM driver-header name field the presence probe matches.
+pub const DRIVER_SIGNATURE = [8]u8{ 'E', 'M', 'M', 'X', 'X', 'X', 'X', '0' };
+
+/// Offset of the device-driver header within the BIOS image (= F000:0000), so
+/// the name lands at image offset 0x0A == F000:000A (the probe's read site).
+pub const DRIVER_HEADER_OFF: u16 = 0x0000;
+/// Offset of the 8-byte name field within the header (DOS device-header spec).
+pub const DRIVER_NAME_OFF: u16 = DRIVER_HEADER_OFF + 0x0A;
+/// Total device-header length staged into the image.
+pub const DRIVER_HEADER_LEN: u16 = 0x12; // 18 bytes
+
+/// Stage the resident EMM device-driver header into the BIOS ROM `image`
+/// (indexed from 0xF0000, matching `int10.stageFonts`). Called by the machine
+/// BEFORE `loadRom` (the F000 window is ROM — guest writes are dropped, so the
+/// bytes must be planted in the image). `entry_off` is the INT 67h trap-stub
+/// offset within the F000 segment (the same offset the INT 67h vector points
+/// at, i.e. F000:<entry_off>), so the header's interrupt-routine field is
+/// self-consistent with the live vector — a faithful real header, not a squat.
+pub fn stageDeviceHeader(image: []u8, entry_off: u16) void {
+    const base = DRIVER_HEADER_OFF;
+    // +0x00 next-device pointer = FFFF:FFFF (this is the last/only EMM header).
+    std.mem.writeInt(u32, image[base..][0..4], 0xFFFFFFFF, .little);
+    // +0x04 attribute word: bit15 set = character device.
+    std.mem.writeInt(u16, image[base + 0x04 ..][0..2], 0x8000, .little);
+    // +0x06 strategy offset, +0x08 interrupt offset: both reference the resident
+    // entry (the existing INT 67h trap stub). A driver's strategy/interrupt
+    // entry points are the real resident code; pointing them at the trap stub
+    // keeps the header self-consistent without a second code path.
+    std.mem.writeInt(u16, image[base + 0x06 ..][0..2], entry_off, .little);
+    std.mem.writeInt(u16, image[base + 0x08 ..][0..2], entry_off, .little);
+    // +0x0A the 8-byte name field — the "EMMXXXX0" presence signature.
+    @memcpy(image[base + 0x0A ..][0..8], &DRIVER_SIGNATURE);
+}
 
 pub const EmsHandle = struct {
     active: bool = false,
@@ -700,6 +782,56 @@ pub fn Ems(comptime Cpu: type) type {
                     return lp - h.base_page;
             }
             return 0xFFFF;
+        }
+
+        // -------------------------------------------------------------------
+        // Snapshot / restore (CLAUDE #6). The EMS state splits the same way the
+        // bus does: the SMALL bookkeeping (handle table, frame map, bump cursor,
+        // page counts) round-trips by value in `Snapshot`; the LARGE ~15 MiB
+        // `backing` slab is captured OUT OF BAND by the caller via `backingBytes`
+        // (read) + `restoreBacking` (write), exactly like `bus.ram`/`vga.vram`.
+        // Putting `backing` in `Snapshot` would make the by-value struct ~15 MiB
+        // (it is returned on the stack) — and would copy the whole slab on every
+        // snapshot, which is the quadratic trap the task warns against.
+        // -------------------------------------------------------------------
+        pub const Snapshot = struct {
+            handles: [EMS_HANDLES]EmsHandle,
+            frame_map: [FRAME_PAGES]?u16,
+            next_page: u16,
+            user_pages: u16,
+            installed: bool,
+        };
+
+        pub fn snapshot(self: *const Self) Snapshot {
+            return .{
+                .handles = self.handles,
+                .frame_map = self.frame_map,
+                .next_page = self.next_page,
+                .user_pages = self.user_pages,
+                .installed = self.installed,
+            };
+        }
+
+        pub fn restore(self: *Self, snap: Snapshot) void {
+            self.handles = snap.handles;
+            self.frame_map = snap.frame_map;
+            self.next_page = snap.next_page;
+            self.user_pages = snap.user_pages;
+            self.installed = snap.installed;
+        }
+
+        /// The large backing slab, for the caller's out-of-band snapshot copy
+        /// (mirrors `bus.ram` / `vga.vram`). Read for capture; pair with
+        /// `restoreBacking` to write it back onto a freshly-init'd machine.
+        pub fn backingBytes(self: *Self) []u8 {
+            return &self.backing;
+        }
+
+        /// Overwrite the backing slab from a previously-captured copy (same
+        /// fixed length). The caller copies bytes in after `restore`.
+        pub fn restoreBacking(self: *Self, bytes: []const u8) void {
+            std.debug.assert(bytes.len == self.backing.len);
+            @memcpy(&self.backing, bytes);
         }
     };
 }

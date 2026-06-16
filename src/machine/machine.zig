@@ -348,6 +348,18 @@ pub const Machine = struct {
         // functionality / video-save-pointer tables) into the same BIOS image;
         // POST then points IVT[0x1D] + BDA VS_POINTER at them (plans/vga-spec §3.3).
         bios_mod.vga_rom.stage(&self.bios_image);
+        // Stage the resident "EMMXXXX0" EMM device-driver header into the BIOS
+        // image at F000:0000 (the free first paragraph; the callback slot table
+        // starts at F000:1000). The INT 67h vector's segment is 0xF000, so this
+        // puts the name signature at F000:000A — exactly where an EMS-presence
+        // probe (BaK's `ems_detect_driver`) reads it. The header's interrupt-
+        // entry field references the live INT 67h trap-stub offset so the header
+        // is self-consistent with the vector; the vector + stub at F000:1160 are
+        // untouched, so EMS dispatch is unchanged.
+        dos_mod.stageEmsDeviceHeader(
+            &self.bios_image,
+            Bridge.slotSegOff(self.dos.ids.get(.int67)).off,
+        );
         self.bus.loadRom(Bridge.IMAGE_BASE, &self.bios_image);
         // The re-entrancy trampoline lives in conventional RAM (writable; its INT
         // immediate is patched per runGuestInt). Plant it after reset zeroed RAM.
@@ -356,8 +368,14 @@ pub const Machine = struct {
         self.bios.post(br);
         // DOS init: vectors + arena MCB + standard handles. The arena spans low
         // DOS memory; place the first MCB at segment 0x0800 (32 KiB) and let it run
-        // up to 0x9000 (just below the UMA), ~0x8800 paragraphs.
-        self.dos.dosInit(br, 0x0800, 0x8800);
+        // up to 0xA000 — the 640 KiB video-RAM wall (the UMA/VGA framebuffer starts
+        // at 0xA0000; see src/bus/memmap.zig conventional_end=0x9FFFF). That is the
+        // faithful real-DOS conventional-memory ceiling (no EBDA is modeled, so the
+        // wall is the full 640 KiB, exactly what INT 12h / BDA 0040:0013 report).
+        // 0xA000 - 0x0800 = 0x9800 paragraphs. This makes the largest free far block
+        // ~275 KiB > BaK's MEM.DAT minimum (243,000 bytes) so check_memory_or_die
+        // passes. Keep this CONSISTENT with bda.OFF_MEMSIZE_KB (640) and INT 12h.
+        self.dos.dosInit(br, 0x0800, 0x9800);
         // NOTE: the EMS page-frame MMIO window is mapped in `wire()` (fixed power-on
         // hardware, like VRAM), NOT here — so `post()` stays re-runnable after a
         // `reset()` (the `--serve` reset→load path re-runs `post()`). See `wire` (e1).
@@ -570,8 +588,8 @@ pub const Machine = struct {
         ///     Phase 0 scope (Phase 0 is narrowly the uncovered *input* state).
         ///   - cwd/cwd_len/search_dir*/fcb_search_*: (c) host-side, also a
         ///     pre-existing non-input gap (out of Phase 0 scope).
-        ///   - sft/dev_table/drives/ems: (c) host-side device/VFS/EMS state, NOT
-        ///     input state (out of Phase 0 scope). NOTE: `dev_table`'s CON
+        ///   - sft/dev_table/drives: (c) host-side device/VFS state, NOT input
+        ///     state (out of Phase 0 scope). NOTE: `dev_table`'s CON
         ///     `CharDevice.in_buf`/`in_pos`/`in_len` (the stdin cursor,
         ///     devices.zig:33-35) IS mutable-host-side input state, but nothing in
         ///     input Phase 0–3 exercises the INT 21h-stdin injection path — it only
@@ -584,6 +602,13 @@ pub const Machine = struct {
         /// The keyboard ring lives in guest BDA RAM (bda.zig:18) and is already
         /// covered by the bus RAM-slab snapshot — needs no field here.
         dos_mouse: @TypeOf(@as(Dos, undefined).mouse).Snapshot,
+        /// EMS host-side state (INT 67h handler table + frame map + bump cursor +
+        /// page counts). This is the SMALL by-value bookkeeping; the large ~15 MiB
+        /// EMS `backing` slab is copied OUT OF BAND by the caller (like `bus.ram`
+        /// and `vga.vram` above — `self.dos.ems.backingBytes()` /
+        /// `restoreBacking`), never inlined into this struct. Now that BACKING ==
+        /// REPORTED (956 pages) the slab is far too large for a by-value snapshot.
+        dos_ems: Dos.EmsType.Snapshot,
         shutdown: bool,
     };
 
@@ -598,6 +623,7 @@ pub const Machine = struct {
             .kbd = self.kbd.snapshot(),
             .sched = self.sched.snapshot(),
             .dos_mouse = self.dos.mouse.snapshot(),
+            .dos_ems = self.dos.ems.snapshot(),
             .shutdown = self.shutdown,
         };
     }
@@ -614,6 +640,7 @@ pub const Machine = struct {
         self.kbd.restore(snap.kbd);
         self.sched.restore(snap.sched);
         self.dos.mouse.restore(snap.dos_mouse);
+        self.dos.ems.restore(snap.dos_ems);
         self.shutdown = snap.shutdown;
     }
 };

@@ -20,6 +20,10 @@ const std = @import("std");
 
 const dos_input_sources = [_][]const u8{
     @embedFile("int33.zig"),
+    // EMS INT 67h handler + the resident "EMMXXXX0" device-driver header staged
+    // at POST (Krondor milestone Stage 1). The header is fixed comptime data —
+    // gated here so it can never grow a host-clock/RNG/float dependence.
+    @embedFile("ems.zig"),
 };
 
 test "src/dos input grep: no host time / RNG / thread / env / float" {

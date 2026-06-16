@@ -25,6 +25,18 @@ pub const clock = @import("clock.zig");
 pub const ems_frame_phys: u32 = @import("ems.zig").FRAME_PHYS;
 pub const ems_frame_len: u32 = @import("ems.zig").FRAME_LEN;
 
+/// Non-generic re-export so the machine can stage the resident "EMMXXXX0" EMM
+/// device-driver header into the BIOS image (before `loadRom`) without naming a
+/// concrete CPU type — the EMS-presence signature BaK's `ems_detect_driver`
+/// reads at [INT 67h vector segment]:0x0A. See `ems.zig` "device-driver header".
+pub const stageEmsDeviceHeader = @import("ems.zig").stageDeviceHeader;
+pub const ems_driver_name_off: u16 = @import("ems.zig").DRIVER_NAME_OFF;
+pub const ems_driver_signature = @import("ems.zig").DRIVER_SIGNATURE;
+/// EMS page accounting (re-exported for tests/callers): the invariant is
+/// `ems_backing_pages == ems_reported_pages` — zdos backs every page it reports.
+pub const ems_reported_pages: u16 = @import("ems.zig").REPORTED_PAGES;
+pub const ems_backing_pages: u16 = @import("ems.zig").BACKING_PAGES;
+
 /// DOS version reported by AH=30 (5.0 — BaK's target).
 pub const DOS_VER_MAJOR: u8 = 5;
 pub const DOS_VER_MINOR: u8 = 0;
