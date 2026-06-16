@@ -207,13 +207,13 @@ test "GET unknown breakpoint id → 404 no_such_breakpoint" {
     try std.testing.expect(std.mem.indexOf(u8, r.body, "\"no_such_breakpoint\"") != null);
 }
 
-test "POST /api/breakpoints kind:io → 501 not_implemented (honest deferral)" {
+test "POST /api/breakpoints kind:io is accepted (port watchpoint, now implemented)" {
     var ts = try TestServer.init(std.testing.allocator);
     try ts.start();
     defer ts.deinit();
     const r = post(&ts, "/api/breakpoints", "{\"kind\":{\"io\":{\"port\":96,\"access\":\"access\"}}}", &obuf);
-    try std.testing.expectEqual(@as(u16, 501), r.status);
-    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"not_implemented\"") != null);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"id\":") != null);
 }
 
 test "GET /api/mem/search finds a hex pattern (single match, seg:off decomposition)" {

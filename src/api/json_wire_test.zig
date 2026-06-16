@@ -23,10 +23,21 @@ fn ser(v: anytype) ![]u8 {
 // Golden serialization strings (the discriminated-union encoding is stable).
 // ---------------------------------------------------------------------------
 
-test "StopReason golden: breakpoint with small at_cycle is a number" {
+test "StopReason golden: breakpoint with small at_cycle is a number (no watch detail)" {
     const r: StopReason = .{ .breakpoint = .{ .id = 0, .at_cycle = 578 } };
     try std.testing.expectEqualStrings(
-        \\{"breakpoint":{"id":0,"at_cycle":578}}
+        \\{"breakpoint":{"id":0,"at_cycle":578,"watch":null}}
+    , try ser(r));
+}
+
+test "StopReason golden: a memory watchpoint hit carries the access detail" {
+    const r: StopReason = .{ .breakpoint = .{
+        .id = 3,
+        .at_cycle = 1000,
+        .watch = .{ .kind = .memory, .addr = 0x1234, .access = .write, .value = 0xAB },
+    } };
+    try std.testing.expectEqualStrings(
+        \\{"breakpoint":{"id":3,"at_cycle":1000,"watch":{"kind":"memory","addr":4660,"access":"write","value":171}}}
     , try ser(r));
 }
 

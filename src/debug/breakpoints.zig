@@ -135,6 +135,8 @@ pub const SeqBefore = struct {
     delivery: u64,
     /// Memory-watch-hit sequence (memory breakpoints, Phase 5).
     watch: u64,
+    /// I/O-port-watch-hit sequence (`io` breakpoints).
+    port_watch: u64,
 };
 
 /// True if `bp` matches the machine's CURRENT (post-retired-step) state, given
@@ -172,14 +174,28 @@ pub fn matches(bp: *const Breakpoint, m: *const Machine, seq: SeqBefore) bool {
                 .write => w.access == .write,
             };
         },
-        .io => return false, // deferred
+        .io => |k| {
+            const w = m.bus.last_io_watch;
+            // Fresh hit this step (seq advanced)?
+            if (w.seq == seq.port_watch) return false;
+            if (w.port != k.port) return false;
+            return switch (k.access) {
+                .access => true,
+                .read => w.access == .read,
+                .write => w.access == .write,
+            };
+        },
     }
 }
 
 /// The current freshness baselines (IVT-delivery + watch-hit sequence numbers) a
 /// caller snapshots before a step.
 pub fn seqBefore(m: *const Machine) SeqBefore {
-    return .{ .delivery = m.cpu.st.last_delivered.seq, .watch = m.bus.last_mem_watch.seq };
+    return .{
+        .delivery = m.cpu.st.last_delivered.seq,
+        .watch = m.bus.last_mem_watch.seq,
+        .port_watch = m.bus.last_io_watch.seq,
+    };
 }
 
 /// The current IVT-delivery sequence number (the freshness baseline a caller

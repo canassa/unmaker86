@@ -51,14 +51,37 @@ fn toWatchAccess(a: AccessKind) WatchAccess {
         .access => .access,
     };
 }
+/// The reverse map (bus `WatchAccess` → debug `AccessKind`) for reporting a hit's
+/// recorded access in the StopReason.
+fn fromWatchAccess(a: WatchAccess) AccessKind {
+    return switch (a) {
+        .read => .read,
+        .write => .write,
+        .access => .access,
+    };
+}
 
 /// The rich, debug-layer stop reason (a superset of `Machine.StopReason`). It is
 /// part of the observable, reproducible result, so its production order is fixed
 /// and tested (see `runUntilEvent`).
+/// The access detail of a `memory`/`io` watchpoint hit, attached to a `breakpoint`
+/// stop. Pointer-free POD; serializes (via std.json) as a nested object, or `null`
+/// for exec/cycle/interrupt breakpoints. `value` is read SIDE-EFFECT-FREE (the peek
+/// path for memory; the recorded access byte for io) — never a re-read that would
+/// re-trip the watch or charge a cycle.
+pub const WatchHit = struct {
+    /// Which choke point tripped.
+    kind: enum { memory, io },
+    /// Linear address (memory) or port number (io).
+    addr: u32,
+    access: AccessKind,
+    value: u8,
+};
+
 pub const StopReason = union(enum) {
-    /// A user (persistent or one-shot) breakpoint fired: which id, and the ledger
-    /// value at that boundary.
-    breakpoint: struct { id: u32, at_cycle: u64 },
+    /// A user (persistent or one-shot) breakpoint fired: which id, the ledger value
+    /// at that boundary, and (for a memory/io watchpoint) the access detail.
+    breakpoint: struct { id: u32, at_cycle: u64, watch: ?WatchHit = null },
     /// A step / stepN / stepOver finished one or more retired instructions.
     step_complete: struct { at_cycle: u64 },
     /// The cycle cap was reached with no terminal/breakpoint.
@@ -314,6 +337,10 @@ pub const Controller = struct {
     /// the watch a `memory` breakpoint armed. Parallel to `set.items[]`; defined
     /// POD (no pointers), so it is snapshot-safe like the rest.
     watch_ids: [bp.MAX_BREAKPOINTS]?u16 = @splat(null),
+    /// For each breakpoint id, the bus PORT-watch slot an `io` breakpoint armed, or
+    /// null. Parallel to `watch_ids` (a bp has exactly one kind, so at most one of
+    /// the two is set).
+    port_watch_ids: [bp.MAX_BREAKPOINTS]?u16 = @splat(null),
 
     /// Construct a controller over an ALREADY-wired machine (pinning invariant).
     /// The controller must not outlive the machine.
@@ -397,7 +424,11 @@ pub const Controller = struct {
             if (!bp.matches(b, self.m, seq_before)) continue;
             // Lowest id wins (the scan is ascending, so the first match is it).
             if (reported == null) {
-                reported = .{ .breakpoint = .{ .id = id, .at_cycle = self.m.cpu.st.cycles } };
+                reported = .{ .breakpoint = .{
+                    .id = id,
+                    .at_cycle = self.m.cpu.st.cycles,
+                    .watch = self.watchDetailFor(b),
+                } };
             }
             // Consume EVERY matching one-shot (its contract is "at most once").
             if (b.one_shot) {
@@ -406,6 +437,35 @@ pub const Controller = struct {
         }
         if (reported != null) self.set.recomputeActive();
         return reported;
+    }
+
+    /// The watchpoint access detail for a reported `memory`/`io` breakpoint, read
+    /// from the bus breadcrumb the matching hit just set. `value` for a memory hit
+    /// is the byte at the hit address read via the SIDE-EFFECT-FREE peek path
+    /// (cycle-neutral, no re-trip); for io it is the recorded access byte. Returns
+    /// null for exec/cycle/interrupt breakpoints (no access detail).
+    fn watchDetailFor(self: *const Controller, b: *const Breakpoint) ?WatchHit {
+        switch (b.kind) {
+            .memory => {
+                const w = self.m.bus.last_mem_watch;
+                return .{
+                    .kind = .memory,
+                    .addr = w.linear,
+                    .access = fromWatchAccess(w.access),
+                    .value = self.m.bus.peekPhys8(w.linear),
+                };
+            },
+            .io => {
+                const w = self.m.bus.last_io_watch;
+                return .{
+                    .kind = .io,
+                    .addr = w.port,
+                    .access = fromWatchAccess(w.access),
+                    .value = w.value,
+                };
+            },
+            else => return null,
+        }
     }
 
     fn record(self: *Controller, r: StopReason) StopReason {
@@ -439,6 +499,19 @@ pub const Controller = struct {
             };
             self.watch_ids[id] = wid;
         }
+        // An `io` breakpoint arms a bus PORT watch (no page-kind flip needed; the
+        // port path is gated by a single armed bool). Same roll-back-on-full policy.
+        if (kind == .io) {
+            const k = kind.io;
+            const wid = self.m.bus.setPortWatch(.{
+                .port = k.port,
+                .access = toWatchAccess(k.access),
+            }) catch {
+                self.set.remove(id) catch unreachable;
+                return error.BreakpointTableFull;
+            };
+            self.port_watch_ids[id] = wid;
+        }
         return id;
     }
     pub fn removeBreakpoint(self: *Controller, id: u32) Error!void {
@@ -448,6 +521,10 @@ pub const Controller = struct {
             if (self.watch_ids[id]) |wid| {
                 self.m.bus.clearWatch(wid);
                 self.watch_ids[id] = null;
+            }
+            if (self.port_watch_ids[id]) |wid| {
+                self.m.bus.clearPortWatch(wid);
+                self.port_watch_ids[id] = null;
             }
         }
         return self.set.remove(id);

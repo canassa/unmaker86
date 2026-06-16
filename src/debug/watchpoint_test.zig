@@ -292,6 +292,185 @@ test "(d) a wide access only PARTLY covered by a watch still fires" {
     try std.testing.expectEqual(@as(u32, WAT + 3), m.bus.last_mem_watch.linear);
 }
 
+// ---- Phase 2: the StopReason carries the watch access detail -----------------
+
+test "Phase2 a memory write watchpoint stop carries {linear, .write, value}" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    loadTouchProg(m);
+    var ctrl = Controller.init(m);
+    _ = try ctrl.addBreakpoint(.{ .memory = .{ .linear = WAT, .len = 1, .access = .write } }, false);
+
+    const r = ctrl.runUntilEvent(10_000);
+    switch (r) {
+        .breakpoint => |hit| {
+            const w = hit.watch orelse return error.MissingWatchDetail;
+            try std.testing.expectEqual(@as(u32, WAT), w.addr);
+            try std.testing.expectEqual(debug.AccessKind.write, w.access);
+            // `value` is the peek of WAT at the boundary == the just-written byte.
+            try std.testing.expectEqual(@as(u8, 0xAB), w.value);
+            try std.testing.expectEqual(@as(@TypeOf(w.kind), .memory), w.kind);
+        },
+        else => return error.WrongStopReason,
+    }
+}
+
+test "Phase2 a non-memory breakpoint stop carries watch=null" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    loadTouchProg(m);
+    var ctrl = Controller.init(m);
+    // An execution-address bp at the HLT — not a watchpoint, so no access detail.
+    _ = try ctrl.addBreakpoint(.{ .execution_address = .{ .linear = 0x050A } }, false);
+    const r = ctrl.runUntilEvent(10_000);
+    switch (r) {
+        .breakpoint => |hit| try std.testing.expect(hit.watch == null),
+        else => return error.WrongStopReason,
+    }
+}
+
+// ---- Phase 3: I/O-port watchpoints (the `io` breakpoint kind) ----------------
+
+// MOV AL,0x5A ; OUT 0x80,AL ; IN AL,0x80 ; HLT. Port 0x80 (POST) — its mapping
+// does not matter: the watch records on the port ACCESS, mapped or not.
+const IOPROG: u32 = 0x0500;
+const IOPORT: u16 = 0x80;
+fn loadPortProg(m: *Machine) void {
+    const b = &m.bus;
+    const code = [_]u8{
+        0xB0, 0x5A, // MOV AL, 0x5A
+        0xE6, 0x80, // OUT 0x80, AL
+        0xE4, 0x80, // IN  AL, 0x80
+        0xF4, // HLT
+    };
+    for (code, 0..) |byte, i| b.writePhys8(IOPROG + @as(u32, @intCast(i)), byte);
+    m.cpu.loadSegment(.cs, 0);
+    m.cpu.loadSegment(.ds, 0);
+    m.cpu.loadSegment(.ss, 0);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.esp), 0x7000);
+    m.cpu.st.eip = IOPROG;
+}
+
+test "Phase3 an io WRITE watch fires on OUT with {port, .write, value}" {
+    const alloc = std.testing.allocator;
+    var captured: ?u64 = null;
+    var run: u32 = 0;
+    while (run < 2) : (run += 1) { // determinism: same cycle both runs
+        const m = try makeMachine(alloc);
+        defer destroy(alloc, m);
+        loadPortProg(m);
+        var ctrl = Controller.init(m);
+        const id = try ctrl.addBreakpoint(.{ .io = .{ .port = IOPORT, .access = .write } }, false);
+        const r = ctrl.runUntilEvent(10_000);
+        switch (r) {
+            .breakpoint => |hit| {
+                try std.testing.expectEqual(id, hit.id);
+                // Stopped right after the OUT (CS:IP at the IN instruction).
+                try std.testing.expectEqual(@as(u32, 0x0504), m.cpu.st.eip);
+                const w = hit.watch orelse return error.MissingWatchDetail;
+                try std.testing.expectEqual(@as(u32, IOPORT), w.addr);
+                try std.testing.expectEqual(debug.AccessKind.write, w.access);
+                try std.testing.expectEqual(@as(u8, 0x5A), w.value); // the OUT byte
+                try std.testing.expectEqual(@as(@TypeOf(w.kind), .io), w.kind);
+                if (captured) |c| try std.testing.expectEqual(c, hit.at_cycle) else captured = hit.at_cycle;
+            },
+            else => return error.WrongStopReason,
+        }
+    }
+}
+
+test "Phase3 an io READ watch ignores the OUT, fires on IN" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    loadPortProg(m);
+    var ctrl = Controller.init(m);
+    _ = try ctrl.addBreakpoint(.{ .io = .{ .port = IOPORT, .access = .read } }, false);
+    const r = ctrl.runUntilEvent(10_000);
+    switch (r) {
+        .breakpoint => |hit| {
+            // Past the IN now: CS:IP at the HLT (0x0506).
+            try std.testing.expectEqual(@as(u32, 0x0506), m.cpu.st.eip);
+            const w = hit.watch orelse return error.MissingWatchDetail;
+            try std.testing.expectEqual(debug.AccessKind.read, w.access);
+            try std.testing.expectEqual(@as(u32, IOPORT), w.addr);
+        },
+        else => return error.WrongStopReason,
+    }
+}
+
+test "Phase3 arming an io watch is byte-identical to an unwatched run (cycle-neutral)" {
+    const alloc = std.testing.allocator;
+
+    // Unwatched reference: step exactly MOV ; OUT ; IN (3 instructions).
+    const mu = try makeMachine(alloc);
+    defer destroy(alloc, mu);
+    loadPortProg(mu);
+    var cu = Controller.init(mu);
+    _ = cu.stepN(3);
+    const ref_snap = mu.snapshot();
+
+    // Watched: arm a bus port watch directly (records hits, never stops), same 3 steps.
+    const mw = try makeMachine(alloc);
+    defer destroy(alloc, mw);
+    loadPortProg(mw);
+    _ = try mw.bus.setPortWatch(.{ .port = IOPORT, .access = .access });
+    var cw = Controller.init(mw);
+    _ = cw.stepN(3);
+
+    try std.testing.expect(mw.bus.last_io_watch.seq > 0); // it actually fired
+    // Byte-identical CPU state + ledger: a port watch charges zero cycles.
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&ref_snap.cpu_state),
+        std.mem.asBytes(&mw.snapshot().cpu_state),
+    );
+}
+
+test "Phase3 an io watch on a real device port still dispatches the device (passthrough)" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    const b = &m.bus;
+    // OUT 0x21, 0x55 sets the master PIC interrupt mask. Watch the port, then run.
+    b.writePhys8(0x0500, 0xB0);
+    b.writePhys8(0x0501, 0x55); // MOV AL, 0x55
+    b.writePhys8(0x0502, 0xE6);
+    b.writePhys8(0x0503, 0x21); // OUT 0x21, AL
+    b.writePhys8(0x0504, 0xF4); // HLT
+    m.cpu.loadSegment(.cs, 0);
+    m.cpu.loadSegment(.ss, 0);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.esp), 0x7000);
+    m.cpu.st.eip = 0x0500;
+
+    var ctrl = Controller.init(m);
+    _ = try ctrl.addBreakpoint(.{ .io = .{ .port = 0x21, .access = .write } }, false);
+    const r = ctrl.runUntilEvent(10_000);
+    switch (r) {
+        .breakpoint => |hit| {
+            const w = hit.watch orelse return error.MissingWatchDetail;
+            try std.testing.expectEqual(@as(u8, 0x55), w.value);
+            // The device ALSO saw the write (faithful passthrough): the PIC mask is set.
+            try std.testing.expectEqual(@as(u8, 0x55), m.pic.master.imr);
+        },
+        else => return error.WrongStopReason,
+    }
+}
+
+test "Phase3 removeBreakpoint(io) clears the port watch + disarms the gate" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    var ctrl = Controller.init(m);
+    const id = try ctrl.addBreakpoint(.{ .io = .{ .port = IOPORT, .access = .access } }, false);
+    try std.testing.expect(m.bus.any_port_watch_armed);
+    try ctrl.removeBreakpoint(id);
+    try std.testing.expect(!m.bus.any_port_watch_armed); // gate back to free
+    try std.testing.expect(!m.bus.port_watch_used[0]);
+}
+
 /// Counting allocator (mirrors controller_test.zig): records every alloc/free so
 /// the watch run path can be asserted alloc-free.
 const CountingAllocator = struct {

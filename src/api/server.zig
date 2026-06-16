@@ -826,9 +826,7 @@ pub const Server = struct {
     fn handleAddBp(self: *Server, req: *http.Server.Request, body: []const u8, is_json: bool) void {
         if (!self.requireJson(req, is_json, body)) return;
         const r = self.parseBody(wire.AddBpReq, body) orelse return self.badJson(req);
-        // `io` breakpoints are declared in the core but matches()==false (M1 deferred)
-        // → 501, never a fake accept (ground rule).
-        if (r.kind == .io) return self.respondError(req, .not_implemented, "not_implemented", "io breakpoints are not implemented");
+        // All breakpoint kinds (incl. `io` port watchpoints) are live.
         self.submitAndRespond(req, .{ .add_bp = .{ .kind = r.kind, .one_shot = r.one_shot } });
     }
 

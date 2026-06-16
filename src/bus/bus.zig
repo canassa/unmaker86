@@ -77,6 +77,25 @@ pub const LastMemWatch = struct {
     seq: u64 = 0,
 };
 
+/// One I/O-port watch (the `io` breakpoint kind). Plain POD, snapshot-safe. A port
+/// has no "kind" to flip (unlike a memory page), so the port path is gated by the
+/// `any_port_watch_armed` bool — free (one test) when unarmed.
+pub const PortWatch = struct {
+    port: u16 = 0,
+    access: WatchAccess = .access,
+};
+
+/// The most-recent I/O-port watch HIT breadcrumb — the port twin of
+/// `LastMemWatch`. Carries the access `value` (the byte the guest read on `IN` /
+/// wrote on `OUT`) so the debugger can report it without a re-read. `seq` is the
+/// freshness counter the controller polls between steps.
+pub const LastIoWatch = struct {
+    port: u16 = 0,
+    access: WatchAccess = .read,
+    value: u8 = 0,
+    seq: u64 = 0,
+};
+
 /// Max registered MMIO/port handlers (B12 — stable IDs index these arrays). ID 0
 /// is the reserved "unmapped" slot for ports; MMIO uses a parallel scheme where
 /// only `.mmio` pages consult `page_handler_id`. 254 device handlers is ample.
@@ -148,6 +167,19 @@ pub const Bus = struct {
     /// steps via the `seq` freshness counter. Default = "no hit yet" (seq 0).
     /// Serialized in `Snapshot` (round-trips), reset in `resetWatchHit`.
     last_mem_watch: LastMemWatch = .{},
+
+    // === I/O-port watchpoints (the `io` breakpoint kind) — cold. The port path is
+    // gated by `any_port_watch_armed` so an unarmed bus pays one bool test. ===
+
+    /// The fixed port-watch table (no per-op alloc); `port_watch_used[i]` marks an
+    /// occupied slot.
+    port_watches: [max_watches]PortWatch = @splat(.{}),
+    port_watch_used: [max_watches]bool = @splat(false),
+    /// Gate: true iff ≥1 port watch is armed. Checked once at the top of every
+    /// `portIn*`/`portOut*`; when false the port path is bit-identical to before.
+    any_port_watch_armed: bool = false,
+    /// The most-recent port-watch HIT breadcrumb; polled by the controller via `seq`.
+    last_io_watch: LastIoWatch = .{},
 
     allocator: std.mem.Allocator,
 
@@ -494,35 +526,43 @@ pub const Bus = struct {
     // Port I/O dispatch (B6/B7/Phase 4).
     // -----------------------------------------------------------------------
 
+    // Each method dispatches FIRST (faithful device passthrough, unchanged), then
+    // — only when a port watch is armed (one bool test otherwise) — records a hit.
+    // The breadcrumb carries the low byte of the access value (wide I/O truncates;
+    // documented). Cycle-neutral: the port handler is unchanged, the breadcrumb
+    // adds no cycles (port I/O cost is charged at the instruction, not the bus).
     pub fn portIn8(self: *Bus, port: u16) u8 {
         const id = self.port_handler_id[port];
-        if (id == unmapped_port_id) return ports.unmapped_in8;
-        return self.port_handlers[id].?.in8(port);
+        const v = if (id == unmapped_port_id) ports.unmapped_in8 else self.port_handlers[id].?.in8(port);
+        if (self.any_port_watch_armed) self.checkPortWatch(port, .read, v);
+        return v;
     }
     pub fn portIn16(self: *Bus, port: u16) u16 {
         const id = self.port_handler_id[port];
-        if (id == unmapped_port_id) return ports.unmapped_in16;
-        return self.port_handlers[id].?.in16(port);
+        const v = if (id == unmapped_port_id) ports.unmapped_in16 else self.port_handlers[id].?.in16(port);
+        if (self.any_port_watch_armed) self.checkPortWatch(port, .read, @truncate(v));
+        return v;
     }
     pub fn portIn32(self: *Bus, port: u16) u32 {
         const id = self.port_handler_id[port];
-        if (id == unmapped_port_id) return ports.unmapped_in32;
-        return self.port_handlers[id].?.in32(port);
+        const v = if (id == unmapped_port_id) ports.unmapped_in32 else self.port_handlers[id].?.in32(port);
+        if (self.any_port_watch_armed) self.checkPortWatch(port, .read, @truncate(v));
+        return v;
     }
     pub fn portOut8(self: *Bus, port: u16, v: u8) void {
         const id = self.port_handler_id[port];
-        if (id == unmapped_port_id) return; // drop (B7)
-        self.port_handlers[id].?.out8(port, v);
+        if (id != unmapped_port_id) self.port_handlers[id].?.out8(port, v); // else drop (B7)
+        if (self.any_port_watch_armed) self.checkPortWatch(port, .write, v);
     }
     pub fn portOut16(self: *Bus, port: u16, v: u16) void {
         const id = self.port_handler_id[port];
-        if (id == unmapped_port_id) return;
-        self.port_handlers[id].?.out16(port, v);
+        if (id != unmapped_port_id) self.port_handlers[id].?.out16(port, v);
+        if (self.any_port_watch_armed) self.checkPortWatch(port, .write, @truncate(v));
     }
     pub fn portOut32(self: *Bus, port: u16, v: u32) void {
         const id = self.port_handler_id[port];
-        if (id == unmapped_port_id) return;
-        self.port_handlers[id].?.out32(port, v);
+        if (id != unmapped_port_id) self.port_handlers[id].?.out32(port, v);
+        if (self.any_port_watch_armed) self.checkPortWatch(port, .write, @truncate(v));
     }
 
     // -----------------------------------------------------------------------
@@ -896,6 +936,74 @@ pub const Bus = struct {
     /// (breakpoints outlive a reset).
     pub fn resetWatchHit(self: *Bus) void {
         self.last_mem_watch = .{};
+        self.last_io_watch = .{};
+    }
+
+    // -----------------------------------------------------------------------
+    // I/O-port watchpoints (the `io` breakpoint kind). Symmetric to the memory
+    // watch, but simpler: there is no port "fast path" to gate — the CPU's IN/OUT
+    // go straight through `portIn*`/`portOut*` — so a single `any_port_watch_armed`
+    // bool is the whole gate.
+    // -----------------------------------------------------------------------
+
+    pub fn setPortWatch(self: *Bus, w: PortWatch) error{WatchTableFull}!u16 {
+        var id: u16 = 0;
+        while (id < max_watches) : (id += 1) {
+            if (!self.port_watch_used[id]) {
+                self.port_watches[id] = w;
+                self.port_watch_used[id] = true;
+                self.any_port_watch_armed = true;
+                return id;
+            }
+        }
+        return error.WatchTableFull;
+    }
+
+    pub fn clearPortWatch(self: *Bus, id: u16) void {
+        std.debug.assert(id < max_watches and self.port_watch_used[id]);
+        self.port_watch_used[id] = false;
+        self.port_watches[id] = .{};
+        // Recompute the gate: armed iff any slot still occupied.
+        var any = false;
+        for (self.port_watch_used) |used| {
+            if (used) {
+                any = true;
+                break;
+            }
+        }
+        self.any_port_watch_armed = any;
+    }
+
+    /// Record a port-watch HIT iff a slot covers `port` with a matching access
+    /// class. Called only when `any_port_watch_armed` (the caller gates). Lowest
+    /// matching id wins; one hit per access.
+    fn checkPortWatch(self: *Bus, port: u16, acc: WatchAccess, value: u8) void {
+        var id: u16 = 0;
+        while (id < max_watches) : (id += 1) {
+            if (!self.port_watch_used[id]) continue;
+            const w = self.port_watches[id];
+            if (w.port != port) continue;
+            const ok = switch (w.access) {
+                .access => true,
+                .read => acc == .read,
+                .write => acc == .write,
+            };
+            if (ok) {
+                self.last_io_watch = .{
+                    .port = port,
+                    .access = acc,
+                    .value = value,
+                    .seq = self.last_io_watch.seq +% 1,
+                };
+                return;
+            }
+        }
+    }
+
+    /// The current port-watch-hit sequence (the freshness baseline the controller
+    /// snapshots BEFORE a step). Mirror of `watchHitSeq`.
+    pub fn portWatchHitSeq(self: *const Bus) u64 {
+        return self.last_io_watch.seq;
     }
 
     /// Register a port handler at a single port (B6). Double registration of a
@@ -960,6 +1068,11 @@ pub const Bus = struct {
         watch_prior: [memmap.page_count]PageKind,
         watch_page_refs: [memmap.page_count]u16,
         last_mem_watch: LastMemWatch,
+        // I/O-port watchpoint state (the `io` kind) — round-trips with the rest.
+        port_watches: [max_watches]PortWatch,
+        port_watch_used: [max_watches]bool,
+        any_port_watch_armed: bool,
+        last_io_watch: LastIoWatch,
         // RAM is captured separately (it is large) via `writeSnapshotRam` /
         // restored via the `ram` field below — but for a self-contained test we
         // also expose a slab copy. Callers may prefer streaming the RAM.
@@ -978,6 +1091,10 @@ pub const Bus = struct {
             .watch_prior = self.watch_prior,
             .watch_page_refs = self.watch_page_refs,
             .last_mem_watch = self.last_mem_watch,
+            .port_watches = self.port_watches,
+            .port_watch_used = self.port_watch_used,
+            .any_port_watch_armed = self.any_port_watch_armed,
+            .last_io_watch = self.last_io_watch,
         };
     }
 
@@ -995,6 +1112,10 @@ pub const Bus = struct {
         self.watch_prior = snap.watch_prior;
         self.watch_page_refs = snap.watch_page_refs;
         self.last_mem_watch = snap.last_mem_watch;
+        self.port_watches = snap.port_watches;
+        self.port_watch_used = snap.port_watch_used;
+        self.any_port_watch_armed = snap.any_port_watch_armed;
+        self.last_io_watch = snap.last_io_watch;
     }
 };
 

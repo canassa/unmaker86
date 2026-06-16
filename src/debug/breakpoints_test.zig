@@ -12,7 +12,7 @@ const BreakpointSet = bp.BreakpointSet;
 
 /// A freshness baseline of "no prior event" — for `matches` calls that don't
 /// exercise interrupt/memory freshness.
-const seq0: bp.SeqBefore = .{ .delivery = 0, .watch = 0 };
+const seq0: bp.SeqBefore = .{ .delivery = 0, .watch = 0, .port_watch = 0 };
 
 fn makeMachine(alloc: std.mem.Allocator) !*Machine {
     const m = try alloc.create(Machine);
