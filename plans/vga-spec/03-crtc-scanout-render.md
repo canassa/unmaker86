@@ -173,13 +173,22 @@ width in words.
 
 ### 2.3 Max Scan Line — char height / double-scan / line doubling
 
-CRTC **Max Scan Line 0x09**: bits 0-4 = (character cell height − 1) in text, or the scan-doubling
-divisor in graphics. **Bit 7 = double-scan** (each logical row drawn twice — how 200-line modes fill
-a 400-line raster). dosbox `address_line_total` (`vga_draw.cpp:2253-2256`), `is_double_scanning`
+CRTC **Max Scan Line 0x09**: bits 0-4 = (character cell height − 1) in text, or the scan-line
+**repeat count − 1** in graphics. **Bit 7 = double-scan** — a *separate* mechanism (the CRTC emits
+each scanned line twice). dosbox `address_line_total` (`vga_draw.cpp:2253-2256`), `is_double_scanning`
 (`:2260-2264`); spice86 `_frameMaximumScanline`, `_frameDrawLinesPerScanLine = CrtcScanDouble ? 2 :
 1` (`Renderer.cs:316-317,239-252`). **The displayed-row address only advances after `MaxScanLine+1`
-raster lines** — this is what makes a text glyph 16 raster lines tall reuse one cell address, and
-what makes mode 13h's 200 rows occupy 400 raster lines. For the **capture output resolution**, zdos
+raster lines** — this is what makes a text glyph 16 raster lines tall reuse one cell address.
+
+> **FIX (review S1) — mode 13h fills 400 lines via Max-Scan-Line, NOT the double-scan bit.** The IBM
+> VGA BIOS programs CRTC 0x09 = **`0x41`** for mode 13h: `0b0100_0001` — **bit 7 (double-scan) is
+> CLEAR**; the set bits are bit 6 (line-compare bit 9) and bit 0 (Max-Scan-Line low bit = 1). So
+> `MaxScanLine = 1` ⇒ each of the 200 logical rows is repeated for **2 raster lines** (the cell-height
+> repeat above), giving the 400-line raster. The earlier draft mislabeled this as "double-scan"; the
+> rasterizer must derive the row repeat from `(MaxScanLine & 0x1F) + 1`, and treat bit 7 (double-scan)
+> as the *additional* per-scan doubling it genuinely is (used by some 200-line modes, but not 13h).
+> The 200-row→400-raster behavior is correct either way; the *register decode* must read bits 0-4, not
+> bit 7. For the **capture output resolution**, zdos
 emits the **logical** resolution (320×200, 640×200, etc.) and records whether double-scan was active;
 the consumer scales for aspect if it wants (the index image and pixel hash are at logical res — §5).
 
@@ -381,15 +390,23 @@ passes through the Attribute Controller, exactly as hardware does (dosbox `VGA_A
 `vga_attr.cpp:60-81`; spice86 builds `AttributeMap[16]`, `DacRegisters.cs:33`):
 
 ```
+0. index &= AC.color_plane_enable                 // Color Plane Enable masks the INDEX (planes feeding
+                                                  //   the AC), BEFORE the palette lookup (AC 0x12)  [FIX S2]
 1. internal = AC.palette[index & 0x0F]            // 16 internal-palette regs (AC 0x00-0x0F), 6-bit each
-2. internal &= AC.color_plane_enable              // Color Plane Enable mask (AC 0x12)        (vga_attr.cpp:68)
-3. if AC.mode_control.palette_bits_5_4_select:    // AC 0x10 bit 7
+2. if AC.mode_control.palette_bits_5_4_select:    // AC 0x10 bit 7
         dac_idx = (internal & 0x0F) | (color_select << 4)        (vga_attr.cpp:71-73)
    else:
         dac_idx = internal                                       // 6-bit internal value
-4. dac_idx |= (color_select & 0x0C) << 4          // high 2 bits from Color Select (AC 0x14) (vga_attr.cpp:77)
-5. rgb = DAC[dac_idx & pel_mask]                  // §3.7
+3. dac_idx |= (color_select & 0x0C) << 4          // high 2 bits from Color Select (AC 0x14) (vga_attr.cpp:77)
+4. rgb = DAC[dac_idx & pel_mask]                  // §3.7
 ```
+
+> **FIX (review S2) — Color-Plane-Enable masks the INDEX, not the 6-bit palette output.** The earlier
+> draft applied `& color_plane_enable` to the *internal* (post-lookup, 6-bit) value. On real hardware
+> (dosbox `vga_attr.cpp:68`: `vga.attr.palette[i & vga.attr.color_plane_enable]`) the mask is applied
+> to the **4-bit attribute index** — i.e. it gates which display *planes* reach the palette lookup —
+> so it must come *before* `AC.palette[index]`, as step 0 above. Masking the 6-bit output would zero
+> palette bits, not disable planes — a different, wrong result.
 
 **The 256-color bypass:** in 8-bit (256-color) mode (AC Mode Control 0x10 bit 6 / GC 256-color bit),
 the 8-bit pixel skips steps 1-4 entirely and indexes the DAC directly (dosbox `M_VGA`/`M_LIN8` use the
@@ -468,7 +485,15 @@ read of guest state producing a `width×height` buffer for the **current** mode.
 
 All reads are pure; the capture **must not** advance cycles or mutate any device field (assert
 cycle-neutrality in a test, mirroring the M1/M2 cycle-neutral audits referenced in
-`plans/lamut-milestone.md` W5).
+`plans/lamut-milestone.md` W5). **The test must explicitly assert these three side-effect-free
+invariants (review R3/R6),** since each has a tempting mutating accessor the render must avoid:
+- **DAC read/write index unchanged** — render via the raw `dac_rgb`/`pel_mask` fields, never `read3c9`
+  (which advances `dac_read_index`, `vga.zig:436-458`).
+- **AC flip-flop unchanged** — render via the raw `attr.regs[]`/`attr.index`, never an `in8(0x3DA)`
+  (which resets `attr_flip_flop_is_index`, `vga.zig:479`) or a 0x3C0 read.
+- **The 4 plane latches unchanged** — the de-interleave reads the planes directly from the slab
+  (§2/§7), never through `memRead8` (which loads all 4 latches, `02-memory-engine.md §3`).
+Snapshot the full `Vga.Snapshot` before and after a capture and assert byte-equality.
 
 ### 5.2 Output format
 
@@ -504,12 +529,33 @@ For text modes the capture also returns the existing `/api/screen` cell grid (ch
 endpoints coexist: `/api/screen` is the cheap text-grid peek (already shipped), `/api/framebuffer` is
 the rendered pixel/index image for any mode.
 
-### 5.3 Plumbing (mirror `/api/screen`)
+### 5.3 Plumbing — server-owned render buffer + binary streaming (NOT the inline-POD `Response`) [FIX B1]
 
-Same flow as the shipped `screen()` path (`controller.zig:671`, `queue`/`worker`/`server`):
-controller `framebuffer(dst) -> FrameView` (pure peek), a `void` command (mode auto-detected),
-worker fills a fixed-size POD result (the index buffer; RGBA derived in serialization or returned
-raw), server route `/api/framebuffer`. Cycle-neutrality test mandatory.
+> **BLOCKING FIX (review B1).** `/api/framebuffer` **cannot** mirror `/api/screen`'s pattern. `screen()`
+> returns its grid inside the value-returned `Response` struct through a stack-allocated `RequestCtx`
+> into a **32 KiB `resp_buf`** — but a rendered frame is **64 KiB (mode 13h index) to ~1.2 MB
+> (640×480 RGBA)**. It does not fit in `resp_buf`, and copying it by value through `Response`/`RequestCtx`
+> would blow the stack. The framebuffer needs a different transport:
+>
+> - **A server-owned, fixed-capacity render buffer**, allocated once at startup (NOT per-request, NOT
+>   on the stack): `index_buf: [640*480]u8` + `rgba_buf: [640*480*4]u8` (≈ 1.5 MB total, owned by the
+>   API server, reused every capture). This honors the project's no-per-op-alloc / fixed-slab discipline.
+> - **The controller command writes the rendered index (and optionally RGBA) into that server buffer**
+>   via the pure peek render (§5.1), returning only a small POD descriptor `{mode, width, height,
+>   index_len, rgba_len}` through the normal `Response` path.
+> - **The server then streams the buffer as a raw binary body** (`Content-Type: application/octet-stream`,
+>   `Content-Length: <len>`), writing directly from the server-owned buffer to the socket — it does
+>   **not** route the pixels through `resp_buf`/JSON. Query `?format=index|rgba` (default index) selects
+>   which buffer to stream; the descriptor goes in headers (e.g. `X-Frame-Width`) or a tiny JSON
+>   prefix the client reads before the binary body. PNG, if wanted, is encoded **host-side in the
+>   client/test**, never in the emulator (keeps the encoder out of the determinism boundary).
+>
+> Everything else still mirrors `screen()`: the `queue`/`worker`/`server` one-command-in-flight model,
+> the side-effect-free render, the determinism guarantees. Only the **transport of the large payload**
+> differs — server-owned buffer + raw stream instead of value-returned struct.
+
+Cycle-neutrality test mandatory (§5.1) — and additionally a **two-run byte-identity** test of the
+streamed index + RGBA buffers at a fixed cycle.
 
 ### 5.4 The oracle (Stage 2, `plans/lamut-milestone.md`)
 

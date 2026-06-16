@@ -81,11 +81,24 @@ offset are four adjacent bytes and a read is a single `uint32_t` load (dosbox
 3. **The capture de-interleave is a trivial `vram[plane*0x10000 + start + y*80 + x/4]`** (the §7
    framebuffer render), the exact inverse of the write mapping.
 
-Cost: a read loads 4 latches from 4 non-adjacent slab bytes (`vram[p*0x10000+off]` for p=0..3)
-instead of one `uint32_t`. This is negligible — the planar path is the slow per-access path anyway
-(taken only when unchained; chained keeps the fast path), and a 4-byte gather is a handful of
-loads. **This is the one place zdos deliberately diverges from both refs' layout.** Document it in
-the `vga.zig` header.
+Cost (corrected — review perf headline; the earlier "negligible" claim was wrong): the plane-major
+layout has a **real, asymmetric cache cost** vs the refs' interleaved layout, and the decision stands
+*despite* it, not because it's free:
+- **All-four-planes access (latch load on read; a 4-plane fan-out fill)** touches 4 bytes that are
+  **64 KiB apart** → up to **4 distinct cache lines and 4 TLB entries** where the interleaved layout
+  touches **one** line (the `uint32_t`). That is a ~4× cache-line / TLB blowup on the planar latch
+  load and the all-plane write.
+- **Single-plane strip access (the common Mode-X case: write one plane across a scanline, Map-Mask =
+  one bit)** is the **inverse 4× win**: consecutive pixels of one plane are contiguous in plane-major
+  (`vram[p*0x10000 + off], off+1, …`) but 4 bytes apart in interleaved. Plane-major is *better* here.
+
+**Net: keep plane-major.** The decisive reason is unchanged and dominates — **mode-13h plane 0 stays
+byte-identical to the existing linear slab (zero regression, fast path untouched)** and the slab/
+snapshot/region contracts need no reshape. The planar path is the slow per-access path regardless
+(taken only when unchained). But the rationale must be honest: it is a *deliberate trade* (single-plane
+locality + zero-reshape + mode-13h identity, at the cost of 4-line latch loads), **not** a free choice.
+**This is the one place zdos deliberately diverges from both refs' layout.** Document this trade in the
+`vga.zig` header.
 
 ### 1.3 The 4 latches are device state
 
@@ -219,6 +232,41 @@ mask) | (latch & ~mask)` — that IS "ALU=replace then Bit-Mask merge". spice86 
 clearer. **zdos copies spice86's separation:** `alu(src, latch[p])` then a distinct Bit-Mask merge,
 because per-plane `u8` arithmetic is trivial and the two-step form maps 1:1 to the hardware prose.
 
+### 2.6 Performance — decode-on-write `WriteConfig` + a trivial-config bulk fast path (review perf F2/F4)
+
+The §2 pipeline as written re-reads and re-decodes ~7 GC/SEQ register fields **on every single byte**
+written to VRAM. In a planar blit (`rep stosb` across a scanline) that is the hot path. Two fixes,
+both pure (no host clock, no determinism impact — they only *cache decoded guest state*):
+
+- **F4 — decode the hot write-mode registers into a packed `WriteConfig` on the rare register write,
+  not on every VRAM byte.** The GC/SEQ registers change ~once per blit setup; the VRAM bytes change
+  millions of times. On each `out` to a GC/SEQ data port, recompute a small POD:
+  ```zig
+  const WriteConfig = struct {
+      write_mode: u2, data_rotate: u3, alu: u2, bit_mask: u8,
+      set_reset: u4, enable_set_reset: u4, map_mask: u4,
+      trivial: bool,   // see F2
+  };
+  ```
+  `memWrite8` then reads `self.wc.*` fields directly — no per-byte register decode. (This is *not* a
+  renderer cache like dosbox's `Expand16Table`; it is the decoded form of live guest registers,
+  recomputed deterministically on the register write that changes them, and it needs no snapshot
+  coverage because it is a pure function of the snapshot-covered raw registers — recompute it in
+  `restore()`.)
+- **F2 — a trivial-config bulk-write fast path.** The overwhelmingly common Mode-X fan-out is
+  `dataRotate==0 && enableSetReset==0 && alu==replace && bitMask==0xFF` — for which the entire §2.1
+  pipeline reduces to `out = v` per masked plane. Precompute `trivial` once (in the `WriteConfig`
+  decode) and, when set, the write is just: for each plane `p` in `map_mask`, `vram[p*0x10000 + off] = v`.
+  This skips the ror / set-reset select / ALU / bit-mask-merge entirely. With the plane-major layout
+  (§1.2) the single-plane trivial case is also contiguous (the §1.2 "inverse 4× win"), so a
+  trivial-config single-plane strip is the best case on both counts. The non-trivial path runs the
+  full §2 pipeline unchanged (correctness first; the fast path is a pure shortcut that must produce
+  byte-identical results — assert it in a test by running both paths on a fuzzed config and comparing).
+
+Both are **transparent optimizations**: identical observable VRAM, identical cycles (the bus handler
+adds zero cycles either way, §6.3), identical snapshot. They make the planar hot path fast without
+touching the determinism boundary.
+
 ---
 
 ## 3. Read modes 0 and 1 — and the latch-load on every read
@@ -325,10 +373,14 @@ work.
   (`vga_memory.cpp:556-595`): map_mask 0x1 → char index plane, 0x2 → attribute plane, 0x4 → font map.
 
 **zdos mapping:** read plane = `off & 1`; write plane set = `(off&1)==0 ? 0b0101 : 0b1010` (planes
-{0,2} for even, {1,3} for odd), gated further by the Map-Mask; plane-offset = `off >> 1` for the
-even/odd packing (the simple, non-chain-odd-maps-to-even case; the chain-odd-maps-to-even and
-EvenPageSelect fixups are the spice86 formulas above, implemented only when a guest drives them —
-§9 flag). **zdos's existing B8000/B0000 text pages are a *flat interleaved {char,attr}* slab**
+{0,2} for even, {1,3} for odd), gated further by the Map-Mask. **Plane-offset is a bit-0 mask/OR
+fixup of `off`, NOT `off >> 1`** [FIX S4]: the address bit that selected the plane pair is *not*
+shifted out — it is rewritten. The three cases (spice86 `VideoMemory.cs:319-331`): chain-odd-maps-to-even
+(GC-Misc bit 1) ⇒ replace `off` bit 0 with a high-order page bit; else EvenPageSelect (Misc-Output
+bit 5) ⇒ `off &= 0xFFFE` (clear bit 0); else ⇒ `off |= 1`. The standard text/CGA even-page case is
+**`off & 0xFFFE`** (plane-offset = the address with bit 0 cleared) — *not* a halving. (The earlier
+draft's `off >> 1` was wrong: it would compress the plane address by 2× and misplace every odd cell.)
+These fixups are implemented only when a guest drives odd/even planar mode — §9 flag. **zdos's existing B8000/B0000 text pages are a *flat interleaved {char,attr}* slab**
 (`vga.zig:68-78`, D-TM1) — guest-observationally identical to odd/even for the chained text mapping
 BaK/oracle uses; the odd/even *planar* decode here is the faithful model for a guest that reprograms
 the text planes (e.g. font upload to plane 2 via map_mask 0x4) and is **not on the BaK path** — flag
@@ -383,7 +435,7 @@ because their memory arithmetic is identical.
 | Chained 256 (13h) | chain-4 set (`seq4 b3=1`) | `1 << (off&3)` | `off&3` | `off>>2` |
 | Unchained planar (Mode-X) | chain-4 clr, odd/even clr | `0b1111` & MapMask | ReadMapSel | `off` |
 | EGA 16-color planar | chain-4 clr, odd/even clr, 256 bit clr | `0b1111` & MapMask | ReadMapSel | `off` |
-| Odd/even (text/CGA) | odd/even-mode set (`seq4 b2=0`) | even→{0,2} odd→{1,3}, & MapMask | `off&1` | `off>>1`(+fixups) |
+| Odd/even (text/CGA) | odd/even-mode set (`seq4 b2=0`) | even→{0,2} odd→{1,3}, & MapMask | `off&1` | `off&0xFFFE` (bit-0 fixup, §4.3 — NOT `off>>1`) |
 | Doubleword | (CRTC 0x17 b6=0) | — same as chain-4 for CPU access — | — | `off>>2` |
 
 In all rows the final write is still gated by the **Map Mask** (§2 stage 5) and the read still

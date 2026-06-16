@@ -137,10 +137,12 @@ CRTC sets (reg 0..0x18, 25 bytes):
   CRTC9 mode 11/12, CRTC10 mode 13, CRTC11 mode 6A (800x600).
   e.g. CRTC10 (mode 13h) = {5f,4f,50,82,54,80,bf,1f,00,41,00,00,00,00,00,00,
                             9c,8e,8f,28,40,96,b9,a3,ff}
-       — reg9=0x41 (max-scanline, dbl-scan bit + 1), reg0x14=0x40 (underline,
-         doubleword), reg0x17=0xa3 (mode control). Matches dosbox's computed
-         M_VGA values (int10_modes.cpp:1471-1473,1603 → underline 0x40, max
-         scanline |=1, mode_control 0xa3).
+       — reg9=0x41 = 0b0100_0001: **bit0 (Max-Scan-Line low = 1 → 2-line row
+         repeat) + bit6 (line-compare bit 9); bit7 (double-scan) is CLEAR**
+         [FIX S1 — NOT the double-scan bit; see 03 §2.3]. reg0x14=0x40
+         (underline, doubleword), reg0x17=0xa3 (mode control). Matches dosbox's
+         computed M_VGA values (int10_modes.cpp:1471-1473,1603 → underline 0x40,
+         max scanline |=1, mode_control 0xa3).
   e.g. CRTC2 (mode 3)  = {5f,4f,50,82,55,81,bf,1f,00,4f,0d,0e,00,00,00,00,
                           9c,8e,8f,28,1f,96,b9,a3,ff}
 
@@ -199,12 +201,17 @@ Mirror spice86 `VgaSetMode` (`VgaFunctionality.cs:229-284`); the dosbox ordering
    ≥ 0x100, mask `& 0xFFF` and check bit 14/15 (VESA — out of scope, flag). dosbox `int10_modes.cpp:1157-1175`.
 2. Look up the `ModeEntry`; if not found, return without changing state (real BIOS leaves AL undefined;
    dosbox logs + returns false `:1198`). **Flag** an unsupported standard mode rather than faking 13h.
-3. **Load the default DAC palette** unless the BDA `MODESET_CTL`/`VIDEO_CTL` "load default palette" bit
-   is set (bit 3 of `VIDEO_CTL` 0x87 — `vga_flags_rec.load_default_palette`, dosbox `:1898`; spice86
-   `ModeFlags.NoPalette`, `:241`). Writes 256×3 (or 16×3 for non-256 modes) 6-bit RGB to the DAC via
+3. **Load the default palette.** [FIX S3 — corrected gate location + scope.] The gating flag is the
+   **MODESET_CTL byte at BDA 0x89 bit 3** ("default-palette-loading disabled"), **not** VIDEO_CTL 0x87
+   — dosbox reads it via `vga_flags_rec` from the modeset-ctl offset (`:1186-1187,1898`), spice86
+   `ModeFlags.NoPalette` (`:241`). It gates the **Attribute-Controller internal-palette load** (the 16
+   EGA-attribute regs written in step 4); the **256-entry DAC palette is loaded unconditionally** at
+   set-mode regardless of this bit. Writes 256×3 (or 16×3 for non-256 modes) 6-bit RGB to the DAC via
    `0x3C8`/`0x3C9` (the same port path INT 10h AL=12 uses; `01-registers.md §6`). The default palettes:
    `Palettes.Vga` (256-entry), `Palettes.Ega` (64-entry), `Palettes.Cga`, `Palettes.Monochrome`
    (spice86 `Data/Palettes.cs`; dosbox `palette.vga/.ega/.cga64/.mono_text`, `int10_modes.cpp:1936-1979`).
+   *(Verify the exact AC-vs-DAC split against the set-mode oracle when implemented — surface, don't
+   assume, if a corpus program sets the no-palette bit; the v1 BaK/LAMUT path leaves it clear.)*
 4. **FillRegisters** (`VgaFunctionality.cs` FillRegisters; dosbox `:1326-1748,1903-1912`): write AC regs
    0..0x14 (via the 0x3C0 flip-flop), SEQ regs 0..4, GC regs 0..8, then disable CRTC write-protect
    (CRTC 0x11 bit 7 = 0), write CRTC regs 0..0x18, then write misc-output `0x3C2`. **This drives the
