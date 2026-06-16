@@ -6,6 +6,9 @@
 
 const std = @import("std");
 const Io = std.Io;
+const cpu_mod = @import("cpu");
+const Seg = cpu_mod.state.Seg;
+const Reg32 = cpu_mod.state.Reg32;
 const bridge_mod = @import("bridge");
 const vfs = @import("vfs.zig");
 const devices = @import("devices.zig");
@@ -337,21 +340,126 @@ pub fn Dos(comptime Cpu: type) type {
         }
 
         // -------------------------------------------------------------------
-        // Terminate (AH=4C / AH=00 / INT 20h) — restore 22/23/24, free PSP mem,
-        // record the exit code. The run loop observes `terminated`.
+        // Terminate (AH=4C / AH=00 / INT 20h) — the full DOS_Terminate unwind
+        // (dos_execute.cpp:114-178). For a NON-ROOT process this restores the
+        // parent's stack + registers and resumes the parent at INT 22h, all
+        // SYNCHRONOUSLY within this one trap, and leaves `terminated == false`
+        // (LOCKED §2 — there is no later host frame to clear it, and
+        // `controller.terminalReason()` stops the parent if it is still set). The
+        // ROOT process (self-parented PSP) leaves `terminated == true` so the run
+        // loop / controller stops there exactly as before.
         // -------------------------------------------------------------------
         pub fn terminate(self: *Self, cpu: *Cpu, br: *Bridge, code: u8, kind: u8) void {
-            _ = br;
+            self.terminateTsr(cpu, br, code, kind, false);
+        }
+
+        /// `terminate` with the TSR (keep-resident) carve-out exposed (LOCKED §5):
+        /// when `tsr` is true the parent switch still happens but the child's open
+        /// files are NOT closed and its memory is NOT freed (it stays resident),
+        /// mirroring `DOS_Terminate(..., is_terminate_and_stay_resident)`
+        /// (dos_execute.cpp:130-173). AH=31h / INT 27h remain `unsupported` for now
+        /// (no caller passes `tsr = true`), but the unwind is correct if/when wired.
+        pub fn terminateTsr(self: *Self, cpu: *Cpu, br: *Bridge, code: u8, kind: u8, tsr: bool) void {
             self.ret_code = code;
             self.ret_type = kind;
-            self.terminated = true;
-            // Restore INT 22/23/24 from the terminating PSP (D-EXEC unwind).
-            const p = self.psp();
-            cpu.bus.writePhys32(0x22 * 4, p.getInt22());
-            cpu.bus.writePhys32(0x23 * 4, p.getInt23());
-            cpu.bus.writePhys32(0x24 * 4, p.getInt24());
-            // (Memory free + transfer to INT 22 are exercised by the EXEC path;
-            // for the initial process the run loop stops on `terminated`.)
+
+            const child_psp_seg = self.current_psp;
+            const child = Psp.at(cpu, child_psp_seg);
+            const parent_psp_seg = child.getParent();
+
+            // ROOT process: PSP is self-parented (dos_execute.cpp:124-126). Restore
+            // its own INT 22/23/24 and surface termination to the run loop /
+            // controller (no unwind, no parent to resume).
+            if (parent_psp_seg == child_psp_seg or parent_psp_seg == 0) {
+                cpu.bus.writePhys32(0x22 * 4, child.getInt22());
+                cpu.bus.writePhys32(0x23 * 4, child.getInt23());
+                cpu.bus.writePhys32(0x24 * 4, child.getInt24());
+                self.terminated = true;
+                return;
+            }
+
+            // --- Non-root unwind (mirrors dos_execute.cpp:134-177) ---
+            // (a) the parent resume CS:IP saved in the child PSP's INT 22.
+            const old22 = child.getInt22();
+            // (b) restore INT 22/23/24 from the terminating (child) PSP.
+            cpu.bus.writePhys32(0x22 * 4, child.getInt22());
+            cpu.bus.writePhys32(0x23 * 4, child.getInt23());
+            cpu.bus.writePhys32(0x24 * 4, child.getInt24());
+            // (c) close the child's files (skipped for a keep-resident TSR).
+            if (!tsr) self.closeProcessFiles(cpu, child_psp_seg);
+            // (d) switch back to the parent PSP + its DTA (PSP:0x80).
+            self.current_psp = parent_psp_seg;
+            self.dta_seg = parent_psp_seg;
+            self.dta_off = 0x80;
+            // (e) restore the parent SS:SP from the parent PSP's saved-stack field.
+            const parent = Psp.at(cpu, parent_psp_seg);
+            const pss = parent.getStackSeg();
+            var psp_sp = parent.getStackOff();
+            cpu.loadSegment(.ss, pss);
+            const pbase: u32 = @as(u32, pss) << 4;
+            // (f) pop the 18-byte parent register block (AX,BX,CX,DX,SI,DI,BP,DS,ES
+            //     ascending from the saved SP); then SP += 18.
+            cpu.st.setReg16(@intFromEnum(Reg32.eax), cpu.bus.readPhys16(pbase + psp_sp + 0));
+            cpu.st.setReg16(@intFromEnum(Reg32.ebx), cpu.bus.readPhys16(pbase + psp_sp + 2));
+            cpu.st.setReg16(@intFromEnum(Reg32.ecx), cpu.bus.readPhys16(pbase + psp_sp + 4));
+            cpu.st.setReg16(@intFromEnum(Reg32.edx), cpu.bus.readPhys16(pbase + psp_sp + 6));
+            cpu.st.setReg16(@intFromEnum(Reg32.esi), cpu.bus.readPhys16(pbase + psp_sp + 8));
+            cpu.st.setReg16(@intFromEnum(Reg32.edi), cpu.bus.readPhys16(pbase + psp_sp + 10));
+            cpu.st.setReg16(@intFromEnum(Reg32.ebp), cpu.bus.readPhys16(pbase + psp_sp + 12));
+            cpu.loadSegment(.ds, cpu.bus.readPhys16(pbase + psp_sp + 14));
+            cpu.loadSegment(.es, cpu.bus.readPhys16(pbase + psp_sp + 16));
+            psp_sp +%= 18;
+            // (g) build the IRET frame the int21 trap's `.iret` tail will pop so the
+            //     parent resumes at INT 22 (old22): IP, CS, FLAGS ascending. IF set,
+            //     test flags cleared, bit1 reserved (dos_execute.cpp:163-168 writes
+            //     0x7202; in real mode the IOPL/NT bits are inert, so 0x0202 — IF +
+            //     reserved — is the faithful, deterministic real-mode value).
+            psp_sp -%= 6;
+            cpu.bus.writePhys16(pbase + psp_sp + 0, @truncate(old22)); // IP
+            cpu.bus.writePhys16(pbase + psp_sp + 2, @truncate(old22 >> 16)); // CS
+            cpu.bus.writePhys16(pbase + psp_sp + 4, 0x0202); // FLAGS (IF set)
+            cpu.st.setReg16(@intFromEnum(Reg32.esp), psp_sp);
+            // (h) free the child's memory (skipped for a keep-resident TSR).
+            if (!tsr) self.mcb().freeByOwner(child_psp_seg);
+            // (i) the parent keeps running — do NOT leave `terminated` set, or the
+            //     controller's terminalReason() would stop the parent (LOCKED §2).
+            self.terminated = false;
+            // The int21 trap stub's `.iret` tail now pops the frame at (g) off the
+            // PARENT stack (SS:SP was switched in (e)) and resumes the parent at
+            // INT 22. The child's own abandoned INT 21h frame is dead (child memory
+            // freed). CF is irrelevant — the parent resumes via the planted IRET
+            // frame, not via the EXEC caller's CF check (it reads the rc via AH=4D).
+            _ = br;
+        }
+
+        /// Close every open file the process `psp_seg` owns (DOS_PSP::CloseFiles,
+        /// dos_execute.cpp:131). Walks the PSP JFT and closes each non-free handle
+        /// the SAME way AH=3E does (refcount-aware: dup'd aliases keep the file open;
+        /// real files close the host file + free the SFT slot at refcount 1; the
+        /// shared CON/AUX/PRN device slots stay open). So a child that exits without
+        /// closing its files does not leak SFT slots.
+        fn closeProcessFiles(self: *Self, cpu: *Cpu, psp_seg: u16) void {
+            const p = Psp.at(cpu, psp_seg);
+            const max = p.maxFiles();
+            var h: u16 = 0;
+            while (h < max) : (h += 1) {
+                const idx = p.jftGet(h);
+                if (idx == psp_mod.JFT_FREE) continue;
+                p.jftFree(h);
+                const e = self.sft.get(idx);
+                if (!e.in_use) continue;
+                if (e.refcount > 1) {
+                    e.refcount -= 1;
+                    continue;
+                }
+                switch (e.ref) {
+                    .file => |hf| {
+                        if (self.drivePtr(e.drive)) |d| d.close(hf);
+                        self.sft.freeSlot(idx);
+                    },
+                    .device => {}, // CON/AUX/PRN persist (shared slots)
+                }
+            }
         }
 
         // ---- DOS error codes (subset) ----

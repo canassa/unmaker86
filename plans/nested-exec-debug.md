@@ -1,8 +1,28 @@
 # Debug INSIDE a nested INT 21h AH=4Bh EXEC (launcher chains)
 
-Status: PLAN — reviewed (3 lenses: determinism, DOS-semantics, architecture).
-Approach (B) confirmed correct/faithful; the review's must-fixes are LOCKED below.
+Status: DONE — approach (B) implemented + all 7 LOCKED fixes landed. Phases 1-3 shipped
+atomically; 11 new tests (`src/dos/nested_exec_debug_test.zig`) + the existing SPAWN oracle stay
+green; `zig build test` = 567/567. Live-proven: an API `interrupt:0x21` breakpoint fires inside
+`ST.COM`→`STUNTS.COM`→`LOAD.EXE` (returned zero before). No golden re-baseline was needed (the
+re-baseline surface was empty — no committed golden pins an EXEC-spanning absolute cycle count).
 Owner: dos / bridge / debug (`src/dos`, `src/bridge`, `src/debug`).
+
+Implementation summary (what shipped):
+- `bridge.zig`: added `emitExecRetf` + `execRetfSegOff` (a planted `RETF` stub at
+  `EXEC_RETF_PHYS`, after the INT 16h hybrid block); DELETED `runUntil`. `machine.post` plants it.
+- `loader.exec`: LOADNGO — sets INT 22 = parent resume, pushes the 18-byte parent register block
+  on the parent stack + saves parent SS:SP into the parent PSP (0x2E), builds the child, then
+  pushes the child entry CS:IP and redirects CS:IP at the RETF stub. DELETED `ParentSnapshot`.
+  The boot/root program now self-parents (`buildPsp`), so `dos.terminate` keys "root?" off
+  `parent == self`.
+- `dos.terminate`: grew into the real `DOS_Terminate` unwind (`terminateTsr` with a TSR carve-out
+  skipping CloseFiles+FreeProcessMemory). Non-root: restore parent SS:SP + the 18-byte block,
+  build the INT-22h IRET frame on the parent stack, free child memory, leave `terminated=false`.
+  Root: surface `program_terminated` as before.
+- `psp.zig`: added `OFF_STACK=0x2E` + `setStack`/`getStackSeg`/`getStackOff`; removed the bogus
+  `OFF_DOS_VER=0x30` (it aliased the saved-stack segment word).
+- `machine.Snapshot`: added `current_psp`/`current_drive`/`dta_seg`/`dta_off`/`ret_code`/
+  `ret_type`/`terminated` (the latent gap the de-nest made live).
 
 ## Review outcome — LOCKED decisions (implement exactly these)
 

@@ -195,7 +195,7 @@ pub fn Loader(comptime Cpu: type) type {
             applyRelocations(cpu, drive, hf, h, load_seg) catch return error.IoFailed;
 
             // Build the PSP + env + JFT inherit.
-            buildPsp(dos, cpu, psp_seg, env_seg, want, cmdtail, params);
+            buildPsp(cpu, psp_seg, env_seg, want, cmdtail, params);
             dos.current_psp = psp_seg;
             dos.dta_seg = psp_seg;
             dos.dta_off = 0x80;
@@ -257,7 +257,7 @@ pub fn Loader(comptime Cpu: type) type {
                 return error.NoMemory;
             };
 
-            buildPsp(dos, cpu, psp_seg, env_seg, largest, cmdtail, params);
+            buildPsp(cpu, psp_seg, env_seg, largest, cmdtail, params);
             dos.current_psp = psp_seg;
             dos.dta_seg = psp_seg;
             dos.dta_off = 0x80;
@@ -325,12 +325,18 @@ pub fn Loader(comptime Cpu: type) type {
             cpu.st.setReg16(EBX, 0x0000);
         }
 
-        fn buildPsp(dos: *Dos, cpu: *Cpu, psp_seg: u16, env_seg: u16, total_paras: u16, cmdtail: []const u8, params: ?ExecParams) void {
+        fn buildPsp(cpu: *Cpu, psp_seg: u16, env_seg: u16, total_paras: u16, cmdtail: []const u8, params: ?ExecParams) void {
             const p = Psp.at(cpu, psp_seg);
             const mem_top = psp_seg + total_paras;
-            // The parent link (PSP 0x16): the caller PSP for a child EXEC, else the
-            // current PSP (boot self-parents through the caller, dos_execute.cpp:482).
-            const parent = if (params) |pp| pp.parent_psp else dos.current_psp;
+            // The parent link (PSP 0x16): the caller PSP for a child EXEC, else
+            // SELF (the root program self-parents, exactly like the DOS shell —
+            // shell.cpp:1345 `psp.SetParent(psp_seg)`). `dos.terminate` keys "is
+            // this the root?" off `parent == self`: a self-parented PSP surfaces
+            // `program_terminated` to the controller (no unwind); a child PSP runs
+            // the full parent unwind. (Before the nested-EXEC de-nest the root's
+            // parent was the throwaway boot PSP, which `terminate` only ever
+            // flagged on — the de-nest makes the parent link load-bearing.)
+            const parent = if (params) |pp| pp.parent_psp else psp_seg;
             p.build(mem_top, env_seg, parent, cmdtail);
             // Snapshot INT 22/23/24 from the current IVT (dos_execute.cpp:486
             // SaveVectors) — done by the EXEC caller AFTER setting INT 22 to the
@@ -500,29 +506,39 @@ pub fn Loader(comptime Cpu: type) type {
         }
 
         // ----------------------------------------------------------------
-        // AH=4B EXEC (Phase 4) — model the param block + unwind setup.
+        // AH=4B EXEC (Phase 3) — LOADNGO: set up the child and RETURN INTO IT.
         // ----------------------------------------------------------------
-        /// AH=4B AL=00 — load and execute a child to termination, then resume the
-        /// caller (the full EXEC / DOS_Terminate unwind). Host-serviced shape: the
-        /// INT 21h trap stub will IRET back to the caller when this returns, so
-        /// rather than "set up the child and return" (the real-DOS RETF-to-child
-        /// shape), zdos runs the CHILD NESTED — exactly like the bridge's
-        /// `runGuestInt` runs a guest INT — then restores the parent and returns.
-        /// Steps mirror dos_execute.cpp:473-528 (EXEC setup) + :114-178 (Terminate):
+        /// The 18-byte parent register block the EXEC caller's frame pushes (real
+        /// DOS reads it back in DOS_Terminate, dos_execute.cpp:149-160): AX, BX, CX,
+        /// DX, SI, DI, BP (7 GP words), then DS, ES (2 segment words) = 18 bytes, in
+        /// ascending stack order (AX lowest). zdos PUSHES it explicitly at EXEC time
+        /// (LOCKED §3 — full fidelity, not relying on the caller having done it) and
+        /// POPS it in `dos.terminate`, so the parent's registers survive the child
+        /// byte-for-byte.
+        pub const PARENT_REG_BLOCK_BYTES: u16 = 18;
+
+        /// AH=4B AL=00 — LOADNGO. The faithful real-DOS / dosbox model
+        /// (dos_execute.cpp:473-572): build the child PSP, save the parent resume
+        /// state IN THE PSP (INT 22 + the parent SS:SP + the 18-byte register block),
+        /// then RETURN INTO the child — the child runs on the ONE controller-owned
+        /// step loop (NO nested host loop). `dos.terminate` is the matching unwind:
+        /// on the child's AH=4C it restores the parent stack/regs and resumes the
+        /// parent at INT 22. Because there is no nesting, every child instruction is
+        /// visible to the debugger's between-steps scan.
         ///   (1) parse path (DS:DX) + the EXEC param block (ES:BX);
         ///   (2) set INT 22 = caller return CS:IP off the caller IRET frame, so the
         ///       child PSP's SaveVectors captures the parent resume address;
-        ///   (3) snapshot the parent CPU state + current PSP/DTA + terminated flag;
-        ///   (4) load + start the child (child PSP links to the parent, inherits env);
-        ///   (5) drive the machine step until the CHILD terminates (nested run);
-        ///   (6) on terminate, restore the parent PSP/DTA + CPU state (keeping the
-        ///       advanced cycle ledger — no hole) and clear `terminated` for the
-        ///       parent; the child's exit code stays in `dos.ret_code` for AH=4D.
+        ///   (3) push the 18-byte parent register block on the PARENT stack + save
+        ///       the parent SS:SP into the PARENT PSP's saved-stack field (0x2E);
+        ///   (4) load + build the child (child PSP links to the parent, inherits env);
+        ///   (5) set the child SS:SP, push the child entry CS:IP, and redirect CS:IP
+        ///       at the RETF stub so the trap "returns into" the child.
         pub fn exec(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
             const al = cpu.st.getReg8(0);
             if (al != 0) {
                 // AL=01 load-but-don't-run / AL=03 overlay are not in scope for the
-                // child-EXEC band; flag faithfully (D11) without faking a run.
+                // child-EXEC band; flag faithfully (D11) without faking a run. (The
+                // de-nest must NOT make AL=03 transfer control — it stays rejected.)
                 dos.unsupported(cpu, br, 0x21);
                 return;
             }
@@ -568,25 +584,51 @@ pub fn Loader(comptime Cpu: type) type {
             // the CPU pushed for this INT 21h (IP@SS:SP, CS@SS:SP+2 —
             // interrupts.zig push order FLAGS,CS,IP). dos_execute.cpp:476 reads the
             // same words. The child PSP's SaveVectors (buildPsp) then captures this
-            // as the child's INT22 = the parent resume address.
-            const sp = cpu.st.getReg16(@intFromEnum(Reg32.esp));
+            // as the child's INT22 = the parent resume address. Preserve the old
+            // INT22 so a load failure can restore it (no child was entered).
+            const old_int22 = cpu.bus.readPhys32(0x22 * 4);
+            const frame_sp = cpu.st.getReg16(@intFromEnum(Reg32.esp));
             const ss = cpu.st.selector[@intFromEnum(Seg.ss)];
-            const ret_ip = cpu.bus.readPhys16((@as(u32, ss) << 4) + sp);
-            const ret_cs = cpu.bus.readPhys16((@as(u32, ss) << 4) + sp + 2);
+            const ret_ip = cpu.bus.readPhys16((@as(u32, ss) << 4) + frame_sp);
+            const ret_cs = cpu.bus.readPhys16((@as(u32, ss) << 4) + frame_sp + 2);
             const caller_int22: u32 = (@as(u32, ret_cs) << 16) | ret_ip;
             cpu.bus.writePhys32(0x22 * 4, caller_int22);
 
-            // (3) Snapshot the parent so it can resume after the child terminates.
-            const save = ParentSnapshot.capture(dos, cpu);
+            // (3) Push the 18-byte parent register block onto the PARENT stack
+            // (LOCKED §3) and save the parent SS:SP into the PARENT PSP's saved-
+            // stack field (0x2E) — exactly the slot `dos.terminate` restores from
+            // (dos_execute.cpp:477-480 reg_sp-=18 + callpsp.SetStack). The block
+            // layout (ascending from the new SP): AX,BX,CX,DX,SI,DI,BP,DS,ES. This
+            // is parent state, so it MUST be written before loadProgramExec switches
+            // current_psp/registers to the child. On a load failure (below) we undo
+            // it by restoring the parent SP — the parent never observed the push.
+            const parent_psp = dos.current_psp;
+            const new_sp = frame_sp -% PARENT_REG_BLOCK_BYTES;
+            const sbase: u32 = @as(u32, ss) << 4;
+            cpu.bus.writePhys16(sbase + new_sp + 0, cpu.st.getReg16(@intFromEnum(Reg32.eax)));
+            cpu.bus.writePhys16(sbase + new_sp + 2, cpu.st.getReg16(@intFromEnum(Reg32.ebx)));
+            cpu.bus.writePhys16(sbase + new_sp + 4, cpu.st.getReg16(@intFromEnum(Reg32.ecx)));
+            cpu.bus.writePhys16(sbase + new_sp + 6, cpu.st.getReg16(@intFromEnum(Reg32.edx)));
+            cpu.bus.writePhys16(sbase + new_sp + 8, cpu.st.getReg16(@intFromEnum(Reg32.esi)));
+            cpu.bus.writePhys16(sbase + new_sp + 10, cpu.st.getReg16(@intFromEnum(Reg32.edi)));
+            cpu.bus.writePhys16(sbase + new_sp + 12, cpu.st.getReg16(@intFromEnum(Reg32.ebp)));
+            cpu.bus.writePhys16(sbase + new_sp + 14, cpu.st.selector[@intFromEnum(Seg.ds)]);
+            cpu.bus.writePhys16(sbase + new_sp + 16, cpu.st.selector[@intFromEnum(Seg.es)]);
+            Psp.at(cpu, parent_psp).setStack(ss, new_sp);
 
-            // (4) Load + start the child. buildPsp links it to the parent and runs
-            // SaveVectors (capturing the INT22 we just set). On failure: restore the
-            // parent INT22 and the parent state, then return a faithful error.
+            // (4) Load + build the child. buildPsp links it to the parent and runs
+            // SaveVectors (capturing the INT22 we just set) and sets the child entry
+            // CS:IP/SS:SP via setupRun. On failure: restore the parent INT22 +
+            // parent SP (un-push the block) and return a faithful error WITHOUT
+            // having entered any child (LOCKED — the failure path must not alter
+            // parent CS:IP/SS:SP).
             var hostbuf: [13]u8 = undefined;
             const hn = r.name.display(&hostbuf);
-            _ = loadProgramExec(dos, cpu, r.drive, hn, ct, .load_and_run, params) catch |e| {
-                cpu.bus.writePhys32(0x22 * 4, save.parent_int22);
-                save.restore(dos, cpu);
+            const res = loadProgramExec(dos, cpu, r.drive, hn, ct, .load_and_run, params) catch |e| {
+                cpu.bus.writePhys32(0x22 * 4, old_int22);
+                dos.current_psp = parent_psp;
+                // (parent SS:SP/regs were never overwritten — loadProgramExec only
+                // calls setupRun on SUCCESS; the un-pushed block bytes are dead.)
                 dos.dosError(cpu, br, switch (e) {
                     error.NotFound => Dos.ERR_FILE_NOT_FOUND,
                     error.NoMemory => Dos.ERR_NOT_ENOUGH_MEM,
@@ -594,69 +636,27 @@ pub fn Loader(comptime Cpu: type) type {
                 });
                 return;
             };
-            const child_psp = dos.current_psp;
 
-            // (5) Run the child NESTED until it terminates (AH=4C/00/INT20 sets
-            // dos.terminated). Driven through the bridge's machine stepper so PIT/
-            // IRQ events fire and the nested instructions charge real cycles — no
-            // separate timing path, no ledger hole (mirrors runGuestInt, D3).
-            dos.terminated = false;
-            br.runUntil(dos, struct {
-                fn done(ctx: *anyopaque) bool {
-                    const d: *Dos = @ptrCast(@alignCast(ctx));
-                    return d.terminated;
-                }
-            }.done);
-
-            // (6) DOS_Terminate unwind (dos_execute.cpp:114-178): the child's
-            // terminate already restored INT 22/23/24 from the child PSP (dos.zig
-            // terminate). Free the child's memory, switch back to the parent PSP +
-            // DTA, restore the parent CPU state (keeping the advanced cycle ledger),
-            // and clear `terminated` so the PARENT keeps running. The child's exit
-            // code remains in dos.ret_code for AH=4D / the spawn() return.
-            freeProcessMemory(dos, child_psp);
-            save.restore(dos, cpu);
-            dos.terminated = false;
-            // Per dos_execute.cpp:540-543 (LOAD) the caller resumes with CF clear;
-            // the exit code is fetched separately via AH=4D.
-            br.setGuestCF(false);
+            // (5) Return INTO the child (dos_execute.cpp:546-572 LOADNGO). setupRun
+            // already loaded the child SS:SP/CS:IP/DS/ES/AX/BX. Re-model dosbox's
+            // "push CS:IP then jump to a RETF" so we resume the child via the RETF
+            // stub instead of the INT 21h trap's own IRET (which would pop the
+            // PARENT frame and clobber the child CS:IP). Push the child entry CS:IP
+            // onto the CHILD stack (CS then IP, IP on top — real-mode far-return
+            // order), then point CS:IP at the RETF stub. When this handler returns,
+            // EIP is already past the trap stub; the CPU fetches the RETF, which
+            // pops the child entry — the child's first instruction is the next thing
+            // the controller's step loop fetches. No nested host loop.
+            var csp = cpu.st.getReg16(@intFromEnum(Reg32.esp));
+            csp -%= 2;
+            cpu.segWrite16(.ss, csp, res.cs) catch {};
+            csp -%= 2;
+            cpu.segWrite16(.ss, csp, res.ip) catch {};
+            cpu.st.setReg16(@intFromEnum(Reg32.esp), csp);
+            const retf = @TypeOf(br.*).execRetfSegOff();
+            cpu.loadSegment(.cs, retf.seg);
+            cpu.st.eip = retf.off;
         }
-
-        /// The parent state captured across a nested child run. Restores everything
-        /// EXCEPT the cycle ledger (which must stay monotonic — the child's cycles
-        /// are real work, no hole). Mirrors the bridge runGuestInt save/restore.
-        const ParentSnapshot = struct {
-            st: @import("cpu").state.State,
-            dec: @import("cpu").decode.Decoded,
-            instr_start_eip: u32,
-            current_psp: u16,
-            dta_seg: u16,
-            dta_off: u16,
-            parent_int22: u32,
-
-            fn capture(dos: *Dos, cpu: *Cpu) ParentSnapshot {
-                return .{
-                    .st = cpu.st,
-                    .dec = cpu.dec,
-                    .instr_start_eip = cpu.instr_start_eip,
-                    .current_psp = dos.current_psp,
-                    .dta_seg = dos.dta_seg,
-                    .dta_off = dos.dta_off,
-                    .parent_int22 = cpu.bus.readPhys32(0x22 * 4),
-                };
-            }
-
-            fn restore(self: ParentSnapshot, dos: *Dos, cpu: *Cpu) void {
-                const saved_cycles = cpu.st.cycles;
-                cpu.st = self.st;
-                cpu.st.cycles = saved_cycles; // keep the advanced ledger (no hole)
-                cpu.dec = self.dec;
-                cpu.instr_start_eip = self.instr_start_eip;
-                dos.current_psp = self.current_psp;
-                dos.dta_seg = self.dta_seg;
-                dos.dta_off = self.dta_off;
-            }
-        };
 
         /// Read the byte-counted command tail at a far pointer into `buf`, returning
         /// the chars (without the length byte or the trailing CR).
@@ -666,13 +666,6 @@ pub fn Loader(comptime Cpu: type) type {
             var i: usize = 0;
             while (i < n) : (i += 1) buf[i] = cpu.bus.readPhys8(base + 1 + @as(u32, @intCast(i)));
             return buf[0..i];
-        }
-
-        /// Free all MCB blocks owned by `psp_seg` (DOS_FreeProcessMemory,
-        /// dos_execute.cpp:172). The child's PSP block + its env block + any heap it
-        /// allocated under its own PSP are released back to the arena.
-        fn freeProcessMemory(dos: *Dos, psp_seg: u16) void {
-            dos.mcb().freeByOwner(psp_seg);
         }
 
         const ResolvedExec = struct { drive: u8, name: name83.Name83 };

@@ -340,6 +340,9 @@ pub const Machine = struct {
         // the BIOS image AFTER the slot table (Phase 1d). INT 16h's IVT vector is
         // pointed at it in `bios.post`/initIvt, not at the bare int16 slot.
         self.bios.emitInt16Hybrid(&self.bios_image);
+        // Plant the EXEC "return into the child" RETF stub (nested-EXEC de-nest):
+        // `loader.exec` redirects CS:IP here after pushing the child entry CS:IP.
+        Bridge.emitExecRetf(&self.bios_image);
         // Stage the VGA ROM fonts into the BIOS image (the F000 window is ROM;
         // writes are dropped, so the bytes must be planted in the image before
         // loadRom). AH=1130 / IVT[0x1F]/[0x43] then return real font pointers.
@@ -609,6 +612,20 @@ pub const Machine = struct {
         /// `restoreBacking`), never inlined into this struct. Now that BACKING ==
         /// REPORTED (956 pages) the slab is far too large for a by-value snapshot.
         dos_ems: Dos.EmsType.Snapshot,
+        /// Host-side DOS KERNEL state the bus RAM slab does NOT cover. Before the
+        /// nested-EXEC de-nest these were a documented latent gap (machine.zig
+        /// audit above): mid-EXEC was never a first-class snapshot point because the
+        /// child ran nested inside one host trap. De-nesting makes mid-child a real
+        /// pause/snapshot boundary (a child breakpoint returns to the API with the
+        /// machine paused mid-child), so these MUST round-trip or a restore into a
+        /// fresh machine would resume the WRONG process/DTA. POD; snapshot-safe.
+        dos_current_psp: u16,
+        dos_current_drive: u8,
+        dos_dta_seg: u16,
+        dos_dta_off: u16,
+        dos_ret_code: u16,
+        dos_ret_type: u8,
+        dos_terminated: bool,
         shutdown: bool,
     };
 
@@ -624,6 +641,13 @@ pub const Machine = struct {
             .sched = self.sched.snapshot(),
             .dos_mouse = self.dos.mouse.snapshot(),
             .dos_ems = self.dos.ems.snapshot(),
+            .dos_current_psp = self.dos.current_psp,
+            .dos_current_drive = self.dos.current_drive,
+            .dos_dta_seg = self.dos.dta_seg,
+            .dos_dta_off = self.dos.dta_off,
+            .dos_ret_code = self.dos.ret_code,
+            .dos_ret_type = self.dos.ret_type,
+            .dos_terminated = self.dos.terminated,
             .shutdown = self.shutdown,
         };
     }
@@ -641,6 +665,13 @@ pub const Machine = struct {
         self.sched.restore(snap.sched);
         self.dos.mouse.restore(snap.dos_mouse);
         self.dos.ems.restore(snap.dos_ems);
+        self.dos.current_psp = snap.dos_current_psp;
+        self.dos.current_drive = snap.dos_current_drive;
+        self.dos.dta_seg = snap.dos_dta_seg;
+        self.dos.dta_off = snap.dos_dta_off;
+        self.dos.ret_code = snap.dos_ret_code;
+        self.dos.ret_type = snap.dos_ret_type;
+        self.dos.terminated = snap.dos_terminated;
         self.shutdown = snap.shutdown;
     }
 };

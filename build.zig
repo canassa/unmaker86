@@ -403,6 +403,20 @@ pub fn build(b: *std.Build) void {
     const dos_int21 = MachineTest.add(b, target, optimize, "src/dos/int21_test.zig", &dosbios_imports);
     const dos_name83 = MachineTest.add(b, target, optimize, "src/dos/name83_test.zig", &dosbios_imports);
     const dos_loader = MachineTest.add(b, target, optimize, "src/dos/loader_test.zig", &dosbios_imports);
+    // Nested-EXEC debugger visibility (plans/nested-exec-debug.md): drives the
+    // debug Controller INTO a child process, so it needs `debug` on top of the
+    // dosbios set (like bios_input_det).
+    const dos_nested_exec = MachineTest.add(b, target, optimize, "src/dos/nested_exec_debug_test.zig", &.{
+        .{ .name = "cpu", .mod = cpu_mod },
+        .{ .name = "bus", .mod = bus_mod },
+        .{ .name = "devices", .mod = devices_mod },
+        .{ .name = "timing", .mod = timing_mod },
+        .{ .name = "bridge", .mod = bridge_mod },
+        .{ .name = "bios", .mod = bios_mod },
+        .{ .name = "dos", .mod = dos_mod },
+        .{ .name = "machine", .mod = machine_mod },
+        .{ .name = "debug", .mod = debug_mod },
+    });
     const dos_integration = MachineTest.add(b, target, optimize, "src/dos/integration_test.zig", &dosbios_imports);
     const dos_determinism = MachineTest.add(b, target, optimize, "src/dos/determinism_test.zig", &dosbios_imports);
     // The real-CRT regression: load + run the committed Borland C++ 3.1 HELLO.EXE
@@ -458,6 +472,7 @@ pub fn build(b: *std.Build) void {
     dos_test_step.dependOn(&dos_int21.step);
     dos_test_step.dependOn(&dos_name83.step);
     dos_test_step.dependOn(&dos_loader.step);
+    dos_test_step.dependOn(&dos_nested_exec.step);
     dos_test_step.dependOn(&dos_integration.step);
     dos_test_step.dependOn(&dos_determinism.step);
     dos_test_step.dependOn(&dos_borland.step);
@@ -574,6 +589,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&dos_int21.step);
     test_step.dependOn(&dos_name83.step);
     test_step.dependOn(&dos_loader.step);
+    test_step.dependOn(&dos_nested_exec.step);
     test_step.dependOn(&dos_integration.step);
     test_step.dependOn(&dos_determinism.step);
     test_step.dependOn(&dos_borland.step);

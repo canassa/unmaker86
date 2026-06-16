@@ -27,20 +27,22 @@ live in `plans/debugging-with-zdos.md` — read that for the narrative; use this
    binary with a specific command tail (e.g. `ST.COM` → `STUNTS.COM` → `LOAD.EXE /u MCGA`). Debug
    the *launcher*, not the inner EXE — running the inner EXE directly gives it no command tail / PSP
    args and produces misleading symptoms (a NULL-arg parse, a clean early exit) that aren't real.
-   **CRITICAL — the nested-EXEC debugger blind spot:** zdos's `INT 21h AH=4Bh` runs the child
-   **nested to termination** inside the host handler (`loader.zig` `br.runUntil`), and that loop
-   steps the machine RAW — it does **NOT** consult your breakpoints / watchpoints / cycle-cap
-   between steps (`bridge.zig:runUntil`). So while the child runs (which, for a launcher chain, is
-   the ENTIRE inner game — possibly tens of millions of cycles), **NOTHING you set from the API
-   fires**: a `run-to-cycle N` whose N falls inside the child overshoots to the first boundary AFTER
-   the outermost EXEC returns; an `interrupt:0x21` breakpoint sees ZERO of the thousands of INT 21h
-   calls the child makes; `execution_address`/`memory`/`io` watchpoints never trip. The child's
-   whole run is opaque to the HTTP debugger. To observe inside it you must temporarily instrument
-   zdos's own Zig (a last-N-INT21h ring in `int21.zig` + a dump in `dos.terminate` is the proven
-   move — that pins exactly which calls/files preceded an abort, and the child's exit code/kind).
-   Symptom decoder: a launcher that "single-steps garbage through INT 1 with TF=1 after ~tens of
-   millions of cycles" is usually the launcher resuming onto a return frame the (now-terminated)
-   nested child clobbered — chase the child's exit, not the TF loop.
+   **Nested EXEC is now fully debuggable (de-nest landed).** zdos's `INT 21h AH=4Bh` no longer
+   runs the child nested inside the host handler — it sets up the child and **returns INTO it**, so
+   the child runs on the ONE controller-owned step loop. Your breakpoints / watchpoints / cycle-cap
+   / step ALL fire inside a child, at any depth: an `interrupt:0x21` breakpoint counts the inner
+   game's INT 21h calls; `run-to-cycle N` for an N inside the child stops AT N; `memory`/`io`/
+   `execution_address` watchpoints trip mid-child; `step`/`step-n` descend; a breakpoint pauses
+   mid-child and a later `run` resumes it, eventually unwinding to the parent at its INT 22h. So for
+   a launcher chain (`ST.COM`→`STUNTS.COM`→`LOAD.EXE`) you can debug the inner game directly from
+   the API — no need to re-instrument zdos's own Zig. (To learn the child's load segment so you can
+   set an `execution_address` bp in it, run to the child's first INT 21h delivery — at that boundary
+   the kernel's current PSP is already the child.) `step-over` of the `INT 21h AH=4Bh` EXEC itself
+   is a documented fallback (it step-INTOs the child rather than running the whole child as one
+   "call"), like the indirect-CALL case.
+   Symptom note: the old "launcher single-steps garbage through INT 1 with TF=1 after the inner
+   game already exited" symptom was an artifact of the nested-EXEC clobbering the resume frame; the
+   faithful INT-22h unwind removes that class of confusion.
 3. **Triage: terminated, hung, or crashed?** Run (`POST /api/run {"cycle_cap":N}`) then
    `GET /api/status` (`terminated` / `ret_code` / last stop) **and** `GET /api/console` FIRST. A
    program that *terminates* (e.g. INT 21h AH=4Ch with a non-zero exit + an error string on the

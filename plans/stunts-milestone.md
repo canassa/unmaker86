@@ -161,23 +161,22 @@ to ~3 min) corroborates every structural fact and adds the decisive divergence e
     route (parse the `CPU` + `Vga` savestate components) is the working oracle method here.
     Artifacts in `/tmp/sx_work/` (configs, `saves*/`, and C parsers `finder.c`/`fb.c`/`vgacomp.c`).
 
-### STRUCTURAL DEBUGGER LIMITATION discovered (flag, do not paper over)
+### STRUCTURAL DEBUGGER LIMITATION — RESOLVED (nested-EXEC de-nest)
 
-`bridge.runUntil` (the nested-EXEC driver, `bridge.zig:703`) steps the machine with the RAW
-`stepOnceThunk` and **does NOT consult the debug controller's breakpoints / watchpoints /
-cycle-cap between steps**. Consequences, all reproduced:
-  - `run-to-cycle N` for ANY N inside a nested EXEC (here cyc 1628 … 49,016,236) cannot stop —
-    it overshoots to the first boundary AFTER the outermost EXEC returns.
-  - `interrupt` / `memory` / `io` / `execution_address` breakpoints set from the API DO NOT
-    FIRE for anything the nested child does (the game made thousands of INT 21h calls in that
-    window; an `interrupt:0x21` breakpoint saw **zero** of them).
-  - The game's entire 49M-cycle init is opaque to the HTTP debugger; it can only be observed
-    by re-instrumenting zdos's own Zig (which is how the chronology above was obtained).
-This is the #1 thing to fix to make Stunts (and any launcher-chain game) debuggable: the
-nested-EXEC loop should route through the controller's step+scan (or the controller should
-expose a "step that descends into nested runUntil" mode). It is a debugger-plumbing change, not
-an emulation change — the emulation itself is faithful and deterministic (byte-identical CPU
-state at cycle 80M across two runs, verified this session).
+**RESOLVED** by `plans/nested-exec-debug.md` (approach B). `bridge.runUntil` (the old
+nested-EXEC driver that stepped the machine RAW, bypassing the controller's between-steps scan)
+is **deleted**. `INT 21h AH=4Bh` EXEC now sets up the child and **returns INTO it** via a planted
+`RETF` stub (`bridge.emitExecRetf`); the child runs on the ONE controller-owned step loop, and
+`dos.terminate` is the real `DOS_Terminate` unwind (restore parent SS:SP from the PSP saved-stack
+field 0x2E, pop the 18-byte parent register block, resume at INT 22h). So breakpoints /
+watchpoints / cycle-cap / step ALL work inside a child — `ST.COM`→`STUNTS.COM`→`LOAD.EXE`
+included. Verified live: `zdos --serve … ST.COM` + an API `interrupt:0x21` breakpoint now FIRES
+inside both nested children (caller CS=`3208` STUNTS.COM, then `bd0a`/`6066` LOAD.EXE) — it
+returned ZERO before. (The original "garbage TF loop after the abort" symptom was the launcher
+resuming onto a frame the nested child clobbered; the faithful INT-22h unwind removes that class.)
+Note: this does NOT by itself fix Stunts' AD15.DRV abort — it makes the abort's lead-up
+*debuggable* from the API. The emulation stayed faithful + deterministic throughout (byte-
+identical across two runs).
 
 ### Method notes / corrections for the next session
 - Drive via `ST.COM`. **Launch `--serve` ONLY via the harness background mode** (or a true
@@ -185,9 +184,9 @@ state at cycle 80M across two runs, verified this session).
   after answering one request and every subsequent `curl` "hangs"/fails. (`--break-cycle`
   headless is the reliable, fast path: `--break-cycle 60000000 … ST.COM` reaches the post-abort
   TF loop at F000:10D3 in ~2s.)
-- The HTTP debugger CANNOT see inside the nested EXEC (above). To inspect the game's init,
-  either fix `runUntil` to honor breakpoints, or temporarily instrument `int21.zig` /
-  `dos.terminate` (a last-N-calls ring + a terminate dump pinned this whole investigation).
+- The HTTP debugger NOW SEES INSIDE the nested EXEC (the de-nest landed — see above). Set an
+  `interrupt:0x21` / `memory` / `io` / `execution_address` breakpoint or a cycle cap and it fires
+  inside `STUNTS.COM` / `LOAD.EXE` directly — no need to re-instrument zdos's Zig for the chain.
 - `dosbox-x` oracle: needs `loadfix` (EXEPACK load-address quirk, not a Stunts bug) AND should
   set `[sblaster] sbtype=sb16 sbbase=220 irq=7 dma=1` so the SB-driver path matches "/ssb".
 - HARD RULES: faithful only; determinism is the prime directive; the exit(1) is the GUEST's

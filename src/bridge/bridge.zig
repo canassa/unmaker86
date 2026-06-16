@@ -382,6 +382,35 @@ pub fn Bridge(comptime Cpu: type) type {
             return .{ .seg = CB_SEG, .off = @intCast(INT16_HYBRID_PHYS - (@as(u32, CB_SEG) << 4)) };
         }
 
+        /// The EXEC "return into the child" RETF stub (a single `0xCB`) — the
+        /// faithful analogue of dosbox `dos_execute.cpp:557` ("Jump to retf so that
+        /// we only need to store cs:ip on the stack"). `loader.exec` pushes the
+        /// child entry CS:IP onto the CHILD stack and points CS:IP here; the RETF
+        /// pops that frame and the child's first instruction is the next thing the
+        /// (controller-owned) step loop fetches — NO nested host loop, so every
+        /// child instruction is visible to the debugger between-steps scan. Placed
+        /// in the BIOS ROM image immediately AFTER the INT 16h hybrid block (real
+        /// guest code at a fixed, paragraph-stable address; D4 faithfulness).
+        pub const EXEC_RETF_PHYS: u32 = INT16_HYBRID_PHYS + INT16_HYBRID_LEN;
+
+        comptime {
+            // The 1-byte RETF stub must fit inside the BIOS ROM window after the
+            // hybrid block.
+            std.debug.assert(EXEC_RETF_PHYS + 1 <= 0x100000);
+        }
+
+        /// The seg:off of the EXEC RETF stub (the CS:IP `loader.exec` redirects to).
+        pub fn execRetfSegOff() struct { seg: u16, off: u16 } {
+            return .{ .seg = CB_SEG, .off = @intCast(EXEC_RETF_PHYS - (@as(u32, CB_SEG) << 4)) };
+        }
+
+        /// Plant the single `RETF` byte of the EXEC return stub into `image` (the
+        /// BIOS ROM image). Call alongside `plantAll`/`emitInt16Hybrid` in `post`,
+        /// before `loadRom`, so it is real guest code at `EXEC_RETF_PHYS`.
+        pub fn emitExecRetf(image: []u8) void {
+            image[EXEC_RETF_PHYS - IMAGE_BASE] = OP_RETF;
+        }
+
         /// Parameters for the INT 16h host/guest-asm HYBRID block (Phase 1d).
         pub const Int16Hybrid = struct {
             /// Callback id of the host `int16.handle` (the AH=01/02/05/11/12/... path).
@@ -691,31 +720,14 @@ pub fn Bridge(comptime Cpu: type) type {
         pub fn onStopSentinel(self: *Self) void {
             self.reentry_done = true;
         }
-
-        /// Drive the MACHINE step until `predicate(ctx)` is true (D3 wiring). Used by
-        /// the EXEC path to run a loaded CHILD program to termination NESTED inside
-        /// the parent's INT 21h handler — the same deterministic, event-honoring
-        /// machine step `runGuestInt` uses (no separate timing path; the nested
-        /// instructions charge their real cycles through the normal ledger). The
-        /// caller has already set CS:IP/SS:SP to the child entry; this just runs.
-        /// BOUNDED — panics if the child never terminates (a structural bug, never a
-        /// silent hang).
-        pub fn runUntil(self: *Self, ctx: *anyopaque, predicate: *const fn (*anyopaque) bool) void {
-            std.debug.assert(self.step_one != null); // stepper must be wired
-            std.debug.assert(self.depth < MAX_DEPTH); // depth guard (D3)
-            self.depth += 1;
-            defer self.depth -= 1;
-
-            var guard: u64 = 0;
-            const max_steps: u64 = 2_000_000_000; // bounded; flag loudly if exceeded
-            while (!predicate(ctx)) {
-                self.step_one.?(self.step_ctx.?);
-                guard += 1;
-                if (guard >= max_steps) {
-                    std.debug.panic("bridge.runUntil: child did not terminate within {d} steps", .{max_steps});
-                }
-            }
-        }
+        // NB: the old `runUntil` (a nested host loop that drove a loaded CHILD to
+        // termination inside the parent's INT 21h handler) was DELETED in the
+        // nested-EXEC de-nest (plans/nested-exec-debug.md). EXEC now returns INTO
+        // the child via `emitExecRetf` and the child runs on the ONE controller-
+        // owned step loop — so breakpoints/watchpoints/step/pause work inside a
+        // child. `runGuestInt`/`runGuestFarCall` remain: they model genuinely
+        // re-entrant, bounded host->guest->host calls (mouse callback, INT 16h
+        // poll), which EXEC was never an instance of.
     };
 }
 
