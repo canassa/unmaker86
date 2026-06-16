@@ -13,27 +13,41 @@ This skill is the workflow + the exact API moves for debugging a guest. The deta
 example (root-causing the EXEPACK "Packed file is corrupt" crash) and the open-tooling backlog
 live in `plans/debugging-with-zdos.md` — read that for the narrative; use this for the moves.
 
+> **curl note:** every `POST` with a body needs `-H 'Content-Type: application/json'` — without it
+> you get `415 unsupported_media_type` (a non-empty body MUST be JSON; `server.zig:654`). `GET`s
+> need no header.
+
 ## The recipe (the spine)
 
 1. **Reproduce headless** with a cycle budget: `zdos --break-cycle N <PROG> [args]`. Record where
    it dies (cycle + symptom). Deterministic and cheap.
-2. **Serve it**: `zdos --serve <PORT> <PROG> [args]` — it loads the program and **pauses at the
-   entry point** before listening, so you inspect the pristine load for free.
-3. **Verify the load first** (rules out loader bugs): diff `GET /api/mem` against the file body and
+2. **Serve the REAL entry point**: `zdos --serve <PORT> <PROG> [args]` — it loads the program and
+   **pauses at the entry point** before listening, so you inspect the pristine load for free.
+   Beware **launcher chains**: many games ship a small launcher that `INT 21h AH=4Bh` EXECs the real
+   binary with a specific command tail (e.g. `ST.COM` → `STUNTS.COM` → `LOAD.EXE /u MCGA`). Debug
+   the *launcher*, not the inner EXE — running the inner EXE directly gives it no command tail / PSP
+   args and produces misleading symptoms (a NULL-arg parse, a clean early exit) that aren't real.
+3. **Triage: terminated, hung, or crashed?** Run (`POST /api/run {"cycle_cap":N}`) then
+   `GET /api/status` (`terminated` / `ret_code` / last stop) **and** `GET /api/console` FIRST. A
+   program that *terminates* (e.g. INT 21h AH=4Ch with a non-zero exit + an error string on the
+   console) is a completely different investigation from one that *hangs* (spins) — and the console
+   message usually names the failure. Don't assume "hang"; check. (`run`/`run-to-cycle` return
+   `program_terminated` once the guest exits.)
+4. **Verify the load** (rules out loader bugs): diff `GET /api/mem` against the file body and
    sanity-check `GET /api/cpu` (CS:IP / SS:SP / DS / ES, and the `*_base` fields) vs. the headers.
    Most "loader" bugs are actually downstream — a self-decompressor failing is almost always the
    *machine* (CPU/bus/BIOS), not the loader, which only has to place bytes correctly.
-4. **Find the error/code path in memory**: `GET /api/mem/search?ascii=<text>` or `?pattern=<hex>`
+5. **Find the error/code path in memory**: `GET /api/mem/search?ascii=<text>` or `?pattern=<hex>`
    to locate a string / magic / opcode sequence in *guest RAM* (survives relocation, unlike a file
    grep).
-5. **Localize the failing instruction**: `GET /api/disasm` around the suspect address; set a
+6. **Localize the failing instruction**: `GET /api/disasm` around the suspect address; set a
    breakpoint (exec-address / cycle / interrupt / memory / io); `POST /api/run`; `step` / `step-n`
    / `step-over` while reading `GET /api/cpu`.
-6. **Read the divergent state**: at the failing instruction, dump regs + the memory/ports it
+7. **Read the divergent state**: at the failing instruction, dump regs + the memory/ports it
    touches. The wrong value names the wrong layer (loader / CPU / bus / BIOS / device).
-7. **Oracle-diff** against DOSBox-x (runnable here) or the reference sources when you need to know
+8. **Oracle-diff** against DOSBox-x (runnable here) or the reference sources when you need to know
    *which* behavior diverged.
-8. **Fix + verify with determinism**: minimal faithful fix; re-run twice → byte-identical CPU
+9. **Fix + verify with determinism**: minimal faithful fix; re-run twice → byte-identical CPU
    state at a fixed cycle; add a self-contained regression test; keep `zig build test` green.
 
 ## The toolbox (exact API moves)
@@ -58,7 +72,7 @@ Start: `zdos --serve 8099 <PROG> [args]` → `[zdos] listening 127.0.0.1:8099`. 
 | Run to a cycle | `POST /api/run-to-cycle {"cycle":N}` |
 | Single step / N steps | `POST /api/step` · `POST /api/step-n {"n":N}` |
 | **Step over** (CALL/INT/**REP**) | `POST /api/step-over` → `{"stop":{…},"stepped_into":bool}` |
-| Inject input | `POST /api/input/key` · `POST /api/input/mouse` |
+| Inject input | `POST /api/input/key {"char":"a"}` (or `{"scancode":N,"make":bool,"ext":bool}`) · `POST /api/input/mouse` |
 | Reset + reload | `POST /api/reset` then `POST /api/load {}` |
 
 ### Breakpoint & watchpoint kinds (`src/debug/breakpoints.zig`)
@@ -82,7 +96,30 @@ Start: `zdos --serve 8099 <PROG> [args]` → `[zdos] listening 127.0.0.1:8099`. 
   side-effect-free at the boundary — answers "what wrote this, and with what value?".
 - **`step-over` runs a whole `REP` string op** (all iterations, real cycles) in one command, immune
   to a mid-REP IRQ. Plain `step` advances ONE rep iteration (EIP stays pinned at the REP) — faithful
-  but looks like a hang on a large `rep movsb`; use `step-over` to skip past it.
+  but looks like a hang on a large `rep movsb`; use `step-over` to skip past it. `stepped_into:true`
+  in the response means it could NOT step over (e.g. an indirect CALL) and fell back to a single
+  step-in — so CS:IP may now be *inside* the callee, not past it.
+- **`run`/`run-to-cycle`/`step` stop at the FIRST matching ENABLED breakpoint**, not just the one
+  you care about. A leftover `interrupt`/exec breakpoint will pre-empt a cycle-targeted run (e.g. an
+  enabled `interrupt:33` stops `run-to-cycle 574000` at the first INT 21h). **Disable/delete
+  unrelated breakpoints before a targeted run** (`DELETE /api/breakpoints/<id>` or PATCH-disable).
+- **An `interrupt` breakpoint stops at the BIOS/handler entry (CS=F000…), not the guest call
+  site.** To recover the caller, read the INT-pushed return frame off the stack:
+  `phys = ss_base + sp` → IP, then `+2` → CS, `+4` → FLAGS (via `GET /api/mem`).
+- **To NAME a fault/trap spin loop, sweep `interrupt` breakpoints on the CPU exception vectors
+  (0–13)** and run. Whichever fires identifies the loop: 0=#DE, 1=#DB (TF single-step), 3=INT3,
+  6=#UD (executing garbage), 8=#DF, 13=#GP. This is often the single decisive move on a "spins
+  forever" bug — e.g. a vector-1 hit means a single-step (#DB) loop. (The delivered vector is NOT
+  exposed by any GET — `cpu.st.last_delivered.vector` has no endpoint — so a per-vector `interrupt`
+  breakpoint is the way to discover it.)
+
+### Reading a DOS call's arguments (INT 21h)
+
+The single most useful move for DOS-call debugging — "what file/string/buffer is this call acting
+on?" Most INT 21h calls pass a pointer in **DS:DX**. At the call boundary:
+`phys = ds_base + (edx & 0xFFFF)` (read `ds_base`/`edx` from `GET /api/cpu`), then
+`GET /api/mem?phys=<that>&len=…` to read the filename/string. (For the buffer of an AH=40h write,
+the length is in CX.) This turns "INT 21h AH=3Dh failed" into "it tried to open `<name>`".
 
 ### Purity / determinism guarantees (rely on these)
 
@@ -99,6 +136,9 @@ zdos's whole premise is "compare to a known-good reference." Two oracles:
   spice86 under `references/spice86/`). For loader/behavior questions, diff the relevant zdos source
   against the reference line-by-line (e.g. `src/dos/loader.zig` vs.
   `references/dosbox-staging/src/dos/dos_execute.cpp`; A20/memory vs. `hardware/memory.cpp`).
+  Caveat: a high-load **EXEPACK** program can report "Packed file is corrupt" under DOSBox-x unless
+  you `loadfix` it — that's a DOSBox load-*address* limitation, not a guest or zdos bug, so a
+  DOSBox failure there is not evidence against zdos (zdos's A20-off POST handles the 1 MiB wrap).
 - **Cycle-determinism is itself an oracle.** Re-run to a fixed cycle and compare registers to prove
   a fix changed only what you intended; bisect a divergence by cycle (`run-to-cycle` then `step`).
 
@@ -116,12 +156,18 @@ zdos's whole premise is "compare to a known-good reference." Two oracles:
 
 ## Staging hygiene
 
-- **DOS filenames must be UPPERCASE 8.3** on the host mount (the VFS is host-case-sensitive); a
-  lowercase `load.exe` is "not found."
+- **The VFS matches host filenames CASE-INSENSITIVELY** (`src/dos/vfs.zig:264` `eqlIgnoreCase`, plus
+  8.3-munge for long names) — a guest opening lowercase `load.exe` resolves to host `LOAD.EXE` fine.
+  Uppercase 8.3 host names are still good hygiene (they ARE the DOS name, no munge), but a
+  "file not found" is **not** caused by case — look elsewhere (wrong path, a NULL filename the guest
+  built, a missing file).
 - Game assets are **not committed** — black-box tests are presence-gated and SKIP honestly when the
   assets are absent. Never fabricate a pass or a golden.
 - Capture progress headlessly via `/api/console` + `/api/framebuffer?format=png` (no display
   needed).
+- **Keep `--serve` alive across calls:** a server started with a trailing `&` inside a one-shot
+  shell gets reaped when that shell exits. Launch it in the harness's background mode (or
+  `nohup … & disown`) so it survives, then drive it with separate `curl` calls.
 
 ## Ground rule
 
