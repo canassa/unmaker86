@@ -61,6 +61,14 @@ comptime {
 
 pub const Command = union(enum) {
     run: struct { cycle_cap: u64 },
+    /// A single paced free-run slice (video-stream §5). Identical to `.run` —
+    /// `Controller.runUntilEvent(slice_cycles)`, a bounded deterministic run — but
+    /// it is the command the host-side run-pacer (`src/host/run_pacer.zig`) submits
+    /// each wall-clock tick. Kept distinct from `.run` so the pacer's slices are
+    /// self-documenting on the wire and a future change to one path cannot silently
+    /// alter the other. Pointer-free POD; returns the `StopReason` so the pacer can
+    /// disarm on a terminal (program_terminated/shutdown/halted_forever).
+    run_slice: struct { slice_cycles: u64 },
     run_to_cycle: struct { cycle: u64 },
     run_to_address: struct { linear: u32 },
     step: void,
@@ -304,6 +312,18 @@ pub const RequestCtx = struct {
 pub const CommandQueue = struct {
     io: Io,
     mutex: Io.Mutex = .init,
+    /// The SUBMIT-GATE (video-stream §5/§9, the multi-producer correctness fix).
+    /// Held by a producer for the ENTIRE submit-and-wait, so concurrent host
+    /// producers (the run-pacer, a frame producer, per-connection input) strictly
+    /// SERIALIZE. Without it the internal `mutex` is RELEASED by the condvar
+    /// `waitUncancelable` below — letting a second producer acquire `mutex` in that
+    /// window and trip the `head==tail` assert (`submit`), since the one-in-flight
+    /// invariant is NOT multi-producer-safe by itself. With the gate, exactly one
+    /// producer is ever inside `submit` at a time → the assert + the one-in-flight
+    /// invariant hold BY CONSTRUCTION. No timeout (`*Uncancelable`, clockless), so
+    /// the determinism grep-gate is unaffected. Single-producer callers are
+    /// unchanged: an uncontended gate lock/unlock is a single CAS pair.
+    submit_gate: Io.Mutex = .init,
     /// Worker wakes on this when a command is enqueued.
     work_ready: Io.Condition = .init,
     ring: [QUEUE_CAP]?*RequestCtx = @splat(null),
@@ -316,13 +336,19 @@ pub const CommandQueue = struct {
 
     /// Producer side: enqueue `ctx` and BLOCK until the worker completes it,
     /// returning the filled `Response`. The "one command in flight" mechanism: after
-    /// taking the mutex we ASSERT the queue is empty — a second concurrent producer
-    /// (impossible in v1's single-listener/one-connection design) would trip this in
-    /// a debug build, surfacing a regression instead of silently smearing ordering.
+    /// taking the mutex we ASSERT the queue is empty — with the SUBMIT-GATE held
+    /// across the whole call (taken first here, released last), only one producer is
+    /// ever inside this body, so the assert holds even with multiple host producers
+    /// (the run-pacer, frame producer, per-connection input). The gate is what makes
+    /// concurrent producers safe: the internal condvar wait below RELEASES `mutex`,
+    /// so without the gate a second producer could race the assert.
     pub fn submit(self: *CommandQueue, ctx: *RequestCtx) Response {
         const io = self.io;
+        // Serialize producers for the ENTIRE submit-and-wait (the multi-producer fix).
+        self.submit_gate.lockUncancelable(io);
+        defer self.submit_gate.unlock(io);
         self.mutex.lockUncancelable(io);
-        // Mechanism, not discipline: at most one command in flight.
+        // Mechanism, not discipline: at most one command in flight (gate-enforced).
         std.debug.assert(self.head == self.tail);
         ctx.done = false;
         self.ring[self.tail & QUEUE_MASK] = ctx;

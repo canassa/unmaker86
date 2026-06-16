@@ -25,6 +25,18 @@ const api_sources = [_][]const u8{
     @embedFile("json_wire.zig"),
     @embedFile("worker.zig"),
     @embedFile("server.zig"),
+    // The run-ownership/arm-flag coordination block (stream §5). It is CLOCKLESS by
+    // design (only `std.atomic` + a no-timeout `Io.Mutex`) — the pacer's host clock
+    // lives in `src/host/run_pacer.zig`, OUTSIDE this embedded set (§5.1a). Embedding
+    // it here proves no clock affordance crept into the api coordination state.
+    @embedFile("run_control.zig"),
+    // The live video-stream side (Phase 3). CLOCKLESS by design: the shared-frame
+    // producer/copy and the per-connection stream threads carry NO host clock — the fps
+    // sampling cadence is decided by the pacer in `src/host/run_pacer.zig` (outside this
+    // embedded set, §5.1a). Embedding them proves the stream path added no clock
+    // affordance to any api source (the frame capture is the cycle-neutral peek).
+    @embedFile("shared_frame.zig"),
+    @embedFile("stream.zig"),
 };
 
 test "src/api grep: no host time / RNG / env / floats / clock affordances" {

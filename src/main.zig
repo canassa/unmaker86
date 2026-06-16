@@ -14,6 +14,7 @@ const std = @import("std");
 const machine_mod = @import("machine");
 const debug_mod = @import("debug");
 const api_mod = @import("api");
+const host_mod = @import("host");
 
 const Machine = machine_mod.Machine;
 const Controller = debug_mod.Controller;
@@ -158,6 +159,37 @@ pub fn main(init: std.process.Init) !void {
         var sbuf: [96]u8 = undefined;
         const banner = std.fmt.bufPrint(&sbuf, "\n[zdos] listening 127.0.0.1:{d}\n", .{server.boundPort()}) catch "\n[zdos] listening\n";
         try stderr.writeStreamingAll(io, banner);
+
+        // The host-side run-pacer (stream §5): a separate thread that, while armed via
+        // `POST /api/run/start`, submits `run_slice` through the submit-gated queue and
+        // sleeps the rest of each wall-clock tick. The HOST CLOCK lives in
+        // `src/host/run_pacer.zig` (outside the api grep-gate, §5.1a). It reaches the
+        // worker ONLY via the gated queue, so it never perturbs the cycle ledger.
+        var pacer: host_mod.RunPacer = .{
+            .queue = server.queueRef(),
+            .control = server.runControl(),
+            .io = io,
+            // The live-stream frame producer (§4.1): each fps tick the pacer captures a
+            // frame via the gated queue and copies it into the shared latest-frame
+            // buffer for the per-connection stream threads. The hub's pointers are wired
+            // by `server.serve()` → `wireStream()` before any client connects.
+            .hub = server.streamHub(),
+        };
+        pacer.start() catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "zdos: --serve pacer start failed: {t}\n", .{err}) catch "zdos: --serve pacer start failed\n";
+            try stderr.writeStreamingAll(io, msg);
+            std.process.exit(1);
+        };
+        // §9.1 shutdown ordering: the server stops + joins the pacer BEFORE the worker
+        // sentinel (so a pacer submit can't race it). Register the pacer's join as the
+        // server's pre-shutdown hook.
+        server.setPreShutdown(&pacer, struct {
+            fn hook(ctx: ?*anyopaque) void {
+                const p: *host_mod.RunPacer = @ptrCast(@alignCast(ctx.?));
+                p.join();
+            }
+        }.hook);
 
         server.serve() catch |err| {
             var buf: [128]u8 = undefined;

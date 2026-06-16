@@ -201,6 +201,65 @@ test "#8 adversarial: a second producer during an in-flight long run trips the e
     queue.mutex.unlock(io);
 }
 
+// ---------------------------------------------------------------------------
+// Submit-gate (video-stream §5/§9): the queue is made MULTI-PRODUCER-SAFE by a
+// dedicated submit-gate mutex held across the whole submit-and-wait. Two threads
+// hammering `submit()` concurrently must BOTH complete and NEVER trip the
+// `head==tail` assert (which `#8` proves the bare invariant cannot uphold).
+// ---------------------------------------------------------------------------
+
+const ProducerArgs = struct {
+    queue: *q.CommandQueue,
+    iters: usize,
+    ok_count: *std.atomic.Value(usize),
+};
+
+fn producerThread(args: ProducerArgs) void {
+    var i: usize = 0;
+    while (i < args.iters) : (i += 1) {
+        // `run_slice` of 1 cycle — a tiny bounded run, the pacer's command kind.
+        var ctx: q.RequestCtx = .{ .cmd = .{ .run = .{ .cycle_cap = 1 } } };
+        const r = args.queue.submit(&ctx);
+        if (r == .stop) _ = args.ok_count.fetchAdd(1, .monotonic);
+    }
+}
+
+test "submit-gate: two concurrent producers both complete, no assert trip (multi-producer-safe)" {
+    // WITHOUT the submit-gate this races the `assert(head==tail)` in submit(): the
+    // condvar `waitUncancelable` releases the internal mutex, letting the 2nd producer
+    // acquire it and enqueue while the 1st is still in flight. WITH the gate, exactly
+    // one producer is inside submit() at a time, so both complete cleanly. Run under a
+    // real worker drain loop + the real Threaded io (genuine OS scheduling).
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    var ctrl = Controller.init(m);
+
+    var queue = q.CommandQueue.init(io);
+    const wt = try std.Thread.spawn(.{}, workerThread, .{WorkerArgs{ .queue = &queue, .ctrl = &ctrl }});
+
+    var ok = std.atomic.Value(usize).init(0);
+    const iters: usize = 200;
+    const a = try std.Thread.spawn(.{}, producerThread, .{ProducerArgs{ .queue = &queue, .iters = iters, .ok_count = &ok }});
+    const b = try std.Thread.spawn(.{}, producerThread, .{ProducerArgs{ .queue = &queue, .iters = iters, .ok_count = &ok }});
+    a.join();
+    b.join();
+
+    // Both producers completed every submit (no panic, no lost completion).
+    try std.testing.expectEqual(@as(usize, iters * 2), ok.load(.monotonic));
+
+    // The queue is empty + consistent after the storm (one-in-flight held throughout).
+    try std.testing.expectEqual(queue.head, queue.tail);
+
+    var ctxs: q.RequestCtx = .{ .cmd = .shutdown_worker };
+    _ = queue.submit(&ctxs);
+    wt.join();
+}
+
 test "#8b adversarial under real scheduling: a long capped run + serialized follow-ups stay byte-identical" {
     // The realized single-client sequence: a long capped run (large cycle_cap that
     // terminates at the program's permanent HLT), then cpu_get. Repeated N times

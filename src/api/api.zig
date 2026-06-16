@@ -19,6 +19,9 @@ const queue = @import("queue.zig");
 const json_wire = @import("json_wire.zig");
 const worker = @import("worker.zig");
 const server = @import("server.zig");
+const run_control = @import("run_control.zig");
+const stream = @import("stream.zig");
+const shared_frame = @import("shared_frame.zig");
 
 // ---- the command queue + handoff (Phase 2) ----
 pub const Command = queue.Command;
@@ -41,15 +44,34 @@ pub const MountSource = worker.MountSource;
 pub const Server = server.Server;
 pub const LoadRecipe = server.LoadRecipe;
 
+// ---- run-ownership arbitration + the clockless pacer arm flag (stream §5) ----
+// The host-side pacer (`src/host/run_pacer.zig`) drives the paced free-run loop; it
+// flips/polls THIS clockless control block (no host clock here — see §5.1a).
+pub const RunControl = run_control.RunControl;
+pub const RunOwner = run_control.RunOwner;
+pub const StopTag = run_control.StopTag;
+
+// ---- the live video stream (Phase 3): shared latest-frame + per-conn threads ----
+// All host-side observation through the gated queue (cycle-neutral peek). The host
+// pacer drives the producer via `StreamHub.produceFrame` each fps tick.
+pub const StreamHub = stream.StreamHub;
+pub const SharedFrame = shared_frame.SharedFrame;
+pub const stream_wire = shared_frame; // the §6.3 wire-protocol helpers (writeHeader, flags)
+
 test {
     _ = queue;
     _ = json_wire;
     _ = worker;
     _ = server;
+    _ = run_control;
+    _ = stream;
+    _ = shared_frame;
     _ = @import("json_wire_test.zig");
     _ = @import("queue_test.zig");
     _ = @import("worker_test.zig");
     _ = @import("server_test.zig");
     _ = @import("determinism_test.zig");
     _ = @import("png_test.zig");
+    _ = @import("run_control_test.zig");
+    _ = @import("stream_test.zig");
 }

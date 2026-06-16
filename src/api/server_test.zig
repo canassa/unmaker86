@@ -343,6 +343,100 @@ test "#4 capped-run reproducibility through the handler path (two fresh servers)
 }
 
 // ---------------------------------------------------------------------------
+// Static UI serving (video-stream Phase 1 / http-static-serving.md). Off-worker,
+// same-origin homepage; the branches sit after `/api/*` and before the 404.
+// ---------------------------------------------------------------------------
+
+test "GET / serves the index.html page (200, text/html, known marker)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const out = try std.testing.allocator.alloc(u8, 16 * 1024);
+    defer std.testing.allocator.free(out);
+    const raw = ts.request("GET / HTTP/1.1\r\nHost: x\r\n\r\n", out);
+    const r = splitResponse(raw);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", headerValue(raw, "content-type").?);
+    try std.testing.expectEqualStrings("no-cache", headerValue(raw, "cache-control").?);
+    // The page carries an explicit marker proving it (not a 404 body) was served.
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "zdos-player-canvas") != null);
+    // It pulls in the WebGL2 player script.
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "app.js") != null);
+}
+
+test "GET /app.js serves the script with text/javascript" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    // The player script is larger than the other assets; size for the full body.
+    const out = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(out);
+    const raw = ts.request("GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n", out);
+    const r = splitResponse(raw);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqualStrings("text/javascript; charset=utf-8", headerValue(raw, "content-type").?);
+    // The full script body fit in the buffer (no truncation).
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\r\n\r\n") != null);
+    // The player script connects to the stream and forwards input.
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "/api/stream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "/api/input/key") != null);
+}
+
+test "GET /style.css serves the stylesheet with text/css" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const out = try std.testing.allocator.alloc(u8, 16 * 1024);
+    defer std.testing.allocator.free(out);
+    const raw = ts.request("GET /style.css HTTP/1.1\r\nHost: x\r\n\r\n", out);
+    const r = splitResponse(raw);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqualStrings("text/css; charset=utf-8", headerValue(raw, "content-type").?);
+}
+
+test "HEAD / returns headers with no body (200, text/html)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const out = try std.testing.allocator.alloc(u8, 16 * 1024);
+    defer std.testing.allocator.free(out);
+    const raw = ts.request("HEAD / HTTP/1.1\r\nHost: x\r\n\r\n", out);
+    const r = splitResponse(raw);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", headerValue(raw, "content-type").?);
+    // HEAD: headers present (incl. content-length), but no body.
+    try std.testing.expectEqual(@as(usize, 0), r.body.len);
+    try std.testing.expect(headerValue(raw, "content-length") != null);
+}
+
+test "unknown static path → 404 (no shadowing of the 404 catch-all)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = get(&ts, "/nope.html", &obuf);
+    try std.testing.expectEqual(@as(u16, 404), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"not_found\"") != null);
+}
+
+test "POST / on a static asset → 405 method_not_allowed" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = post(&ts, "/", "", &obuf);
+    try std.testing.expectEqual(@as(u16, 405), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"method_not_allowed\"") != null);
+}
+
+test "static routes do not shadow the API (/api/health still resolves)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = get(&ts, "/api/health", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"version\":\"zdos-m2\"}", r.body);
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/framebuffer (Phase 4, B1) — the raw-binary capture transport. The
 // pixels stream from the server-owned render buffer, NOT through resp_buf/JSON.
 // ---------------------------------------------------------------------------

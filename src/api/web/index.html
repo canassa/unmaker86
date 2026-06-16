@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zdos &mdash; live</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="stage">
+  <!-- The WebGL2 surface. The backing store is resized to the guest resolution
+       on every (width,height) change; CSS scales it to the viewport (NEAREST +
+       image-rendering:pixelated keep the upscale crisp). -->
+  <canvas id="screen" width="320" height="200" tabindex="0"
+          data-marker="zdos-player-canvas"></canvas>
+
+  <!-- Shown when the guest is in a mode the player can't render (text mode or an
+       unsupported flag), or while (re)connecting. Hidden during normal streaming.
+       The socket is NEVER torn down for an unsupported frame; streaming resumes
+       automatically when a renderable frame arrives. -->
+  <div id="overlay" class="overlay">
+    <div id="overlay-msg" class="overlay-msg">connecting&hellip;</div>
+  </div>
+</div>
+
+<div id="hud" class="hud">
+  <span id="status" class="status pending">connecting&hellip;</span>
+  <span id="info" class="info"></span>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -30,9 +30,12 @@ const debug = @import("debug");
 const cpu_mod = @import("cpu");
 const q = @import("queue.zig");
 const worker_mod = @import("worker.zig");
+const run_control = @import("run_control.zig");
 const wire = @import("json_wire.zig");
 const scancodes = @import("bios").scancodes;
 const png = @import("png.zig");
+const stream_mod = @import("stream.zig");
+const sf = @import("shared_frame.zig");
 
 /// The three `/api/framebuffer?format=` surfaces (§3.2). `index`/`rgba` stream the raw
 /// server-owned buffer (the byte-diffable oracle); `png` is a derived, viewable artifact.
@@ -54,6 +57,31 @@ const MAX_BODY = 64 * 1024; // > MAX_MEM_CHUNK*2 hex + JSON overhead; reject lar
 const RESPONSE_BUF = 32 * 1024; // serialized JSON body
 
 const json_content_type = [_]http.Header{.{ .name = "content-type", .value = "application/json; charset=utf-8" }};
+
+/// Static UI assets, embedded at compile time (`@embedFile` resolves relative to
+/// THIS source file, so no `build.zig` change is needed). The servable file set is
+/// fixed at compile time → a single self-contained binary, no runtime FS dependency,
+/// and zero path-traversal surface. Served same-origin so the page's `fetch('/api/*')`
+/// and a future stream socket need no CORS / second port. See `plans/http-static-serving.md`.
+const StaticAsset = struct { path: []const u8, bytes: []const u8 };
+const static_assets = [_]StaticAsset{
+    .{ .path = "/", .bytes = @embedFile("web/index.html") },
+    .{ .path = "/index.html", .bytes = @embedFile("web/index.html") },
+    .{ .path = "/app.js", .bytes = @embedFile("web/app.js") },
+    .{ .path = "/style.css", .bytes = @embedFile("web/style.css") },
+};
+
+/// Map a request path's extension to a MIME type (the tiny v1 set). `/` (no
+/// extension) and anything unknown fall back to HTML / octet-stream respectively.
+fn contentTypeFor(path: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, path, ".html") or std.mem.eql(u8, path, "/")) return "text/html; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".js")) return "text/javascript; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".png")) return "image/png";
+    if (std.mem.endsWith(u8, path, ".ico")) return "image/x-icon";
+    if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
+    return "application/octet-stream";
+}
 
 /// The server-held program-load recipe (captured at `--serve` startup, updated by
 /// `POST /api/load`). Re-applied via the worker — the only way to a runnable
@@ -103,12 +131,34 @@ pub const Server = struct {
     worker_thread: ?std.Thread = null,
     net_server: ?net.Server = null,
 
+    /// Run-ownership arbitration + the pacer arm flag (stream §5.2/§5.3). CLOCKLESS
+    /// (only atomics + a no-timeout mutex), so it is safe in the api determinism
+    /// grep-gate. `/api/run/start|stop` flip it; debugger commands auto-disarm via it.
+    /// The host run-pacer (`src/host/run_pacer.zig`) holds a pointer to this and polls
+    /// `armed`. Server-owned (allocated once at `init`, like `render`).
+    run_control: *run_control.RunControl,
+
+    /// A pre-shutdown hook invoked ONCE before the worker `shutdown_worker` sentinel
+    /// (shutdown ordering §9.1: stop + join any host producer — the run-pacer — so its
+    /// submit cannot race the sentinel). Type-agnostic (opaque ctx + fn) so the server
+    /// stays free of any `src/host` dependency. main.zig registers the pacer's join.
+    pre_shutdown_ctx: ?*anyopaque = null,
+    pre_shutdown_fn: ?*const fn (?*anyopaque) void = null,
+
     /// The server-owned fixed render buffers for `GET /api/framebuffer` (B1):
     /// allocated ONCE at `init` (~1.5 MiB; too large for the stack/`resp_buf`), reused
     /// for every capture. The worker renders into these via the pure peek; the server
     /// streams the selected buffer as a raw binary body — the pixels NEVER flow through
     /// `resp_buf`/JSON.
     render: *worker_mod.RenderBuffers,
+
+    /// The live-video-stream side (§4/§6/§9.1): the shared latest-frame buffer + the
+    /// per-connection stream-thread registry/cap + the frame producer. Server-owned,
+    /// allocated ONCE at `init` (a stable pointer the pacer + stream threads hold). All
+    /// host-side observation — it reaches the worker ONLY via the gated queue
+    /// (`framebuffer_get`), so it charges no cycle and never perturbs ordering.
+    shared_frame: *sf.SharedFrame,
+    stream_hub: *stream_mod.StreamHub,
 
     // Per-request scratch (one connection at a time → safe to reuse).
     arena: std.heap.ArenaAllocator,
@@ -120,6 +170,18 @@ pub const Server = struct {
         // The server-owned render buffers (~1.5 MiB) are heap-allocated ONCE here
         // (B1: no per-op alloc; too large for the stack/`resp_buf`).
         const render = try gpa.create(worker_mod.RenderBuffers);
+        errdefer gpa.destroy(render);
+        // The run-control block (clockless arm flag + owner). Heap-allocated ONCE so
+        // the host pacer can hold a stable pointer to it across the server's lifetime.
+        const rc = try gpa.create(run_control.RunControl);
+        rc.* = run_control.RunControl.init(io);
+        errdefer gpa.destroy(rc);
+        // The shared latest-frame buffer (~308 KiB) + the stream hub: allocated ONCE so
+        // the host pacer + stream threads hold stable pointers across the lifetime.
+        const frame = try gpa.create(sf.SharedFrame);
+        frame.* = sf.SharedFrame.init(io);
+        errdefer gpa.destroy(frame);
+        const hub = try gpa.create(stream_mod.StreamHub);
         return .{
             .gpa = gpa,
             .io = io,
@@ -130,12 +192,43 @@ pub const Server = struct {
             .queue = q.CommandQueue.init(io),
             .arena = std.heap.ArenaAllocator.init(gpa),
             .render = render,
+            .run_control = rc,
+            .shared_frame = frame,
+            .stream_hub = hub,
         };
+    }
+
+    /// Finish wiring the stream hub. Called after `init` (when the Server has its FINAL
+    /// address) so the hub's `*CommandQueue`/`*RunControl`/`*RenderBuffers`/`*SharedFrame`
+    /// point at the stable server-owned instances (the queue lives INLINE in `Server`,
+    /// so its address is only stable once the Server is at rest).
+    pub fn wireStream(self: *Server) void {
+        self.stream_hub.* = stream_mod.StreamHub.init(self.io, &self.queue, self.run_control, self.render, self.shared_frame);
     }
 
     pub fn deinit(self: *Server) void {
         self.arena.deinit();
         self.gpa.destroy(self.render);
+        self.gpa.destroy(self.run_control);
+        self.gpa.destroy(self.shared_frame);
+        self.gpa.destroy(self.stream_hub);
+    }
+
+    /// The stream hub (for the host pacer to drive the frame producer each fps tick).
+    pub fn streamHub(self: *Server) *stream_mod.StreamHub {
+        return self.stream_hub;
+    }
+
+    /// The shared run-control block (for the host pacer to poll the arm flag). Valid
+    /// for the server's lifetime. The pacer reaches the machine ONLY via the gated
+    /// queue (`queueRef`); it never dereferences the run-controller handle.
+    pub fn runControl(self: *Server) *run_control.RunControl {
+        return self.run_control;
+    }
+
+    /// The command queue (for the host pacer to submit `run_slice` via the submit-gate).
+    pub fn queueRef(self: *Server) *q.CommandQueue {
+        return &self.queue;
     }
 
     /// Bind, spawn the worker, and run the accept loop until shutdown (= `bind` then
@@ -153,6 +246,10 @@ pub const Server = struct {
     /// `getsockname`, `Io/Threaded.zig:11828`). Split out of `run` so a caller (the
     /// `--serve 0` path) can PRINT the resolved port BEFORE the blocking accept loop.
     pub fn bind(self: *Server) !void {
+        // Wire the stream hub now that the Server is at its final address (its `&self.queue`
+        // pointer is stable). Done in `bind` — BEFORE the pacer starts or any client
+        // connects — so `produceFrame`/`hasClients` never read an uninitialized hub.
+        self.wireStream();
         const w: worker_mod.Worker = .{ .queue = &self.queue, .ctrl = self.ctrl, .mount_dir = self.mount_dir, .io = self.io, .render = self.render };
         self.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
 
@@ -176,8 +273,11 @@ pub const Server = struct {
                 error.ConnectionAborted, error.WouldBlock => continue,
                 else => return err,
             };
-            self.handleConnection(&stream);
-            stream.close(self.io);
+            // A WS upgrade on /api/stream is handed to a dedicated stream thread that
+            // OWNS the socket (§9.1) — the accept loop must NOT close it then. Every
+            // other request is a short-lived serial control connection (closed here).
+            const claimed = self.handleConnection(&stream);
+            if (!claimed) stream.close(self.io);
         }
 
         if (self.net_server) |*s| {
@@ -199,7 +299,23 @@ pub const Server = struct {
         }
     }
 
+    /// Register a pre-shutdown hook (the run-pacer's stop+join). Invoked once before
+    /// the worker sentinel (§9.1). main.zig wires the pacer here after `bind`.
+    pub fn setPreShutdown(self: *Server, ctx: ?*anyopaque, hook: *const fn (?*anyopaque) void) void {
+        self.pre_shutdown_ctx = ctx;
+        self.pre_shutdown_fn = hook;
+    }
+
     fn joinWorker(self: *Server) void {
+        // §9.1 ordering: stop + join host producers (the run-pacer) FIRST, so no
+        // producer can be mid-`submit` when the sentinel goes in.
+        if (self.pre_shutdown_fn) |hook| {
+            hook(self.pre_shutdown_ctx);
+            self.pre_shutdown_fn = null; // run once
+        }
+        // §9.1 ordering: THEN stop-flag + shutdown sockets + join ALL stream threads,
+        // so no stream producer/consumer can be mid-`submit` when the sentinel goes in.
+        self.stream_hub.shutdown();
         // Drain the worker with the shutdown sentinel, then join.
         var ctx: q.RequestCtx = .{ .cmd = .shutdown_worker };
         _ = self.queue.submit(&ctx);
@@ -211,28 +327,68 @@ pub const Server = struct {
     // Per-connection: one request, keep-alive OFF.
     // -----------------------------------------------------------------------
 
-    fn handleConnection(self: *Server, stream: *net.Stream) void {
+    /// Handle one accepted connection. Returns true iff the socket was CLAIMED by a
+    /// stream thread (a WS upgrade on `/api/stream`) — the accept loop must then NOT
+    /// close it (the stream thread owns + closes it). Otherwise returns false (a normal
+    /// serial control request, closed by the accept loop).
+    fn handleConnection(self: *Server, stream: *net.Stream) bool {
         // Named locals that OUTLIVE the http.Server (return-by-value lifetime rule).
         var rbuf: [HTTP_HEADER_MAX]u8 = undefined;
         var wbuf: [WRITE_BUF]u8 = undefined;
         var sr = stream.reader(self.io, &rbuf);
         var sw = stream.writer(self.io, &wbuf);
         var hs = http.Server.init(&sr.interface, &sw.interface);
-        self.serveOne(&hs);
+
+        var request = hs.receiveHead() catch return false; // malformed/oversized → drop
+
+        // WS-upgrade path (§6.1): a `GET /api/stream` with the Upgrade headers is handed
+        // to a dedicated stream thread that owns the socket. `upgradeRequested` does not
+        // invalidate `head`, so the target check below is safe.
+        if (isStreamUpgrade(&request)) |key| {
+            // The handshake's 101 is written on THIS frame's `sw` (shared); the stream
+            // thread then builds its own Reader/Writer over the same socket (the
+            // post-handshake protocol is raw WS frames). We must capture the key into the
+            // request frame; `respondWebSocket` reads it immediately, before any body
+            // reader invalidates head strings.
+            if (self.stream_hub.upgrade(&request, stream.*, key)) return true; // claimed
+            return false; // rejected (503) — handler wrote the error; loop closes socket
+        }
+
+        self.serveRequest(&request);
+        return false;
+    }
+
+    /// Detect a WebSocket upgrade for `GET /api/stream`. Returns the `Sec-WebSocket-Key`
+    /// when it is a valid WS upgrade on the stream path, else null. A `GET /api/stream`
+    /// WITHOUT the upgrade headers falls through to the normal dispatch (a sensible 426/
+    /// error), per the test plan.
+    fn isStreamUpgrade(request: *const http.Server.Request) ?[]const u8 {
+        const target = request.head.target;
+        const qmark = std.mem.indexOfScalar(u8, target, '?');
+        const path = if (qmark) |i| target[0..i] else target;
+        if (!std.mem.eql(u8, path, "/api/stream")) return null;
+        return switch (request.upgradeRequested()) {
+            .websocket => |maybe_key| maybe_key, // null key → invalid; caller treats as none
+            else => null,
+        };
     }
 
     /// Handle exactly one HTTP request over an already-constructed `http.Server`.
-    /// Factored out of `handleConnection` so an in-process test can drive it over
-    /// in-memory reader/writer streams (no real socket).
+    /// Used by the in-process test (over in-memory reader/writer streams, no real
+    /// socket); the real accept path calls `serveRequest` directly after `receiveHead`.
     pub fn serveOne(self: *Server, hs: *http.Server) void {
         var request = hs.receiveHead() catch return; // malformed/oversized head → drop
+        self.serveRequest(&request);
+    }
 
+    /// The shared request body: capture route + content-type, read the body, dispatch.
+    fn serveRequest(self: *Server, request: *http.Server.Request) void {
         // CAPTURE route + content-type BEFORE taking the body reader (it invalidates
         // Head strings). We copy into fixed locals.
         var target_buf: [1024]u8 = undefined;
         const target_src = request.head.target;
         if (target_src.len > target_buf.len) {
-            self.respondError(&request, .payload_too_large, "payload_too_large", "request target too long");
+            self.respondError(request, .payload_too_large, "payload_too_large", "request target too long");
             return;
         }
         @memcpy(target_buf[0..target_src.len], target_src);
@@ -246,7 +402,7 @@ pub const Server = struct {
 
         // Reject an oversized body BEFORE reading it (413).
         if (content_length > MAX_BODY) {
-            self.respondError(&request, .payload_too_large, "payload_too_large", "request body too large");
+            self.respondError(request, .payload_too_large, "payload_too_large", "request body too large");
             return;
         }
 
@@ -257,13 +413,13 @@ pub const Server = struct {
         if (content_length > 0) {
             const reader = request.readerExpectNone(self.read_scratch[0..]);
             const got = reader.readSliceShort(self.body_buf[0..@intCast(content_length)]) catch {
-                self.respondError(&request, .bad_request, "bad_request", "failed to read request body");
+                self.respondError(request, .bad_request, "bad_request", "failed to read request body");
                 return;
             };
             body = self.body_buf[0..got];
         }
 
-        self.dispatch(&request, method, target, body, is_json);
+        self.dispatch(request, method, target, body, is_json);
     }
 
     // -----------------------------------------------------------------------
@@ -330,6 +486,22 @@ pub const Server = struct {
             return self.handleLoad(req, body, is_json);
         }
 
+        // --- paced free-run control (stream §5.2) ---
+        // Placed BEFORE the `/api/run` exact-match (eql) so the longer paths resolve
+        // first; all are clockless (they only flip/read the atomic RunControl).
+        if (std.mem.eql(u8, path, "/api/run/start")) {
+            if (method != .POST) return self.methodNotAllowed(req);
+            return self.handleRunStart(req, body, is_json);
+        }
+        if (std.mem.eql(u8, path, "/api/run/stop")) {
+            if (method != .POST) return self.methodNotAllowed(req);
+            return self.handleRunStop(req);
+        }
+        if (std.mem.eql(u8, path, "/api/run/status")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            return self.handleRunStatus(req);
+        }
+
         // --- execution control ---
         if (std.mem.eql(u8, path, "/api/run")) {
             if (method != .POST) return self.methodNotAllowed(req);
@@ -345,7 +517,7 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, path, "/api/step")) {
             if (method != .POST) return self.methodNotAllowed(req);
-            return self.submitAndRespond(req, .step);
+            return self.submitDebuggerAndRespond(req, .step);
         }
         if (std.mem.eql(u8, path, "/api/step-n")) {
             if (method != .POST) return self.methodNotAllowed(req);
@@ -353,7 +525,7 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, path, "/api/step-over")) {
             if (method != .POST) return self.methodNotAllowed(req);
-            return self.submitAndRespond(req, .step_over);
+            return self.submitDebuggerAndRespond(req, .step_over);
         }
 
         // --- breakpoints ---
@@ -424,9 +596,26 @@ pub const Server = struct {
             return self.handleInputMouse(req, body, is_json);
         }
 
+        // --- live video stream (§6) ---
+        // The WS UPGRADE is intercepted in `handleConnection` BEFORE dispatch (it needs
+        // the raw socket to hand to a stream thread). Reaching here means a plain
+        // `GET /api/stream` WITHOUT the Upgrade headers (or a non-GET) — a sensible 426.
+        if (std.mem.eql(u8, path, "/api/stream")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            return self.respondError(req, .upgrade_required, "upgrade_required", "GET /api/stream requires a WebSocket upgrade");
+        }
+
         // --- deferred, honestly reported ---
         if (std.mem.eql(u8, path, "/api/disasm")) {
             return self.respondError(req, .not_implemented, "not_implemented", "disassembly is deferred to a later milestone");
+        }
+
+        // --- static UI assets (same-origin homepage) ---
+        // Slotted AFTER every `/api/*` route and BEFORE the 404 catch-all so a
+        // static path can never shadow an API route. Off-worker, no command
+        // submitted, cycle-neutral — exactly like `/api/health`.
+        for (static_assets) |asset| {
+            if (std.mem.eql(u8, path, asset.path)) return self.serveStatic(req, method, path, asset.bytes);
         }
 
         self.respondError(req, .not_found, "not_found", "no such endpoint");
@@ -459,25 +648,92 @@ pub const Server = struct {
             const r = self.parseBody(wire.RunReq, body) orelse return self.badJson(req);
             cap = r.cycle_cap orelse default_cap;
         }
-        self.submitAndRespond(req, .{ .run = .{ .cycle_cap = cap } });
+        self.submitDebuggerAndRespond(req, .{ .run = .{ .cycle_cap = cap } });
     }
 
     fn handleRunToCycle(self: *Server, req: *http.Server.Request, body: []const u8, is_json: bool) void {
         if (!self.requireJson(req, is_json, body)) return;
         const r = self.parseBody(wire.RunToCycleReq, body) orelse return self.badJson(req);
-        self.submitAndRespond(req, .{ .run_to_cycle = .{ .cycle = r.cycle } });
+        self.submitDebuggerAndRespond(req, .{ .run_to_cycle = .{ .cycle = r.cycle } });
     }
 
     fn handleRunToAddr(self: *Server, req: *http.Server.Request, body: []const u8, is_json: bool) void {
         if (!self.requireJson(req, is_json, body)) return;
         const r = self.parseBody(wire.RunToAddrReq, body) orelse return self.badJson(req);
-        self.submitAndRespond(req, .{ .run_to_address = .{ .linear = r.linear } });
+        self.submitDebuggerAndRespond(req, .{ .run_to_address = .{ .linear = r.linear } });
     }
 
     fn handleStepN(self: *Server, req: *http.Server.Request, body: []const u8, is_json: bool) void {
         if (!self.requireJson(req, is_json, body)) return;
         const r = self.parseBody(wire.StepNReq, body) orelse return self.badJson(req);
-        self.submitAndRespond(req, .{ .step_n = .{ .n = r.n } });
+        self.submitDebuggerAndRespond(req, .{ .step_n = .{ .n = r.n } });
+    }
+
+    // -----------------------------------------------------------------------
+    // Paced free-run control (stream §5.2). CLOCKLESS handlers: they only flip/read
+    // the atomic `RunControl`; the wall clock lives in src/host/run_pacer.zig (§5.1a).
+    // -----------------------------------------------------------------------
+
+    /// `POST /api/run/start {slice_cycles?, fps?}` — arm the pacer (owner=paced).
+    /// 409 if a debugger run is in flight (owner==debugger). Idempotent: re-arming
+    /// while already paced is `{"ok":true,...}`. Body optional → keep current tuning.
+    fn handleRunStart(self: *Server, req: *http.Server.Request, body: []const u8, is_json: bool) void {
+        if (!self.requireJson(req, is_json, body)) return;
+        var slice_cycles: u64 = 0; // 0 => keep current
+        var fps: u32 = 0;
+        if (body.len > 0) {
+            const r = self.parseBody(wire.RunStartReq, body) orelse return self.badJson(req);
+            slice_cycles = r.slice_cycles orelse 0;
+            fps = r.fps orelse 0;
+        }
+        if (!self.run_control.start(slice_cycles, fps)) {
+            return self.respondError(req, .conflict, "run_in_flight", "a debugger run is in flight; cannot start the paced run");
+        }
+        self.respondRunStatus(req);
+    }
+
+    /// `POST /api/run/stop` — disarm the pacer (owner=idle); return the run status
+    /// (incl. the stop cycle). A stopped machine stays inspectable/steppable.
+    fn handleRunStop(self: *Server, req: *http.Server.Request) void {
+        self.run_control.stop();
+        self.respondRunStatus(req);
+    }
+
+    /// `GET /api/run/status` — `{running, owner, cycle, slice_cycles, fps,
+    /// last_stop_reason}`. `cycle` is the machine cycle: fetched via a normal `status`
+    /// command (the worker is the sole reader of `cpu.st.cycles`; we never read it
+    /// off-worker). The rest come from the clockless RunControl atomics.
+    fn handleRunStatus(self: *Server, req: *http.Server.Request) void {
+        self.respondRunStatus(req);
+    }
+
+    fn respondRunStatus(self: *Server, req: *http.Server.Request) void {
+        // Fetch the live machine cycle via the worker (off-worker reads are banned).
+        var ctx: q.RequestCtx = .{ .cmd = .status };
+        const resp = self.queue.submit(&ctx);
+        const cycle: u64 = switch (resp) {
+            .status => |st| st.cycles,
+            else => self.run_control.lastCycle(),
+        };
+        const rc = self.run_control;
+        const owner = rc.getOwner();
+        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
+        const ok = blk: {
+            w.print(
+                "{{\"running\":{s},\"owner\":\"{s}\",\"cycle\":{d},\"slice_cycles\":{d},\"fps\":{d},\"last_stop_reason\":\"{s}\"}}",
+                .{
+                    if (rc.isArmed()) "true" else "false",
+                    @tagName(owner),
+                    cycle,
+                    rc.sliceCycles(),
+                    rc.getFps(),
+                    @tagName(rc.lastStop()),
+                },
+            ) catch break :blk false;
+            break :blk true;
+        };
+        if (!ok) return self.respondError(req, .service_unavailable, "internal", "response too large");
+        self.respondJson(req, .ok, w.buffered());
     }
 
     fn handleInputKey(self: *Server, req: *http.Server.Request, body: []const u8, is_json: bool) void {
@@ -691,6 +947,22 @@ pub const Server = struct {
     // -----------------------------------------------------------------------
 
     fn submitAndRespond(self: *Server, req: *http.Server.Request, cmd: q.Command) void {
+        var ctx: q.RequestCtx = .{ .cmd = cmd };
+        self.submitCtxAndRespond(req, &ctx);
+    }
+
+    /// Submit a DEBUGGER run/step command (the bounded `run`/`run-to-cycle`/
+    /// `run-to-address`/`step*`) — AUTO-DISARMING the pacer for its duration (§5.3) so
+    /// it lands deterministically without interleaving pacer slices. `beginDebugger`
+    /// clears the arm flag + sets owner=debugger; the submit-gate then makes this
+    /// command wait for any in-flight pacer slice at the queue and run NEXT;
+    /// `endDebugger` restores the prior owner (re-arm the pacer iff it owned the run).
+    /// Determinism: this is byte-identical to the same command with no pacer — it is
+    /// the SAME bounded run-until-event on the SAME single worker; the pacer only
+    /// changes wall-time pacing, never which cycles run.
+    fn submitDebuggerAndRespond(self: *Server, req: *http.Server.Request, cmd: q.Command) void {
+        const restore = self.run_control.beginDebugger();
+        defer self.run_control.endDebugger(restore);
         var ctx: q.RequestCtx = .{ .cmd = cmd };
         self.submitCtxAndRespond(req, &ctx);
     }
@@ -995,6 +1267,25 @@ pub const Server = struct {
             .status = status,
             .keep_alive = false, // one request per connection (R1)
             .extra_headers = &json_content_type,
+        }) catch {};
+    }
+
+    /// Serve one embedded static asset (the same-origin UI). GET/HEAD only —
+    /// any other method is a 405 (reusing `methodNotAllowed`). The content-type
+    /// comes from the path extension; `Cache-Control: no-cache` keeps a rebuilt
+    /// binary's assets fresh during dev. `req.respond` sets content-length from the
+    /// slice and OMITS the body for HEAD automatically. No command is submitted —
+    /// off-worker and cycle-neutral, like `/api/health`.
+    fn serveStatic(self: *Server, req: *http.Server.Request, m: http.Method, path: []const u8, body: []const u8) void {
+        if (m != .GET and m != .HEAD) return self.methodNotAllowed(req);
+        const headers = [_]http.Header{
+            .{ .name = "content-type", .value = contentTypeFor(path) },
+            .{ .name = "cache-control", .value = "no-cache" },
+        };
+        req.respond(body, .{
+            .status = .ok,
+            .keep_alive = false, // one request per connection (R1)
+            .extra_headers = &headers,
         }) catch {};
     }
 };

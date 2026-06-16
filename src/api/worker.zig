@@ -93,6 +93,11 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
     return switch (ctx.cmd) {
         // ---- run / step ----------------------------------------------------
         .run => |c| .{ .stop = ctrl.runUntilEvent(c.cycle_cap) },
+        // A paced free-run slice — identical to `.run`, a bounded deterministic
+        // `runUntilEvent`. The host run-pacer submits this each wall-clock tick;
+        // the worker just runs the slice on the single owned controller. The
+        // returned `StopReason` lets the pacer disarm on a terminal (§10).
+        .run_slice => |c| .{ .stop = ctrl.runUntilEvent(c.slice_cycles) },
         .run_to_cycle => |c| .{ .stop = ctrl.runToCycle(c.cycle) catch |e| return errResp(e) },
         .run_to_address => |c| .{ .stop = ctrl.runToAddress(c.linear) catch |e| return errResp(e) },
         .step => .{ .stop = ctrl.stepInstruction() },

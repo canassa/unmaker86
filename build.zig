@@ -160,6 +160,18 @@ pub fn build(b: *std.Build) void {
     api_mod.addImport("machine", machine_mod);
     api_mod.addImport("bios", bios_mod); // for the {"char"} scancode reverse map (§5.1e)
 
+    // The host layer (CLAUDE.md: "consumes machine output"; may thread). Sits ABOVE
+    // `api` — it imports `api` (the gated queue + the clockless RunControl) and reaches
+    // the worker ONLY through the submit-gated queue. The run-pacer's HOST CLOCK lives
+    // here, DELIBERATELY outside the `src/api` determinism grep-gate (stream §5.1a), so
+    // the api gate stays intact while the paced free-run loop can sleep on wall time.
+    const host_mod = b.addModule("host", .{
+        .root_source_file = b.path("src/host/host.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    host_mod.addImport("api", api_mod);
+
     // The headless runner frontend: loads a real-mode DOS program through the
     // emulated loader, runs it, and dumps its CON output. `zig build run -- prog`.
     const exe = b.addExecutable(.{
@@ -173,6 +185,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("machine", machine_mod);
     exe.root_module.addImport("debug", debug_mod);
     exe.root_module.addImport("api", api_mod);
+    exe.root_module.addImport("host", host_mod);
     b.installArtifact(exe);
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -489,6 +502,27 @@ pub fn build(b: *std.Build) void {
     const api_test_step = b.step("test-api", "Run the HTTP/JSON API-server tests");
     api_test_step.dependOn(&api_tests.step);
 
+    // ---- Host-layer tests (test-host) ----
+    // The run-pacer (paced free-run loop). Its HOST CLOCK lives here, outside the
+    // `src/api` determinism grep-gate (stream §5.1a). The tests build a real machine +
+    // Controller + the api queue/worker + the pacer to prove paced ≡ unpaced
+    // (byte-identical at the actual final cycle), terminal self-disarm, and the
+    // run-ownership arbitration. Needs `host` + `api` + the machine-building set.
+    const host_imports = [_]Imp{
+        .{ .name = "host", .mod = host_mod },
+        .{ .name = "api", .mod = api_mod },
+        .{ .name = "debug", .mod = debug_mod },
+        .{ .name = "machine", .mod = machine_mod },
+        .{ .name = "cpu", .mod = cpu_mod },
+        .{ .name = "bus", .mod = bus_mod },
+        .{ .name = "devices", .mod = devices_mod },
+        .{ .name = "timing", .mod = timing_mod },
+        .{ .name = "bios", .mod = bios_mod },
+    };
+    const host_tests = MachineTest.add(b, target, optimize, "src/host/host.zig", &host_imports);
+    const host_test_step = b.step("test-host", "Run the host-layer (run-pacer) tests");
+    host_test_step.dependOn(&host_tests.step);
+
     // The single real-socket integration test (opt-in; not in the default `test`).
     const api_integration = MachineTest.add(b, target, optimize, "src/api/server_integration_test.zig", &api_imports);
     const api_integration_step = b.step("test-api-integration", "Run the real-socket API integration test (opt-in)");
@@ -547,6 +581,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&io_oracle.step);
     test_step.dependOn(&debug_tests.step);
     test_step.dependOn(&api_tests.step);
+    test_step.dependOn(&host_tests.step);
 
     // Dedicated full-conformance sweep: runs ALL vendored 80386 real-mode
     // vectors and reports per-opcode pass/fail/revoked counts. Separate from

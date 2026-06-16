@@ -43,6 +43,10 @@ pub const parse_options: std.json.ParseOptions = .{ .ignore_unknown_fields = tru
 /// default (NEVER unbounded) at the handler.
 pub const RunReq = struct { cycle_cap: ?u64 = null };
 pub const RunToCycleReq = struct { cycle: u64 };
+/// `POST /api/run/start` — both optional; absent keeps the pacer's current tuning
+/// (so `start {}` re-arms with the prior `slice_cycles`/`fps`). Parsed at the handler
+/// into the clockless `RunControl` atomics (the pacer reads them each loop).
+pub const RunStartReq = struct { slice_cycles: ?u64 = null, fps: ?u32 = null };
 pub const RunToAddrReq = struct { linear: u32 };
 pub const StepNReq = struct { n: u64 };
 
