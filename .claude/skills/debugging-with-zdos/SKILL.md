@@ -78,7 +78,7 @@ Start: `zdos --serve 8099 <PROG> [args]` → `[zdos] listening 127.0.0.1:8099`. 
 | Read memory (physical / seg:off) | `GET /api/mem?phys=<dec>&len=<dec>` · `GET /api/mem/seg?seg=<name>&off=&len=` → `{"data":"<hex>"}` |
 | **Search guest RAM** | `GET /api/mem/search?pattern=<hex>&start=&len=&max=` (or `?ascii=<text>`) → `{count,truncated,matches:[{phys,seg,off}]}` |
 | **Disassemble** | `GET /api/disasm?linear=N&count=K` (or `?seg=&off=`, or no-arg = CS:EIP) → `{instructions:[{linear,seg,off,bytes,length,text}]}` |
-| **Chipset/A20/device state** | `GET /api/devices` · `GET /api/device/<a20\|pic\|pit\|vga\|kbc\|speaker\|ems>` |
+| **Chipset/A20/device state** | `GET /api/devices` · `GET /api/device/<a20\|pic\|pit\|vga\|kbc\|speaker\|opl\|ems>` |
 | **I/O-port shadow** (non-mutating!) | `GET /api/io?port=N` → `{port,value,shadow:true}` |
 | Console (DOS CON stream) | `GET /api/console` → `{"data":"<hex>"}` |
 | Screenshot | `GET /api/framebuffer?format=png` (also `index`/`rgba`) |
@@ -110,6 +110,13 @@ Start: `zdos --serve 8099 <PROG> [args]` → `[zdos] listening 127.0.0.1:8099`. 
   `{"stop":{"breakpoint":{"id":N,"at_cycle":C,"watch":{"kind":"memory|io","addr":A,"access":"write","value":V}}}}`.
   `watch` is `null` for exec/cycle/interrupt. `value` is the byte at the address/port read
   side-effect-free at the boundary — answers "what wrote this, and with what value?".
+- **`/api/disasm` of a near-CALL/JMP target can look like garbage** when the offset lands in code
+  that overlays runtime-populated data (e.g. a driver's BSS, or bytes a relocator hasn't filled at
+  pause time), or when you mis-compute `linear` (always `SEG*16 + OFF`). If a disasm window is
+  nonsense, don't trust it — `step` INTO the call instead and read the actual executed instruction +
+  its `bytes` from `GET /api/cpu` + a 1-count disasm at the live CS:IP. That single-step reveals the
+  real opcode (it was how `in al, dx` on the OPL status port 0x388 was found behind a garbage-looking
+  `call 0x16b5`).
 - **`step-over` runs a whole `REP` string op** (all iterations, real cycles) in one command, immune
   to a mid-REP IRQ. Plain `step` advances ONE rep iteration (EIP stays pinned at the REP) — faithful
   but looks like a hang on a large `rep movsb`; use `step-over` to skip past it. `stepped_into:true`
@@ -136,6 +143,15 @@ on?" Most INT 21h calls pass a pointer in **DS:DX**. At the call boundary:
 `phys = ds_base + (edx & 0xFFFF)` (read `ds_base`/`edx` from `GET /api/cpu`), then
 `GET /api/mem?phys=<that>&len=…` to read the filename/string. (For the buffer of an AH=40h write,
 the length is in CX.) This turns "INT 21h AH=3Dh failed" into "it tried to open `<name>`".
+
+**Trace the INT 21h call STREAM** (the decisive move for "the game aborts after loading X"): set
+one `interrupt:0x21` breakpoint and loop `POST /api/run {"cycle_cap":HUGE}` → `GET /api/cpu`,
+decoding `AH=(eax>>8)&0xFF`, `AL`, `BX`/`CX`, and the `DS:DX` target each hit, until
+`program_terminated`. A short shell loop prints the whole sequence of file opens/seeks/reads/IOCTLs
+the program made right up to its `AH=4Ch` exit — the last few calls usually name the failing
+subsystem (e.g. for Stunts: `AH=3D 'ad15.drv'` … `AH=3F read` … `AH=4C AL=01` pinpointed the
+sound-driver init as the aborter). The breakpoint fires inside nested children too (the de-nest),
+so this works for the inner game of a launcher chain.
 
 ### Purity / determinism guarantees (rely on these)
 
