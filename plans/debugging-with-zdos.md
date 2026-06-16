@@ -56,20 +56,31 @@ structs). The ones used here:
 | Read memory (seg:off) | `GET /api/mem/seg?seg=<name>&off=<dec>&len=<dec>` |
 | Console (DOS CON stream) | `GET /api/console` → `{"data":"<hex>"}` |
 | Framebuffer PNG | `GET /api/framebuffer?format=png` (also `index`/`rgba`) |
+| **Disassemble** | `GET /api/disasm?linear=N&count=K` (or `?seg=&off=`, or no-arg = CS:EIP) → `{"instructions":[{"linear","seg","off","bytes","length","text"},…]}` |
+| **Search guest RAM** | `GET /api/mem/search?pattern=<hex>&start=&len=&max=` (or `?ascii=<text>`) → `{"count","truncated","matches":[{"phys","seg","off"},…]}` |
+| **Chipset/A20/device state** | `GET /api/devices` (all groups) · `GET /api/device/<a20\|pic\|pit\|vga\|kbc\|speaker\|ems>` |
+| **I/O-port shadow** (non-mutating) | `GET /api/io?port=N` → `{"port","value","shadow":true,…}` |
 | Add breakpoint | `POST /api/breakpoints` `{"kind":{"execution_address":{"linear":N}}}` |
 | Run with a cap | `POST /api/run` `{"cycle_cap":N}` |
 | Run to a cycle | `POST /api/run-to-cycle` `{"cycle":N}` |
 | Single step | `POST /api/step` → `{"stop":{"step_complete":{"at_cycle":N}}}` |
+| **Step over** (CALL/INT/**REP**) | `POST /api/step-over` → `{"stop":{…},"stepped_into":bool}` |
 | Reset + reload | `POST /api/reset` then `POST /api/load {}` |
 
 ### Breakpoint kinds (from `src/debug/breakpoints.zig`)
 
 ```
-{"kind":{"execution_address":{"linear":N}}}   // linear = cs_base + eip  (NOT seg:off!)
+{"kind":{"execution_address":{"linear":N}}}            // linear = cs_base + eip  (NOT seg:off!)
 {"kind":{"cycle":{"at_cycle":N}}}
 {"kind":{"interrupt":{"vector":N}}}
-{"kind":{"memory":{...}}}                      // watchpoint
+{"kind":{"memory":{"linear":N,"len":L,"access":"read|write|access"}}}   // memory watchpoint
+{"kind":{"io":{"port":N,"access":"read|write|access"}}}                 // I/O-port watchpoint
 ```
+
+When a `memory`/`io` watchpoint fires, the stop carries the access detail:
+`{"stop":{"breakpoint":{"id":N,"at_cycle":C,"watch":{"kind":"memory|io","addr":A,"access":"write","value":V}}}}`.
+For exec/cycle/interrupt breakpoints `watch` is `null`. `value` is the byte at the
+address/port at the stop boundary, read side-effect-free (no re-trip, no cycle charge).
 
 `linear` is a **physical/linear address**, computed as `cs_base + eip` (see `currentLinear`). To break
 at a guest `SEG:OFF`, compute `linear = SEG*16 + OFF` yourself — or read `cs_base` from `GET /api/cpu`
@@ -161,43 +172,52 @@ DOSBox initializes A20 **disabled** (`MEM_A20_Enable(false)`), while zdos's POST
   guest progress without a display — confirmed Stunts printed "Loading Stunts..." and set mode 13h
   after the fix.
 
-### What was awkward or missing (→ concrete recommendations)
+### Resolved by the debugger-tooling round (these gaps are now closed)
 
-1. **No disassembler.** The API exposes raw instruction bytes only, so I **hand-decoded ~120 bytes
-   of x86** to find the `cmp al,0xb2 ; jne error` branch and to understand the EXEPACK stub. This is
-   the single biggest friction. → **Add `GET /api/disasm?phys=&count=` (or `seg`/`off`)** returning
-   decoded mnemonics + lengths. zdos already has a full instruction *decoder* (`src/cpu/decode.zig`);
-   a read-only disasm view over it is low-risk and cycle-neutral. (Already on the roadmap as
-   "[later] 386 disassembler" — this bug is the case for prioritizing it.)
+The frictions this worked example exposed have since been built — all side-effect-free, on the
+worker, cycle-neutral (`plans/{disassembler,mem-search,device-state-reader,step-over-rep,
+memory-watchpoints}.md`):
 
-2. **No memory-search endpoint.** Finding the error string and the stub code meant `grep -aob` on
-   the *file* and manually mapping file offset → guest physical (file_off − header_bytes +
-   load_seg*16). I could not search *guest memory* for a byte pattern. → **Add
-   `POST /api/mem/search {phys_start, len, pattern (hex), max_hits}`.** Pairs naturally with a
-   "break on string/pattern reference."
+1. ✅ **Disassembler — `GET /api/disasm`.** No more hand-decoding x86. `?linear=N&count=K`, or
+   `?seg=&off=`, or no-arg = the current CS:EIP. Returns `{linear,seg,off,bytes,length,text}` per
+   instruction; unknown/truncated bytes render `db 0x..` (never a fabricated mnemonic). Reuses the
+   CPU's own decode front-end, so it can't drift from the executor (pinned by a length cross-check).
+   *Worked example, redone:* `curl ".../api/disasm?linear=53684&count=4"` shows the
+   `cmp al,0xb2 ; jne …` branch directly.
+
+2. ✅ **Memory search — `GET /api/mem/search`.** Search *guest RAM* (not the file): `?pattern=<hex>`
+   or `?ascii=<text>` (percent-decoded), with `start`/`len`/`max`. Returns ascending, overlapping
+   matches as `{phys,seg,off}` + a `truncated` flag. Finds an error string / magic / code sequence
+   in memory in one call — no more `grep -aob` the file and hand-mapping offsets.
+
+4. ✅ **Step over a whole REP — `POST /api/step-over`.** It now detects a `REP/REPE/REPNE` string op
+   and runs the *entire* REP (all iterations, real cycles) in one command, stopping after — immune
+   to an IRQ landing mid-REP. (Also still steps over direct CALL/INT; indirect CALL honestly reports
+   `stepped_into:true`.) A 781-byte `rep movsb` is now one `step-over`, not 781 steps.
+
+6. ✅ **A20 / chipset state — `GET /api/devices`.** `a20.enabled`/`mask` is one GET away (plus PIC/
+   PIT/VGA/8042/speaker/EMS, and `GET /api/io?port=` for a non-mutating port shadow). The A20 root
+   cause would have been a single `GET /api/device/a20` instead of inferring it from read behavior.
+
+**Bonus (not in the original list): I/O-port watchpoints.** The `io` breakpoint kind is now live
+(`{"kind":{"io":{"port":N,"access":"…"}}}`) and watchpoint stops now carry the access detail
+(`watch:{addr,access,value}`) — so "what wrote this port / address, and with what value?" is a
+breakpoint, not a guessing game.
+
+### Still open (→ concrete recommendations)
 
 3. **Breakpoints are linear-address only — brittle for self-relocating code.** EXEPACK copies its
    stub *up* in memory and `retf`s into the copy, so a breakpoint set on the error handler at its
    *load* address never fired (the code now runs at a different segment). I had to re-derive the
    relocated linear address by stepping. → **Add a `seg:off`-relative breakpoint** and/or a
-   **"break on execution of these bytes/this pattern"** kind that survives relocation. At minimum,
-   document the linear≠seg:off gotcha (done here).
-
-4. **`POST /api/step` over a `REP` instruction steps one *iteration*, not one instruction.** A `rep
-   movsb` of 781 bytes took ~781 steps with EIP pinned, which initially looked like a hang. This is
-   arguably faithful (each iteration is a cycle event), but it's surprising. → **Document it**, and
-   consider a **`step-over`-style "step to next EIP"** for getting past long string ops. (`step-over`
-   exists for calls; an "advance until EIP changes" mode would help REP.)
+   **"break on execution of these bytes/this pattern"** kind that survives relocation. (Partly eased
+   now: `/api/mem/search` finds the relocated copy's bytes, then break on that linear address.) At
+   minimum, the linear≠seg:off gotcha is documented here.
 
 5. **No symbol / `.map` support.** Everything is bare addresses. For compressed/cracked retro
    binaries there are no symbols anyway, but for in-house/toolchain-built guests a symbol map would
    turn address soup into names. → **Optional: load a `.map`/symbol file, annotate `/api/cpu` +
    disasm + breakpoints by name.**
-
-6. **No A20 / chipset state in the API.** The root cause was the A20 gate, but I could only infer
-   its state from the *behavior* of a physical read (wrapped vs. not). → **Expose A20 (and other
-   chipset latches) in `GET /api/status` or a `GET /api/chipset`.** A one-line `a20Enabled()` read
-   would have pointed straight at the bug.
 
 7. **No "break on interrupt with AH=" filter.** `interrupt` breakpoints match a vector only. To
    catch the EXEPACK error's `INT 21h AH=4C` exit vs. the `AH=40` write, I'd have had to break on
@@ -233,7 +253,11 @@ DOSBox initializes A20 **disabled** (`MEM_A20_Enable(false)`), while zdos's POST
 5. **Common DOS loader / compression pitfalls** — EXEPACK/LZEXE/PKLITE self-decompressors and the
    real-mode behaviors they rely on (1 MiB wrap = A20 off, segment underflow, overlapping backward
    copy); the "0 relocations + a corrupt-string" fingerprint; MCB/`minalloc`/`maxalloc` sizing.
-6. **The tooling gaps as a checklist of workarounds** — hand-decode bytes when there's no disasm;
-   `grep -aob` the file + map offsets when there's no memory search; re-derive relocated addresses
-   for self-modifying/relocating stubs; reset+reload between experiments.
+6. **The introspection toolbox** — disassemble (`/api/disasm`), search guest RAM (`/api/mem/search`),
+   read chipset/A20 (`/api/devices`, `/api/io?port=`), step over CALL/INT/REP (`/api/step-over`),
+   and watch a memory address or I/O port (`memory`/`io` breakpoints, with `{addr,access,value}` in
+   the stop). Remaining workarounds: re-derive relocated addresses for self-modifying/relocating
+   stubs (search for the relocated bytes, then break on that linear address); break on every vector
+   then filter AH by hand (no register predicate yet); no symbol names; reset+reload between
+   experiments.
 7. **Staging hygiene** — uppercase 8.3 names, presence-gated assets, headless capture.
