@@ -27,6 +27,20 @@ live in `plans/debugging-with-zdos.md` — read that for the narrative; use this
    binary with a specific command tail (e.g. `ST.COM` → `STUNTS.COM` → `LOAD.EXE /u MCGA`). Debug
    the *launcher*, not the inner EXE — running the inner EXE directly gives it no command tail / PSP
    args and produces misleading symptoms (a NULL-arg parse, a clean early exit) that aren't real.
+   **CRITICAL — the nested-EXEC debugger blind spot:** zdos's `INT 21h AH=4Bh` runs the child
+   **nested to termination** inside the host handler (`loader.zig` `br.runUntil`), and that loop
+   steps the machine RAW — it does **NOT** consult your breakpoints / watchpoints / cycle-cap
+   between steps (`bridge.zig:runUntil`). So while the child runs (which, for a launcher chain, is
+   the ENTIRE inner game — possibly tens of millions of cycles), **NOTHING you set from the API
+   fires**: a `run-to-cycle N` whose N falls inside the child overshoots to the first boundary AFTER
+   the outermost EXEC returns; an `interrupt:0x21` breakpoint sees ZERO of the thousands of INT 21h
+   calls the child makes; `execution_address`/`memory`/`io` watchpoints never trip. The child's
+   whole run is opaque to the HTTP debugger. To observe inside it you must temporarily instrument
+   zdos's own Zig (a last-N-INT21h ring in `int21.zig` + a dump in `dos.terminate` is the proven
+   move — that pins exactly which calls/files preceded an abort, and the child's exit code/kind).
+   Symptom decoder: a launcher that "single-steps garbage through INT 1 with TF=1 after ~tens of
+   millions of cycles" is usually the launcher resuming onto a return frame the (now-terminated)
+   nested child clobbered — chase the child's exit, not the TF loop.
 3. **Triage: terminated, hung, or crashed?** Run (`POST /api/run {"cycle_cap":N}`) then
    `GET /api/status` (`terminated` / `ret_code` / last stop) **and** `GET /api/console` FIRST. A
    program that *terminates* (e.g. INT 21h AH=4Ch with a non-zero exit + an error string on the
@@ -166,8 +180,14 @@ zdos's whole premise is "compare to a known-good reference." Two oracles:
 - Capture progress headlessly via `/api/console` + `/api/framebuffer?format=png` (no display
   needed).
 - **Keep `--serve` alive across calls:** a server started with a trailing `&` inside a one-shot
-  shell gets reaped when that shell exits. Launch it in the harness's background mode (or
-  `nohup … & disown`) so it survives, then drive it with separate `curl` calls.
+  shell gets reaped when that shell exits. **Prefer the harness's own background mode** (the most
+  reliable: the server survives and answers every `curl`). `setsid … & disown` / `nohup … & disown`
+  were observed to be FLAKY here (the server answered the first `/api/status` then died, making
+  every later `curl` look like a "hang") — if you see a server die after one request, that's the
+  launch method, not an emulator bug; relaunch via the harness background mode. Sanity-check it's up
+  with `GET /api/status` BEFORE a `POST /api/run`. If you only need a fixed cycle target and one
+  state dump, **`--break-cycle N` headless is the simplest reliable path** (no server lifecycle at
+  all; it prints regs at the stop) and is fast even through a multi-million-cycle nested EXEC.
 
 ## Ground rule
 
