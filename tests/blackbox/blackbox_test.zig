@@ -19,6 +19,7 @@ const Session = @import("session.zig").Session;
 // `test-blackbox` step (they live in their own file for focus).
 test {
     _ = @import("keyecho_test.zig");
+    _ = @import("ttm_test.zig");
 }
 
 const FIXTURE = "examples/HELLO.EXE";

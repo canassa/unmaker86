@@ -2,6 +2,9 @@
 .zig-cache/
 zig-out/
 
+# TTM black-box screenshot artifacts (the staged work dir is under zig-out/)
+/ttm-shots/
+
 # direnv
 .direnv/
 

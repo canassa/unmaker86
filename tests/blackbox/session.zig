@@ -61,8 +61,24 @@ pub const Session = struct {
     /// Spawn `./zig-out/bin/zdos --serve 0 <exe_path>`, parse the ephemeral port from
     /// the stderr banner, and poll `/api/health` until the server answers.
     pub fn spawn(gpa: std.mem.Allocator, io: Io, exe_path: []const u8) !Session {
+        return spawnArgs(gpa, io, exe_path, &.{});
+    }
+
+    /// Like `spawn`, but appends `guest_args` after `exe_path` on the zdos command
+    /// line. zdos forwards extra CLI args as the guest DOS command tail (e.g. passing
+    /// `&.{"headless"}` runs the TTM movie without the trailing BIOS-tick end-hold).
+    pub fn spawnArgs(gpa: std.mem.Allocator, io: Io, exe_path: []const u8, guest_args: []const []const u8) !Session {
+        // argv = { "./zig-out/bin/zdos", "--serve", "0", exe_path } ++ guest_args.
+        const argv = try gpa.alloc([]const u8, 4 + guest_args.len);
+        defer gpa.free(argv);
+        argv[0] = "./zig-out/bin/zdos";
+        argv[1] = "--serve";
+        argv[2] = "0";
+        argv[3] = exe_path;
+        for (guest_args, 0..) |arg, i| argv[4 + i] = arg;
+
         var child = try std.process.spawn(io, .{
-            .argv = &.{ "./zig-out/bin/zdos", "--serve", "0", exe_path },
+            .argv = argv,
             .stdout = .ignore, // the guest prints CON output only on run-to-termination
             .stderr = .pipe, // the `[zdos] listening 127.0.0.1:<PORT>` banner lands here
         });
