@@ -20,6 +20,7 @@ const Session = @import("session.zig").Session;
 test {
     _ = @import("keyecho_test.zig");
     _ = @import("ttm_test.zig");
+    _ = @import("mouse_test.zig");
 }
 
 const FIXTURE = "examples/HELLO.EXE";

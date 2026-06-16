@@ -182,6 +182,74 @@ pub const Session = struct {
         return .{ .status = response.head.status, .body = body_alloc.written() };
     }
 
+    /// One captured framebuffer: the descriptor (`X-Frame-*` headers) plus the raw
+    /// body bytes (the index image for `format=index`). All slices live in the session
+    /// arena until the next `requestRaw` resets it.
+    pub const Frame = struct {
+        status: http.Status,
+        width: u16,
+        height: u16,
+        kind: u8, // 0=vga256_linear, 1=vga256_planar (Mode-X/Y), 2=text, …
+        format: []const u8,
+        data: []u8,
+    };
+
+    /// `GET /api/framebuffer?format=<fmt>` — capture the framebuffer descriptor +
+    /// raw body. Unlike `requestRaw` (JSON-shaped), this also harvests the
+    /// `X-Frame-Width/Height/Kind/Format` headers, which are the only place the
+    /// dimensions/kind are reported for the binary octet-stream body. Mirrors
+    /// `requestRaw`'s lower-level request path so the body never routes through JSON.
+    pub fn framebuffer(self: *Session, fmt: []const u8) !Frame {
+        var path_buf: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "/api/framebuffer?format={s}", .{fmt});
+
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        const url = try std.fmt.allocPrint(a, "{s}{s}", .{ self.base, path });
+        const uri = try std.Uri.parse(url);
+
+        var req = try self.client.request(.GET, uri, .{
+            .keep_alive = false,
+            .redirect_behavior = .unhandled,
+        });
+        defer req.deinit();
+        try req.sendBodiless();
+
+        var redirect_buf: [1024]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buf);
+
+        var frame: Frame = .{
+            .status = response.head.status,
+            .width = 0,
+            .height = 0,
+            .kind = 0xFF,
+            .format = "",
+            .data = &.{},
+        };
+        var it = response.head.iterateHeaders();
+        while (it.next()) |hdr| {
+            if (std.ascii.eqlIgnoreCase(hdr.name, "x-frame-width")) {
+                frame.width = std.fmt.parseInt(u16, hdr.value, 10) catch 0;
+            } else if (std.ascii.eqlIgnoreCase(hdr.name, "x-frame-height")) {
+                frame.height = std.fmt.parseInt(u16, hdr.value, 10) catch 0;
+            } else if (std.ascii.eqlIgnoreCase(hdr.name, "x-frame-kind")) {
+                frame.kind = std.fmt.parseInt(u8, hdr.value, 10) catch 0xFF;
+            } else if (std.ascii.eqlIgnoreCase(hdr.name, "x-frame-format")) {
+                frame.format = try a.dupe(u8, hdr.value);
+            }
+        }
+
+        var body_alloc: std.Io.Writer.Allocating = .init(a);
+        var transfer_buf: [8192]u8 = undefined;
+        const reader = response.reader(&transfer_buf);
+        _ = reader.streamRemaining(&body_alloc.writer) catch |err| switch (err) {
+            error.ReadFailed => return response.bodyErr().?,
+            else => |e| return e,
+        };
+        frame.data = body_alloc.written();
+        return frame;
+    }
+
     /// Assert a 2xx status and parse the body into `RespT` (in the session arena).
     pub fn parseOk(self: *Session, comptime RespT: type, r: Resp) !RespT {
         if (@intFromEnum(r.status) < 200 or @intFromEnum(r.status) >= 300) {

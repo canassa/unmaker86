@@ -5,6 +5,9 @@ zig-out/
 # TTM black-box screenshot artifacts (the staged work dir is under zig-out/)
 /ttm-shots/
 
+# MOUSE black-box cursor screenshot artifacts (the staged work dir is under zig-out/)
+/mouse-shots/
+
 # direnv
 .direnv/
 

@@ -551,6 +551,46 @@ pub fn Int33(comptime Cpu: type) type {
             self.firing = true;
             defer self.firing = false;
 
+            // PRESERVE THE INTERRUPTED GUEST CONTEXT (the ISR-frame model).
+            //
+            // On real hardware the AX=0Ch handler is reached from the mouse driver's
+            // INT 74h ISR: the hardware IRQ pushes FLAGS/CS/IP, and the driver's
+            // dispatch preserves the GP registers around the user handler. The user
+            // handler is therefore free to clobber AX/BX/CX/DX (mouse-handler ABI
+            // scratch), but the FOREGROUND code it interrupted resumes with its
+            // registers intact (dosbox-x INT74_Handler, mouse.cpp:2266 — the IRQ
+            // entry frame restores the caller's full context on IRET).
+            //
+            // zdos fires the callback as a bare far-call between debugger commands
+            // (the machine is parked mid-program), and `runGuestFarCall` only
+            // restores CS:IP/SP. Without preserving the rest, the callback's scratch
+            // writes to AX/BX/CX/DX/SI/DI and any DS/ES it establishes would corrupt
+            // the parked foreground context — e.g. Betrayal at Krondor's per-frame
+            // cursor loop resumes with garbage registers and blits to wrong VRAM
+            // offsets (observed as top-of-screen corruption on every injected event).
+            // Save the full architectural GP/DS/ES/FLAGS context here, set the
+            // callback-ABI inputs, run the handler, then restore — so an injected
+            // event is transparent to the interrupted program, exactly as a real IRQ
+            // is. The whole GP file (incl. ESP) is captured BEFORE we touch any
+            // register; `runGuestFarCall` independently restores ESP to this same
+            // pre-call value, so restoring the saved file is consistent (no skew).
+            const saved_regs = cpu.st.regs;
+            const saved_eflags = cpu.st.eflags;
+            const ds = @intFromEnum(Seg.ds);
+            const es = @intFromEnum(Seg.es);
+            const saved_ds_sel = cpu.st.selector[ds];
+            const saved_ds_base = cpu.st.seg_base[ds];
+            const saved_es_sel = cpu.st.selector[es];
+            const saved_es_base = cpu.st.seg_base[es];
+            defer {
+                cpu.st.regs = saved_regs;
+                cpu.st.eflags = saved_eflags;
+                cpu.st.selector[ds] = saved_ds_sel;
+                cpu.st.seg_base[ds] = saved_ds_base;
+                cpu.st.selector[es] = saved_es_sel;
+                cpu.st.seg_base[es] = saved_es_base;
+            }
+
             cpu.st.setReg16(EAX, fire_bits);
             cpu.st.setReg16(EBX, self.buttons & 0x00FF); // BL=buttons, BH=wheel=0
             cpu.st.setReg16(ECX, self.posX());
