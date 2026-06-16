@@ -573,6 +573,10 @@ pub const Server = struct {
                 else => return self.methodNotAllowed(req),
             }
         }
+        if (std.mem.eql(u8, path, "/api/mem/search")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            return self.handleMemSearch(req, query);
+        }
 
         // --- ivt / stack ---
         if (std.mem.startsWith(u8, path, "/api/ivt/")) {
@@ -928,6 +932,102 @@ pub const Server = struct {
         self.submitCtxAndRespond(req, &ctx);
     }
 
+    /// `GET /api/mem/search?pattern=<hex>|ascii=<str>&start&len&max` — find a byte
+    /// needle in the guest RAM slab (side-effect-free, on the worker, cycle-neutral).
+    /// Exactly one of `pattern` (hex) / `ascii` (text, percent-decoded) is required.
+    fn handleMemSearch(self: *Server, req: *http.Server.Request, query: []const u8) void {
+        const start = self.queryU32(query, "start") orelse 0;
+        const len = self.queryU32(query, "len") orelse 0; // 0 => to slab end (worker)
+        const max_q = self.queryU32(query, "max") orelse 0; // 0 => MAX_SEARCH_HITS (worker)
+        if (max_q > std.math.maxInt(u16)) return self.respondError(req, .bad_request, "out_of_range", "max too large");
+
+        const pat = queryValue(query, "pattern");
+        const asc = queryValue(query, "ascii");
+        // Exactly one of pattern/ascii.
+        if ((pat == null) == (asc == null)) {
+            return self.respondError(req, .bad_request, "bad_request", "specify exactly one of pattern/ascii");
+        }
+
+        var ctx: q.RequestCtx = .{ .cmd = undefined };
+        const needle: []const u8 = blk: {
+            if (pat) |p| {
+                const d = wire.hexDecode(ctx.scratch[0..], p) catch return self.respondError(req, .bad_request, "bad_request", "invalid hex in pattern");
+                break :blk d;
+            }
+            // ascii: percent-decode the literal text into scratch.
+            const d = percentDecode(ctx.scratch[0..], asc.?) orelse return self.respondError(req, .bad_request, "bad_request", "malformed percent-encoding in ascii");
+            break :blk d;
+        };
+        if (needle.len == 0) return self.respondError(req, .bad_request, "bad_request", "empty search pattern");
+        if (needle.len > q.MAX_SEARCH_NEEDLE) return self.respondError(req, .bad_request, "out_of_range", "needle too long");
+
+        ctx.cmd = .{ .mem_search = .{
+            .start = start,
+            .len = len,
+            .needle_len = @intCast(needle.len),
+            .max = @intCast(max_q),
+        } };
+        const resp = self.queue.submit(&ctx);
+        switch (resp) {
+            // `ctx` (hence the decoded needle in scratch) is still owned by us here —
+            // submit() blocks until the worker is done — so the `pattern` echo is intact.
+            .search => |sr| self.respondSearch(req, sr, ctx.scratch[0..sr.needle_len]),
+            .err => |code| self.respondErrCode(req, code),
+            else => self.respondError(req, .service_unavailable, "internal", "unexpected search response"),
+        }
+    }
+
+    /// Serialize a search result: `{"pattern","needle_len","start","len","count",
+    /// "truncated","matches":[{"phys","seg","off"},...]}`. `pattern` echoes the
+    /// searched needle as lowercase hex (both modes). `seg`/`off` are the canonical
+    /// real-mode decomposition (`seg=phys>>4, off=phys&0xF`) — pure arithmetic.
+    fn respondSearch(self: *Server, req: *http.Server.Request, sr: q.SearchResult, needle: []const u8) void {
+        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
+        const ok = blk: {
+            w.writeAll("{\"pattern\":\"") catch break :blk false;
+            for (needle) |b| {
+                w.writeByte("0123456789abcdef"[b >> 4]) catch break :blk false;
+                w.writeByte("0123456789abcdef"[b & 0x0F]) catch break :blk false;
+            }
+            w.print("\",\"needle_len\":{d},\"start\":{d},\"len\":{d},\"count\":{d},\"truncated\":{s},\"matches\":[", .{
+                sr.needle_len, sr.start, sr.len, sr.count, if (sr.truncated) "true" else "false",
+            }) catch break :blk false;
+            for (sr.hits[0..sr.count], 0..) |phys, i| {
+                if (i != 0) w.writeAll(",") catch break :blk false;
+                w.print("{{\"phys\":{d},\"seg\":{d},\"off\":{d}}}", .{ phys, phys >> 4, phys & 0xF }) catch break :blk false;
+            }
+            w.writeAll("]}") catch break :blk false;
+            break :blk true;
+        };
+        if (!ok) return self.respondError(req, .service_unavailable, "internal", "response too large");
+        self.respondJson(req, .ok, w.buffered());
+    }
+
+    /// Percent-decode a query value into `dst`, returning the decoded slice (a
+    /// prefix of `dst`) or null on a malformed `%XX`. `+` is left literal (query
+    /// values here are not form-encoded). Used for the `ascii` search needle.
+    fn percentDecode(dst: []u8, src: []const u8) ?[]u8 {
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < src.len) {
+            if (src[i] == '%') {
+                if (i + 2 >= src.len) return null;
+                const hi = std.fmt.charToDigit(src[i + 1], 16) catch return null;
+                const lo = std.fmt.charToDigit(src[i + 2], 16) catch return null;
+                if (n >= dst.len) return null;
+                dst[n] = @as(u8, hi) << 4 | lo;
+                n += 1;
+                i += 3;
+            } else {
+                if (n >= dst.len) return null;
+                dst[n] = src[i];
+                n += 1;
+                i += 1;
+            }
+        }
+        return dst[0..n];
+    }
+
     fn handleStack(self: *Server, req: *http.Server.Request, query: []const u8) void {
         const count = self.queryU32(query, "count") orelse return self.respondError(req, .bad_request, "bad_request", "missing/invalid count");
         if (count > std.math.maxInt(u16)) return self.respondError(req, .bad_request, "out_of_range", "count too large");
@@ -1193,6 +1293,10 @@ pub const Server = struct {
             // `/api/devices` route passes `?palette` via `handleDevices`.
             .devices => |d| self.respondDevices(req, d, false),
             .io_shadow => |io| self.respondIoShadow(req, io),
+            // `/api/mem/search` serializes directly in `handleMemSearch` (it needs
+            // the listener-owned needle for the `pattern` echo); this arm only
+            // exists for switch-exhaustiveness and would lack that echo.
+            .search => |sr| self.respondSearch(req, sr, &.{}),
         }
     }
 

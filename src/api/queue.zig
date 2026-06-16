@@ -145,6 +145,11 @@ pub const Command = union(enum) {
     /// The non-mutating shadow of one I/O port (`GET /api/io?port=N`). Pure
     /// per-port raw-field read; NEVER issues the mutating `in8`.
     io_shadow: struct { port: u16 },
+    /// Search the guest RAM slab for a byte needle (`GET /api/mem/search`). The
+    /// needle BYTES live in `RequestCtx.scratch[0..needle_len]` (decoded by the
+    /// handler before submit, like `mem_write`); the command carries only the
+    /// length + window. Pure peek path; cycle-neutral.
+    mem_search: MemSearchCmd,
     /// The worker-shutdown sentinel: the worker loop exits when it dequeues this.
     shutdown_worker: void,
 };
@@ -197,6 +202,29 @@ pub const MemResult = struct {
     phys: u32,
     len: u32,
     bytes: [MAX_MEM_CHUNK]u8 = undefined,
+};
+
+/// Max match addresses a single `/api/mem/search` returns (the result cap).
+pub const MAX_SEARCH_HITS = 256;
+/// Max needle length (bytes). Bounded by the per-request scratch buffer.
+pub const MAX_SEARCH_NEEDLE = MAX_MEM_CHUNK;
+
+/// A resolved memory-search command. Pointer-free POD: the needle bytes live in
+/// `RequestCtx.scratch[0..needle_len]`; this carries the window + lengths.
+pub const MemSearchCmd = struct {
+    start: u32,
+    len: u32, // 0 => "to slab end" (resolved/clamped on the worker)
+    needle_len: u16,
+    max: u16, // 0 => MAX_SEARCH_HITS (resolved on the worker)
+};
+
+pub const SearchResult = struct {
+    start: u32,
+    len: u32, // the clamped haystack length actually scanned
+    needle_len: u16,
+    count: u16,
+    truncated: bool,
+    hits: [MAX_SEARCH_HITS]u32 = undefined, // phys addresses; seg/off derived at serialize
 };
 
 pub const StackResult = struct {
@@ -306,6 +334,8 @@ pub const Response = union(enum) {
     devices: debug.DevicesSnapshot,
     /// A single I/O-port shadow (`/api/io`). Pointer-free POD.
     io_shadow: debug.IoShadow,
+    /// A memory-search result (`/api/mem/search`). Pointer-free POD.
+    search: SearchResult,
     /// A typed error. The handler maps `code` → HTTP status.
     err: ErrCode,
 };

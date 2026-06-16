@@ -789,6 +789,18 @@ pub const Controller = struct {
         self.m.bus.peekBlock(phys, dst);
     }
 
+    /// Side-effect-free RAM-slab search (`GET /api/mem/search`). Thin delegate to
+    /// `Bus.searchRam` — the bus owns the slab + A20 invariants, so the raw `[]u8`
+    /// never leaks up through the debug layer. Pure, cycle-neutral.
+    pub fn searchRam(self: *const Controller, start: u32, len: u32, needle: []const u8, hits: []u32) bus_mod.Bus.SearchHits {
+        return self.m.bus.searchRam(start, len, needle, hits);
+    }
+
+    /// The conventional+HMA RAM slab size (the search domain upper bound).
+    pub fn ramSlabSize(self: *const Controller) u32 {
+        return @intCast(self.m.bus.ram.len);
+    }
+
     /// Side-effect-free read of `dst.len` bytes from a logical `seg:off` view.
     pub fn peekMem(self: *const Controller, seg: Seg, off: u32, dst: []u8) void {
         const linear = self.m.cpu.st.seg_base[@intFromEnum(seg)] +% off;

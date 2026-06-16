@@ -436,6 +436,38 @@ test "#18 device-reader contrast: the SHADOW leaves the AC flip-flop; a LIVE in8
     try std.testing.expect(m.vga.attr_flip_flop_is_index);
 }
 
+test "#19 mem search is side-effect-free + ascending/overlapping, zero cycles" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    m.post();
+    loadNopProg(m);
+
+    // Lay a known needle at three ascending addresses (one pair overlapping).
+    const needle = [_]u8{ 0xAA, 0xAA };
+    m.bus.writePhys8(0x2000, 0xAA);
+    m.bus.writePhys8(0x2001, 0xAA);
+    m.bus.writePhys8(0x2002, 0xAA); // 0x2000 and 0x2001 both match "aaaa" (overlap)
+    m.bus.writePhys8(0x3000, 0xAA);
+    m.bus.writePhys8(0x3001, 0xAA);
+
+    var ctrl = Controller.init(m);
+    const before = m.snapshot();
+    var hits: [16]u32 = undefined;
+    const r = ctrl.searchRam(0, ctrl.ramSlabSize(), &needle, &hits);
+    const after = m.snapshot();
+
+    try std.testing.expectEqual(@as(u16, 3), r.count); // 0x2000, 0x2001, 0x3000
+    try std.testing.expectEqual(@as(u32, 0x2000), hits[0]);
+    try std.testing.expectEqual(@as(u32, 0x2001), hits[1]); // overlapping match reported
+    try std.testing.expectEqual(@as(u32, 0x3000), hits[2]); // ascending order
+    try std.testing.expect(!r.truncated);
+    // Pure: no cycles charged, no CPU/device mutation (searchRam is a `*const`
+    // read of the slab — it structurally cannot write RAM).
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&before.cpu_state), std.mem.asBytes(&after.cpu_state));
+    try std.testing.expectEqualDeep(before.vga, after.vga);
+}
+
 /// Counting allocator (mirrors machine/determinism_test.zig): records every
 /// alloc/free so the control path can be asserted alloc-free.
 const CountingAllocator = struct {

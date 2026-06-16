@@ -681,6 +681,36 @@ pub const Bus = struct {
         for (dst, 0..) |*b, i| b.* = self.peekPhys8(phys +% @as(u32, @intCast(i)));
     }
 
+    /// Side-effect-free forward scan of the RAM slab for `needle`, recording the
+    /// ABSOLUTE physical address of each match start into `hits` (the cap). Matches
+    /// OVERLAP (the cursor advances by 1, not needle_len) and come out in ascending
+    /// order (a forward linear walk — no container-iteration-order dependence).
+    /// `truncated` is true iff a further match exists beyond `hits.len`.
+    ///
+    /// Pure `*const Bus`: scans the `.ram` backing slab DIRECTLY (== what
+    /// `peekPhys8` returns for `.ram` pages, above) — equivalent to a per-byte peek
+    /// loop but memchr-fast via `std.mem.indexOfPos`, with no 1 MiB temp copy. The
+    /// reported `phys` is the raw slab offset, NOT A20-folded: the slab IS physical
+    /// RAM; A20 only aliases the >1 MiB wrap into the HMA, an addressing artifact,
+    /// not distinct storage (plans/mem-search.md §6). `start`/`len` are clamped to
+    /// the slab here defensively.
+    pub const SearchHits = struct { count: u16, truncated: bool };
+    pub fn searchRam(self: *const Bus, start: u32, len: u32, needle: []const u8, hits: []u32) SearchHits {
+        if (needle.len == 0 or hits.len == 0) return .{ .count = 0, .truncated = false };
+        const slab_end = @min(start +| len, @as(u32, @intCast(self.ram.len)));
+        if (start >= slab_end) return .{ .count = 0, .truncated = false };
+        const hay = self.ram[start..slab_end];
+        var count: u16 = 0;
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, hay, pos, needle)) |idx| {
+            if (count == hits.len) return .{ .count = count, .truncated = true };
+            hits[count] = start + @as(u32, @intCast(idx));
+            count += 1;
+            pos = idx + 1; // overlapping matches: advance by exactly one byte
+        }
+        return .{ .count = count, .truncated = false };
+    }
+
     /// If `[phys, phys+len)` A20-masks to a contiguous run that stays within the
     /// slab, never crosses an A20-mask wrap, and is entirely `.ram` pages, return
     /// the masked start offset for a single `@memcpy`; else null (per-byte path).

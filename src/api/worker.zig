@@ -165,6 +165,7 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
         .disasm => |c| disasmResp(ctrl, c.origin, c.count),
         .devices_get => .{ .devices = ctrl.devicesSnapshot() },
         .io_shadow => |c| .{ .io_shadow = .{ .port = c.port, .value = ctrl.ioShadow(c.port) } },
+        .mem_search => |c| memSearch(ctrl, ctx, c),
 
         .shutdown_worker => .ok,
     };
@@ -268,6 +269,26 @@ fn memWritePhys(ctrl: *Controller, ctx: *RequestCtx, phys: u32, len: u32) Respon
     if (!inSlab(ctrl, phys, len)) return .{ .err = .address_out_of_range };
     ctrl.writeMemPhys(phys, ctx.scratch[0..len]);
     return .{ .mem_written = .{ .phys = phys, .len = len } };
+}
+
+// --- memory search -----------------------------------------------------------
+
+fn memSearch(ctrl: *Controller, ctx: *RequestCtx, c: q.MemSearchCmd) Response {
+    if (c.needle_len == 0) return .{ .err = .bad_request };
+    if (c.needle_len > q.MAX_SEARCH_NEEDLE) return .{ .err = .out_of_range };
+    const slab = ctrl.ramSlabSize();
+    if (c.start >= slab) return .{ .err = .address_out_of_range };
+    // Clamp the haystack window to the slab end (NOT an error — mem-search.md §4).
+    const avail = slab - c.start;
+    const len = if (c.len == 0) avail else @min(c.len, avail);
+    const cap: u16 = if (c.max == 0 or c.max > q.MAX_SEARCH_HITS) q.MAX_SEARCH_HITS else c.max;
+
+    var res: q.SearchResult = .{ .start = c.start, .len = len, .needle_len = c.needle_len, .count = 0, .truncated = false };
+    const needle = ctx.scratch[0..c.needle_len];
+    const r = ctrl.searchRam(c.start, len, needle, res.hits[0..cap]);
+    res.count = r.count;
+    res.truncated = r.truncated;
+    return .{ .search = res };
 }
 
 // --- disassembly -------------------------------------------------------------

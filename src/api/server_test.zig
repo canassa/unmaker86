@@ -216,6 +216,90 @@ test "POST /api/breakpoints kind:io → 501 not_implemented (honest deferral)" {
     try std.testing.expect(std.mem.indexOf(u8, r.body, "\"not_implemented\"") != null);
 }
 
+test "GET /api/mem/search finds a hex pattern (single match, seg:off decomposition)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    // Plant DE AD BE EF at phys 0x1230 = 4656 (seg 0x123, off 0).
+    _ = method(&ts, "PUT", "/api/mem", "{\"phys\":4656,\"data\":\"deadbeef\"}", &obuf);
+    const r = get(&ts, "/api/mem/search?pattern=deadbeef", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"truncated\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"phys\":4656,\"seg\":291,\"off\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"pattern\":\"deadbeef\"") != null);
+}
+
+test "GET /api/mem/search?ascii (percent-decoded) matches literal text" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    // "Hi There" = 48 69 20 54 68 65 72 65 at phys 8192.
+    _ = method(&ts, "PUT", "/api/mem", "{\"phys\":8192,\"data\":\"4869205468657265\"}", &obuf);
+    // ascii=Hi%20There exercises the percent-decoder (space).
+    const r = get(&ts, "/api/mem/search?ascii=Hi%20There", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"phys\":8192") != null);
+    // pattern echo is the hex of the decoded needle.
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"pattern\":\"4869205468657265\"") != null);
+}
+
+test "GET /api/mem/search overlapping matches + ascending order" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    // aa aa aa aa at phys 4096 -> needle aaaa matches at 4096,4097,4098.
+    _ = method(&ts, "PUT", "/api/mem", "{\"phys\":4096,\"data\":\"aaaaaaaa\"}", &obuf);
+    const r = get(&ts, "/api/mem/search?pattern=aaaa&start=4096&len=4", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"count\":3") != null);
+    // Ascending: 4096 < 4097 < 4098 (overlap reported).
+    const p0 = std.mem.indexOf(u8, r.body, "\"phys\":4096").?;
+    const p1 = std.mem.indexOf(u8, r.body, "\"phys\":4097").?;
+    const p2 = std.mem.indexOf(u8, r.body, "\"phys\":4098").?;
+    try std.testing.expect(p0 < p1 and p1 < p2);
+}
+
+test "GET /api/mem/search?max caps results and sets truncated" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    _ = method(&ts, "PUT", "/api/mem", "{\"phys\":4096,\"data\":\"aaaaaaaa\"}", &obuf);
+    const r = get(&ts, "/api/mem/search?pattern=aa&start=4096&len=4&max=2", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"truncated\":true") != null);
+}
+
+test "GET /api/mem/search window excludes out-of-range matches" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    _ = method(&ts, "PUT", "/api/mem", "{\"phys\":20000,\"data\":\"cafe\"}", &obuf);
+    // Search a window that does NOT cover 20000.
+    const miss = get(&ts, "/api/mem/search?pattern=cafe&start=0&len=1000", &obuf);
+    try std.testing.expect(std.mem.indexOf(u8, miss.body, "\"count\":0") != null);
+    // A window that DOES cover it.
+    const hit = get(&ts, "/api/mem/search?pattern=cafe&start=20000&len=16", &obuf);
+    try std.testing.expect(std.mem.indexOf(u8, hit.body, "\"count\":1") != null);
+}
+
+test "GET /api/mem/search error cases (both/neither needle, bad hex, start past slab)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const both = get(&ts, "/api/mem/search?pattern=aa&ascii=x", &obuf);
+    try std.testing.expectEqual(@as(u16, 400), both.status);
+    const neither = get(&ts, "/api/mem/search", &obuf);
+    try std.testing.expectEqual(@as(u16, 400), neither.status);
+    const odd = get(&ts, "/api/mem/search?pattern=abc", &obuf);
+    try std.testing.expectEqual(@as(u16, 400), odd.status);
+    const past = get(&ts, "/api/mem/search?pattern=aa&start=99999999", &obuf);
+    try std.testing.expectEqual(@as(u16, 400), past.status);
+    try std.testing.expect(std.mem.indexOf(u8, past.body, "\"address_out_of_range\"") != null);
+}
+
 test "GET /api/devices reports all groups; A20 is OFF after boot (EXEPACK invariant)" {
     var ts = try TestServer.init(std.testing.allocator);
     try ts.start();
