@@ -259,6 +259,141 @@ test "#15 stepOver an INT (0xCD) steps over the handler via SP guard" {
     try std.testing.expectEqual(@as(u16, 1), m.cpu.st.getReg16(@intFromEnum(Reg32.eax)));
 }
 
+// ---- #15b stepOver a whole REP-string (plans/step-over-rep.md) ---------------
+
+// REP MOVSB then a marker then HLT. DS:SI -> source, ES:DI -> dest, CX = count.
+//   0800: F3 A4        REP MOVSB
+//   0802: BE 99 00     MOV SI, 0x99   (after-REP marker)
+//   0805: F4           HLT
+const REPPROG: u32 = 0x0800;
+const REP_AFTER: u32 = 0x0802;
+const REP_SRC: u32 = 0x1000;
+const REP_DST: u32 = 0x2000;
+fn loadRepProg(m: *Machine, count: u16) void {
+    const b = &m.bus;
+    b.writePhys8(REPPROG, 0xF3); // REP
+    b.writePhys8(REPPROG + 1, 0xA4); // MOVSB
+    b.writePhys8(REPPROG + 2, 0xBE);
+    b.writePhys8(REPPROG + 3, 0x99);
+    b.writePhys8(REPPROG + 4, 0x00); // MOV SI, 0x99
+    b.writePhys8(REPPROG + 5, 0xF4); // HLT
+    // Distinct source bytes so a correct copy is verifiable.
+    var i: u32 = 0;
+    while (i < count) : (i += 1) b.writePhys8(REP_SRC + i, @intCast(0x40 + (i & 0x3F)));
+    m.cpu.loadSegment(.cs, 0);
+    m.cpu.loadSegment(.ds, 0);
+    m.cpu.loadSegment(.es, 0);
+    m.cpu.loadSegment(.ss, 0);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.esp), 0x7000);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.esi), REP_SRC);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.edi), REP_DST);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.ecx), count);
+    m.cpu.st.eflags.df = false;
+    m.cpu.st.eip = REPPROG;
+}
+
+test "#15b stepOver a large REP MOVSB lands AFTER the REP in one command, copy complete" {
+    const alloc = std.testing.allocator;
+    const N: u16 = 64;
+
+    // Machine A: one stepOver over the whole REP.
+    const a = try makeMachine(alloc);
+    defer destroy(alloc, a);
+    loadRepProg(a, N);
+    var ca = Controller.init(a);
+    const res = ca.stepOver();
+
+    try std.testing.expect(!res.stepped_into); // stepped OVER the whole REP
+    try std.testing.expectEqual(@as(u32, REP_AFTER), a.cpu.st.eip); // past the REP
+    try std.testing.expectEqual(@as(u16, 0), a.cpu.st.getReg16(@intFromEnum(Reg32.ecx))); // CX exhausted
+    // The block was actually copied.
+    var di: u32 = 0;
+    while (di < N) : (di += 1) {
+        try std.testing.expectEqual(a.bus.peekPhys8(REP_SRC + di), a.bus.peekPhys8(REP_DST + di));
+    }
+
+    // Machine B: drive the REP via per-iteration stepInstruction; the cycle count
+    // must match — stepOver charges the REP's REAL cycles, no synthetic count.
+    const bm = try makeMachine(alloc);
+    defer destroy(alloc, bm);
+    loadRepProg(bm, N);
+    var cb = Controller.init(bm);
+    while (bm.cpu.st.eip == REPPROG) _ = cb.stepInstruction();
+    try std.testing.expectEqual(bm.cpu.st.cycles, a.cpu.st.cycles);
+}
+
+test "#15b stepOver a REP with CX=0 is a single no-op step to the next instruction" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    loadRepProg(m, 0); // CX = 0: REP is a no-op
+    var ctrl = Controller.init(m);
+    const res = ctrl.stepOver();
+    try std.testing.expect(!res.stepped_into);
+    try std.testing.expectEqual(@as(u32, REP_AFTER), m.cpu.st.eip);
+    // Nothing copied (dest stays zero).
+    try std.testing.expectEqual(@as(u8, 0), m.bus.peekPhys8(REP_DST));
+}
+
+test "#15b stepOver entered MID-REP still completes the remaining iterations" {
+    const alloc = std.testing.allocator;
+    const N: u16 = 32;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    loadRepProg(m, N);
+    var ctrl = Controller.init(m);
+
+    // Step 5 iterations by hand — EIP stays pinned at the REP opcode (mid-flight).
+    var k: u32 = 0;
+    while (k < 5) : (k += 1) _ = ctrl.stepInstruction();
+    try std.testing.expectEqual(@as(u32, REPPROG), m.cpu.st.eip); // still on the REP
+    try std.testing.expectEqual(@as(u16, N - 5), m.cpu.st.getReg16(@intFromEnum(Reg32.ecx)));
+
+    // stepOver from mid-REP completes the rest in one command.
+    const res = ctrl.stepOver();
+    try std.testing.expect(!res.stepped_into);
+    try std.testing.expectEqual(@as(u32, REP_AFTER), m.cpu.st.eip);
+    try std.testing.expectEqual(@as(u16, 0), m.cpu.st.getReg16(@intFromEnum(Reg32.ecx)));
+}
+
+test "#15b stepOver over a REP is deterministic (two runs byte-identical + same cycle)" {
+    const alloc = std.testing.allocator;
+    const N: u16 = 50;
+    var snaps: [2]Machine.Snapshot = undefined;
+    var cycles: [2]u64 = undefined;
+    for (0..2) |run| {
+        const m = try makeMachine(alloc);
+        defer destroy(alloc, m);
+        loadRepProg(m, N);
+        var ctrl = Controller.init(m);
+        _ = ctrl.stepOver();
+        snaps[run] = m.snapshot();
+        cycles[run] = m.cpu.st.cycles;
+    }
+    try std.testing.expectEqual(cycles[0], cycles[1]);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&snaps[0].cpu_state), std.mem.asBytes(&snaps[1].cpu_state));
+}
+
+test "#15b stepOver an INDIRECT CALL (FF /2) still reports step-into (documented gap)" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    const b = &m.bus;
+    // FF D0 = CALL AX (register-indirect near call). Not a direct CALL/INT, not a
+    // REP — so step-over has no cheap next-addr and reports a step-into fallback.
+    b.writePhys8(0x0500, 0xFF);
+    b.writePhys8(0x0501, 0xD0); // CALL AX
+    m.cpu.loadSegment(.cs, 0);
+    m.cpu.loadSegment(.ss, 0);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.esp), 0x7000);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.eax), 0x0600); // call target
+    m.cpu.st.eip = 0x0500;
+
+    var ctrl = Controller.init(m);
+    const res = ctrl.stepOver();
+    try std.testing.expect(res.stepped_into); // reported fallback, never silent
+}
+
 // ---- reset + mutate -----------------------------------------------------------
 
 test "reset then re-load + rerun == fresh run, byte-identical" {

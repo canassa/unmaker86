@@ -529,21 +529,76 @@ pub const Controller = struct {
         self.set.remove(id) catch {};
     }
 
-    /// Step OVER a direct CALL/INT by running to its return; otherwise == step
-    /// into. Returns `StepOverResult{reason, stepped_into}` — the `stepped_into`
-    /// flag reports a fallback to step-into (never a silent degrade, ground rule).
+    /// Option A REP sizer (plans/step-over-rep.md): peek the bytes at CS:EIP and,
+    /// IFF the instruction is a REP/REPE/REPNE-prefixed STRING op, return the linear
+    /// address of the instruction that FOLLOWS it. REP legally prefixes only the
+    /// single-byte, no-ModR/M, no-immediate string ops (MOVS/CMPS/STOS/LODS/SCAS =
+    /// A4-A7, AA-AF; INS/OUTS = 6C-6F), so length = (prefix bytes) + 1. Pure peek
+    /// (side-effect-free), no CPU surface. null => not a REP-string instruction.
+    fn repStringNextLinear(self: *const Controller) ?u32 {
+        const cs_base = self.m.cpu.st.seg_base[@intFromEnum(Seg.cs)];
+        const start = cs_base +% self.m.cpu.st.eip;
+        var i: u8 = 0;
+        var saw_rep = false;
+        while (i < 15) : (i += 1) { // bounded by MAX_INSTR_LEN
+            const b = self.m.bus.peekPhys8(start +% i);
+            switch (b) {
+                0xF2, 0xF3 => saw_rep = true, // REPNE / REP(E)
+                // segment / operand-size / address-size / lock prefixes: keep scanning.
+                0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0 => {},
+                else => {
+                    // `b` is the opcode. Is it a REP-able string op?
+                    const is_string = switch (b) {
+                        0x6C...0x6F, 0xA4...0xA7, 0xAA...0xAF => true,
+                        else => false,
+                    };
+                    if (saw_rep and is_string) return start +% (@as(u32, i) + 1);
+                    return null;
+                },
+            }
+        }
+        return null; // 15 prefix bytes with no opcode: not a sane REP string
+    }
+
+    /// Step OVER a direct CALL/INT or a whole REP-string by running past it;
+    /// otherwise == step into. Returns `StepOverResult{reason, stepped_into}` — the
+    /// `stepped_into` flag reports a fallback to step-into (never a silent degrade).
     ///
-    /// We classify only the opcodes we can size cheaply from the FIRST byte at
-    /// CS:IP (read via the side-effect-free peek path): `0xE8` near `CALL rel`,
-    /// `0x9A` far `CALL ptr`, `0xCD` `INT imm8`. For these we execute the call/INT
-    /// itself (one step), then set a one-shot `execution_address` bp at the pushed
-    /// return linear address, SP-GUARDED so recursion is correct (a deeper re-entry
-    /// to the same address does not trip it). Everything else (indirect CALL, REP,
-    /// prefixed, far RET sizing) falls back to `stepInstruction` with
-    /// `stepped_into = true`.
+    /// - Direct CALL/INT (`0xE8`/`0x9A`/`0xCD`): execute the call/INT (one step),
+    ///   then a one-shot `execution_address` bp at the pushed return address,
+    ///   SP-GUARDED so recursion is correct.
+    /// - REP/REPE/REPNE string (`F2/F3` + string op): a one-shot at the REP's
+    ///   next-instruction address; the REP runs ALL iterations (real cycles) and we
+    ///   stop after. Immune to an IRQ landing mid-REP — the bp matches only when
+    ///   CS:EIP has genuinely moved PAST the REP (mid-flight EIP stays pinned at the
+    ///   REP opcode; an ISR runs at its own CS:EIP). No SP guard (REP pushes no
+    ///   frame).
+    /// - Everything else (indirect CALL / `FF`-group, LOOP, …) falls back to
+    ///   `stepInstruction` with `stepped_into = true` — a known, intentional gap
+    ///   pending a general instruction sizer/decoder.
     pub fn stepOver(self: *Controller) StepOverResult {
         self.last_stop = null;
         if (self.terminalReason()) |r| return .{ .reason = self.record(r), .stepped_into = false };
+
+        // REP/REPE/REPNE string: step OVER the whole REP via a one-shot at the
+        // next-instruction address (no SP guard — REP pushes no return frame).
+        if (self.repStringNextLinear()) |next_linear| {
+            const rid = self.set.add(.{ .execution_address = .{ .linear = next_linear } }, true) catch {
+                // Table full: degrade to step-into rather than panic (ground rule).
+                return .{ .reason = self.stepInstruction(), .stepped_into = true };
+            };
+            defer self.discardOneShot(rid);
+            const r = self.runUntilEvent(std.math.maxInt(u64));
+            switch (r) {
+                .breakpoint => |hit| {
+                    if (hit.id == rid) {
+                        return .{ .reason = self.record(.{ .step_complete = .{ .at_cycle = self.m.cpu.st.cycles } }), .stepped_into = false };
+                    }
+                    return .{ .reason = r, .stepped_into = false }; // some OTHER user bp pre-empted
+                },
+                else => return .{ .reason = r, .stepped_into = false }, // terminal / budget
+            }
+        }
 
         const cs_base = self.m.cpu.st.seg_base[@intFromEnum(Seg.cs)];
         const ip_linear = cs_base +% self.m.cpu.st.eip;
