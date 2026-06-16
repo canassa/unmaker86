@@ -116,6 +116,33 @@ pub const PitChannel = struct {
     /// The live counter value computed from elapsed cycles since the last arm
     /// (M-D8 — pure function of the cycle ledger, not host time). For periodic
     /// modes (2/3) the counter wraps within the period; mode 0 counts down once.
+    /// The OUT pin level as a PURE function of this channel + `cycles_now` (no
+    /// mutation, no host clock). Identical math to `Pit.outBit` but const and
+    /// per-channel, so the side-effect-free device reader can compute OUT for any
+    /// channel without the (non-const, Pit-level) port path. `Pit.outBit`
+    /// delegates here so the two never drift.
+    pub fn outBitAt(self: *const PitChannel, cycles_now: u64) bool {
+        if (self.mode == .inactive) return false;
+        const period = self.reloadTicks();
+        if (period == 0) return self.output;
+        // A LOW gate forces OUT HIGH on the rate/square modes (counter frozen).
+        if (!self.gate and (self.mode == .mode2 or self.mode == .mode3)) return true;
+        const ref = if (self.gate) cycles_now else self.gate_off_cycle;
+        const elapsed_ticks = timing.cyclesToTicks(ref -% self.last_arm_cycle);
+        switch (self.mode) {
+            .mode3 => {
+                const half = period / 2;
+                const into = elapsed_ticks % period;
+                return into < half;
+            },
+            .mode2 => {
+                const into = elapsed_ticks % period;
+                return into != (period - 1);
+            },
+            else => return self.output,
+        }
+    }
+
     pub fn liveCounter(self: *const PitChannel, cycles_now: u64) u16 {
         const period = self.reloadTicks();
         if (period == 0) return 0;
@@ -396,30 +423,8 @@ pub const Pit = struct {
     /// modes 2/0 have their own OUT shape. This affects ONLY read-back/speaker,
     /// NOT the scheduled IRQ0 period (M-D8: IRQ0 period = R for both 2 and 3).
     fn outBit(self: *Pit, chan: usize) bool {
-        const ch = &self.channels[chan];
-        if (ch.mode == .inactive) return false;
-        const period = ch.reloadTicks();
-        if (period == 0) return ch.output;
-        // A LOW gate forces OUT HIGH on the rate/square modes (the counter is
-        // frozen and the speaker AND-gate sees a steady level); freeze the
-        // elapsed time at the gate-drop cycle so OUT is stable while gated off.
-        if (!ch.gate and (ch.mode == .mode2 or ch.mode == .mode3)) return true;
-        const ref = if (ch.gate) self.cyclesNow() else ch.gate_off_cycle;
-        const elapsed_ticks = timing.cyclesToTicks(ref -% ch.last_arm_cycle);
-        switch (ch.mode) {
-            .mode3 => {
-                // High for the first half of the period, low for the second.
-                const half = period / 2;
-                const into = elapsed_ticks % period;
-                return into < half;
-            },
-            .mode2 => {
-                // OUT is low for one tick at terminal count, high otherwise.
-                const into = elapsed_ticks % period;
-                return into != (period - 1);
-            },
-            else => return ch.output,
-        }
+        // Single source of truth: the pure per-channel `outBitAt` (above).
+        return self.channels[chan].outBitAt(self.cyclesNow());
     }
 
     // -----------------------------------------------------------------------

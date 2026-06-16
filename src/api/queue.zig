@@ -137,6 +137,14 @@ pub const Command = union(enum) {
     /// peek path; cycle-neutral (charges no ledger cost). `count` is validated
     /// ≤ MAX_DISASM_INSNS at the handler.
     disasm: struct { origin: debug.DisasmOrigin, count: u16 },
+    /// Side-effect-free chipset/A20/device snapshot (`GET /api/devices`). A `void`
+    /// command: the `?palette=1` flag is parsed server-side and only widens the
+    /// JSON (the worker always fills the DAC palette; the server nulls it when the
+    /// flag is absent). Cycle-neutral, pure peek path.
+    devices_get: void,
+    /// The non-mutating shadow of one I/O port (`GET /api/io?port=N`). Pure
+    /// per-port raw-field read; NEVER issues the mutating `in8`.
+    io_shadow: struct { port: u16 },
     /// The worker-shutdown sentinel: the worker loop exits when it dequeues this.
     shutdown_worker: void,
 };
@@ -294,6 +302,10 @@ pub const Response = union(enum) {
     regions: RegionsResult,
     /// A disassembly window (`/api/disasm`). Pointer-free POD filled by the worker.
     disasm: debug.DisasmResult,
+    /// A chipset/A20/device snapshot (`/api/devices`). Pointer-free POD.
+    devices: debug.DevicesSnapshot,
+    /// A single I/O-port shadow (`/api/io`). Pointer-free POD.
+    io_shadow: debug.IoShadow,
     /// A typed error. The handler maps `code` → HTTP status.
     err: ErrCode,
 };

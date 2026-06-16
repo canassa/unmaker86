@@ -913,9 +913,19 @@ pub const Vga = struct {
         // Documented read side effect: reset the attribute-controller (0x3C0)
         // flip-flop to the index/address phase (D-RT3, §3.4). Idempotent at true.
         self.attr_flip_flop_is_index = true;
+        // The status BYTE itself is pure `f(cycles)` — computed by the non-mutating
+        // peek so the live read and the debugger's device reader share the bit math.
+        return self.statusReg1Peek(self.cyclesNow());
+    }
 
-        const now = self.cyclesNow();
-        const into_frame = now % FRAME_CYCLES; // 0 .. FRAME_CYCLES-1 (anchored at cycle 0)
+    /// The Input Status #1 byte as a PURE function of `cycles_now` — the exact bit
+    /// math of `statusReg1` MINUS its one documented mutation (the AC flip-flop
+    /// reset). The side-effect-free device reader (`/api/devices`, `/api/io`) calls
+    /// THIS so an inspect never perturbs `attr_flip_flop_is_index` (the prime
+    /// directive: snapshot-before == snapshot-after).
+    pub fn statusReg1Peek(self: *const Vga, cycles_now: u64) u8 {
+        _ = self;
+        const into_frame = cycles_now % FRAME_CYCLES; // 0 .. FRAME_CYCLES-1 (anchored at cycle 0)
         const scanline = into_frame / LINE_CYCLES; // 0 .. 449 (449 is harmless, see §3.2)
         const into_line = into_frame % LINE_CYCLES; // 0 .. LINE_CYCLES-1
 

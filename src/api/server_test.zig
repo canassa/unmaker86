@@ -216,6 +216,87 @@ test "POST /api/breakpoints kind:io → 501 not_implemented (honest deferral)" {
     try std.testing.expect(std.mem.indexOf(u8, r.body, "\"not_implemented\"") != null);
 }
 
+test "GET /api/devices reports all groups; A20 is OFF after boot (EXEPACK invariant)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = get(&ts, "/api/devices", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    // All device groups present.
+    for ([_][]const u8{ "\"a20\"", "\"pic\"", "\"pit\"", "\"vga\"", "\"kbc\"", "\"speaker\"", "\"ems\"" }) |k| {
+        try std.testing.expect(std.mem.indexOf(u8, r.body, k) != null);
+    }
+    // DMA is honestly null (not modeled), never fabricated.
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"dma\":null") != null);
+    // The motivating invariant: A20 boots OFF (the 1 MiB-wrap EXEPACK depends on).
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"a20\":{\"enabled\":false") != null);
+    // PIC master/slave both present.
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"master\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"slave\"") != null);
+    // Default snapshot omits the bulky DAC palette.
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"palette\":null") != null);
+}
+
+test "GET /api/devices?palette=1 includes the 256-entry DAC palette" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = get(&ts, "/api/devices?palette=1", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    // The palette is now an array of {red,green,blue} entries.
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"red\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"palette\":null") == null);
+}
+
+test "GET /api/device/<name> returns one group; unknown → 404" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const a = get(&ts, "/api/device/a20", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), a.status);
+    try std.testing.expect(std.mem.indexOf(u8, a.body, "\"enabled\":false") != null);
+
+    const p = get(&ts, "/api/device/pit", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), p.status);
+    try std.testing.expect(std.mem.indexOf(u8, p.body, "\"channels\":[") != null);
+
+    const u = get(&ts, "/api/device/bogus", &obuf);
+    try std.testing.expectEqual(@as(u16, 404), u.status);
+}
+
+test "GET /api/io?port=0x3da is a non-mutating shadow (AC flip-flop unchanged)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    // The VGA AC flip-flop state BEFORE any 0x3DA access.
+    var before_buf: [16 * 1024]u8 = undefined;
+    const dev_before = get(&ts, "/api/devices", &before_buf);
+    try std.testing.expectEqual(@as(u16, 200), dev_before.status);
+    var saved: [16 * 1024]u8 = undefined;
+    @memcpy(saved[0..dev_before.body.len], dev_before.body);
+    const before_body = saved[0..dev_before.body.len];
+
+    // Two shadow reads of 0x3DA in a row: a LIVE in8 would flip the flip-flop;
+    // the shadow must return the same value and leave state untouched.
+    const io1 = get(&ts, "/api/io?port=0x3da", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), io1.status);
+    try std.testing.expect(std.mem.indexOf(u8, io1.body, "\"shadow\":true") != null);
+
+    // Devices snapshot AFTER must be byte-identical (nothing mutated, no cycles).
+    const dev_after = get(&ts, "/api/devices", &obuf);
+    try std.testing.expectEqualStrings(before_body, dev_after.body);
+}
+
+test "GET /api/io?port for an unmapped port → value null with the shadow disclaimer" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = get(&ts, "/api/io?port=0x1234", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"value\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"shadow\":true") != null);
+}
+
 test "GET /api/disasm?linear decodes a real instruction window (pure peek)" {
     var ts = try TestServer.init(std.testing.allocator);
     try ts.start();

@@ -163,6 +163,8 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
         .load => |c| loadResp(ctrl, c, mount),
         .mem_regions => regionsResp(ctrl),
         .disasm => |c| disasmResp(ctrl, c.origin, c.count),
+        .devices_get => .{ .devices = ctrl.devicesSnapshot() },
+        .io_shadow => |c| .{ .io_shadow = .{ .port = c.port, .value = ctrl.ioShadow(c.port) } },
 
         .shutdown_worker => .ok,
     };

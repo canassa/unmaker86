@@ -199,6 +199,112 @@ pub const DisasmOrigin = union(enum) {
     cs_eip: void,
 };
 
+// ===========================================================================
+// Device / chipset / A20 state reader (plans/device-state-reader.md). Every field
+// below is a RAW device-struct field read or a pure `f(cpu.st.cycles)` compute —
+// NEVER a call into a device's `in8`/port handler (those mutate: DAC index
+// advance, FIFO pop, AC flip-flop reset). The whole snapshot is JSON-Stringify-able
+// (enums render as strings, fixed arrays as JSON arrays).
+// ===========================================================================
+
+/// A20 gate. `enabled`/`mask` are the BUS's authoritative state; `kbc_output_port_bit1`
+/// is the 8042 output-port LATCH (read-back only — the bus, not the 8042, owns A20).
+pub const DevA20 = struct {
+    enabled: bool,
+    mask: u32,
+    kbc_output_port_bit1: bool,
+};
+
+/// One PIT channel: raw programmed state + the two CYCLE-DERIVED values (`counter`,
+/// `output`) computed from `cpu.st.cycles` via the pure `liveCounter`/`outBitAt`.
+pub const DevPitChannel = struct {
+    mode: devices.pit.PitMode,
+    access: devices.pit.AccessMode,
+    bcd: bool,
+    reload: u32, // effective reload (0 programmed -> 65536)
+    gate: bool,
+    counter: u16, // computed: liveCounter(cyclesNow)
+    output: bool, // computed: outBitAt(cyclesNow)
+    latched: bool,
+    status_latched: bool,
+    new_mode: bool,
+};
+
+pub const DevPit = struct {
+    channels: [3]DevPitChannel,
+    /// True for the cycle-derived fields (`counter`/`output`): they move with the
+    /// ledger. ch2 `output` is a cross-emulator non-determinism boundary (host-clock
+    /// in other emulators) — here it is `f(cycles)`, so deterministic.
+    cycle_derived: bool = true,
+};
+
+pub const DevSpeaker = struct {
+    port_b: u8, // the 0x61 latch (speaker.port_61_data)
+    ch2_gate: bool,
+    ch2_out: bool, // computed: pit ch2 outBitAt(cyclesNow)
+};
+
+pub const DevVga = struct {
+    mode: u8, // BDA video mode (peek of BDA 0x49, same source as /api/screen)
+    misc_output: u8,
+    feature_control: u8,
+    pel_mask: u8,
+    attr_flip_flop_is_index: bool,
+    attr_pas: bool,
+    seq_index: u8,
+    seq: [5]u8,
+    crtc_index: u8,
+    crtc: [32]u8,
+    gfx_index: u8,
+    gfx: [9]u8,
+    attr_index: u8,
+    attr: [21]u8,
+    dac_read_index: u8,
+    dac_write_index: u8,
+    dac_pel_index: u8,
+    dac_state: devices.vga.DacState,
+    /// COMPUTED (non-mutating) Input Status #1 byte — `statusReg1Peek(cyclesNow)`,
+    /// NOT a read of 0x3DA (which would flip the AC flip-flop). Labeled so a client
+    /// never mistakes it for a live port read.
+    input_status1: u8,
+    latch: [4]u8,
+    /// The 256-entry DAC palette — only present when the request passed `?palette=1`
+    /// (nulled server-side otherwise to keep the default snapshot small).
+    palette: ?[256]devices.vga.DacRgb = null,
+};
+
+pub const DevEms = struct {
+    installed: bool,
+    reported_pages: u16,
+    backing_pages: u16,
+    user_pages: u16,
+    free_pages: u16,
+    active_handles: u16,
+    frame_pages: u8,
+};
+
+/// The grouped chipset snapshot for `GET /api/devices`. `dma` is always null:
+/// zdos models no 8237 — surfacing the absence honestly (never fabricated regs).
+pub const DevicesSnapshot = struct {
+    a20: DevA20,
+    pic: devices.Pic.Snapshot, // {master, slave} controllers, all raw fields
+    pit: DevPit,
+    vga: DevVga,
+    kbc: devices.Keyboard.Snapshot, // fifo/status/config/output_port/pending/...
+    speaker: DevSpeaker,
+    ems: DevEms,
+    /// Not modeled — honest null, never a fabricated 8237 register set.
+    dma: ?u0 = null,
+};
+
+/// The non-mutating shadow of one I/O port (`GET /api/io`): the value an `in8`
+/// would currently return, computed from raw fields WITHOUT issuing the mutating
+/// read. `null` => no stable shadow defined for that port.
+pub const IoShadow = struct {
+    port: u16,
+    value: ?u8,
+};
+
 pub const Controller = struct {
     m: *Machine,
     set: BreakpointSet = .{},
@@ -687,6 +793,140 @@ pub const Controller = struct {
     pub fn peekMem(self: *const Controller, seg: Seg, off: u32, dst: []u8) void {
         const linear = self.m.cpu.st.seg_base[@intFromEnum(seg)] +% off;
         self.m.bus.peekBlock(linear, dst);
+    }
+
+    /// A side-effect-free snapshot of the chipset / A20 / device state
+    /// (plans/device-state-reader.md). Reads ONLY raw device fields (via each
+    /// device's by-value `snapshot()`) and pure cycle-derived helpers
+    /// (`liveCounter`/`outBitAt`/`statusReg1Peek`) — NEVER a port `in8`/read
+    /// handler (those mutate). So `machine.snapshot()` is byte-identical before
+    /// and after, and zero cycles are charged (the prime directive).
+    pub fn devicesSnapshot(self: *const Controller) DevicesSnapshot {
+        const cyclesNow = self.m.cpu.st.cycles;
+
+        // ---- A20 (the thing that was invisible during the EXEPACK bug) ----
+        const a20: DevA20 = .{
+            .enabled = self.m.bus.a20Enabled(),
+            .mask = self.m.bus.a20_mask,
+            .kbc_output_port_bit1 = (self.m.kbd.output_port & 0x02) != 0,
+        };
+
+        // ---- PIT (raw fields + the two cycle-derived values) ----
+        var pit: DevPit = .{ .channels = undefined };
+        for (&self.m.pit.channels, 0..) |*ch, i| {
+            pit.channels[i] = .{
+                .mode = ch.mode,
+                .access = ch.access,
+                .bcd = ch.bcd,
+                .reload = if (ch.reload == 0) 65536 else ch.reload,
+                .gate = ch.gate,
+                .counter = ch.liveCounter(cyclesNow),
+                .output = ch.outBitAt(cyclesNow),
+                .latched = ch.latched,
+                .status_latched = ch.status_latched,
+                .new_mode = ch.new_mode,
+            };
+        }
+
+        // ---- VGA (register files + DAC indices + COMPUTED status, never 0x3DA) ----
+        const vsnap = self.m.vga.snapshot();
+        const vga: DevVga = .{
+            .mode = self.m.bus.peekPhys8(0x449), // BDA video mode (== /api/screen)
+            .misc_output = vsnap.misc_output,
+            .feature_control = vsnap.feature_control,
+            .pel_mask = vsnap.pel_mask,
+            .attr_flip_flop_is_index = vsnap.attr_flip_flop_is_index,
+            .attr_pas = vsnap.attr_pas,
+            .seq_index = vsnap.seq.index,
+            .seq = vsnap.seq.regs,
+            .crtc_index = vsnap.crtc.index,
+            .crtc = vsnap.crtc.regs,
+            .gfx_index = vsnap.gfx.index,
+            .gfx = vsnap.gfx.regs,
+            .attr_index = vsnap.attr.index,
+            .attr = vsnap.attr.regs,
+            .dac_read_index = vsnap.dac_read_index,
+            .dac_write_index = vsnap.dac_write_index,
+            .dac_pel_index = vsnap.dac_pel_index,
+            .dac_state = vsnap.dac_state,
+            .input_status1 = self.m.vga.statusReg1Peek(cyclesNow),
+            .latch = vsnap.latch,
+            .palette = vsnap.dac_rgb, // server nulls this when ?palette not set
+        };
+
+        // ---- Speaker / KBC port B (latch + computed ch2 OUT) ----
+        const speaker: DevSpeaker = .{
+            .port_b = self.m.speaker.snapshot().port_61_data,
+            .ch2_gate = self.m.pit.channels[2].gate,
+            .ch2_out = self.m.pit.channels[2].outBitAt(cyclesNow),
+        };
+
+        // ---- EMS config (the EMS-bug surface) ----
+        const er = self.m.dos.ems.report();
+        const ems: DevEms = .{
+            .installed = er.installed,
+            .reported_pages = er.reported_pages,
+            .backing_pages = er.backing_pages,
+            .user_pages = er.user_pages,
+            .free_pages = er.free_pages,
+            .active_handles = er.active_handles,
+            .frame_pages = er.frame_pages,
+        };
+
+        return .{
+            .a20 = a20,
+            .pic = self.m.pic.snapshot(),
+            .pit = pit,
+            .vga = vga,
+            .kbc = self.m.kbd.snapshot(),
+            .speaker = speaker,
+            .ems = ems,
+        };
+    }
+
+    /// The non-mutating shadow of a single I/O port (`GET /api/io`) — the value an
+    /// `in8(port)` would currently return, computed from RAW fields/pure helpers
+    /// WITHOUT issuing the mutating read (no DAC-index advance, no FIFO pop, no AC
+    /// flip-flop reset). `null` => no stable shadow is defined for that port.
+    pub fn ioShadow(self: *const Controller, port: u16) ?u8 {
+        const cyclesNow = self.m.cpu.st.cycles;
+        const vsnap = self.m.vga.snapshot();
+        const ksnap = self.m.kbd.snapshot();
+        return switch (port) {
+            // VGA Input Status #1 — computed retrace/display bits (no flip-flop reset).
+            0x3DA, 0x3BA => self.m.vga.statusReg1Peek(cyclesNow),
+            0x3C6 => vsnap.pel_mask, // PEL mask
+            0x3C7 => @intFromEnum(vsnap.dac_state), // DAC state (read/write)
+            0x3C8 => vsnap.dac_write_index,
+            // DAC data: the sub-byte at the current read entry/pel WITHOUT advancing.
+            0x3C9 => switch (vsnap.dac_pel_index) {
+                0 => vsnap.dac_rgb[vsnap.dac_read_index].red,
+                1 => vsnap.dac_rgb[vsnap.dac_read_index].green,
+                else => vsnap.dac_rgb[vsnap.dac_read_index].blue,
+            },
+            0x3CC => vsnap.misc_output, // Misc Output read-back
+            // PIC: OCW3-selected IRR/ISR (master/slave), and the mask register.
+            0x20 => if (self.m.pic.master.read_isr) self.m.pic.master.isr else self.m.pic.master.irr,
+            0x21 => self.m.pic.master.imr,
+            0xA0 => if (self.m.pic.slave.read_isr) self.m.pic.slave.isr else self.m.pic.slave.irr,
+            0xA1 => self.m.pic.slave.imr,
+            // PIT counters: the low byte of the live counter (best-defined shadow).
+            0x40 => @truncate(self.m.pit.channels[0].liveCounter(cyclesNow)),
+            0x41 => @truncate(self.m.pit.channels[1].liveCounter(cyclesNow)),
+            0x42 => @truncate(self.m.pit.channels[2].liveCounter(cyclesNow)),
+            // 8042 data: the FIFO head WITHOUT popping (or last response if empty).
+            0x60 => if (ksnap.fifo_count > 0) ksnap.fifo[ksnap.fifo_head] else ksnap.last_response,
+            // KBC port B: the 0x61 latch with bit5 reflecting computed ch2 OUT.
+            0x61 => blk: {
+                var v = self.m.speaker.snapshot().port_61_data;
+                if (self.m.pit.channels[2].outBitAt(cyclesNow)) v |= 0x20 else v &= ~@as(u8, 0x20);
+                break :blk v;
+            },
+            0x64 => ksnap.status, // 8042 status register
+            // Fast-A20 gate (port 0x92): bit1 = A20 enabled.
+            0x92 => if (self.m.bus.a20Enabled()) @as(u8, 0x02) else 0x00,
+            else => null,
+        };
     }
 
     /// Disassemble up to `count` instructions starting at `origin`, filling `out`.

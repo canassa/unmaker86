@@ -166,6 +166,38 @@ pub fn Ems(comptime Cpu: type) type {
         user_pages: u16 = 0,
         installed: bool = false,
 
+        /// A side-effect-free summary of EMS config/usage for the debugger device
+        /// reader (plans/device-state-reader.md). Pure field reads + the module
+        /// page constants — never mutates, charges no cycle.
+        pub const Report = struct {
+            installed: bool,
+            reported_pages: u16,
+            backing_pages: u16,
+            user_pages: u16,
+            free_pages: u16,
+            active_handles: u16,
+            frame_pages: u8,
+        };
+        pub fn report(self: *const Self) Report {
+            var active: u16 = 0;
+            for (self.handles) |h| {
+                if (h.active) active += 1;
+            }
+            var mapped: u8 = 0;
+            for (self.frame_map) |f| {
+                if (f != null) mapped += 1;
+            }
+            return .{
+                .installed = self.installed,
+                .reported_pages = REPORTED_PAGES,
+                .backing_pages = BACKING_PAGES,
+                .user_pages = self.user_pages,
+                .free_pages = REPORTED_PAGES -| self.user_pages,
+                .active_handles = active,
+                .frame_pages = mapped,
+            };
+        }
+
         pub fn init(self: *Self, cpu: *Cpu) void {
             self.cpu = cpu;
             @memset(&self.backing, 0);

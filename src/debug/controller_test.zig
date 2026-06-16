@@ -391,6 +391,51 @@ test "#16 screen() is side-effect-free: machine.snapshot() byte-identical before
     try std.testing.expectEqualSlices(u8, before_text_mono, m.vga.text_vram_mono);
 }
 
+test "#17 device-reader devicesSnapshot/ioShadow are side-effect-free (snapshot byte-identical)" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    m.post();
+    loadNopProg(m);
+
+    var ctrl = Controller.init(m);
+    _ = ctrl.stepN(7); // advance the ledger so cycle-derived values are non-trivial
+
+    const before = m.snapshot();
+    _ = ctrl.devicesSnapshot();
+    // Hit every dangerous port whose LIVE in8 would mutate device state.
+    for ([_]u16{ 0x3DA, 0x3BA, 0x3C9, 0x3C7, 0x3C8, 0x60, 0x40, 0x41, 0x42, 0x61, 0x20, 0x21, 0xA0, 0xA1, 0x64, 0x92 }) |port| {
+        _ = ctrl.ioShadow(port);
+    }
+    const after = m.snapshot();
+
+    // CPU + ledger untouched (zero cycles charged), and every device's full
+    // register state byte-identical — including the fields a real in8 would have
+    // mutated (AC flip-flop, DAC indices, 8042 FIFO head/count, PIT read phase).
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&before.cpu_state), std.mem.asBytes(&after.cpu_state));
+    try std.testing.expectEqualDeep(before.vga, after.vga);
+    try std.testing.expectEqualDeep(before.pic, after.pic);
+    try std.testing.expectEqualDeep(before.pit, after.pit);
+    try std.testing.expectEqualDeep(before.kbd, after.kbd);
+    try std.testing.expectEqualDeep(before.speaker, after.speaker);
+}
+
+test "#18 device-reader contrast: the SHADOW leaves the AC flip-flop; a LIVE in8(0x3DA) flips it" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    m.post();
+    loadNopProg(m);
+
+    var ctrl = Controller.init(m);
+    m.vga.attr_flip_flop_is_index = false; // put the AC flip-flop in the DATA phase
+    _ = ctrl.ioShadow(0x3DA);
+    try std.testing.expect(!m.vga.attr_flip_flop_is_index); // the shadow did NOT flip it
+    // Proof the hazard is real: a true port read resets it to the index phase.
+    _ = m.bus.portIn8(0x3DA);
+    try std.testing.expect(m.vga.attr_flip_flop_is_index);
+}
+
 /// Counting allocator (mirrors machine/determinism_test.zig): records every
 /// alloc/free so the control path can be asserted alloc-free.
 const CountingAllocator = struct {

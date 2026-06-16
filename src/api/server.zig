@@ -605,6 +605,20 @@ pub const Server = struct {
             return self.respondError(req, .upgrade_required, "upgrade_required", "GET /api/stream requires a WebSocket upgrade");
         }
 
+        // --- device / chipset / A20 state reader ---
+        if (std.mem.eql(u8, path, "/api/devices")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            return self.handleDevices(req, query);
+        }
+        if (std.mem.startsWith(u8, path, "/api/device/")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            return self.handleDevice(req, path["/api/device/".len..], query);
+        }
+        if (std.mem.eql(u8, path, "/api/io")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            return self.handleIoShadow(req, query);
+        }
+
         // --- disassembly ---
         if (std.mem.eql(u8, path, "/api/disasm")) {
             if (method != .GET) return self.methodNotAllowed(req);
@@ -951,6 +965,50 @@ pub const Server = struct {
         self.submitAndRespond(req, .{ .disasm = .{ .origin = origin, .count = count } });
     }
 
+    /// `GET /api/devices[?palette=1]` — the grouped chipset/A20/device snapshot.
+    /// `void` command; `?palette=1` only widens the JSON (the worker always fills
+    /// the DAC palette, the server nulls it when the flag is absent). Pure peek.
+    fn handleDevices(self: *Server, req: *http.Server.Request, query: []const u8) void {
+        const want_palette = (self.queryU32(query, "palette") orelse 0) != 0;
+        var ctx: q.RequestCtx = .{ .cmd = .devices_get };
+        const resp = self.queue.submit(&ctx);
+        switch (resp) {
+            .devices => |d| self.respondDevices(req, d, want_palette),
+            .err => |code| self.respondErrCode(req, code),
+            else => self.respondError(req, .service_unavailable, "internal", "unexpected devices response"),
+        }
+    }
+
+    /// `GET /api/device/<name>` — a single device group (a20|pic|pit|vga|kbc|
+    /// speaker|ems). Same data as the matching key in `/api/devices`; unknown → 404.
+    fn handleDevice(self: *Server, req: *http.Server.Request, name: []const u8, query: []const u8) void {
+        const want_palette = (self.queryU32(query, "palette") orelse 0) != 0;
+        var ctx: q.RequestCtx = .{ .cmd = .devices_get };
+        const resp = self.queue.submit(&ctx);
+        const d = switch (resp) {
+            .devices => |d| d,
+            .err => |code| return self.respondErrCode(req, code),
+            else => return self.respondError(req, .service_unavailable, "internal", "unexpected devices response"),
+        };
+        var snap = d;
+        if (!want_palette) snap.vga.palette = null;
+        if (std.mem.eql(u8, name, "a20")) return self.respondValue(req, .ok, snap.a20);
+        if (std.mem.eql(u8, name, "pic")) return self.respondValue(req, .ok, snap.pic);
+        if (std.mem.eql(u8, name, "pit")) return self.respondValue(req, .ok, snap.pit);
+        if (std.mem.eql(u8, name, "vga")) return self.respondValue(req, .ok, snap.vga);
+        if (std.mem.eql(u8, name, "kbc")) return self.respondValue(req, .ok, snap.kbc);
+        if (std.mem.eql(u8, name, "speaker")) return self.respondValue(req, .ok, snap.speaker);
+        if (std.mem.eql(u8, name, "ems")) return self.respondValue(req, .ok, snap.ems);
+        return self.respondError(req, .not_found, "not_found", "unknown device group");
+    }
+
+    /// `GET /api/io?port=N` — the non-mutating shadow of one I/O port.
+    fn handleIoShadow(self: *Server, req: *http.Server.Request, query: []const u8) void {
+        const v = queryValue(query, "port") orelse return self.respondError(req, .bad_request, "bad_request", "missing port");
+        const port = std.fmt.parseInt(u16, v, 0) catch return self.respondError(req, .bad_request, "bad_request", "invalid port");
+        self.submitAndRespond(req, .{ .io_shadow = .{ .port = port } });
+    }
+
     // -----------------------------------------------------------------------
     // Query helpers (decimal integers; seg name).
     // -----------------------------------------------------------------------
@@ -1131,7 +1189,39 @@ pub const Server = struct {
             .framebuffer => self.respondError(req, .service_unavailable, "internal", "framebuffer must be streamed via /api/framebuffer"),
             .regions => |rg| self.respondRegions(req, rg),
             .disasm => |dr| self.respondDisasm(req, dr),
+            // Direct `.devices` responses default to no palette; the dedicated
+            // `/api/devices` route passes `?palette` via `handleDevices`.
+            .devices => |d| self.respondDevices(req, d, false),
+            .io_shadow => |io| self.respondIoShadow(req, io),
         }
+    }
+
+    /// Serialize the grouped device snapshot. The whole POD is JSON-Stringify-able
+    /// (enums → strings, fixed arrays → arrays); the only server-side shaping is
+    /// nulling the bulky DAC palette unless `?palette=1` was passed.
+    fn respondDevices(self: *Server, req: *http.Server.Request, d: debug.DevicesSnapshot, want_palette: bool) void {
+        var snap = d;
+        if (!want_palette) snap.vga.palette = null;
+        self.respondValue(req, .ok, snap);
+    }
+
+    /// `{"port":N,"value":"0xNN"|null,"shadow":true,"note":"..."}` — the I/O-port
+    /// shadow. `shadow:true` + the `/api/io` name (not `/api/in`) make explicit this
+    /// is a non-mutating VIEW, never a live read (a live `in` would advance the DAC
+    /// index / pop the 8042 FIFO / flip the AC flip-flop).
+    fn respondIoShadow(self: *Server, req: *http.Server.Request, io: debug.IoShadow) void {
+        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
+        const ok = blk: {
+            if (io.value) |v| {
+                w.print("{{\"port\":{d},\"value\":\"0x{x:0>2}\",\"shadow\":true,", .{ io.port, v }) catch break :blk false;
+            } else {
+                w.print("{{\"port\":{d},\"value\":null,\"shadow\":true,", .{io.port}) catch break :blk false;
+            }
+            w.writeAll("\"note\":\"non-mutating view; a live IN may differ for stateful ports (DAC index advance, FIFO pop, AC flip-flop)\"}") catch break :blk false;
+            break :blk true;
+        };
+        if (!ok) return self.respondError(req, .service_unavailable, "internal", "response too large");
+        self.respondJson(req, .ok, w.buffered());
     }
 
     fn respondValue(self: *Server, req: *http.Server.Request, status: http.Status, v: anytype) void {

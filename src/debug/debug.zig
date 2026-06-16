@@ -40,6 +40,9 @@ pub const DisasmResult = controller.DisasmResult;
 pub const DisasmOrigin = controller.DisasmOrigin;
 pub const MAX_DISASM_INSNS = controller.MAX_DISASM_INSNS;
 pub const MAX_DISASM_TEXT = controller.MAX_DISASM_TEXT;
+/// Device / chipset / A20 state reader types (`/api/devices`, `/api/io`).
+pub const DevicesSnapshot = controller.DevicesSnapshot;
+pub const IoShadow = controller.IoShadow;
 pub const FramebufferView = controller.FramebufferView;
 /// The rendered-frame family (re-exported from the rasterizer so the API layer can
 /// report it without importing `devices`).
