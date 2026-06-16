@@ -1078,7 +1078,7 @@ pub const Server = struct {
     }
 
     /// `GET /api/device/<name>` — a single device group (a20|pic|pit|vga|kbc|
-    /// speaker|ems). Same data as the matching key in `/api/devices`; unknown → 404.
+    /// speaker|opl|ems). Same data as the matching key in `/api/devices`; unknown → 404.
     fn handleDevice(self: *Server, req: *http.Server.Request, name: []const u8, query: []const u8) void {
         const want_palette = (self.queryU32(query, "palette") orelse 0) != 0;
         var ctx: q.RequestCtx = .{ .cmd = .devices_get };
@@ -1096,6 +1096,7 @@ pub const Server = struct {
         if (std.mem.eql(u8, name, "vga")) return self.respondValue(req, .ok, snap.vga);
         if (std.mem.eql(u8, name, "kbc")) return self.respondValue(req, .ok, snap.kbc);
         if (std.mem.eql(u8, name, "speaker")) return self.respondValue(req, .ok, snap.speaker);
+        if (std.mem.eql(u8, name, "opl")) return self.respondValue(req, .ok, snap.opl);
         if (std.mem.eql(u8, name, "ems")) return self.respondValue(req, .ok, snap.ems);
         return self.respondError(req, .not_found, "not_found", "unknown device group");
     }

@@ -303,6 +303,11 @@ pub fn build(b: *std.Build) void {
         .{ .name = "devices", .mod = devices_mod },
         .{ .name = "bus", .mod = bus_mod },
     });
+    const opl_tests = MachineTest.add(b, target, optimize, "src/devices/opl_test.zig", &.{
+        .{ .name = "devices", .mod = devices_mod },
+        .{ .name = "bus", .mod = bus_mod },
+        .{ .name = "timing", .mod = timing_mod },
+    });
     const machine_unit = MachineTest.add(b, target, optimize, "src/machine/machine_test.zig", &.{
         .{ .name = "machine", .mod = machine_mod },
         .{ .name = "cpu", .mod = cpu_mod },
@@ -338,6 +343,7 @@ pub fn build(b: *std.Build) void {
     machine_test_step.dependOn(&pit_tests.step);
     machine_test_step.dependOn(&vga_tests.step);
     machine_test_step.dependOn(&keyboard_tests.step);
+    machine_test_step.dependOn(&opl_tests.step);
     machine_test_step.dependOn(&machine_unit.step);
     machine_test_step.dependOn(&machine_determinism.step);
     machine_test_step.dependOn(&machine_integration.step);
@@ -574,6 +580,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&pit_tests.step);
     test_step.dependOn(&vga_tests.step);
     test_step.dependOn(&keyboard_tests.step);
+    test_step.dependOn(&opl_tests.step);
     test_step.dependOn(&machine_unit.step);
     test_step.dependOn(&machine_determinism.step);
     test_step.dependOn(&machine_integration.step);

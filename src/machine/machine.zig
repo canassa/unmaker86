@@ -47,6 +47,7 @@ const Pit = devices.Pit;
 const Vga = devices.Vga;
 const Speaker = devices.Speaker;
 const Keyboard = devices.Keyboard;
+const Opl = devices.Opl;
 const Scheduler = scheduler.Scheduler;
 const EventKind = scheduler.EventKind;
 
@@ -136,6 +137,10 @@ pub const Machine = struct {
     /// 8042 keyboard controller (ports 0x60/0x64) — the keyboard hardware *fill*
     /// path (input-injection.md §4.1). Asserts IRQ1 via the PIC.
     kbd: Keyboard = .{},
+    /// AdLib / OPL2 (ports 0x388/0x389) — register-trace timer+status only (no FM
+    /// synthesis, D2). Lets an AdLib/SB driver's presence probe succeed (Stunts'
+    /// AD15.DRV). Overflow is derived from the cycle ledger (wired below).
+    opl: Opl = .{},
     sched: Scheduler = .{},
     cpu: Cpu = undefined,
     /// The host-serviced BIOS + DOS + the CallbackSink aggregate (D2/D12).
@@ -249,6 +254,14 @@ pub const Machine = struct {
         _ = self.bus.registerPort(0x3D5, self.vga.portHandler()); // CRTC data (colour)
         _ = self.bus.registerPort(0x3B4, self.vga.portHandler()); // CRTC index (mono alias)
         _ = self.bus.registerPort(0x3B5, self.vga.portHandler()); // CRTC data (mono alias)
+        // (c3) bus PortHandler.ctx = &self.opl: the AdLib / OPL2 timer+status card
+        //      (port 0x388 address/status, 0x389 data). Registered AFTER all the
+        //      VGA ports so the snapshot replay order (registerPort by ID) stays
+        //      stable. This is register-trace sound (no FM synthesis, D2): it only
+        //      models the two timers + the status byte an AdLib/SB presence probe
+        //      reads back. Cycle back-pointer bound at (d3) below.
+        _ = self.bus.registerPort(0x388, self.opl.portHandler());
+        _ = self.bus.registerPort(0x389, self.opl.portHandler());
         _ = self.bus.mapMmio(devices.vga.VRAM_PHYS, devices.vga.VRAM_WINDOW_LEN, self.vga.memHandler());
         // (c1) The text-mode video pages — color B8000 (modes 0-3) + mono B0000
         //      (mode 7). Both are permanently mapped RAM-like MMIO (like A0000):
@@ -277,6 +290,10 @@ pub const Machine = struct {
         //       retrace + display-enable bits are derived from the cycle ledger,
         //       not host time. Re-bound on restore exactly like the PIT/speaker.
         self.vga.cycles = &self.cpu.st.cycles;
+        // (d3) OPL2 cycle back-pointer: the timer-overflow state read back through
+        //      the status register (port 0x388) is derived from the cycle ledger,
+        //      not host time. Re-bound on restore exactly like the PIT/speaker/VGA.
+        self.opl.cycles = &self.cpu.st.cycles;
         // (d2) 8042 keyboard controller back-pointer: it asserts IRQ1 through the
         //      PIC (the same `picRaiseThunk` the PIT uses for IRQ0). Re-bound on
         //      restore exactly like the PIT/speaker pointers.
@@ -464,6 +481,7 @@ pub const Machine = struct {
         self.speaker.reset(); // port_61_data=0; lowers ch2 gate (needs pit reset first)
         self.kbd.reset(); // 8042 FIFO/status/config back to power-on (IRQ ptr kept)
         self.vga.reset(); // zero VRAM + DAC + indices (deterministic power-on)
+        self.opl.reset(); // OPL2 timers + reg index to power-on (no overflow)
         self.sched.reset();
         self.shutdown = false;
         // Re-init the host-serviced state (the callback ids + routing are re-
@@ -577,6 +595,9 @@ pub const Machine = struct {
         /// re-maps them on restore (§3.4 of plans/text-mode-video.md).
         vga: Vga.Snapshot,
         speaker: Speaker.Snapshot,
+        /// OPL2 (AdLib) timer + status + register-index state. The `cycles`
+        /// back-pointer is re-bound by the machine on restore, never snapshotted.
+        opl: Opl.Snapshot,
         /// 8042 keyboard-controller state (FIFO + status + config). The PIC raise
         /// back-pointer is re-bound by the machine on restore, never snapshotted.
         kbd: Keyboard.Snapshot,
@@ -637,6 +658,7 @@ pub const Machine = struct {
             .pit = self.pit.snapshot(),
             .vga = self.vga.snapshot(),
             .speaker = self.speaker.snapshot(),
+            .opl = self.opl.snapshot(),
             .kbd = self.kbd.snapshot(),
             .sched = self.sched.snapshot(),
             .dos_mouse = self.dos.mouse.snapshot(),
@@ -661,6 +683,7 @@ pub const Machine = struct {
         self.pit.restore(snap.pit);
         self.vga.restore(snap.vga);
         self.speaker.restore(snap.speaker);
+        self.opl.restore(snap.opl);
         self.kbd.restore(snap.kbd);
         self.sched.restore(snap.sched);
         self.dos.mouse.restore(snap.dos_mouse);

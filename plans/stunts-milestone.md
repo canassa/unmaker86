@@ -1,5 +1,57 @@
 # Stunts 1.1 milestone — boot chain investigation
 
+## RESOLVED (FIXED) — the AD15.DRV abort was a missing OPL2/AdLib device; Stunts now renders its intro
+
+**Root cause (zdos GAP, class (a)).** `AD15.DRV` (the "/ssb" AdLib/SB FM driver) runs the
+canonical AdLib presence probe at init and aborts when no OPL2 chip answers. The probe
+(disassembled live inside LOAD.EXE via the now-debuggable nested EXEC, driver loaded at seg
+`0x40EB`) is textbook:
+```
+write reg4 = 0x80 (IRQ reset)          ; clear timer flags
+read  0x388, require (status&0xE0)==0x00
+write reg2 = 0xFF (timer-1: 1 tick=80us)
+write reg4 = 0x21 (start timer1, mask timer2)
+poll  0x388 (300x) until (status&0xE0)==0xC0   ; bit7 IRQ + bit6 timer-1-overflow
+```
+zdos had **no OPL/AdLib device** (`src/devices/` = pic/pit/vga/kbd/speaker only), so port
+`0x388` returned the floating-bus `0xFF` → `0xFF&0xE0 = 0xE0 != 0xC0` → the poll fails 300×
+→ the detect routine returns CF=1 for all four probed bases (0x388/0x318/0x288/0x218) → the
+driver-init helper `2f99:7fa` returns **AX=2** → LOAD.EXE's `326d:02A6 or ax,ax; jne`
+→ `_exit(1)` at `2551:019C`. (The session-3 note "no 0x388/0x389 I/O occurs" was WRONG — the
+driver DOES drive 0x388/0x389; the earlier instrumentation simply missed it.)
+
+This matches the DOSBox-x oracle exactly: `adlib.cpp Chip::Read()` returns `0x40|0x80` when
+timer-1 (the 80us timer) has overflowed and `0x20|0x80` for timer-2 — i.e. `0xC0`/`0xA0`.
+With an OPL present on the oracle, Stunts gets past this point (the oracle finding from
+session 3); zdos lacked the device, so it aborted.
+
+**Fix (commit on master).** New faithful **register-trace OPL2 device** — `src/devices/opl.zig`
+(`Opl`) — modeling only the guest-OBSERVABLE timer + status (NO FM synthesis, per the v1 sound
+contract D2, exactly like `speaker.zig` models port 0x61 without a tone emitter). Ports
+0x388 (address/status) + 0x389 (data); timers 1/2 (80us/320us); reg 2/3 reload, reg 4
+control (start/stop/mask/IRQ-reset); status read returns `0x40|0x80` / `0x20|0x80` on
+overflow. Overflow is a PURE FUNCTION OF THE CYCLE LEDGER (`start_cycle`, `intervalCycles`)
+— integer cycle math, NO host clock, NO float, NO scheduler event (it is not an IRQ source in
+this model). Wired into the machine (field, port registration after the VGA ports to keep
+snapshot replay-ID order stable, `cycles` back-pointer, reset, snapshot/restore). Observable
+via `GET /api/device/opl` + `GET /api/devices` + the `/api/io` shadow for 0x388 (non-mutating,
+does NOT latch overflow). 7 unit tests in `src/devices/opl_test.zig` (incl. the exact AD15.DRV
+0x00→0xC0 sequence, mask, IRQ-reset, timer-2 cadence, ledger-purity, snapshot round-trip);
+controller/server device-snapshot tests extended for the new group + the side-effect-free
+shadow sweep. `zig build` + `zig build test` GREEN (**574 tests**, was 567).
+
+**Result.** Stunts no longer aborts. It runs its full init, passes the AD15.DRV probe, and
+**renders its intro**: the DSI logo + starfield (~cyc 500M) then the bridge/city "Professional
+Driver on Closed Circuit" animation (~cyc 1.8B). Screenshots in
+`/tmp/stunts/shots/stunts_intro_opl_fixed.png` (+ `opl_fixed_500M.png`). Determinism verified
+BYTE-IDENTICAL across two fresh launches at cycle 400M (CPU regs + full 640 KiB RAM + VRAM
+md5-identical). The faithful, oracle-matched contract is honored end to end (no fake/hardcode;
+emulated time = f(cycles); no ledger hole — port I/O is charged by the CPU IN/OUT, the device
+adds zero cycles).
+
+---
+
+
 Target: run **Stunts (4D Sports Driving) 1.1** under zdos. The real entry is `ST.COM`
 (a 203-byte launcher), NOT `LOAD.EXE` directly. The boot chain is:
 

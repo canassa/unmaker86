@@ -296,6 +296,21 @@ pub const DevVga = struct {
     palette: ?[256]devices.vga.DacRgb = null,
 };
 
+pub const DevOpl = struct {
+    /// Currently-addressed OPL register (last write to port 0x388).
+    reg_index: u8,
+    /// COMPUTED (non-mutating) status byte — `statusPeek(cyclesNow)`, NOT a read of
+    /// 0x388 (which latches overflow). Labeled so a client never mistakes it for a
+    /// live port read. `(status & 0xE0) == 0xC0` is the AdLib-detected condition.
+    status: u8,
+    timer1_enabled: bool,
+    timer1_masked: bool,
+    timer1_reload: u8,
+    timer2_enabled: bool,
+    timer2_masked: bool,
+    timer2_reload: u8,
+};
+
 pub const DevEms = struct {
     installed: bool,
     reported_pages: u16,
@@ -315,6 +330,8 @@ pub const DevicesSnapshot = struct {
     vga: DevVga,
     kbc: devices.Keyboard.Snapshot, // fifo/status/config/output_port/pending/...
     speaker: DevSpeaker,
+    /// AdLib / OPL2 timer + (computed) status — the AdLib-detection surface.
+    opl: DevOpl,
     ems: DevEms,
     /// Not modeled — honest null, never a fabricated 8237 register set.
     dma: ?u0 = null,
@@ -1005,6 +1022,18 @@ pub const Controller = struct {
             .ch2_out = self.m.pit.channels[2].outBitAt(cyclesNow),
         };
 
+        // ---- AdLib / OPL2 timer + (computed) status ----
+        const opl: DevOpl = .{
+            .reg_index = self.m.opl.snapshot().reg_index,
+            .status = self.m.opl.statusPeek(),
+            .timer1_enabled = self.m.opl.timer1Enabled(),
+            .timer1_masked = self.m.opl.timer1Masked(),
+            .timer1_reload = self.m.opl.timer1Reload(),
+            .timer2_enabled = self.m.opl.timer2Enabled(),
+            .timer2_masked = self.m.opl.timer2Masked(),
+            .timer2_reload = self.m.opl.timer2Reload(),
+        };
+
         // ---- EMS config (the EMS-bug surface) ----
         const er = self.m.dos.ems.report();
         const ems: DevEms = .{
@@ -1024,6 +1053,7 @@ pub const Controller = struct {
             .vga = vga,
             .kbc = self.m.kbd.snapshot(),
             .speaker = speaker,
+            .opl = opl,
             .ems = ems,
         };
     }
@@ -1067,6 +1097,9 @@ pub const Controller = struct {
                 break :blk v;
             },
             0x64 => ksnap.status, // 8042 status register
+            // OPL2 status (port 0x388): computed timer-overflow bits WITHOUT latching
+            // (a real read latches overflow into device state — this peek does not).
+            0x388 => self.m.opl.statusPeek(),
             // Fast-A20 gate (port 0x92): bit1 = A20 enabled.
             0x92 => if (self.m.bus.a20Enabled()) @as(u8, 0x02) else 0x00,
             else => null,

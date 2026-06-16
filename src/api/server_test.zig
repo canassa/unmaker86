@@ -307,7 +307,7 @@ test "GET /api/devices reports all groups; A20 is OFF after boot (EXEPACK invari
     const r = get(&ts, "/api/devices", &obuf);
     try std.testing.expectEqual(@as(u16, 200), r.status);
     // All device groups present.
-    for ([_][]const u8{ "\"a20\"", "\"pic\"", "\"pit\"", "\"vga\"", "\"kbc\"", "\"speaker\"", "\"ems\"" }) |k| {
+    for ([_][]const u8{ "\"a20\"", "\"pic\"", "\"pit\"", "\"vga\"", "\"kbc\"", "\"speaker\"", "\"opl\"", "\"ems\"" }) |k| {
         try std.testing.expect(std.mem.indexOf(u8, r.body, k) != null);
     }
     // DMA is honestly null (not modeled), never fabricated.
