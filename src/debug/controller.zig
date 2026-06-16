@@ -155,6 +155,50 @@ pub const MouseInject = struct {
     set_buttons: bool = false,
 };
 
+/// Per-instruction rendered-text cap for a `/api/disasm` window. The longest
+/// real-mode instruction text (e.g. `mov dword [eax+ecx*8+0x12345678],
+/// 0x12345678`) fits comfortably under this.
+pub const MAX_DISASM_TEXT = 64;
+/// The max instructions a single `/api/disasm` request may return — a bounded
+/// window. A larger `count` is REJECTED at the handler (never silently truncated).
+pub const MAX_DISASM_INSNS = 64;
+
+/// One disassembled instruction in a `/api/disasm` window. Pointer-free POD: the
+/// rendered text + raw bytes are copied into fixed buffers so the result flows
+/// through the queue/Response without borrowing machine memory.
+pub const DisasmInsn = struct {
+    /// The linear (physical) address the instruction starts at.
+    linear: u32 = 0,
+    /// The real-mode `seg:off` view, valid only when `has_seg` (the `seg`/`cs_eip`
+    /// origins). The `linear`-only origin leaves `has_seg` false.
+    seg: u16 = 0,
+    off: u32 = 0,
+    has_seg: bool = false,
+    /// Encoded length in bytes (1..15; always ≥1 so a walk always advances).
+    len: u8 = 0,
+    /// The first `len` raw opcode bytes (the tail of `bytes` is undefined).
+    bytes: [cpu_mod.disasm.MAX_INSTR_LEN]u8 = undefined,
+    /// The rendered Intel-syntax text length (valid bytes in `text`).
+    text_len: u8 = 0,
+    text: [MAX_DISASM_TEXT]u8 = undefined,
+};
+
+pub const DisasmResult = struct {
+    count: u16 = 0,
+    items: [MAX_DISASM_INSNS]DisasmInsn = undefined,
+};
+
+/// Where a `/api/disasm` walk starts. Resolved to a (seg_base, offset) ON THE
+/// WORKER — reading live CPU `seg_base`/`eip` off-worker would be a torn read.
+pub const DisasmOrigin = union(enum) {
+    /// Disassemble at a linear (physical) address; no segment context.
+    linear: u32,
+    /// Disassemble at a real-mode `seg:off` (linear = seg*16 + off).
+    seg_off: struct { seg: u16, off: u32 },
+    /// Disassemble at the current CS:EIP (resolved from live CPU state).
+    cs_eip: void,
+};
+
 pub const Controller = struct {
     m: *Machine,
     set: BreakpointSet = .{},
@@ -643,6 +687,70 @@ pub const Controller = struct {
     pub fn peekMem(self: *const Controller, seg: Seg, off: u32, dst: []u8) void {
         const linear = self.m.cpu.st.seg_base[@intFromEnum(seg)] +% off;
         self.m.bus.peekBlock(linear, dst);
+    }
+
+    /// Disassemble up to `count` instructions starting at `origin`, filling `out`.
+    /// PURE peek path (`bus.peekPhys8`) — never executes, never charges a cycle,
+    /// never mutates machine state (determinism prime directive): a disasm leaves
+    /// `machine.snapshot()` byte-identical. `count` MUST be ≤ MAX_DISASM_INSNS
+    /// (the handler validates); a larger value is clamped here defensively.
+    pub fn disasmWindow(self: *const Controller, origin: DisasmOrigin, count: u16, out: *DisasmResult) void {
+        const n = @min(count, @as(u16, MAX_DISASM_INSNS));
+
+        // Resolve the segment base + starting in-segment offset. `off` is what the
+        // disassembler uses BOTH to read bytes (linear = seg_base + off) AND to
+        // compute relative branch targets (in-segment), so it must be the segment
+        // offset, not the linear address.
+        var seg_base: u32 = 0;
+        var off: u32 = 0;
+        var seg_sel: u16 = 0;
+        var has_seg = false;
+        switch (origin) {
+            .linear => |lin| off = lin, // seg_base 0, has_seg false
+            .seg_off => |s| {
+                seg_base = @as(u32, s.seg) << 4;
+                off = s.off;
+                seg_sel = s.seg;
+                has_seg = true;
+            },
+            .cs_eip => {
+                seg_base = self.m.cpu.st.seg_base[@intFromEnum(Seg.cs)];
+                off = self.m.cpu.st.eip;
+                seg_sel = @truncate(seg_base >> 4); // real-mode CS selector
+                has_seg = true;
+            },
+        }
+
+        // Real mode is 16-bit default (CS D-bit clear); zdos is real-mode only.
+        const cs_big = false;
+        // A side-effect-free byte source over the bus peek path. `read(o)` reads at
+        // `seg_base + o`, so the disassembler's offset arithmetic maps to linear.
+        const Src = struct {
+            ctrl: *const Controller,
+            base: u32,
+            pub fn read(s: @This(), o: u32) ?u8 {
+                return s.ctrl.m.bus.peekPhys8(s.base +% o);
+            }
+        };
+
+        var i: u16 = 0;
+        while (i < n) : (i += 1) {
+            const insn = &out.items[i];
+            var textbuf: [MAX_DISASM_TEXT]u8 = undefined;
+            const d = cpu_mod.disasm.decodeOne(Src{ .ctrl = self, .base = seg_base }, off, cs_big, &textbuf);
+            insn.linear = seg_base +% off;
+            insn.has_seg = has_seg;
+            insn.seg = seg_sel;
+            insn.off = off;
+            insn.len = d.len;
+            var b: u8 = 0;
+            while (b < d.len) : (b += 1) insn.bytes[b] = self.m.bus.peekPhys8(seg_base +% off +% b);
+            const tl: u8 = @intCast(@min(d.text.len, MAX_DISASM_TEXT));
+            @memcpy(insn.text[0..tl], d.text[0..tl]);
+            insn.text_len = tl;
+            off +%= d.len;
+        }
+        out.count = n;
     }
 
     /// Side-effect-free read of a real-mode IVT entry (IP at base+vec*4, CS at +2).

@@ -605,9 +605,10 @@ pub const Server = struct {
             return self.respondError(req, .upgrade_required, "upgrade_required", "GET /api/stream requires a WebSocket upgrade");
         }
 
-        // --- deferred, honestly reported ---
+        // --- disassembly ---
         if (std.mem.eql(u8, path, "/api/disasm")) {
-            return self.respondError(req, .not_implemented, "not_implemented", "disassembly is deferred to a later milestone");
+            if (method != .GET) return self.methodNotAllowed(req);
+            return self.handleDisasm(req, query);
         }
 
         // --- static UI assets (same-origin homepage) ---
@@ -919,6 +920,37 @@ pub const Server = struct {
         self.submitAndRespond(req, .{ .stack_get = .{ .count = @intCast(count) } });
     }
 
+    /// `GET /api/disasm` — disassemble a window of instructions. Origin precedence:
+    ///   - `?linear=N`           → linear (physical) address, no segment context
+    ///   - `?seg=N[&off=N]`      → real-mode `seg:off` (linear = seg*16 + off)
+    ///   - (no linear, no seg)   → the current CS:EIP (live CPU state)
+    /// `?count=N` (default 16, ≤ MAX_DISASM_INSNS). Integers accept decimal or `0x`
+    /// hex. Pure peek on the worker — cycle-neutral, never perturbs guest state.
+    fn handleDisasm(self: *Server, req: *http.Server.Request, query: []const u8) void {
+        const count: u16 = blk: {
+            const v = queryValue(query, "count") orelse break :blk 16;
+            const n = std.fmt.parseInt(u32, v, 0) catch return self.respondError(req, .bad_request, "bad_request", "invalid count");
+            if (n == 0 or n > debug.MAX_DISASM_INSNS) return self.respondError(req, .bad_request, "out_of_range", "count must be 1..64");
+            break :blk @intCast(n);
+        };
+        const origin: debug.DisasmOrigin = orig: {
+            if (queryValue(query, "linear")) |v| {
+                const lin = std.fmt.parseInt(u32, v, 0) catch return self.respondError(req, .bad_request, "bad_request", "invalid linear");
+                break :orig .{ .linear = lin };
+            }
+            if (queryValue(query, "seg")) |v| {
+                const seg = std.fmt.parseInt(u16, v, 0) catch return self.respondError(req, .bad_request, "bad_request", "invalid seg (numeric selector)");
+                const off: u32 = if (queryValue(query, "off")) |o|
+                    (std.fmt.parseInt(u32, o, 0) catch return self.respondError(req, .bad_request, "bad_request", "invalid off"))
+                else
+                    0;
+                break :orig .{ .seg_off = .{ .seg = seg, .off = off } };
+            }
+            break :orig .cs_eip;
+        };
+        self.submitAndRespond(req, .{ .disasm = .{ .origin = origin, .count = count } });
+    }
+
     // -----------------------------------------------------------------------
     // Query helpers (decimal integers; seg name).
     // -----------------------------------------------------------------------
@@ -1098,6 +1130,7 @@ pub const Server = struct {
             // ever does, report it honestly rather than emitting a wrong body.
             .framebuffer => self.respondError(req, .service_unavailable, "internal", "framebuffer must be streamed via /api/framebuffer"),
             .regions => |rg| self.respondRegions(req, rg),
+            .disasm => |dr| self.respondDisasm(req, dr),
         }
     }
 
@@ -1199,6 +1232,38 @@ pub const Server = struct {
                 w.writeAll(",\"attrs\":null") catch break :blk false;
             }
             w.writeAll("}") catch break :blk false;
+            break :blk true;
+        };
+        if (!ok) return self.respondError(req, .service_unavailable, "internal", "response too large");
+        self.respondJson(req, .ok, w.buffered());
+    }
+
+    /// Serialize a disassembly window:
+    /// `{"count":N,"instructions":[{"linear":N,"seg":N|null,"off":N|null,
+    ///   "bytes":"<hex>","length":N,"text":"..."},...]}`
+    /// `seg`/`off` are null for the `?linear=` origin (no segment context).
+    fn respondDisasm(self: *Server, req: *http.Server.Request, dr: debug.DisasmResult) void {
+        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
+        const ok = blk: {
+            w.print("{{\"count\":{d},\"instructions\":[", .{dr.count}) catch break :blk false;
+            for (dr.items[0..dr.count], 0..) |insn, i| {
+                if (i != 0) w.writeAll(",") catch break :blk false;
+                w.print("{{\"linear\":{d},", .{insn.linear}) catch break :blk false;
+                if (insn.has_seg) {
+                    w.print("\"seg\":{d},\"off\":{d},", .{ insn.seg, insn.off }) catch break :blk false;
+                } else {
+                    w.writeAll("\"seg\":null,\"off\":null,") catch break :blk false;
+                }
+                w.writeAll("\"bytes\":\"") catch break :blk false;
+                for (insn.bytes[0..insn.len]) |b| {
+                    w.writeByte("0123456789abcdef"[b >> 4]) catch break :blk false;
+                    w.writeByte("0123456789abcdef"[b & 0x0F]) catch break :blk false;
+                }
+                w.print("\",\"length\":{d},\"text\":", .{insn.len}) catch break :blk false;
+                std.json.Stringify.value(insn.text[0..insn.text_len], wire.stringify_options, &w) catch break :blk false;
+                w.writeAll("}") catch break :blk false;
+            }
+            w.writeAll("]}") catch break :blk false;
             break :blk true;
         };
         if (!ok) return self.respondError(req, .service_unavailable, "internal", "response too large");

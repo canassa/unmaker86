@@ -131,6 +131,12 @@ pub const Command = union(enum) {
     reset: void,
     load: LoadCmd,
     mem_regions: void,
+    /// Disassemble a window of instructions (`GET /api/disasm`). The `origin`
+    /// (linear / seg:off / CS:EIP) is resolved to a (seg_base, offset) ON THE
+    /// WORKER — reading live CPU state off-worker would be a torn read. Pure
+    /// peek path; cycle-neutral (charges no ledger cost). `count` is validated
+    /// ≤ MAX_DISASM_INSNS at the handler.
+    disasm: struct { origin: debug.DisasmOrigin, count: u16 },
     /// The worker-shutdown sentinel: the worker loop exits when it dequeues this.
     shutdown_worker: void,
 };
@@ -286,6 +292,8 @@ pub const Response = union(enum) {
     /// The framebuffer-capture descriptor; pixels live in the server render buffers.
     framebuffer: FramebufferResult,
     regions: RegionsResult,
+    /// A disassembly window (`/api/disasm`). Pointer-free POD filled by the worker.
+    disasm: debug.DisasmResult,
     /// A typed error. The handler maps `code` → HTTP status.
     err: ErrCode,
 };

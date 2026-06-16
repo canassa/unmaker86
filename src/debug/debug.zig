@@ -34,6 +34,12 @@ pub const Reg16 = controller.Reg16;
 pub const Reg8 = controller.Reg8;
 pub const Region = controller.Region;
 pub const MouseInject = controller.MouseInject;
+/// Disassembly window types (`/api/disasm`).
+pub const DisasmInsn = controller.DisasmInsn;
+pub const DisasmResult = controller.DisasmResult;
+pub const DisasmOrigin = controller.DisasmOrigin;
+pub const MAX_DISASM_INSNS = controller.MAX_DISASM_INSNS;
+pub const MAX_DISASM_TEXT = controller.MAX_DISASM_TEXT;
 pub const FramebufferView = controller.FramebufferView;
 /// The rendered-frame family (re-exported from the rasterizer so the API layer can
 /// report it without importing `devices`).

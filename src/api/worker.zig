@@ -162,6 +162,7 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
         },
         .load => |c| loadResp(ctrl, c, mount),
         .mem_regions => regionsResp(ctrl),
+        .disasm => |c| disasmResp(ctrl, c.origin, c.count),
 
         .shutdown_worker => .ok,
     };
@@ -265,6 +266,16 @@ fn memWritePhys(ctrl: *Controller, ctx: *RequestCtx, phys: u32, len: u32) Respon
     if (!inSlab(ctrl, phys, len)) return .{ .err = .address_out_of_range };
     ctrl.writeMemPhys(phys, ctx.scratch[0..len]);
     return .{ .mem_written = .{ .phys = phys, .len = len } };
+}
+
+// --- disassembly -------------------------------------------------------------
+
+fn disasmResp(ctrl: *Controller, origin: debug.DisasmOrigin, count: u16) Response {
+    // Reject (never silently truncate) a window larger than the bounded cap.
+    if (count == 0 or count > debug.MAX_DISASM_INSNS) return .{ .err = .out_of_range };
+    var res: debug.DisasmResult = .{};
+    ctrl.disasmWindow(origin, count, &res);
+    return .{ .disasm = res };
 }
 
 fn segLinear(ctrl: *const Controller, seg: Seg, off: u32) u32 {

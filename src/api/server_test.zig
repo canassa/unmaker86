@@ -216,12 +216,81 @@ test "POST /api/breakpoints kind:io → 501 not_implemented (honest deferral)" {
     try std.testing.expect(std.mem.indexOf(u8, r.body, "\"not_implemented\"") != null);
 }
 
-test "GET /api/disasm → 501 (deferred, not faked)" {
+test "GET /api/disasm?linear decodes a real instruction window (pure peek)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    // Plant: B8 02 00 (mov ax,0x2) ; 90 (nop) ; CD 21 (int 0x21) at linear 1536.
+    const w = method(&ts, "PUT", "/api/mem", "{\"phys\":1536,\"data\":\"b8020090cd21\"}", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), w.status);
+
+    const r = get(&ts, "/api/disasm?linear=1536&count=3", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"count\":3") != null);
+    // Linear origin has no segment context.
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"seg\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"linear\":1536") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "mov ax, 0x2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "nop") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "int 0x21") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"bytes\":\"b80200\"") != null);
+}
+
+test "GET /api/disasm?seg=&off= uses a real-mode seg:off window" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    // seg 0x10 : off 0x20 -> linear 0x10*16 + 0x20 = 0x120 = 288. Plant 0x90 (nop).
+    const w = method(&ts, "PUT", "/api/mem", "{\"phys\":288,\"data\":\"90\"}", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), w.status);
+
+    const r = get(&ts, "/api/disasm?seg=0x10&off=0x20&count=1", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"linear\":288") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"seg\":16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"off\":32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "nop") != null);
+}
+
+test "GET /api/disasm with no origin disassembles at CS:EIP (default count)" {
     var ts = try TestServer.init(std.testing.allocator);
     try ts.start();
     defer ts.deinit();
     const r = get(&ts, "/api/disasm", &obuf);
-    try std.testing.expectEqual(@as(u16, 501), r.status);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    // Default window is 16 instructions; CS:EIP origin carries segment context.
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"count\":16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"instructions\":[") != null);
+}
+
+test "GET /api/disasm?count over the cap → 400 out_of_range (no silent truncation)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = get(&ts, "/api/disasm?count=65", &obuf);
+    try std.testing.expectEqual(@as(u16, 400), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"out_of_range\"") != null);
+}
+
+test "GET /api/disasm is cycle-neutral (a pure peek never advances the ledger)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    // Status BEFORE the disasm, copied out (the shared obuf is reused below).
+    var before_buf: [4 * 1024]u8 = undefined;
+    const before = get(&ts, "/api/status", &before_buf);
+    try std.testing.expectEqual(@as(u16, 200), before.status);
+    var saved: [4 * 1024]u8 = undefined;
+    @memcpy(saved[0..before.body.len], before.body);
+    const before_body = saved[0..before.body.len];
+
+    // A pure peek: 16 instructions at linear 0.
+    const d = get(&ts, "/api/disasm?linear=0&count=16", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), d.status);
+
+    // Status AFTER must be byte-identical (no cycles charged, no state touched).
+    const after = get(&ts, "/api/status", &obuf);
+    try std.testing.expectEqualStrings(before_body, after.body);
 }
 
 test "PUT /api/mem writes hex, GET /api/mem reads it back" {

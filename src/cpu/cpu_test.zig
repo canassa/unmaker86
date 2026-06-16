@@ -10,6 +10,7 @@ comptime {
     _ = @import("bus.zig");
     _ = @import("alu.zig");
     _ = @import("decode.zig");
+    _ = @import("disasm.zig");
     _ = @import("dispatch.zig");
     _ = @import("exec.zig");
     _ = @import("exec_data.zig");
@@ -26,6 +27,7 @@ comptime {
     _ = @import("interrupts.zig");
     _ = @import("cycles.zig");
     _ = @import("decode_test.zig");
+    _ = @import("disasm_test.zig");
     _ = @import("exec_test.zig");
     _ = @import("interrupts_test.zig");
     _ = @import("determinism_test.zig");

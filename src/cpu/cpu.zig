@@ -17,6 +17,10 @@ pub const decode = @import("decode.zig");
 pub const segmentation = @import("segmentation.zig");
 pub const interrupts = @import("interrupts.zig");
 pub const cycles = @import("cycles.zig");
+/// Decode-only 386 real-mode disassembler (reuses decode.zig's front-end + its own
+/// operand-shape table). Pure/side-effect-free; drives the debugger's `/api/disasm`
+/// peek path. See src/cpu/disasm.zig.
+pub const disasm = @import("disasm.zig");
 
 pub const State = state.State;
 pub const StepResult = state.StepResult;
