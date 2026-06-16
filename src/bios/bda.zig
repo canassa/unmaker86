@@ -22,16 +22,22 @@ pub const OFF_KB_BUF_END: u16 = 0x82; // ring end pointer
 pub const OFF_VIDEO_MODE: u16 = 0x49; // current video mode
 pub const OFF_VIDEO_COLS: u16 = 0x4A; // text columns
 pub const OFF_VIDEO_PAGE_SIZE: u16 = 0x4C; // page size in bytes
+pub const OFF_CURRENT_START: u16 = 0x4E; // active-page start offset in VRAM (AH=05)
 pub const OFF_CURSOR_POS: u16 = 0x50; // cursor positions (8 pages, word each)
 pub const OFF_CURSOR_SHAPE: u16 = 0x60; // cursor shape
 pub const OFF_ACTIVE_PAGE: u16 = 0x62; // active display page
 // Video fields the VGA mode-set fills (dosbox-x int10.h BIOSMEM_* offsets,
 // written by FinishSetMode, int10_modes.cpp:942-985).
 pub const OFF_CRTC_ADDRESS: u16 = 0x63; // CRTC port base (0x3D4 color / 0x3B4 mono)
+pub const OFF_CURRENT_MSR: u16 = 0x65; // CGA mode-control (3D8/3B8) shadow
+pub const OFF_CURRENT_PAL: u16 = 0x66; // CGA palette/color-select (3D9) shadow
 pub const OFF_NB_ROWS: u16 = 0x84; // text rows - 1 (EGA/VGA)
 pub const OFF_CHAR_HEIGHT: u16 = 0x85; // character cell height (word)
 pub const OFF_VIDEO_CTL: u16 = 0x87; // EGA/VGA video control flags
+pub const OFF_SWITCHES: u16 = 0x88; // EGA feature switches
+pub const OFF_MODESET_CTL: u16 = 0x89; // VGA flags rec (scan-lines/gray-sum/palette gate)
 pub const OFF_DCC_INDEX: u16 = 0x8A; // display combination code index
+pub const OFF_VS_POINTER: u16 = 0xA8; // far ptr to the video save-pointer table (ROM)
 pub const OFF_KB_FLAG2: u16 = 0x96; // keyboard enhanced flags (FLAGS3, §5.1a)
 pub const OFF_TICK_COUNT: u16 = 0x6C; // timer tick count (dword)
 pub const OFF_TICK_OVERFLOW: u16 = 0x70; // 24h rollover flag
@@ -114,6 +120,16 @@ pub fn Bda(comptime Cpu: type) type {
             // (int10_modes.cpp:988). AH=03 reads this word, so set-then-get and the
             // boot value both round-trip (int10.zig AH=01/03).
             self.wr16(OFF_CURSOR_SHAPE, 0x0607);
+            // Video state for the boot 80x25 text mode (the rest is filled by
+            // set-mode). MODESET_CTL default 0x51 (color, 400-line — IBM POST value;
+            // bit 3 clear => default-palette loading enabled). DCC default 0x08 =
+            // "VGA with color analog monitor" — what AH=1A00 returns and LAMUT's
+            // adapter-detect tests for (plans/vga-spec/04-modes-int10-bda.md §2.5).
+            self.wr8(OFF_MODESET_CTL, 0x51);
+            self.wr8(OFF_DCC_INDEX, 0x08);
+            self.wr16(OFF_CHAR_HEIGHT, 16); // 80x25 text cell height
+            self.wr8(OFF_VIDEO_CTL, 0x60);
+            self.wr16(OFF_CRTC_ADDRESS, 0x3D4); // color CRTC base
             self.wr32(OFF_TICK_COUNT, 0);
             self.wr8(OFF_TICK_OVERFLOW, 0);
         }
@@ -151,6 +167,10 @@ pub fn Bda(comptime Cpu: type) type {
         }
         pub fn setVideoMode(self: Self, m: u8) void {
             self.wr8(OFF_VIDEO_MODE, m);
+        }
+        /// Read a single BDA byte at `off` (used by set-mode's MODESET_CTL gate).
+        pub fn rawByte(self: Self, off: u16) u8 {
+            return self.rd8(off);
         }
 
         // ---- Keyboard ring (INT 09h fills, INT 16h drains) ----

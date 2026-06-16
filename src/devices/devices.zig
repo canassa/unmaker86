@@ -6,6 +6,7 @@
 pub const pic = @import("pic.zig");
 pub const pit = @import("pit.zig");
 pub const vga = @import("vga.zig");
+pub const vga_render = @import("vga_render.zig");
 pub const speaker = @import("speaker.zig");
 pub const keyboard = @import("keyboard.zig");
 

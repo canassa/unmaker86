@@ -317,6 +317,65 @@ match the golden's. Two strategies (decision needed — see Risks):
 
 ---
 
+## RESULT — both stages LANDED (2026-06-16)
+
+The full VGA build (P1–P6, ROADMAP #10/#10c/#11) closed every hole the gap analysis predicted.
+The Stage-1/Stage-2 acceptance probe required **no further emulator changes** — it was a pure
+verification run.
+
+**Stage 1 — `LAMUT-OK` (PASS).** `./zig-out/bin/zdos /tmp/lamut-work/LAMUT.EXE headless` prints:
+
+```
+LAMUT-OK: adapter=8 296x101
+[zdos] normal; exit code 28; 14860944 cycles
+```
+
+Deterministic: two headless runs are byte-identical at **14,860,944 cycles**. The no-argument run
+(with the `wait_seconds` INT 1Ah 3-second hold) also reaches LAMUT-OK, at **56,637,088 cycles** —
+the BIOS tick advances off the cycle counter, so the hold terminates with no host clock. (Exit code
+28 is the Borland CRT epilogue "null-pointer-assignment" check, the same benign quirk DOSBox sees;
+the `LAMUT-OK` line is the acceptance criterion per `main.c`, which checks return values + descriptor
+dims, not the exit code.)
+
+**Stage 2 — visual oracle (PASS, strategy A).** Driven over the HTTP API:
+- Post-blit plateau located by scanning `GET /api/framebuffer?format=index` while running to
+  successive cycles: the blit completes at **cycle 14,848,000** (nonzero pixels stabilize at 29,189),
+  then `restore_text_mode()` flips to text mode at ~14,849,000. `run-to-cycle 14848000` lands at the
+  next instruction boundary, **cycle 14,848,079**, inside the plateau.
+- The framebuffer reports **kind=1 (vga256_linear, chained mode 13h)** — i.e. LAMUT/Vmcode.ovl
+  drives the blit through the **chained** mode-13h path, not unchained Mode-Y, at capture time. (The
+  blit's plane-cycling write pattern is visible in the diff signature below, but the SEQ chain-4 bit
+  is set, so the rasterizer correctly de-interleaves via the linear path. This is faithful to what
+  the overlay actually programs; the milestone's Mode-Y expectation was a prediction, not a
+  requirement — the render classification follows the live SEQ register.)
+- **Index-image match: EXACT.** Cropping the 320×200 index frame at (x=12, y=49, 296×101) — the
+  centring `main.c` computes — yields a buffer **byte-identical** to `tools/lamut-oracle/lamut_0.idx`
+  (the convention-independent ground truth, 296×101 = 29,896 bytes). 0 byte differences. Verified
+  byte-identical across a second fresh run (determinism) and across two consecutive captures
+  (purity).
+- **Capture is cycle-neutral + a pure peek:** the status cycle is unchanged (14,848,079) before and
+  after capture; two consecutive captures are byte-identical.
+- **RGBA cross-check (documented reconciliation).** The `format=rgba` crop vs `lamut_0.ppm` differs
+  in 27,220/29,896 pixels but with a **max per-channel delta of 3** — the expected DAC 6→8-bit
+  scaling-convention difference (milestone Risk #4): the golden palette `lamut.pal.rgb` was minted
+  with plain `c<<2` (its max byte is **252** = `63<<2`), while zdos uses the more hardware-faithful
+  `(c<<2)|(c>>4)` (which gives 255 for c=63). Both are faithful; the ≤3 delta is the convention gap,
+  which is exactly why the index image (`lamut_0.idx`) is the authoritative oracle — and it matches
+  exactly. No fudge.
+
+`zig build test` → exit 0, **476 tests** (unchanged; no emulator code touched).
+
+> **Regression-test note (P7/P8 deferred, honestly).** A committed black-box test cannot bundle the
+> inputs: `LAMUT.EXE` + `Vmcode.ovl` + `G_LAMUT.BMX/.PAL` are **copyrighted Betrayal at Krondor game
+> assets** (`assets.txt`: "Not committed"), and the oracle extraction (`oracle.py`) needs Python,
+> which is absent on this host. The faithful path for a permanent gate is the milestone's Risk-#6
+> option: stage the assets out-of-tree at test setup (gitignored) and gate the test on their
+> presence (skip when absent), mirroring how `run.sh` stages from `Krondor.001`. The verification
+> above is fully reproducible from the staged work dir; only the *committed CI gate* is deferred for
+> the asset-licensing reason.
+
+---
+
 ## Phased checklist (each ≈ one focused commit; gates stay green; independently testable)
 
 - [ ] **P1 — INT 10h AH=1Ah (adapter detect).** Add the AH=1Ah case to `src/bios/int10.zig:45`

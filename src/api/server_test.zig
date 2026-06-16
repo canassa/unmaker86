@@ -59,7 +59,7 @@ const TestServer = struct {
         const io = threaded.io();
         const m = try makeMachine(alloc);
         const srv = try alloc.create(Server);
-        srv.* = Server.init(alloc, io, undefined, 0, server_mod.LoadRecipe.init(2, "PROG.COM", ""), std.Io.Dir.cwd());
+        srv.* = try Server.init(alloc, io, undefined, 0, server_mod.LoadRecipe.init(2, "PROG.COM", ""), std.Io.Dir.cwd());
         // The Controller lives inline in the returned struct; `start()` binds
         // `srv.ctrl` to its FINAL address (after the caller stores the struct), so
         // the worker thread sees the stable Controller.
@@ -78,7 +78,7 @@ const TestServer = struct {
         const w = struct {
             fn run(s: *Server) void {
                 const worker = @import("worker.zig");
-                const ww: worker.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl };
+                const ww: worker.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl, .render = s.render };
                 ww.run();
             }
         };
@@ -340,4 +340,95 @@ test "#4 capped-run reproducibility through the handler path (two fresh servers)
             first_body = first_body_buf[0..stop.body.len];
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/framebuffer (Phase 4, B1) — the raw-binary capture transport. The
+// pixels stream from the server-owned render buffer, NOT through resp_buf/JSON.
+// ---------------------------------------------------------------------------
+
+/// Find a header value (case-insensitive name) in the raw HTTP head.
+fn headerValue(raw: []const u8, name: []const u8) ?[]const u8 {
+    const head_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return null;
+    var it = std.mem.splitSequence(u8, raw[0..head_end], "\r\n");
+    _ = it.next(); // status line
+    while (it.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(line[0..colon], name)) {
+            var v = line[colon + 1 ..];
+            while (v.len > 0 and v[0] == ' ') v = v[1..];
+            return v;
+        }
+    }
+    return null;
+}
+
+test "GET /api/framebuffer mode 13h streams the raw index image (B1)" {
+    const alloc = std.testing.allocator;
+    var ts = try TestServer.init(alloc);
+    try ts.start();
+    defer ts.deinit();
+
+    // Put the BDA in mode 13h and lay a known VRAM pattern + palette.
+    ts.m.bus.writePhys8(0x400 + 0x49, 0x13); // OFF_VIDEO_MODE = 13h
+    var i: u32 = 0;
+    while (i < 320 * 200) : (i += 1) ts.m.vga.vram[i] = @truncate(i * 3 + 1);
+    var k: u16 = 0;
+    while (k < 256) : (k += 1) ts.m.vga.dac_rgb[k] = .{ .red = @truncate(k & 0x3F), .green = 5, .blue = 9 };
+
+    // A big out buffer: status+headers + 64000-byte body.
+    const out = try alloc.alloc(u8, 80 * 1024);
+    defer alloc.free(out);
+    const raw = ts.request("GET /api/framebuffer HTTP/1.1\r\nHost: x\r\n\r\n", out);
+
+    try std.testing.expect(std.mem.indexOf(u8, raw, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "application/octet-stream") != null);
+    try std.testing.expectEqualStrings("320", headerValue(raw, "x-frame-width").?);
+    try std.testing.expectEqualStrings("200", headerValue(raw, "x-frame-height").?);
+    try std.testing.expectEqualStrings("index", headerValue(raw, "x-frame-format").?);
+
+    const sep = std.mem.indexOf(u8, raw, "\r\n\r\n").?;
+    const body = raw[sep + 4 ..];
+    try std.testing.expectEqual(@as(usize, 320 * 200), body.len);
+    // The body IS the raw VRAM index bytes (mode 13h: index == VRAM).
+    try std.testing.expectEqual(ts.m.vga.vram[0], body[0]);
+    try std.testing.expectEqual(ts.m.vga.vram[100], body[100]);
+    try std.testing.expectEqual(ts.m.vga.vram[320 * 200 - 1], body[320 * 200 - 1]);
+}
+
+test "GET /api/framebuffer?format=rgba streams the DAC-expanded RGBA" {
+    const alloc = std.testing.allocator;
+    var ts = try TestServer.init(alloc);
+    try ts.start();
+    defer ts.deinit();
+    ts.m.bus.writePhys8(0x400 + 0x49, 0x13);
+    var i: u32 = 0;
+    while (i < 320 * 200) : (i += 1) ts.m.vga.vram[i] = @truncate(i);
+    var k: u16 = 0;
+    while (k < 256) : (k += 1) ts.m.vga.dac_rgb[k] = .{ .red = @truncate(k & 0x3F), .green = 0, .blue = 0 };
+
+    const out = try alloc.alloc(u8, 320 * 200 * 4 + 4096);
+    defer alloc.free(out);
+    const raw = ts.request("GET /api/framebuffer?format=rgba HTTP/1.1\r\nHost: x\r\n\r\n", out);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "200") != null);
+    try std.testing.expectEqualStrings("rgba", headerValue(raw, "x-frame-format").?);
+    const sep = std.mem.indexOf(u8, raw, "\r\n\r\n").?;
+    const body = raw[sep + 4 ..];
+    try std.testing.expectEqual(@as(usize, 320 * 200 * 4), body.len);
+    // Pixel 0: DAC[vram[0]] -> 6->8. vram[0] = 0 -> red = expand(0)=0; alpha=0xFF.
+    const idx0 = ts.m.vga.vram[0];
+    const expect_r = (@as(u8, ts.m.vga.dac_rgb[idx0].red & 0x3F) << 2) | (ts.m.vga.dac_rgb[idx0].red >> 4);
+    try std.testing.expectEqual(expect_r, body[0]);
+    try std.testing.expectEqual(@as(u8, 0xFF), body[3]);
+}
+
+test "GET /api/framebuffer in an unsupported mode -> 501 (honest, no fake frame)" {
+    const alloc = std.testing.allocator;
+    var ts = try TestServer.init(alloc);
+    try ts.start();
+    defer ts.deinit();
+    // Mode 0xFE has no rasterizer wired -> 501, never a fabricated body.
+    ts.m.bus.writePhys8(0x400 + 0x49, 0xFE);
+    const r = get(&ts, "/api/framebuffer", &obuf);
+    try std.testing.expectEqual(@as(u16, 501), r.status);
 }

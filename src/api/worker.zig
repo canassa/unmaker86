@@ -36,6 +36,19 @@ pub const MountSource = struct {
     io: ?Io = null,
 };
 
+/// The server-owned fixed render buffers (B1). Allocated ONCE at server startup and
+/// reused for every `GET /api/framebuffer` capture (no per-op alloc; honors the
+/// fixed-slab discipline). Sized for the widest standard VGA mode (640x480). The
+/// worker renders into these via the pure peek; the server streams the selected
+/// buffer as a raw binary body. NOT carried in the (pointer-free) Command — the
+/// worker reaches them through a `*RenderBuffers` it holds, mirroring `mount_dir`.
+pub const RenderBuffers = struct {
+    /// Palette-index image (one byte per pixel). 640*480 = 307200 bytes.
+    index: [debug.RENDER_INDEX_CAP]u8 = undefined,
+    /// RGBA image (4 bytes per pixel). 640*480*4 = 1228800 bytes.
+    rgba: [debug.RENDER_RGBA_CAP]u8 = undefined,
+};
+
 /// The addressable guest RAM slab size — the bound for memory containment checks
 /// (§B.5/G3). The bus is host-OOB-safe regardless; this returns a clean
 /// `address_out_of_range` BEFORE the controller call rather than silently reading
@@ -59,7 +72,7 @@ fn inSlab(ctrl: *const Controller, start: u32, len: u32) bool {
 /// Dispatch exactly one command to one `Controller` method. Pure mapping; the only
 /// state it touches is via `ctrl` (the worker owns it) and `ctx.scratch` (the
 /// mem_write bytes, copied in by the handler before submit).
-pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource) Response {
+pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render: ?*RenderBuffers) Response {
     return switch (ctx.cmd) {
         // ---- run / step ----------------------------------------------------
         .run => |c| .{ .stop = ctrl.runUntilEvent(c.cycle_cap) },
@@ -119,6 +132,7 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource) Respons
         // ---- session -------------------------------------------------------
         .console_get => consoleResp(ctrl),
         .screen_get => screenResp(ctrl),
+        .framebuffer_get => framebufferResp(ctrl, render),
         .status => statusResp(ctrl),
         .reset => blk: {
             ctrl.reset() catch return .{ .err = .load_failed };
@@ -291,6 +305,27 @@ fn screenResp(ctrl: *Controller) Response {
     return .{ .screen = res };
 }
 
+/// Render the current VGA mode into the SERVER-OWNED render buffers (B1) via the pure
+/// peek (`Controller.framebuffer` — side-effect-free: no cycle charge, no DAC-index /
+/// AC-flip-flop / latch / device mutation). Returns only the small descriptor; the
+/// server streams the selected buffer (index|rgba) as a raw binary body. When the
+/// render buffers are absent (an in-process test that never set them) we fail loud
+/// with `load_failed` rather than faking a capture into a stack buffer.
+fn framebufferResp(ctrl: *Controller, render: ?*RenderBuffers) Response {
+    const rb = render orelse return .{ .err = .load_failed };
+    const v = ctrl.framebuffer(rb.index[0..], rb.rgba[0..]);
+    return .{ .framebuffer = .{
+        .kind = v.kind,
+        .width = v.width,
+        .height = v.height,
+        .index_len = v.index_len,
+        .rgba_len = v.rgba_len,
+        .double_scan = v.double_scan,
+        .row_repeat = v.row_repeat,
+        .supported = v.supported,
+    } };
+}
+
 fn statusResp(ctrl: *Controller) Response {
     const s = ctrl.status();
     // Map the controller's `running` field to the wire key `runnable` (§B.1/G11).
@@ -347,6 +382,9 @@ pub const Worker = struct {
     /// The host mount source for `load` re-mounts (set by the server at startup).
     mount_dir: ?Io.Dir = null,
     io: ?Io = null,
+    /// The server-owned render buffers for `GET /api/framebuffer` (B1). Null in a test
+    /// harness that never drives a capture; a `framebuffer_get` then fails loud.
+    render: ?*RenderBuffers = null,
 
     pub fn run(self: Worker) void {
         const mount: MountSource = .{ .dir = self.mount_dir, .io = self.io };
@@ -356,7 +394,7 @@ pub const Worker = struct {
                 self.queue.complete(ctx, .ok);
                 return;
             }
-            const resp = drainOne(self.ctrl, ctx, mount);
+            const resp = drainOne(self.ctrl, ctx, mount, self.render);
             self.queue.complete(ctx, resp);
         }
     }

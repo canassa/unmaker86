@@ -25,6 +25,15 @@ const bios_sources = [_][]const u8{
     @embedFile("int16.zig"),
     @embedFile("int1a.zig"),
     @embedFile("scancodes.zig"),
+    // VGA Phase 2 (plans/vga-spec/04-modes-int10-bda.md, R1): the new font /
+    // mode-table / palette comptime-data files must be in the gate the moment
+    // they exist — a new bios source not in the gate IS the determinism regression.
+    @embedFile("vga_font.zig"),
+    @embedFile("vga_modes.zig"),
+    @embedFile("vga_palettes.zig"),
+    // VGA Phase 5c (R1): the save-pointer / DCC / static-functionality ROM-table
+    // comptime-data file — float-gated here alongside the other VGA ROM data.
+    @embedFile("vga_rom.zig"),
 };
 
 test "src/bios grep: no host time / RNG / thread / env / float" {

@@ -133,6 +133,11 @@ pub fn build(b: *std.Build) void {
     });
     debug_mod.addImport("cpu", cpu_mod);
     debug_mod.addImport("machine", machine_mod);
+    // controller.zig (Phase 4 framebuffer capture) reads the staged ROM-font phys
+    // addresses (bios.int10_mod.FONT*_PHYS) to peek real glyph bytes for text render,
+    // and drives the pure rasterizer (devices.vga_render) over the live VGA state.
+    debug_mod.addImport("bios", bios_mod);
+    debug_mod.addImport("devices", devices_mod);
     // controller.zig imports `bus` for the memory-watchpoint (setWatch/clearWatch)
     // path. The exe never references that path so lazy analysis hid the dependency,
     // but the api module's tests do — so the `debug` module must provide `bus`.

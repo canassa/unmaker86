@@ -141,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
         // a `POST /api/reset` can re-establish the C: mount and re-run the full boot
         // (reset wipes the mount via `dos.init`). Re-mount happens server-side on the
         // worker thread (the sole owner of machine state) — see worker.zig loadResp.
-        var server = api_mod.Server.init(gpa, io, &ctrl, port, recipe, dir);
+        var server = try api_mod.Server.init(gpa, io, &ctrl, port, recipe, dir);
         defer server.deinit();
 
         // Bind first so we can print the OS-RESOLVED port (when `--serve 0` was

@@ -111,6 +111,14 @@ pub const Command = union(enum) {
     /// parsed server-side and drives JSON serialization only (Finding 5), so the
     /// worker always fills the full cells buffer.
     screen_get: void,
+    /// Capture the current VGA framebuffer (any mode) — the side-effect-free
+    /// rasterizer peek for `GET /api/framebuffer` (plans/vga-spec/03 §3.5.3, B1). A
+    /// `void` command: the `?format=index|rgba` flag is parsed server-side and selects
+    /// which server-owned buffer is streamed; the worker always renders BOTH the index
+    /// + RGBA into the server-owned render buffers and returns only the small
+    /// `FramebufferResult` descriptor through the normal path (the large payload is
+    /// streamed from the server buffer, NOT routed through `resp_buf`).
+    framebuffer_get: void,
     status: void,
     reset: void,
     load: LoadCmd,
@@ -204,6 +212,23 @@ pub const ScreenResult = struct {
     cells: [MAX_SCREEN_CELLS]u8 = undefined,
 };
 
+/// The framebuffer-capture descriptor (B1) — a SMALL POD returned through the normal
+/// path. The large index/RGBA payloads are NOT here: the worker renders them into the
+/// server-owned render buffers (reached via the worker's `*RenderBuffers`, not the
+/// Command), and the server streams the selected buffer as a raw binary body.
+pub const FramebufferResult = struct {
+    kind: debug.FramebufferKind = .unsupported,
+    width: u16 = 0,
+    height: u16 = 0,
+    index_len: u32 = 0,
+    rgba_len: u32 = 0,
+    double_scan: bool = false,
+    row_repeat: u8 = 1,
+    /// False => no faithful rasterizer for the current mode; the server replies 501
+    /// rather than streaming a wrong frame (no fake).
+    supported: bool = false,
+};
+
 pub const StatusResult = struct {
     runnable: bool,
     terminated: bool,
@@ -244,6 +269,8 @@ pub const Response = union(enum) {
     status: StatusResult,
     console: ConsoleResult,
     screen: ScreenResult,
+    /// The framebuffer-capture descriptor; pixels live in the server render buffers.
+    framebuffer: FramebufferResult,
     regions: RegionsResult,
     /// A typed error. The handler maps `code` → HTTP status.
     err: ErrCode,

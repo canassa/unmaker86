@@ -34,6 +34,14 @@ pub const Reg16 = controller.Reg16;
 pub const Reg8 = controller.Reg8;
 pub const Region = controller.Region;
 pub const MouseInject = controller.MouseInject;
+pub const FramebufferView = controller.FramebufferView;
+/// The rendered-frame family (re-exported from the rasterizer so the API layer can
+/// report it without importing `devices`).
+pub const FramebufferKind = @import("devices").vga_render.Kind;
+/// The fixed render-buffer capacities (widest standard VGA mode, 640x480) — the API
+/// server sizes its server-owned render buffers from these (B1).
+pub const RENDER_INDEX_CAP = @import("devices").vga_render.MAX_INDEX_LEN;
+pub const RENDER_RGBA_CAP = @import("devices").vga_render.MAX_RGBA_LEN;
 
 test {
     _ = breakpoints;

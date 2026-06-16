@@ -230,6 +230,25 @@ pub const Machine = struct {
         //       (registerPort by ID) stays stable (plans/vga-retrace.md §3.5).
         _ = self.bus.registerPort(0x3DA, self.vga.portHandler());
         _ = self.bus.registerPort(0x3BA, self.vga.portHandler());
+        // (c2b) The four indexed register files + Input Status #0 / Feature
+        //       Control (plans/vga-spec/01-registers.md, H2). Registered AFTER
+        //       the retrace ports so the snapshot replay order (registerPort by
+        //       ID) stays stable. Both index AND data ports must be reachable so a
+        //       16-bit OUT to an index port splits to index(lo)+data(hi) via the
+        //       bus's default out16 byte-split (ports.zig:65-71): port+1 lands on
+        //       the data port registered here. Mono CRTC aliases 0x3B4/0x3B5 follow
+        //       the existing 0x3BA convention (zdos is always colour for v1).
+        _ = self.bus.registerPort(0x3C0, self.vga.portHandler()); // AC index/data (flip-flop)
+        _ = self.bus.registerPort(0x3C1, self.vga.portHandler()); // AC data read
+        _ = self.bus.registerPort(0x3C4, self.vga.portHandler()); // SEQ index
+        _ = self.bus.registerPort(0x3C5, self.vga.portHandler()); // SEQ data
+        _ = self.bus.registerPort(0x3CA, self.vga.portHandler()); // Feature Control read
+        _ = self.bus.registerPort(0x3CE, self.vga.portHandler()); // GC index
+        _ = self.bus.registerPort(0x3CF, self.vga.portHandler()); // GC data
+        _ = self.bus.registerPort(0x3D4, self.vga.portHandler()); // CRTC index (colour)
+        _ = self.bus.registerPort(0x3D5, self.vga.portHandler()); // CRTC data (colour)
+        _ = self.bus.registerPort(0x3B4, self.vga.portHandler()); // CRTC index (mono alias)
+        _ = self.bus.registerPort(0x3B5, self.vga.portHandler()); // CRTC data (mono alias)
         _ = self.bus.mapMmio(devices.vga.VRAM_PHYS, devices.vga.VRAM_WINDOW_LEN, self.vga.memHandler());
         // (c1) The text-mode video pages — color B8000 (modes 0-3) + mono B0000
         //      (mode 7). Both are permanently mapped RAM-like MMIO (like A0000):
@@ -321,6 +340,14 @@ pub const Machine = struct {
         // the BIOS image AFTER the slot table (Phase 1d). INT 16h's IVT vector is
         // pointed at it in `bios.post`/initIvt, not at the bare int16 slot.
         self.bios.emitInt16Hybrid(&self.bios_image);
+        // Stage the VGA ROM fonts into the BIOS image (the F000 window is ROM;
+        // writes are dropped, so the bytes must be planted in the image before
+        // loadRom). AH=1130 / IVT[0x1F]/[0x43] then return real font pointers.
+        bios_mod.int10_mod.stageFonts(&self.bios_image);
+        // Stage the VGA save-pointer ROM chain (video parameter / DCC / static-
+        // functionality / video-save-pointer tables) into the same BIOS image;
+        // POST then points IVT[0x1D] + BDA VS_POINTER at them (plans/vga-spec §3.3).
+        bios_mod.vga_rom.stage(&self.bios_image);
         self.bus.loadRom(Bridge.IMAGE_BASE, &self.bios_image);
         // The re-entrancy trampoline lives in conventional RAM (writable; its INT
         // immediate is patched per runGuestInt). Plant it after reset zeroed RAM.

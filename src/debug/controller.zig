@@ -34,6 +34,11 @@ const memmap = bus_mod.memmap;
 const WatchAccess = bus_mod.WatchAccess;
 const AccessKind = bp.AccessKind;
 
+const devices = @import("devices");
+const bios = @import("bios");
+const vga_render = devices.vga_render;
+const int10 = bios.int10_mod;
+
 const SS = @intFromEnum(Seg.ss);
 const ESP = @intFromEnum(Reg32.esp);
 
@@ -702,6 +707,111 @@ pub const Controller = struct {
         var b: [2]u8 = undefined;
         self.m.bus.peekBlock(phys, &b);
         return @as(u16, b[0]) | (@as(u16, b[1]) << 8);
+    }
+
+    /// The framebuffer-capture descriptor returned through the normal small-POD path
+    /// (plans/vga-spec/03 §3.5.3, B1). The large index/RGBA payloads are written into
+    /// the CALLER-PROVIDED buffers (the server-owned render buffers), NOT returned by
+    /// value — a frame is 64 KiB..1.2 MiB and must not flow through the 32 KiB resp_buf.
+    pub const FramebufferView = struct {
+        kind: vga_render.Kind,
+        width: u16,
+        height: u16,
+        index_len: u32,
+        rgba_len: u32,
+        double_scan: bool,
+        row_repeat: u8,
+        /// True iff the current mode has a faithful rasterizer; false => the caller
+        /// surfaces "no renderer for this mode" rather than streaming a wrong frame.
+        supported: bool,
+    };
+
+    /// Capture the CURRENT VGA mode into `index_buf` (palette indices) and `rgba_buf`
+    /// (index -> DAC -> 6->8 -> RGBA). A PURE peek of guest state (VRAM + registers +
+    /// DAC) at the live cycle: it advances NO cycles and mutates NO device field
+    /// (CLAUDE prime directive; the R3/R6 invariants). It reads RAW fields only — the
+    /// VRAM/plane slab directly (never `memRead8`, which loads the 4 latches), the raw
+    /// `dac_rgb`/`pel_mask` (never `read3c9`), the raw `attr.regs`/CRTC (never
+    /// `in8(0x3DA)`). Blink is rendered high, the cursor solid (§6 — no wall clock).
+    ///
+    /// `index_buf` must be >= width*height; `rgba_buf` >= width*height*4 (the server's
+    /// fixed 640x480 buffers always satisfy this). For an unsupported mode it returns
+    /// `supported=false` with zero dims and writes nothing (no fake frame).
+    pub fn framebuffer(self: *const Controller, index_buf: []u8, rgba_buf: []u8) FramebufferView {
+        const BDA: u32 = 0x400;
+        const mode = self.m.bus.peekPhys8(BDA + 0x49); // OFF_VIDEO_MODE
+        var cols: u16 = self.peekU16(BDA + 0x4A); // OFF_VIDEO_COLS
+        if (cols == 0) cols = 80;
+        const rows: u16 = @as(u16, self.m.bus.peekPhys8(BDA + 0x84)) + 1; // OFF_NB_ROWS+1
+        var char_height: u8 = @intCast(self.peekU16(BDA + 0x85) & 0xFF); // OFF_CHAR_HEIGHT
+        if (char_height == 0) char_height = 16;
+        const active_page = self.m.bus.peekPhys8(BDA + 0x62); // OFF_ACTIVE_PAGE
+        const cursor_word = self.peekU16(BDA + 0x50 + @as(u32, active_page) * 2); // OFF_CURSOR_POS
+        const cursor_shape = self.peekU16(BDA + 0x60); // OFF_CURSOR_SHAPE (start<<8|end)
+
+        // Text-page cell slab (B0000 mono for mode 7, else B8000 color), one page =
+        // 0x1000 bytes. Peeked into a fixed scratch — the same pure path /api/screen uses.
+        var cell_scratch: [80 * 50 * 2]u8 = undefined; // headroom for 80x50
+        const cell_bytes: usize = @min(@as(usize, cols) * rows * 2, cell_scratch.len);
+        const text_base: u32 = if (mode == 0x07) 0xB0000 else 0xB8000;
+        self.m.bus.peekBlock(text_base + @as(u32, active_page) * 0x1000, cell_scratch[0..cell_bytes]);
+
+        // The staged ROM glyph slab for the active cell height — peeked from BIOS ROM
+        // space (the real bytes a hardware character generator would fetch). 8/14/16.
+        var font_scratch: [256 * 16]u8 = undefined;
+        const font_phys: u32, const fh: u8 = switch (char_height) {
+            8 => .{ int10.FONT8_PHYS, 8 },
+            14 => .{ int10.FONT14_PHYS, 14 },
+            else => .{ int10.FONT16_PHYS, 16 },
+        };
+        const font_bytes: usize = @as(usize, 256) * fh;
+        self.m.bus.peekBlock(font_phys, font_scratch[0..font_bytes]);
+
+        const mv: vga_render.ModeView = .{
+            .mode = mode,
+            .cols = cols,
+            .rows = rows,
+            .char_height = char_height,
+            // Cell width from the Sequencer Clocking-Mode 8/9-dot bit (SEQ 0x01 bit 0):
+            // 1 => 8-dot, 0 => 9-dot (the 720-wide text family, §3.1). Read raw (pure).
+            .char_width = self.m.vga.charWidth(),
+            .active_page = active_page,
+            .cursor_row = cursor_word >> 8,
+            .cursor_col = cursor_word & 0xFF,
+            .cursor_start = @intCast(cursor_shape >> 8),
+            .cursor_end = @intCast(cursor_shape & 0xFF),
+            // Cursor enabled unless the start-scanline bit 5 (disable) is set — and it
+            // is only shown for text modes. Rendered SOLID (no blink, §6).
+            .cursor_visible = mode <= 0x03 or mode == 0x07,
+            .text_cells = cell_scratch[0..cell_bytes],
+            .font = font_scratch[0..font_bytes],
+        };
+
+        const d = vga_render.render(&self.m.vga, mv, index_buf);
+        if (d.kind == .unsupported) {
+            return .{
+                .kind = .unsupported,
+                .width = 0,
+                .height = 0,
+                .index_len = 0,
+                .rgba_len = 0,
+                .double_scan = false,
+                .row_repeat = 1,
+                .supported = false,
+            };
+        }
+        // Second pass: index -> RGBA via the DAC (raw fields; no port mutation).
+        vga_render.indexToRgba(&self.m.vga, index_buf[0..d.index_len], rgba_buf[0..d.rgba_len]);
+        return .{
+            .kind = d.kind,
+            .width = d.width,
+            .height = d.height,
+            .index_len = d.index_len,
+            .rgba_len = d.rgba_len,
+            .double_scan = d.double_scan,
+            .row_repeat = d.row_repeat,
+            .supported = true,
+        };
     }
 
     /// Side-effect-free read of up to `out.len` 16-bit words from SS:SP upward

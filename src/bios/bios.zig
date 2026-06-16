@@ -16,6 +16,17 @@ pub const Bda = bda_mod.Bda;
 /// Scancode set-1 + BIOS-keycode tables (input Phase 1b). Re-exported so the API
 /// layer can resolve the `{"char"}` convenience over the REAL table (§5.1e).
 pub const scancodes = @import("scancodes.zig");
+/// The (non-generic) module holding the VGA ROM font staging into the BIOS image
+/// — the machine calls `int10_mod.stageFonts(image)` before `loadRom` (the F000
+/// window is ROM, so the bytes must be planted in the image). Re-exported so the
+/// machine can reach it without naming a concrete CPU type.
+pub const int10_mod = @import("int10.zig");
+/// The (non-generic) module holding the VGA save-pointer ROM chain (video
+/// parameter table, DCC table, static-functionality table, video-save-pointer
+/// table). Staged into the BIOS image like the fonts; re-exported so the machine
+/// can stage it before `loadRom` (plans/vga-spec §3.3). POST then sets IVT[0x1D]
+/// + BDA VS_POINTER 0x40:00A8.
+pub const vga_rom = @import("vga_rom.zig");
 
 /// The set of BIOS INTs zdos services. Each maps to one callback id; the handler
 /// switches on AH (the IndexBasedDispatcher shape, D7).
@@ -191,6 +202,30 @@ pub fn Bios(comptime Cpu: type) type {
             self.cpu.bus.setA20(true);
             self.initIvt(br);
             self.bda().initDefaults();
+            self.initFontVectors();
+        }
+
+        /// Point INT 1Fh / INT 43h at the staged ROM fonts (the machine planted the
+        /// bytes into the BIOS image via `int10_mod.stageFonts` before `loadRom`).
+        /// INT 1Fh = the graphics 8x8 high-half (chars 128-255); INT 43h = the
+        /// active cell-height font (boot 80x25 text => 8x16). The BDA SWITCHES/
+        /// MODESET_CTL/DCC defaults are set in `bda.initDefaults`. These vectors are
+        /// guest-overridable (AH=11h AL=2x / AH=25h). plans/vga-spec §3.3.
+        fn initFontVectors(self: *Self) void {
+            const bus = self.cpu.bus;
+            // INT 1Fh -> 8x8 second half.
+            bus.writePhys16(0x1F * 4, int10_mod.FONT8_2ND_OFF);
+            bus.writePhys16(0x1F * 4 + 2, int10_mod.FONT_SEG);
+            // INT 43h -> 8x16 (the boot text cell).
+            bus.writePhys16(0x43 * 4, int10_mod.FONT16_OFF);
+            bus.writePhys16(0x43 * 4 + 2, int10_mod.FONT_SEG);
+            // INT 1Dh -> the video parameter table (the save-pointer chain, §3.3).
+            bus.writePhys16(0x1D * 4, vga_rom.PARAM_OFF);
+            bus.writePhys16(0x1D * 4 + 2, vga_rom.ROM_SEG);
+            // BDA 0040:00A8 (VS_POINTER) -> the 7-dword video-save-pointer table
+            // (closes the Phase-2 deferral; backs AH=1B's +0 ptr + AH=1A's table).
+            bus.writePhys16(bda_mod.BDA_PHYS + bda_mod.OFF_VS_POINTER, vga_rom.VS_POINTER_OFF);
+            bus.writePhys16(bda_mod.BDA_PHYS + bda_mod.OFF_VS_POINTER + 2, vga_rom.ROM_SEG);
         }
 
         /// Program the 8259 master+slave to the standard real-mode config (the

@@ -59,6 +59,9 @@ test "no host time / RNG / thread / env / float anywhere in src/devices (grep)" 
         // float / host-clock / RNG free (the temptation to write an f64 "70.086 Hz"
         // is real — both reference emulators use double/fmod). plans/vga-retrace.md §5.5.
         @embedFile("vga.zig"),
+        // The rasterizer (Phase 4, R1): a PURE spatial render — integer-only, no host
+        // clock, no render timer, no float, no blink wall-clock. plans/vga-spec/03 §0.
+        @embedFile("vga_render.zig"),
     };
     const forbidden = [_][]const u8{
         "std.time",

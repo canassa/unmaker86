@@ -98,13 +98,23 @@ pub const Server = struct {
     worker_thread: ?std.Thread = null,
     net_server: ?net.Server = null,
 
+    /// The server-owned fixed render buffers for `GET /api/framebuffer` (B1):
+    /// allocated ONCE at `init` (~1.5 MiB; too large for the stack/`resp_buf`), reused
+    /// for every capture. The worker renders into these via the pure peek; the server
+    /// streams the selected buffer as a raw binary body — the pixels NEVER flow through
+    /// `resp_buf`/JSON.
+    render: *worker_mod.RenderBuffers,
+
     // Per-request scratch (one connection at a time → safe to reuse).
     arena: std.heap.ArenaAllocator,
     resp_buf: [RESPONSE_BUF]u8 = undefined,
     body_buf: [MAX_BODY]u8 = undefined,
     read_scratch: [MAX_BODY]u8 = undefined,
 
-    pub fn init(gpa: std.mem.Allocator, io: Io, ctrl: *Controller, port: u16, recipe: LoadRecipe, mount_dir: Io.Dir) Server {
+    pub fn init(gpa: std.mem.Allocator, io: Io, ctrl: *Controller, port: u16, recipe: LoadRecipe, mount_dir: Io.Dir) !Server {
+        // The server-owned render buffers (~1.5 MiB) are heap-allocated ONCE here
+        // (B1: no per-op alloc; too large for the stack/`resp_buf`).
+        const render = try gpa.create(worker_mod.RenderBuffers);
         return .{
             .gpa = gpa,
             .io = io,
@@ -114,11 +124,13 @@ pub const Server = struct {
             .mount_dir = mount_dir,
             .queue = q.CommandQueue.init(io),
             .arena = std.heap.ArenaAllocator.init(gpa),
+            .render = render,
         };
     }
 
     pub fn deinit(self: *Server) void {
         self.arena.deinit();
+        self.gpa.destroy(self.render);
     }
 
     /// Bind, spawn the worker, and run the accept loop until shutdown (= `bind` then
@@ -136,7 +148,7 @@ pub const Server = struct {
     /// `getsockname`, `Io/Threaded.zig:11828`). Split out of `run` so a caller (the
     /// `--serve 0` path) can PRINT the resolved port BEFORE the blocking accept loop.
     pub fn bind(self: *Server) !void {
-        const w: worker_mod.Worker = .{ .queue = &self.queue, .ctrl = self.ctrl, .mount_dir = self.mount_dir, .io = self.io };
+        const w: worker_mod.Worker = .{ .queue = &self.queue, .ctrl = self.ctrl, .mount_dir = self.mount_dir, .io = self.io, .render = self.render };
         self.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
 
         const addr: net.IpAddress = .{ .ip4 = .loopback(self.port) };
@@ -283,6 +295,18 @@ pub const Server = struct {
             // the flag only decides whether the JSON carries the attribute array.
             const want_attrs = (self.queryU32(query, "attrs") orelse 0) != 0;
             return self.submitAndRespondScreen(req, want_attrs);
+        }
+        if (std.mem.eql(u8, path, "/api/framebuffer")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            // Pure rasterizer peek of the current VGA mode (B1). `?format=index|rgba`
+            // (default index) selects which server-owned buffer to stream as a raw
+            // binary body; the descriptor goes in `X-Frame-*` headers. No JSON for the
+            // pixels — a frame is 64 KiB..1.2 MiB and must NOT route through resp_buf.
+            const want_rgba = blk: {
+                const fmt = queryValue(query, "format") orelse break :blk false;
+                break :blk std.mem.eql(u8, fmt, "rgba");
+            };
+            return self.submitAndRespondFramebuffer(req, want_rgba);
         }
         if (std.mem.eql(u8, path, "/api/memory-regions")) {
             if (method != .GET) return self.methodNotAllowed(req);
@@ -679,6 +703,53 @@ pub const Server = struct {
         }
     }
 
+    /// Submit the `framebuffer_get` command (the worker renders into the SERVER-OWNED
+    /// `self.render` buffers) and stream the selected buffer as a raw binary body (B1).
+    /// The pixels are read straight from `self.render` to the socket — never through
+    /// `resp_buf`/JSON. The descriptor (mode/width/height/lens/double-scan) goes in
+    /// `X-Frame-*` response headers. A mode with no faithful rasterizer is a 501 (the
+    /// honest deferral — never a fabricated frame).
+    fn submitAndRespondFramebuffer(self: *Server, req: *http.Server.Request, want_rgba: bool) void {
+        var ctx: q.RequestCtx = .{ .cmd = .framebuffer_get };
+        const resp = self.queue.submit(&ctx);
+        const fr = switch (resp) {
+            .framebuffer => |f| f,
+            .err => |code| return self.respondErrCode(req, code),
+            else => return self.respondError(req, .service_unavailable, "internal", "unexpected framebuffer response"),
+        };
+        if (!fr.supported) {
+            return self.respondError(req, .not_implemented, "not_implemented", "no faithful rasterizer for the current video mode");
+        }
+        // Select the buffer + length (the worker rendered BOTH into self.render).
+        const body: []const u8 = if (want_rgba)
+            self.render.rgba[0..fr.rgba_len]
+        else
+            self.render.index[0..fr.index_len];
+
+        // Descriptor headers (the client reads dims/kind from these; the body is raw
+        // pixels). Formatted into small fixed scratch buffers (no alloc).
+        var wbuf: [8]u8 = undefined;
+        var hbuf: [8]u8 = undefined;
+        var kbuf: [8]u8 = undefined;
+        const w_str = std.fmt.bufPrint(&wbuf, "{d}", .{fr.width}) catch "0";
+        const h_str = std.fmt.bufPrint(&hbuf, "{d}", .{fr.height}) catch "0";
+        const kind_str = std.fmt.bufPrint(&kbuf, "{d}", .{@intFromEnum(fr.kind)}) catch "0";
+        const fmt_str: []const u8 = if (want_rgba) "rgba" else "index";
+
+        const headers = [_]http.Header{
+            .{ .name = "content-type", .value = "application/octet-stream" },
+            .{ .name = "x-frame-width", .value = w_str },
+            .{ .name = "x-frame-height", .value = h_str },
+            .{ .name = "x-frame-kind", .value = kind_str },
+            .{ .name = "x-frame-format", .value = fmt_str },
+        };
+        req.respond(body, .{
+            .status = .ok,
+            .keep_alive = false,
+            .extra_headers = &headers,
+        }) catch {};
+    }
+
     fn serializeResponse(self: *Server, req: *http.Server.Request, resp: q.Response) void {
         switch (resp) {
             .err => |code| self.respondErrCode(req, code),
@@ -699,6 +770,10 @@ pub const Server = struct {
             // Direct `.screen` responses default to no attributes; the dedicated
             // `/api/screen` route uses `submitAndRespondScreen` to pass `?attrs`.
             .screen => |sr| self.respondScreen(req, sr, false),
+            // The framebuffer is streamed by the dedicated `submitAndRespondFramebuffer`
+            // (raw binary, B1) — it never reaches this generic JSON serializer. If it
+            // ever does, report it honestly rather than emitting a wrong body.
+            .framebuffer => self.respondError(req, .service_unavailable, "internal", "framebuffer must be streamed via /api/framebuffer"),
             .regions => |rg| self.respondRegions(req, rg),
         }
     }
