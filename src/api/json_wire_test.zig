@@ -38,19 +38,19 @@ test "StopReason golden: u64 at_cycle > 2^53 emits as a JSON string (R6)" {
     , try ser(r));
 }
 
-test "StopReason golden: void-payload variants serialize as {}" {
+test "StopReason golden: terminal variants carry at_cycle" {
     try std.testing.expectEqualStrings(
-        \\{"halted_forever":{}}
-    , try ser(@as(StopReason, .halted_forever)));
+        \\{"halted_forever":{"at_cycle":42}}
+    , try ser(@as(StopReason, .{ .halted_forever = .{ .at_cycle = 42 } })));
     try std.testing.expectEqualStrings(
-        \\{"shutdown":{}}
-    , try ser(@as(StopReason, .shutdown)));
+        \\{"shutdown":{"at_cycle":7}}
+    , try ser(@as(StopReason, .{ .shutdown = .{ .at_cycle = 7 } })));
 }
 
-test "StopReason golden: program_terminated carries ret_code" {
-    const r: StopReason = .{ .program_terminated = .{ .ret_code = 0 } };
+test "StopReason golden: program_terminated carries ret_code + at_cycle" {
+    const r: StopReason = .{ .program_terminated = .{ .ret_code = 0, .at_cycle = 7425 } };
     try std.testing.expectEqualStrings(
-        \\{"program_terminated":{"ret_code":0}}
+        \\{"program_terminated":{"ret_code":0,"at_cycle":7425}}
     , try ser(r));
 }
 

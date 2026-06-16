@@ -64,13 +64,13 @@ pub const StopReason = union(enum) {
     /// The cycle cap was reached with no terminal/breakpoint.
     cycle_budget_exhausted: struct { at_cycle: u64 },
     /// Deterministic permanent HLT (no pending events, not wakeable).
-    halted_forever,
+    halted_forever: struct { at_cycle: u64 },
     /// The DOS program terminated (INT 21h AH=4C / INT 20h). `ret_code` is the
     /// full DOS exit word (`dos.ret_code` is u16 — low byte = AL exit code, high
     /// byte = exit type per AH=4D), carried verbatim rather than truncated.
-    program_terminated: struct { ret_code: u16 },
+    program_terminated: struct { ret_code: u16, at_cycle: u64 },
     /// Triple fault / shutdown latched.
-    shutdown,
+    shutdown: struct { at_cycle: u64 },
 };
 
 pub const StepOverResult = struct {
@@ -213,9 +213,10 @@ pub const Controller = struct {
     /// machine is not terminal). Order: shutdown → program_terminated →
     /// halted_forever.
     fn terminalReason(self: *const Controller) ?StopReason {
-        if (self.m.cpu.st.shutdown or self.m.shutdown) return .shutdown;
-        if (self.m.dos.terminated) return .{ .program_terminated = .{ .ret_code = self.m.dos.ret_code } };
-        if (self.permanentlyHalted()) return .halted_forever;
+        const at = self.m.cpu.st.cycles;
+        if (self.m.cpu.st.shutdown or self.m.shutdown) return .{ .shutdown = .{ .at_cycle = at } };
+        if (self.m.dos.terminated) return .{ .program_terminated = .{ .ret_code = self.m.dos.ret_code, .at_cycle = at } };
+        if (self.permanentlyHalted()) return .{ .halted_forever = .{ .at_cycle = at } };
         return null;
     }
 
