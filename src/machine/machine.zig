@@ -808,15 +808,33 @@ pub const Machine = struct {
         self.clock = snap.clock;
     }
 
-    /// INTERNAL test-only seam (Phase 2): set the active CPU:PIT multiplier. There
-    /// is deliberately NO command/API wiring in Phase 2 — this exists ONLY so tests
-    /// can exercise the runtime mult path (snapshot round-trip, per-config
-    /// determinism) before Phase 3 adds `Command.set_clock`. Writing the VALUE does
-    /// not move the embedded `clock` field, so the device back-pointers stay valid.
-    /// Determinism note: a real live change must apply at a serialized cycle
-    /// boundary (Phase 3); this raw setter makes no such guarantee and is test-only.
-    pub fn setClockMult(self: *Machine, mult: u64) void {
-        std.debug.assert(mult >= 1);
-        self.clock.mult = mult;
+    /// Set the active CPU:PIT multiplier (Phase 3 — the real live-clock setter). The
+    /// requested `mult` is CLAMPED to `[1, timing.MAX_MULT]` (reject 0; cap at the
+    /// host-ceiling knob bound) and the APPLIED value is returned so the caller can
+    /// echo it + derive the pacer slice / displayed MHz from the same number.
+    ///
+    /// Approach (B), the no-re-arm payoff: devices schedule + phase in the
+    /// mult-independent DEVICE-TIME domain (`abi/timing.zig`), so only the
+    /// device-time↔CPU-cycle conversion factor changes for FUTURE conversions —
+    /// VGA/speaker retrace PHASE stays continuous and the scheduler's pending PIT/
+    /// OPL/keyboard events keep their device-time fire points across the change. We
+    /// therefore ONLY overwrite the VALUE: no event is re-armed, cancelled, or
+    /// re-anchored (a re-arm here would be the very fragility approach B was chosen
+    /// to avoid). Writing the value does not move the embedded `clock` field, so the
+    /// device `*const u64` back-pointers stay valid.
+    ///
+    /// Determinism: this applies at the serialized worker-command boundary (a precise
+    /// cycle), exactly like `reset` — a live change is a deterministic input
+    /// recordable/replayable as `(cycle, mult)`. The default mult (12) is never
+    /// changed by the determinism harness, so every golden stays byte-identical.
+    pub fn setClockMult(self: *Machine, mult: u64) u64 {
+        const applied = std.math.clamp(mult, @as(u64, 1), timing.MAX_MULT);
+        self.clock.mult = applied;
+        return applied;
+    }
+
+    /// The active CPU:PIT multiplier (read-back for the API GET path).
+    pub fn clockMult(self: *const Machine) u64 {
+        return self.clock.mult;
     }
 };

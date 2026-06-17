@@ -137,6 +137,16 @@ pub const Command = union(enum) {
     /// streamed from the server buffer, NOT routed through `resp_buf`).
     framebuffer_get: void,
     status: void,
+    /// Set the active CPU:PIT multiplier at the serialized worker-command boundary
+    /// (Phase 3 of the live-CPU-clock work). Integer `mult` (NO float on the wire —
+    /// the determinism grep-gate bans host floats); the handler validated/parsed it,
+    /// the worker calls `Controller.setCpuMult(mult)` which CLAMPS to `[1, MAX_MULT]`
+    /// and returns the APPLIED mult in the `.clock` response. A live change is a
+    /// deterministic input applied at a precise cycle, exactly like `reset` — NOT the
+    /// non-blocking live-mouse fold. Pointer-free POD.
+    set_clock: struct { mult: u64 },
+    /// Read the active CPU:PIT multiplier (the GET path). Cycle-neutral peek.
+    clock_get: void,
     reset: void,
     load: LoadCmd,
     mem_regions: void,
@@ -327,6 +337,9 @@ pub const Response = union(enum) {
     bp_list: BpListResult, // list_bp
     cleared: u32, // clear_bp removed count
     cpu: CpuSnapshot,
+    /// The applied CPU:PIT multiplier (`set_clock` / `clock_get`). The server derives
+    /// the displayed ≈MHz + the pacer slice from this integer (no float on the wire).
+    clock: u64,
     mem: MemResult, // mem_peek
     mem_written: struct { phys: u32, len: u32 }, // mem_write
     ivt: IvtResult,

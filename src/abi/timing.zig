@@ -62,12 +62,33 @@ pub const REF_MULT: u64 = cycles_num;
 /// whole cycle ledger is byte-identical to Phase 1 / the pre-seam emulator.
 pub const DEFAULT_MULT: u64 = cycles_num;
 
+/// The MAXIMUM live CPU:PIT multiplier the API knob accepts (Phase 3). Capped near
+/// the Phase-0 host ceiling (~49M sustained guest cycles/sec in ReleaseFast):
+/// `mult 55` → `cpu_clock_hz = 1_193_182 * 55 ≈ 65.6 MHz` (`≈66 MHz`), the top of
+/// the UI slider. Above this the host can't feed the cycles and the pacer would
+/// just fall behind (the lag becomes interpreter-throughput, not the clock — the
+/// Phase-0 honesty note). The setter clamps to `[1, MAX_MULT]`; this is a knob
+/// bound, NOT a determinism constant (a config's `mult` is still fully
+/// deterministic at any value — different `mult` ⇒ a different, self-consistent
+/// golden, by design).
+pub const MAX_MULT: u64 = 55;
+
 comptime {
     // Device-time == nominal cycles at the reference mult: the boundary
     // conversions are the IDENTITY at the default mult. (A divergence here would
     // move every golden.)
     std.debug.assert(REF_MULT == cycles_num);
     std.debug.assert(DEFAULT_MULT == REF_MULT);
+    std.debug.assert(DEFAULT_MULT <= MAX_MULT);
+}
+
+/// The active CPU clock in Hz at the given `mult`: `PIT_TICK_RATE * mult`. This is
+/// the "cycles per real second" rate the host pacer paces at (slice = `hz / 100`
+/// for a 10 ms slice) so the device wall rates (timer 18.2 Hz, VGA 70.086 Hz) stay
+/// correct as `mult` rises. Integer-only. At the default mult this is the pinned
+/// `CPU_CLOCK_HZ` (14_318_184). NOT a determinism input — wall-pacing only.
+pub fn cpuClockHz(mult: u64) u64 {
+    return PIT_TICK_RATE * mult;
 }
 
 /// Convert a DEVICE-TIME span into CPU cycles at the active `mult`:
@@ -206,6 +227,15 @@ test "device-time->CPU scales with a non-default mult (faster CPU)" {
     try std.testing.expectEqual(@as(u64, 24), deviceToCpu(12, 24));
     try std.testing.expectEqual(@as(u64, 408_586), deviceToCpu(204_293, 24));
     try std.testing.expectEqual(@as(u64, 6), cpuToDevice(12, 24)); // 12 * 12 / 24
+}
+
+test "cpuClockHz scales linearly with mult; default == CPU_CLOCK_HZ" {
+    try std.testing.expectEqual(CPU_CLOCK_HZ, cpuClockHz(DEFAULT_MULT));
+    try std.testing.expectEqual(@as(u64, 14_318_184), cpuClockHz(12));
+    try std.testing.expectEqual(@as(u64, 28_636_368), cpuClockHz(24)); // 2x
+    // The timer's WALL rate is mult-invariant: cpu_clock_hz / 100 (the pacer slice)
+    // divided by the 18.2 Hz reload (65536 ticks @ default) cancels the mult.
+    try std.testing.expect(cpuClockHz(MAX_MULT) > cpuClockHz(DEFAULT_MULT));
 }
 
 test "ms/us -> device-time match the former cycle math (device-time == nominal cycles)" {

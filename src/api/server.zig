@@ -34,6 +34,7 @@ const run_control = @import("run_control.zig");
 const live_mouse_mod = @import("live_mouse.zig");
 const wire = @import("json_wire.zig");
 const scancodes = @import("bios").scancodes;
+const timing = @import("timing"); // PIT_TICK_RATE / MAX_MULT for the CPU-speed knob (Phase 3)
 const png = @import("png.zig");
 const stream_mod = @import("stream.zig");
 const sf = @import("shared_frame.zig");
@@ -526,6 +527,15 @@ pub const Server = struct {
             return self.handleRunStatus(req);
         }
 
+        // --- live CPU speed (Phase 3): GET reflects the applied mult; POST sets it ---
+        if (std.mem.eql(u8, path, "/api/cpu/clock")) {
+            switch (method) {
+                .GET => return self.handleCpuSpeedGet(req),
+                .POST => return self.handleCpuSpeedSet(req, body, is_json),
+                else => return self.methodNotAllowed(req),
+            }
+        }
+
         // --- execution control ---
         if (std.mem.eql(u8, path, "/api/run")) {
             if (method != .POST) return self.methodNotAllowed(req);
@@ -772,6 +782,92 @@ pub const Server = struct {
                     rc.getFps(),
                     @tagName(rc.lastStop()),
                 },
+            ) catch break :blk false;
+            break :blk true;
+        };
+        if (!ok) return self.respondError(req, .service_unavailable, "internal", "response too large");
+        self.respondJson(req, .ok, w.buffered());
+    }
+
+    // -----------------------------------------------------------------------
+    // Live CPU speed knob (Phase 3 of the live-CPU-clock work). INTEGER wire only
+    // (the determinism grep-gate bans host floats): `{mult}` is the CPU:PIT
+    // multiplier; `{mhz}` is a convenience converted to `round(mhz*1_000_000 /
+    // PIT_TICK_RATE)` with integer math. A live change goes through the worker
+    // command queue (applied at a precise serialized cycle, like `reset`) — NOT the
+    // non-blocking live-mouse fold. On a set, the handler ALSO updates the pacer
+    // slice (`PIT_TICK_RATE * applied_mult / 100`) so the timer's WALL rate stays
+    // ~18.2 Hz at any speed (game pace invariant — wall-only, no golden moves).
+    // -----------------------------------------------------------------------
+
+    /// `GET /api/cpu/clock` — reflect the applied mult + derived cpu_hz/MHz so the UI
+    /// can sync its knob. Reads the mult via the worker (sole reader of machine state).
+    fn handleCpuSpeedGet(self: *Server, req: *http.Server.Request) void {
+        var ctx: q.RequestCtx = .{ .cmd = .clock_get };
+        const resp = self.queue.submit(&ctx);
+        switch (resp) {
+            .clock => |mult| self.respondCpuSpeed(req, mult),
+            .err => |code| self.respondErrCode(req, code),
+            else => self.respondError(req, .service_unavailable, "internal", "unexpected clock response"),
+        }
+    }
+
+    /// `POST /api/cpu/clock {mult}` or `{mhz}` — set the active CPU:PIT multiplier.
+    /// Rejects `mult==0`/`mhz==0` (400). The worker CLAMPS to `[1, MAX_MULT]` and
+    /// returns the APPLIED value; we then retune the pacer slice from the SAME applied
+    /// value and reply with `{mult, cpu_hz, mhz, slice_cycles}`.
+    fn handleCpuSpeedSet(self: *Server, req: *http.Server.Request, body: []const u8, is_json: bool) void {
+        if (!self.requireJson(req, is_json, body)) return;
+        const r = self.parseBody(wire.CpuSpeedReq, body) orelse return self.badJson(req);
+        // Exactly one of mult / mhz (avoid an ambiguous request).
+        if (r.mult != null and r.mhz != null) {
+            return self.respondError(req, .bad_request, "bad_request", "give either mult or mhz, not both");
+        }
+        const requested: u64 = blk: {
+            if (r.mult) |m| break :blk m;
+            if (r.mhz) |mhz| {
+                if (mhz == 0) return self.respondError(req, .bad_request, "bad_request", "mhz must be >= 1");
+                // Integer round: mult = round(mhz_hz / PIT_TICK_RATE).
+                const mhz_hz: u64 = mhz * 1_000_000;
+                break :blk (mhz_hz + timing.PIT_TICK_RATE / 2) / timing.PIT_TICK_RATE;
+            }
+            return self.respondError(req, .bad_request, "bad_request", "provide mult or mhz");
+        };
+        if (requested == 0) return self.respondError(req, .bad_request, "bad_request", "mult must be >= 1");
+
+        // Apply at the serialized worker boundary; the worker clamps + echoes.
+        var ctx: q.RequestCtx = .{ .cmd = .{ .set_clock = .{ .mult = requested } } };
+        const resp = self.queue.submit(&ctx);
+        const applied: u64 = switch (resp) {
+            .clock => |m| m,
+            .err => |code| return self.respondErrCode(req, code),
+            else => return self.respondError(req, .service_unavailable, "internal", "unexpected clock response"),
+        };
+
+        // Retune the pacer slice from the APPLIED mult so the timer wall rate stays
+        // correct as the CPU speeds up (§3). Wall-only: the pacer reads this atomic at
+        // the top of each slice (paced ≡ unpaced — no cycle golden moves). fps==0 keeps
+        // the current frame cadence; we only change the slice.
+        const slice: u64 = timing.PIT_TICK_RATE * applied / 100;
+        _ = self.run_control.setSlice(slice);
+
+        self.respondCpuSpeed(req, applied);
+    }
+
+    /// `{mult, cpu_hz, mhz, slice_cycles}` — the CPU-speed view. `mhz` is rendered as
+    /// a fixed-point string ("14.32") via INTEGER math (no float in src/api): cpu_hz
+    /// is `PIT_TICK_RATE * mult`, the integer part is `cpu_hz / 1_000_000` and the two
+    /// fractional digits are `(cpu_hz % 1_000_000) / 10_000`.
+    fn respondCpuSpeed(self: *Server, req: *http.Server.Request, mult: u64) void {
+        const cpu_hz: u64 = timing.PIT_TICK_RATE * mult;
+        const mhz_int: u64 = cpu_hz / 1_000_000;
+        const mhz_frac: u64 = (cpu_hz % 1_000_000) / 10_000; // 2 decimals
+        const slice: u64 = cpu_hz / 100;
+        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
+        const ok = blk: {
+            w.print(
+                "{{\"mult\":{d},\"cpu_hz\":{d},\"mhz\":\"{d}.{d:0>2}\",\"slice_cycles\":{d},\"max_mult\":{d}}}",
+                .{ mult, cpu_hz, mhz_int, mhz_frac, slice, timing.MAX_MULT },
             ) catch break :blk false;
             break :blk true;
         };
@@ -1333,6 +1429,10 @@ pub const Server = struct {
             .bp_list => |l| self.respondBpList(req, l),
             .cleared => |n| self.respondValue(req, .ok, .{ .removed = n }),
             .cpu => |snap| self.respondValue(req, .ok, snap),
+            // The CPU-speed routes (`/api/cpu/clock`) serialize directly via
+            // `respondCpuSpeed` (they add the derived cpu_hz/MHz/slice). This arm only
+            // exists for switch-exhaustiveness; it emits the same view from the mult.
+            .clock => |mult| self.respondCpuSpeed(req, mult),
             .mem => |mr| self.respondMem(req, mr),
             .mem_written => |w| self.respondValue(req, .ok, .{ .phys = w.phys, .len = w.len }),
             .ivt => |i| self.respondValue(req, .ok, .{ .vector = i.vector, .ip = i.ip, .cs = i.cs }),

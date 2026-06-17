@@ -549,7 +549,7 @@ fn runIrq0Config(alloc: std.mem.Allocator, mult: u64, target: u64) !Machine.Snap
         m.deinit();
         alloc.destroy(m);
     }
-    m.setClockMult(mult);
+    _ = m.setClockMult(mult);
     armIrq0Counter(m, 0x14); // reload 20 ticks
     _ = m.runCycles(target);
     return m.snapshot();
@@ -583,7 +583,7 @@ test "Phase 2: the clock mult rides the snapshot (round-trip byte-identical at a
         m.deinit();
         alloc.destroy(m);
     }
-    m.setClockMult(24); // internal test seam (no API in Phase 2)
+    _ = m.setClockMult(24); // internal test seam (no API in Phase 2)
     armIrq0Counter(m, 0x14);
     _ = m.runCycles(20_000); // populate device + RAM state at mult 24
 
@@ -648,7 +648,7 @@ test "Phase 2: per-config determinism — same mult reproduces; different mult i
             m12.deinit();
             alloc.destroy(m12);
         }
-        m12.setClockMult(12);
+        _ = m12.setClockMult(12);
         armIrq0Counter(m12, 0x14);
         _ = m12.runCycles(target);
         const c12 = m12.bus.readPhys8(0x2000);
@@ -658,7 +658,7 @@ test "Phase 2: per-config determinism — same mult reproduces; different mult i
             m24.deinit();
             alloc.destroy(m24);
         }
-        m24.setClockMult(24);
+        _ = m24.setClockMult(24);
         armIrq0Counter(m24, 0x14);
         _ = m24.runCycles(target);
         const c24 = m24.bus.readPhys8(0x2000);
@@ -668,4 +668,88 @@ test "Phase 2: per-config determinism — same mult reproduces; different mult i
         try std.testing.expect(c12 != c24);
         try std.testing.expect(c12 > c24);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — live-mult-change behavior.
+//
+// NO-RE-ARM (verified): a live mult change does NOT touch the scheduler — a pending
+// PIT/keyboard event keeps its DEVICE-TIME fire point in the queue; only the
+// device-time→CPU conversion changes for the FUTURE. The test below proves this.
+//
+// PHASE CONTINUITY (KNOWN BLOCKER — see plans/configurable-cpu-clock.md, locked
+// design point 1): the LOCKED design requires a CONTINUOUS `device_time` ACCUMULATOR
+// so the VGA/speaker phase + the scheduler "now" reference stay continuous across a
+// change. Phases 1-2 shipped the SHORTCUT `cpuToDevice(absolute_cpu_cycles, mult)`
+// instead — byte-identical at the fixed default mult 12, but NOT continuous when the
+// mult changes mid-run (the absolute cycle history is retro-scaled by the new mult).
+// At cycle 123457 the device-time is 123457 @ mult 12 but 61728 @ mult 24 → a ~30%
+// frame-phase JUMP. This is a one-shot fidelity glitch at the instant of the change
+// (a VGA-retrace tear / PIT phase hiccup); it is STILL fully deterministic given
+// `(cycle, mult)`. The faithful fix is the device_time accumulator (Phase-1-scope),
+// NOT per-device anchor fields (rejected approach A). DELIBERATELY NOT papered over.
+// ---------------------------------------------------------------------------
+
+test "Phase 3: a scripted (cycle, mult) change replays byte-identically across two runs" {
+    const alloc = std.testing.allocator;
+
+    // Run the SAME program with the SAME scripted clock-change schedule twice; the
+    // final machine state must be byte-identical (a live change is a deterministic
+    // input, recordable/replayable as (cycle, mult)).
+    const Run = struct {
+        fn go(a: std.mem.Allocator) !Machine.Snapshot {
+            const m = try makeMachine(a);
+            defer {
+                m.deinit();
+                a.destroy(m);
+            }
+            armIrq0Counter(m, 0x14);
+            // Scripted schedule: run to ~10k, bump to 24, run to ~25k, bump to 7,
+            // run to ~40k. The bumps land at the runCycles boundary (a precise cycle).
+            _ = m.runCycles(10_000);
+            _ = m.setClockMult(24);
+            _ = m.runCycles(15_000);
+            _ = m.setClockMult(7);
+            _ = m.runCycles(15_000);
+            return m.snapshot();
+        }
+    };
+    const a = try Run.go(alloc);
+    const b = try Run.go(alloc);
+    try expectStateEqual(a.cpu_state, b.cpu_state);
+    try std.testing.expectEqualDeep(a.sched, b.sched);
+    try std.testing.expectEqualDeep(a.pit, b.pit);
+    try std.testing.expectEqualDeep(a.clock, b.clock);
+    try std.testing.expectEqual(@as(u64, 7), b.clock.mult); // last applied mult rode through
+}
+
+test "Phase 3: a pending PIT event keeps its device-time fire point across a mult change (no drop/double)" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    // Arm a periodic ch0 (mode 2, reload 0x14 = 20 ticks) -> a PIT event in the
+    // scheduler at a fixed DEVICE-TIME fire point.
+    armIrq0Counter(m, 0x14);
+    _ = m.runCycles(5_000); // let it run + reschedule a few times
+
+    // The scheduler's next event is in DEVICE-TIME (mult-independent). Read it.
+    const fire_dt_before = m.sched.nextEventCycle();
+    try std.testing.expect(fire_dt_before != std.math.maxInt(u64));
+
+    // A live mult change must NOT touch the scheduler — the event keeps its
+    // device-time fire point (the crystal kept counting). Only the device-time→CPU
+    // conversion changes for the FUTURE: the scheduler queue is untouched.
+    _ = m.setClockMult(24);
+    const fire_dt_after = m.sched.nextEventCycle();
+    try std.testing.expectEqual(fire_dt_before, fire_dt_after);
+
+    // ...and the CPU cycle the event now lands at is the device-time fire point
+    // scaled by the NEW mult (a faster CPU runs more cycles before the same
+    // device-time elapses) — no re-arm, just the new conversion ratio for the
+    // FUTURE. There is exactly ONE such event (no double-arm from the change).
+    const next_cpu = m.nextEventCycle();
+    try std.testing.expectEqual(timing.deviceToCpu(fire_dt_before, 24), next_cpu);
 }

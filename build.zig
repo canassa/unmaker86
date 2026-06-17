@@ -159,6 +159,7 @@ pub fn build(b: *std.Build) void {
     api_mod.addImport("cpu", cpu_mod);
     api_mod.addImport("machine", machine_mod);
     api_mod.addImport("bios", bios_mod); // for the {"char"} scancode reverse map (§5.1e)
+    api_mod.addImport("timing", timing_mod); // PIT_TICK_RATE/MAX_MULT for the CPU-clock knob (Phase 3)
 
     // The host layer (CLAUDE.md: "consumes machine output"; may thread). Sits ABOVE
     // `api` — it imports `api` (the gated queue + the clockless RunControl) and reaches

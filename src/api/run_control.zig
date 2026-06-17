@@ -21,6 +21,7 @@
 //!     `/api/run/start` and a debugger `step` cannot race the owner transition.
 
 const std = @import("std");
+const timing = @import("timing");
 const Io = std.Io;
 
 /// The single mutually-exclusive run owner (§5.3). `idle` = nobody is driving the
@@ -75,20 +76,24 @@ pub const RunControl = struct {
     /// (§5). The pacer runs one slice then sleeps the rest of the tick, so this sets
     /// the effective WALL-CLOCK speed (cycles/sec ≈ `slice_cycles * 100`), NOT guest
     /// determinism (paced ≡ unpaced — `run_pacer.zig`). ~10 ms keeps input/control
-    /// latency low (one slice's wall-time). A caller (e.g. the player's speed knob)
-    /// retunes it live via `/api/run/start {slice_cycles}`.
+    /// latency low (one slice's wall-time).
+    ///
+    /// The CPU-speed knob (Phase 3) retunes it live: the `/api/cpu/clock` handler sets
+    /// `slice_cycles = PIT_TICK_RATE * mult / 100` so the timer's WALL rate stays
+    /// correct (18.2 Hz) at any `mult` (the mult cancels in the PIT wall rate — game
+    /// pace invariant). The DEFAULT is the TRUE device rate at mult 12
+    /// (`PIT_TICK_RATE * 12 / 100` ≈ 143_181, the faithful 14.32 MHz device rate),
+    /// NOT the former hardcoded 25 MHz — so the default now plays at faithful 386
+    /// speed (the knob is how the user speeds it up). This is WALL-ONLY: paced ≡
+    /// unpaced, no cycle golden moves.
     pub const DEFAULT_SLICE_CYCLES: u64 = SLICE_CYCLES_10MS;
     pub const DEFAULT_FPS: u32 = 30;
 
-    /// The pacer's WALL-CLOCK throughput target — how many guest cycles we aim to
-    /// execute per real second (25 MHz, a 386-class "feel"). This is DELIBERATELY
-    /// SEPARATE from `abi/timing.zig`'s `CPU_CLOCK_HZ` (14.32 MHz, the determinism-
-    /// pinned PIT/device clock that the cycle ledger keys on): this one only scales
-    /// how fast wall-time advances and may be retuned per session; it does NOT affect
-    /// reproducibility. (Named distinctly so it is not mistaken for the device clock —
-    /// they are not, and need not be, equal.)
-    const PACER_TARGET_HZ: u64 = 25_000_000;
-    const SLICE_CYCLES_10MS: u64 = PACER_TARGET_HZ / 100; // 250_000 (10 ms @ 25 MHz)
+    /// The default pacer slice = the device rate's cycles-per-10ms at mult 12, so the
+    /// timer + all peripherals run at their faithful wall rates (timer 18.2 Hz, VGA
+    /// 70.086 Hz). Recomputed for the live mult by the CPU-speed handler. Integer math
+    /// (`PIT_TICK_RATE * mult`), no float — inline so the api grep-gate stays clean.
+    const SLICE_CYCLES_10MS: u64 = timing.PIT_TICK_RATE * timing.DEFAULT_MULT / 100; // 143_181
 
     pub fn getOwner(self: *const RunControl) RunOwner {
         return @enumFromInt(self.owner.load(.acquire));
@@ -181,6 +186,18 @@ pub const RunControl = struct {
     }
     pub fn sliceCycles(self: *const RunControl) u64 {
         return self.slice_cycles.load(.acquire);
+    }
+
+    /// Retune the pacer slice (the CPU-speed knob, Phase 3): the pacer reads this
+    /// atomic at the top of each slice, so the new value takes effect on the next
+    /// tick. WALL-ONLY — it changes only how fast wall time advances (paced ≡ unpaced;
+    /// no cycle golden moves). Returns the value stored. `slice==0` is a no-op (keeps
+    /// the current tuning); otherwise it is stored as-is (the caller derived it from
+    /// the applied, already-clamped mult: `PIT_TICK_RATE * mult / 100`).
+    pub fn setSlice(self: *RunControl, slice: u64) u64 {
+        if (slice == 0) return self.slice_cycles.load(.acquire);
+        self.slice_cycles.store(slice, .release);
+        return slice;
     }
     pub fn getFps(self: *const RunControl) u32 {
         return self.fps.load(.acquire);

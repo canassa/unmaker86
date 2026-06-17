@@ -93,6 +93,30 @@ device-time periods, not the mult directly. Worker reaches it via worker→contr
   (label "CPU ≈N MHz" derived); pacer derives slice from runtime `cpu_clock_hz`. With (B) the live
   change is trivial (no re-arm) — verify VGA/speaker phase continuity + `(cycle,mult)` determinism.
 
+### Phase 3 outcome (SHIPPED, with one BLOCKER surfaced — do not re-run blind)
+SHIPPED: `Command.set_clock`/`clock_get` → `Controller.setCpuMult`/`clockMult` → `Machine.setClockMult`
+(clamps `[1, MAX_MULT=55]`); `POST`/`GET /api/cpu/clock` (integer `{mult}` or `{mhz}`, integer-only
+wire, derived `cpu_hz`/`mhz`/`slice_cycles`); the pacer paces at the DEVICE clock — `PACER_TARGET_HZ`
+(25 MHz) DROPPED, default slice now `PIT_TICK_RATE*12/100 = 143_181` (faithful 14.32 MHz), retuned
+live to `PIT_TICK_RATE*mult/100` by the handler via `RunControl.setSlice`. UI = a "CPU ≈N MHz" HUD
+slider (mult 1..55), synced from GET, POSTs on change. Default byte-identical (BaK to 50M cycles
+identical pre/post; full suite + oracle green, NO re-mint). `(cycle,mult)` replays byte-identically;
+the scheduler-side NO-RE-ARM holds (a pending PIT event keeps its device-time fire point); timer WALL
+rate invariant to mult (live BaK: ~17 ticks/s at BOTH mult 12 and 24 while CPU cyc/s doubled).
+
+**BLOCKER — VGA/speaker phase + scheduler "now" are NOT continuous across a live change.** Phases 1-2
+shipped the SHORTCUT `cpuToDevice(absolute_cpu_cycles, mult)` instead of the LOCKED design's continuous
+`device_time` ACCUMULATOR (locked point 1). At a fixed mult both agree (byte-identical goldens), but a
+mid-run mult change RETRO-SCALES the absolute cycle history: at cycle 123457 device-time is 123457 @
+mult 12 but 61728 @ mult 24 → a ~30%-of-a-frame VGA-retrace phase JUMP (and the scheduler's `now_dt`
+reference jumps the same way). It is a ONE-SHOT fidelity glitch at the instant of the change (a retrace
+tear / PIT phase hiccup), STILL fully deterministic given `(cycle,mult)` — NOT a determinism break.
+The faithful fix is the device_time accumulator (advance a machine-owned `device_time` by
+`cpu_delta*REF_MULT/mult` per step with a remainder, snapshot it, and have every device read it instead
+of recomputing from absolute cycles) — that is Phase-1-scope (touches the hot run loop + every device
+phase read + the snapshot format), NOT the rejected per-device anchor fields (approach A). Deliberately
+NOT papered over. Until then the knob works but glitches once per change.
+
 ---
 
 Original plan body follows (read through the LOCKED lens above; approach (B) supersedes the

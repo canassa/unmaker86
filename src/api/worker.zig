@@ -160,6 +160,12 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
         .screen_get => screenResp(ctrl),
         .framebuffer_get => framebufferResp(ctrl, render),
         .status => statusResp(ctrl),
+        // Live CPU:PIT clock (Phase 3). Applied at THIS serialized command boundary
+        // (a precise cycle), exactly like `reset` — a deterministic input. The
+        // controller clamps + returns the APPLIED mult; the server derives the pacer
+        // slice + displayed MHz from it. No re-arm (approach B: device-time domain).
+        .set_clock => |c| .{ .clock = ctrl.setCpuMult(c.mult) },
+        .clock_get => .{ .clock = ctrl.clockMult() },
         .reset => blk: {
             ctrl.reset() catch return .{ .err = .load_failed };
             break :blk .ok;

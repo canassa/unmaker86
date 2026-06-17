@@ -94,3 +94,31 @@ body {
 .info {
   color: #8990a0;
 }
+
+/* CPU-speed knob (Phase 3). Reuses the HUD chip shape; the slider drives the
+   integer CPU:PIT multiplier and the value chip shows the derived ≈MHz. */
+.knob {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto; /* push the knob to the right edge of the HUD */
+}
+
+.knob-label {
+  color: #8ce99a;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.knob-range {
+  width: 11rem;
+  accent-color: #8ce99a;
+  cursor: pointer;
+}
+
+.knob-val {
+  min-width: 6.5rem;
+  text-align: right;
+  color: #c8cdd6;
+  font-variant-numeric: tabular-nums;
+}

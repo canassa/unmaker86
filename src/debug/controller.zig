@@ -930,6 +930,25 @@ pub const Controller = struct {
         self.last_stop = null;
     }
 
+    /// Set the active CPU:PIT multiplier at the serialized worker-command boundary
+    /// (Phase 3 of the live-CPU-clock work — `plans/configurable-cpu-clock.md`,
+    /// approach B). Mirrors `reset`: the worker owns this; it applies at a precise
+    /// cycle (a deterministic input, recordable as `(cycle, mult)`). Delegates to
+    /// `Machine.setClockMult`, which CLAMPS to `[1, MAX_MULT]` and — the approach-(B)
+    /// payoff — does NOT re-arm any device (events/phases live in the mult-independent
+    /// device-time domain; only the device-time↔cycle conversion changes going
+    /// forward). Returns the APPLIED mult so the server can echo it + derive the
+    /// pacer slice / displayed MHz from the same value.
+    pub fn setCpuMult(self: *Controller, mult: u64) u64 {
+        return self.m.setClockMult(mult);
+    }
+
+    /// Read the active CPU:PIT multiplier (the GET path; the worker is the sole reader
+    /// of machine state). Cycle-neutral, side-effect-free.
+    pub fn clockMult(self: *const Controller) u64 {
+        return self.m.clockMult();
+    }
+
     // -----------------------------------------------------------------------
     // Inspect — SIDE-EFFECT-FREE peek path (never routes through device read
     // handlers, which mutate device state).

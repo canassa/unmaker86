@@ -50,6 +50,13 @@ pub const RunStartReq = struct { slice_cycles: ?u64 = null, fps: ?u32 = null };
 pub const RunToAddrReq = struct { linear: u32 };
 pub const StepNReq = struct { n: u64 };
 
+/// `POST /api/cpu/clock` — the live CPU-speed knob (Phase 3). INTEGER fields only
+/// (the determinism grep-gate bans host floats): `mult` is the CPU:PIT multiplier
+/// (cpu_hz = PIT_TICK_RATE * mult); `mhz` is a convenience the handler converts to a
+/// nearest-integer mult. Provide exactly one (both → 400). The handler validates
+/// (reject 0) and the worker clamps to `[1, MAX_MULT]`.
+pub const CpuSpeedReq = struct { mult: ?u64 = null, mhz: ?u64 = null };
+
 /// `POST /api/breakpoints` — `kind` is the discriminated `BreakpointKind`
 /// (`{"execution_address":{"linear":N}}`, etc.); parsed by std.json's default
 /// tagged-union decoding. `io` parses but the handler rejects it (501).

@@ -26,6 +26,17 @@
 <div id="hud" class="hud">
   <span id="status" class="status pending">connecting&hellip;</span>
   <span id="info" class="info"></span>
+
+  <!-- CPU SPEED knob (Phase 3). Changes CPU cycles/sec (rendering smoothness),
+       NOT game pace — the PIT/timer wall rate is invariant to this, so a faster
+       CPU only fixes frame-render lag. It is NOT a fast-forward. The label shows
+       the derived ≈MHz; the underlying control is the integer CPU:PIT multiplier
+       (mult). The initial value is synced from GET /api/cpu/clock. -->
+  <label id="cpu-knob" class="knob" title="CPU speed (smoothness) — does NOT change game pace">
+    <span class="knob-label">CPU</span>
+    <input id="cpu-speed" class="knob-range" type="range" min="1" max="55" step="1" value="12">
+    <span id="cpu-mhz" class="knob-val">&#8776;14.32 MHz</span>
+  </label>
 </div>
 
 <script src="app.js"></script>

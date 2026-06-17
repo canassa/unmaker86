@@ -9,6 +9,7 @@ const worker = @import("worker.zig");
 const debug = @import("debug");
 const cpu_mod = @import("cpu");
 const machine_mod = @import("machine");
+const timing = @import("timing");
 
 const Machine = machine_mod.Machine;
 const Controller = debug.Controller;
@@ -281,6 +282,29 @@ test "#5 bounded/retained-capacity: the queue ring + scratch do zero allocations
         _ = drain(&c, .status);
     }
     try std.testing.expectEqual(baseline, counter.alloc_count); // zero new allocations on the dispatch path
+}
+
+test "Phase 3: set_clock applies the mult (clamped) and clock_get reflects it" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    var c = Controller.init(m);
+
+    // Default reads back 12.
+    try std.testing.expectEqual(q.Response{ .clock = 12 }, drain(&c, .clock_get));
+
+    // Set to 24 — the response echoes the APPLIED mult and the machine state changed.
+    try std.testing.expectEqual(q.Response{ .clock = 24 }, drain(&c, .{ .set_clock = .{ .mult = 24 } }));
+    try std.testing.expectEqual(@as(u64, 24), m.clock.mult);
+    try std.testing.expectEqual(q.Response{ .clock = 24 }, drain(&c, .clock_get));
+
+    // mult 0 is clamped UP to 1 (the worker/controller/machine never let it be 0).
+    try std.testing.expectEqual(q.Response{ .clock = 1 }, drain(&c, .{ .set_clock = .{ .mult = 0 } }));
+
+    // A huge mult is clamped DOWN to MAX_MULT (the host-ceiling knob bound).
+    const maxed = drain(&c, .{ .set_clock = .{ .mult = 1_000_000 } });
+    try std.testing.expectEqual(q.Response{ .clock = timing.MAX_MULT }, maxed);
+    try std.testing.expectEqual(timing.MAX_MULT, m.clock.mult);
 }
 
 /// A counting allocator wrapper (M1 lineage) — tallies alloc calls so we can assert

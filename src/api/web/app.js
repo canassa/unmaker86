@@ -422,6 +422,61 @@ void main() {
     postJSON("/api/input/key", { scancode: scancode, make: make, ext: ext });
   }
 
+  // ===================================================================
+  // CPU-speed knob (Phase 3). Changes the emulated CPU clock (cycles/sec) so a
+  // CPU-bound render fits its timer budget => smoother frames. The PIT/timer wall
+  // rate is INVARIANT to this (the pacer paces at the device clock), so GAME PACE
+  // does NOT change — this is a CPU/cycles control, NOT a fast-forward. The slider
+  // is the integer CPU:PIT multiplier; we DISPLAY the derived "≈N MHz" (mult ×
+  // 1.193182 MHz). Initial value synced from GET /api/cpu/clock; each change POSTs.
+  // ===================================================================
+  const PIT_MHZ = 1.193182; // PIT_TICK_RATE in MHz — mult × this = the ≈CPU MHz
+
+  const cpuSpeed = document.getElementById("cpu-speed");
+  const cpuMhz = document.getElementById("cpu-mhz");
+
+  function renderCpuMhz(mult) {
+    if (!cpuMhz) return;
+    cpuMhz.textContent = "≈" + (mult * PIT_MHZ).toFixed(2) + " MHz";
+  }
+
+  function setCpuSpeed(mult) {
+    // Apply at the serialized worker boundary; the server clamps + echoes the
+    // applied mult (and retunes the pacer slice). We render the derived MHz.
+    fetch("/api/cpu/clock", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mult: mult }),
+    }).then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j) return;
+        if (cpuSpeed) {
+          cpuSpeed.value = String(j.mult);
+          if (j.max_mult) cpuSpeed.max = String(j.max_mult);
+        }
+        renderCpuMhz(j.mult);
+      }).catch(function () { /* best-effort */ });
+  }
+
+  function initCpuKnob() {
+    if (!cpuSpeed) return;
+    // Sync the initial value from the server (the GET reflects the applied mult).
+    fetch("/api/cpu/clock").then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j) return;
+        if (j.max_mult) cpuSpeed.max = String(j.max_mult);
+        cpuSpeed.value = String(j.mult);
+        renderCpuMhz(j.mult);
+      }).catch(function () { /* keep the HTML default */ });
+    cpuSpeed.addEventListener("input", function () {
+      // Live preview the label while dragging; POST on each settled value.
+      renderCpuMhz(parseInt(cpuSpeed.value, 10) || 1);
+    });
+    cpuSpeed.addEventListener("change", function () {
+      setCpuSpeed(parseInt(cpuSpeed.value, 10) || 1);
+    });
+  }
+
   // Track held keys so OS auto-repeat (repeated keydown without keyup) sends a
   // single make and we don't spam breaks.
   const held = Object.create(null);
@@ -540,6 +595,7 @@ void main() {
     }
     requestAnimationFrame(renderLoop);
     connect();
+    initCpuKnob();
     canvas.focus();
   }
 

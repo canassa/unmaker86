@@ -230,3 +230,51 @@ test "8: reset -> load -> run reproduces a fresh run byte-identically (Part-1 re
     // reset+load must reproduce the documented fresh-launch state.
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&fresh_cpu), std.mem.asBytes(&re_cpu));
 }
+
+/// The CPU-speed knob view (`/api/cpu/clock`). INTEGER fields only (no float on the
+/// wire); `mhz` is a derived display string.
+const ClockView = struct {
+    mult: u64,
+    cpu_hz: u64,
+    mhz: []const u8,
+    slice_cycles: u64,
+    max_mult: u64,
+};
+
+test "9: CPU-speed knob — GET defaults to mult 12; POST {mult} sets it; integer-only wire" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var s = try spawn(io);
+    defer s.deinit();
+
+    // GET reflects the power-on default mult 12 (≈14.32 MHz), with the derived view.
+    const g0 = try s.get("/api/cpu/clock", ClockView);
+    try std.testing.expectEqual(@as(u64, 12), g0.mult);
+    try std.testing.expectEqual(@as(u64, 14_318_184), g0.cpu_hz);
+    try std.testing.expectEqualStrings("14.31", g0.mhz); // 14318184 -> 14.31 (floor 2dp)
+    try std.testing.expectEqual(@as(u64, 143_181), g0.slice_cycles);
+
+    // POST {mult:24} applies it; the response echoes the applied mult + derived view.
+    const p = try s.post("/api/cpu/clock", .{ .mult = @as(u64, 24) }, ClockView);
+    try std.testing.expectEqual(@as(u64, 24), p.mult);
+    try std.testing.expectEqual(@as(u64, 28_636_368), p.cpu_hz);
+    try std.testing.expectEqual(@as(u64, 286_363), p.slice_cycles); // pacer slice retuned
+
+    // GET now reflects the applied mult (the UI can sync).
+    const g1 = try s.get("/api/cpu/clock", ClockView);
+    try std.testing.expectEqual(@as(u64, 24), g1.mult);
+
+    // POST {mhz} converts to a nearest-integer mult (mhz/1.193182): 50 MHz -> mult 42.
+    const pm = try s.post("/api/cpu/clock", .{ .mhz = @as(u64, 50) }, ClockView);
+    try std.testing.expectEqual(@as(u64, 42), pm.mult); // round(50_000_000/1_193_182)=42
+
+    // A too-large mult is clamped to max_mult (the host-ceiling knob bound).
+    const pmax = try s.post("/api/cpu/clock", .{ .mult = @as(u64, 9999) }, ClockView);
+    try std.testing.expectEqual(g0.max_mult, pmax.mult);
+
+    // mult 0 is a 400 (validated at the handler — never applied).
+    const bad = try s.rawStatus(.POST, "/api/cpu/clock", "{\"mult\":0}");
+    try std.testing.expectEqual(std.http.Status.bad_request, bad.status);
+}
