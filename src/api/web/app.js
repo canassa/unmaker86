@@ -445,8 +445,10 @@ void main() {
   });
 
   // ---- mouse ----
-  // Absolute mapping (no Pointer Lock): client coords -> guest pixels via the
-  // canvas bounding rect, scaled to the current guest resolution.
+  // Absolute mapping (no Pointer Lock): client coords -> guest pixels. The canvas
+  // element fills the stage but the frame is drawn object-fit:contain (letterboxed,
+  // aspect preserved), so we map against the CONTAINED image rect, not the full
+  // element rect — otherwise the letterbox bands would skew the coordinates.
   let lastButtons = 0;
   let mouseThrottle = false; // ~rAF-rate throttle for mousemove
 
@@ -455,8 +457,13 @@ void main() {
     if (rect.width === 0 || rect.height === 0) return null;
     const gw = texW || canvas.width;
     const gh = texH || canvas.height;
-    let gx = Math.round((e.clientX - rect.left) * gw / rect.width);
-    let gy = Math.round((e.clientY - rect.top) * gh / rect.height);
+    // The displayed image is the largest gw:gh rectangle that fits `rect`,
+    // centered (object-fit:contain). Compute its size + letterbox offsets.
+    const scale = Math.min(rect.width / gw, rect.height / gh);
+    const dispW = gw * scale, dispH = gh * scale;
+    const offX = (rect.width - dispW) / 2, offY = (rect.height - dispH) / 2;
+    let gx = Math.round((e.clientX - rect.left - offX) / scale);
+    let gy = Math.round((e.clientY - rect.top - offY) / scale);
     if (gx < 0) gx = 0; else if (gx >= gw) gx = gw - 1;
     if (gy < 0) gy = 0; else if (gy >= gh) gy = gh - 1;
     return { x: gx, y: gy };
