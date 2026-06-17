@@ -32,6 +32,11 @@ pub const EventKind = enum(u8) {
     pit_ch0,
     pit_ch1,
     pit_ch2,
+    /// Keyboard typematic auto-repeat (the held-key re-make event). The keyboard
+    /// device schedules ONE of these while a key is held; on fire it re-injects the
+    /// make and reschedules at the typematic rate. Rides the scheduler snapshot
+    /// verbatim (M-D11) so a mid-delay snapshot/restore resumes the same cadence.
+    kbd_repeat,
 };
 
 /// One scheduled event. Plain old data — snapshots verbatim (incl. `seq`).

@@ -302,6 +302,7 @@ pub fn build(b: *std.Build) void {
     const keyboard_tests = MachineTest.add(b, target, optimize, "src/devices/keyboard_test.zig", &.{
         .{ .name = "devices", .mod = devices_mod },
         .{ .name = "bus", .mod = bus_mod },
+        .{ .name = "timing", .mod = timing_mod },
     });
     const opl_tests = MachineTest.add(b, target, optimize, "src/devices/opl_test.zig", &.{
         .{ .name = "devices", .mod = devices_mod },

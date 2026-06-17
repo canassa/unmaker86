@@ -74,6 +74,42 @@ test "INT 10h AH=00 set mode 13h updates the BDA video mode" {
     try std.testing.expectEqual(@as(u8, 0x13), bda.videoMode());
 }
 
+test "INT 16h AH=03 AL=05 sets typematic rate/delay on the keyboard device" {
+    const alloc = std.testing.allocator;
+    const m = try boot(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    // AL=05: byte = ((BH&3)<<5) | (BL&0x1F). BH=1 (delay 500 ms), BL=8 (period 67 ms).
+    // MOV AX,0x0305 ; MOV BX,0x0108 ; INT 0x16 ; HLT
+    loadCode(m, &.{ 0xB8, 0x05, 0x03, 0xBB, 0x08, 0x01, 0xCD, 0x16, 0xF4 });
+    run(m);
+    const CPU_HZ: u64 = 14_318_184;
+    try std.testing.expectEqual(@as(u64, 500 * CPU_HZ / 1000), m.kbd.delay_cycles);
+    try std.testing.expectEqual(@as(u64, 67 * CPU_HZ / 1000), m.kbd.rate_cycles);
+    // The command must NOT strand its two 0xFA ACK bytes in the 8042 FIFO.
+    try std.testing.expectEqual(@as(u8, 0), m.kbd.fifo_count);
+}
+
+test "INT 16h AH=03 AL=00 sets the keyboard default rate/delay" {
+    const alloc = std.testing.allocator;
+    const m = try boot(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    // First skew the rate so we can see AL=00 reset it to the default.
+    m.kbd.setTypematicByte((3 << 5) | 31); // 1000 ms / 500 ms
+    // MOV AX,0x0300 ; INT 0x16 ; HLT  (AL=00 -> byte 0x20 -> default 500 ms / 33 ms)
+    loadCode(m, &.{ 0xB8, 0x00, 0x03, 0xCD, 0x16, 0xF4 });
+    run(m);
+    const CPU_HZ: u64 = 14_318_184;
+    try std.testing.expectEqual(@as(u64, 500 * CPU_HZ / 1000), m.kbd.delay_cycles);
+    try std.testing.expectEqual(@as(u64, 33 * CPU_HZ / 1000), m.kbd.rate_cycles);
+    try std.testing.expectEqual(@as(u8, 0), m.kbd.fifo_count);
+}
+
 test "INT 16h reads a key enqueued into the BDA keyboard buffer" {
     const alloc = std.testing.allocator;
     const m = try boot(alloc);

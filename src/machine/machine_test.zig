@@ -5,11 +5,45 @@
 const std = @import("std");
 const machine = @import("machine");
 const cpu_mod = @import("cpu");
+const timing = @import("timing");
 
 const Machine = machine.Machine;
 const StopReason = machine.StopReason;
 const Seg = cpu_mod.Seg;
 const Reg32 = cpu_mod.state.Reg32;
+
+fn msToCycles(ms: u64) u64 {
+    return ms * timing.CPU_CLOCK_HZ / 1000;
+}
+
+/// Mirror the Controller's `injectScancode` at the machine layer (push the byte(s)
+/// then drive the typematic edge), without pulling in the debug controller.
+fn injectKey(m: *Machine, scancode: u8, make: bool, ext: bool) void {
+    const code = if (make) scancode else scancode | 0x80;
+    if (ext) {
+        _ = m.kbd.pushScancode(0xE0);
+    }
+    _ = m.kbd.pushScancode(code);
+    m.kbd.noteEdge(scancode, make, ext);
+}
+
+/// Advance the cycle ledger to each due keyboard event and fire it (mirrors the
+/// HLT fast-forward + `fireDue`), counting how many `kbd_repeat` events fire while
+/// `nextEventCycle <= until_cycle`. Drives the REAL scheduler + KBD_SOURCE_ID +
+/// `fireDue` dispatch + `onRepeatFire` reschedule path.
+fn fireKbdReptsUntil(m: *Machine, until_cycle: u64) u32 {
+    var fired: u32 = 0;
+    while (true) {
+        const next = m.nextEventCycle();
+        if (next > until_cycle) break;
+        m.cpu.st.cycles = next;
+        const before = m.kbd.fifo_count;
+        m.fireDue();
+        if (m.kbd.fifo_count > before) fired += 1; // a repeat pushed a byte
+    }
+    m.cpu.st.cycles = until_cycle;
+    return fired;
+}
 
 fn makeMachine(alloc: std.mem.Allocator) !*Machine {
     const m = try alloc.create(Machine);
@@ -319,4 +353,139 @@ test "EMS driver signature: INT 67h vector segment + 0x0A reads EMMXXXX0" {
     const entry_phys: u32 = seg_base + vec_off;
     try std.testing.expectEqual(@as(u8, 0xFE), m.bus.readPhys8(entry_phys));
     try std.testing.expectEqual(@as(u8, 0x38), m.bus.readPhys8(entry_phys + 1));
+}
+
+// ===========================================================================
+// Keyboard typematic auto-repeat (integration: the REAL scheduler + KBD_SOURCE_ID
+// + fireDue dispatch + onRepeatFire reschedule).
+// ===========================================================================
+
+test "typematic KEYSTONE: no key held ⇒ no scheduled event ⇒ identical to today" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    // No keyboard make ever injected: the scheduler stays empty (no kbd_repeat).
+    try std.testing.expectEqual(std.math.maxInt(u64), m.nextEventCycle());
+    // A tap (make+break) must leave NO live event either.
+    injectKey(m, 0x1E, true, false);
+    try std.testing.expect(m.nextEventCycle() != std.math.maxInt(u64)); // armed while held
+    injectKey(m, 0x1E, false, false);
+    try std.testing.expectEqual(std.math.maxInt(u64), m.nextEventCycle()); // released
+}
+
+test "typematic BaK: a held key yields cycle-exact repeated scancodes" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    m.cpu.st.cycles = 0;
+    // Hold 'a' (make, no break). Default cadence: 500 ms delay, 33 ms period.
+    injectKey(m, 0x1E, true, false);
+    // The first repeat fires at delay; subsequent at delay + k*period. Over a span
+    // covering the delay + 5 periods, exactly 6 repeats fire (k=0..5).
+    const span = msToCycles(500) + 5 * msToCycles(33);
+    const fired = fireKbdReptsUntil(m, span);
+    try std.testing.expectEqual(@as(u32, 6), fired);
+    // The next repeat is scheduled exactly one period past the last fire.
+    try std.testing.expectEqual(msToCycles(500) + 6 * msToCycles(33), m.nextEventCycle());
+}
+
+test "typematic Stunts: extra makes are idempotent; break ends the hold" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    m.cpu.st.cycles = 0;
+    injectKey(m, 0x48, true, true); // up-arrow make (extended)
+    const first = m.nextEventCycle();
+    // A redundant make of the SAME key restarts the delay (last-key-wins) but keeps
+    // exactly one live event — never an assert (cancel-then-schedule).
+    m.cpu.st.cycles = 50;
+    injectKey(m, 0x48, true, true);
+    try std.testing.expectEqual(@as(u64, 50 + msToCycles(500)), m.nextEventCycle());
+    try std.testing.expect(m.nextEventCycle() != first);
+    // The break ends the hold: no live event remains.
+    injectKey(m, 0x48, false, true);
+    try std.testing.expectEqual(std.math.maxInt(u64), m.nextEventCycle());
+}
+
+test "typematic last-key-wins: a second make redirects; the first does not resume" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    m.cpu.st.cycles = 0;
+    injectKey(m, 0x1E, true, false); // 'a' held
+    injectKey(m, 0x30, true, false); // 'b' make redirects the repeat
+    // Drain the two make bytes already in the FIFO.
+    try std.testing.expectEqual(@as(u8, 0x1E), m.bus.portIn8(0x60));
+    try std.testing.expectEqual(@as(u8, 0x30), m.bus.portIn8(0x60));
+    // Fire one repeat: it must be 'b' (0x30), not 'a'.
+    _ = fireKbdReptsUntil(m, msToCycles(500));
+    try std.testing.expectEqual(@as(u8, 0x30), m.bus.portIn8(0x60));
+    // Releasing 'b' stops everything; 'a' does NOT resume.
+    injectKey(m, 0x30, false, false);
+    try std.testing.expectEqual(std.math.maxInt(u64), m.nextEventCycle());
+}
+
+test "typematic determinism: two runs of the same script are byte-identical" {
+    const alloc = std.testing.allocator;
+    const run = struct {
+        fn go(a: std.mem.Allocator) !Machine.Snapshot {
+            const m = try makeMachine(a);
+            defer {
+                m.deinit();
+                a.destroy(m);
+            }
+            m.cpu.st.cycles = 0;
+            injectKey(m, 0x48, true, true); // hold up-arrow at cycle 0
+            _ = fireKbdReptsUntil(m, msToCycles(500) + 10 * msToCycles(33));
+            return m.snapshot();
+        }
+    };
+    const a = try run.go(alloc);
+    const b = try run.go(alloc);
+    try expectStateEqual(a.cpu_state, b.cpu_state);
+    try std.testing.expectEqualDeep(a.sched, b.sched);
+    try std.testing.expectEqualDeep(a.kbd, b.kbd);
+}
+
+test "typematic snapshot: arm mid-delay, restore, continue → same cadence" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    m.cpu.st.cycles = 0;
+    injectKey(m, 0x1E, true, false); // arm; first repeat at 500 ms
+    // Snapshot mid-delay (no repeat has fired yet).
+    m.cpu.st.cycles = msToCycles(100);
+    const snap = m.snapshot();
+    const ram_copy = try alloc.dupe(u8, m.bus.ram);
+    defer alloc.free(ram_copy);
+
+    const m2 = try makeMachine(alloc);
+    defer {
+        m2.deinit();
+        alloc.destroy(m2);
+    }
+    m2.restore(snap);
+    @memcpy(m2.bus.ram, ram_copy);
+
+    // The live repeat event rode the scheduler snapshot: same fire cycle, same code.
+    try std.testing.expectEqual(msToCycles(500), m2.nextEventCycle());
+    try std.testing.expectEqual(@as(u8, 0x1E), m2.kbd.repeat_code.?.scancode);
+    // Continue: the resumed cadence fires repeats at the same period.
+    const fired = fireKbdReptsUntil(m2, msToCycles(500) + 3 * msToCycles(33));
+    try std.testing.expectEqual(@as(u32, 4), fired); // delay + 3 periods (k=0..3)
 }

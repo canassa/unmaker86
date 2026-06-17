@@ -37,6 +37,7 @@
 
 const std = @import("std");
 const bus_mod = @import("bus");
+const timing = @import("timing");
 
 const PortHandler = bus_mod.PortHandler;
 
@@ -44,6 +45,45 @@ const PortHandler = bus_mod.PortHandler;
 /// NOT import the machine. The machine binds it to its `Pic` at `wire` and re-binds
 /// on restore. Pointer-free w.r.t. the device for snapshot.
 pub const RaiseFn = *const fn (ctx: *anyopaque, line: u4) void;
+
+/// The scheduler seam the keyboard uses for typematic auto-repeat, as bound
+/// callbacks (mirror `pit.zig` `SchedulerApi`) so the device module does NOT import
+/// the machine (module-graph rule: devices <- bus/abi only). The machine binds these
+/// to its own `Scheduler` at `wire` and re-binds on restore. `schedule`/`cancel`
+/// carry an opaque `ctx` (the machine, which owns the scheduler).
+pub const SchedulerApi = struct {
+    ctx: *anyopaque,
+    /// schedule(ctx, from_cycle, delta_cycles) — schedules the keyboard's repeat
+    /// event `delta_cycles` after `from`. Unlike the PIT seam this passes CYCLES
+    /// directly (typematic is an ms→cycle conversion, not a PIT-tick count).
+    schedule: *const fn (ctx: *anyopaque, from: u64, delta_cycles: u64) void,
+    /// cancel any live keyboard repeat event.
+    cancel: *const fn (ctx: *anyopaque) void,
+};
+
+/// AT/PS2 `0xF3` typematic byte `0dd rrrrr`: the delay field (bits 6-5) selects one
+/// of these initial-delay values, in milliseconds (dosbox-x keyboard.cpp:684-690 /
+/// dosbox-staging input/keyboard.cpp:346-354).
+const DELAY_MS = [4]u64{ 250, 500, 750, 1000 };
+
+/// The rate field (bits 4-0) selects one of these inter-repeat PERIODS, in
+/// milliseconds (non-linear table; same references). Index 0 (~30 cps / 33 ms) is
+/// the keyboard power-on default period.
+const PERIOD_MS = [32]u64{
+    33,  37,  42,  46,  50,  54,  58,  63,  67,  75,  83,  92,  100, 109, 118, 125,
+    133, 149, 167, 182, 200, 217, 233, 250, 270, 303, 333, 370, 400, 435, 476, 500,
+};
+
+/// Convert milliseconds to CPU cycles on the pinned emulated clock (M-D8a). Integer
+/// math, no host time, no floats — `cycles = ms * CPU_CLOCK_HZ / 1000`.
+fn msToCycles(ms: u64) u64 {
+    return ms * timing.CPU_CLOCK_HZ / 1000;
+}
+
+/// The currently-repeating key (the last make still held). `scancode` is the set-1
+/// make code; `ext` true means it is an extended key (re-injected with an 0xE0
+/// prefix). Pause/PrtScn are excluded (no typematic — set to `null`).
+const RepeatCode = struct { scancode: u8, ext: bool };
 
 // ---- Status-register (port 0x64 read) bit layout, AT 8042 spec ----
 const ST_OBF: u8 = 0x01; // output buffer full (a byte is ready on 0x60)
@@ -109,16 +149,44 @@ pub const Keyboard = struct {
     last_response: u8 = 0, // for the 0xFE "resend last byte" command
     pending: PendingParam = .none,
 
-    // ---- back-pointer wired by the machine at `wire` (M-D1) ----
+    // ---- typematic auto-repeat state (config; the live repeat event rides the
+    //      scheduler snapshot, NOT this struct, so there is no `next_repeat_cycle`
+    //      here — that would duplicate the scheduler entry's `fire_cycle`) ----
+    /// The key currently auto-repeating (last make still held), or `null` when no
+    /// key is held. KEYSTONE: `null` ⇒ no `schedule` call ⇒ byte-identical to a run
+    /// with no typematic at all.
+    repeat_code: ?RepeatCode = null,
+    /// Initial-delay before the first repeat, in CPU cycles (decoded from `0xF3` /
+    /// INT 16h AH=03; default 500 ms).
+    delay_cycles: u64 = msToCycles(500),
+    /// Inter-repeat period, in CPU cycles (default 33 ms ≈ 30 cps).
+    rate_cycles: u64 = msToCycles(33),
+
+    // ---- back-pointers wired by the machine at `wire` (M-D1) — NOT snapshotted;
+    //      re-bound on restore exactly like `raise_*` ----
     raise_ctx: ?*anyopaque = null,
     raise_fn: ?RaiseFn = null,
+    /// The typematic scheduler seam (bound at `wire`). `null` outside a wired
+    /// machine (e.g. a pure port-level unit test) — then typematic is inert.
+    sched: ?SchedulerApi = null,
+    /// Back-pointer to the cycle ledger (`&cpu.st.cycles`) — the single time source
+    /// for the "now" the first repeat is scheduled from.
+    cycles: ?*const u64 = null,
 
     pub fn reset(self: *Keyboard) void {
         const ctx = self.raise_ctx;
         const f = self.raise_fn;
+        const s = self.sched;
+        const cyc = self.cycles;
         self.* = .{};
         self.raise_ctx = ctx;
         self.raise_fn = f;
+        self.sched = s;
+        self.cycles = cyc;
+    }
+
+    fn cyclesNow(self: *const Keyboard) u64 {
+        return (self.cycles orelse return 0).*;
     }
 
     fn raiseIrq1(self: *Keyboard) void {
@@ -203,6 +271,109 @@ pub const Keyboard = struct {
     }
 
     // -----------------------------------------------------------------------
+    // Typematic auto-repeat (the held-key re-make path). The keyboard re-sends the
+    // MAKE code (no intervening break) while a key is held, after an initial delay
+    // and then at the typematic rate — exactly like real AT/PS2 hardware. The
+    // cadence is a PURE function of the cycle ledger via the machine scheduler
+    // (mirror `pit.zig` ch0): NEVER host time. The repeat event rides the scheduler
+    // snapshot verbatim (`EventKind.kbd_repeat`); only the decoded config lives in
+    // the keyboard snapshot.
+    //
+    // Driven from the INJECTION EDGE (`noteEdge`, called by the Controller's
+    // `injectScancode`) with the clean `(scancode, make, ext)` decomposition, NOT by
+    // re-parsing raw FIFO bytes (which would have to track 0xE0 prefixes / break
+    // bit). Last-key-wins: a new make redirects the repeat and restarts the delay;
+    // a break of a DIFFERENT key is ignored (no resume-on-release).
+    // -----------------------------------------------------------------------
+
+    /// Pause and Print-Screen do NOT auto-repeat on real hardware (dosbox-staging
+    /// `typematic_update`). Pause cannot be injected through the single-(scancode,
+    /// ext) seam at all; Print-Screen makes as the extended scancode 0x37.
+    fn excludedFromRepeat(scancode: u8, ext: bool) bool {
+        return ext and scancode == 0x37; // E0 37 = Print Screen make
+    }
+
+    /// Cancel any live repeat event (cancel-then-schedule discipline — `schedule`
+    /// asserts `!hasLive`, so every (re)arm cancels first).
+    fn cancelRepeat(self: *Keyboard) void {
+        if (self.sched) |s| s.cancel(s.ctx);
+    }
+
+    /// Schedule the repeat event `delta` cycles after `from`. Caller has already
+    /// canceled any live event.
+    fn scheduleRepeat(self: *Keyboard, from: u64, delta: u64) void {
+        if (self.sched) |s| s.schedule(s.ctx, from, delta);
+    }
+
+    /// Note a make/break EDGE entering the keyboard (called from the injection seam
+    /// AFTER a successful push, so the typematic model tracks exactly the edges the
+    /// guest observes). Drives the typematic state machine:
+    ///   - MAKE of a repeatable key: set `repeat_code` (last-key-wins) and
+    ///     cancel-then-schedule the first repeat at `now + delay_cycles`.
+    ///   - BREAK of the repeating key: clear `repeat_code` + cancel.
+    ///   - BREAK of a different key: ignore (only the last-held key repeats).
+    pub fn noteEdge(self: *Keyboard, scancode: u8, make: bool, ext: bool) void {
+        if (make) {
+            if (excludedFromRepeat(scancode, ext)) {
+                // A non-repeating make ends any current repeat candidate (real
+                // hardware: the last key sent is what repeats; Pause/PrtScn aside).
+                self.repeat_code = null;
+                self.cancelRepeat();
+                return;
+            }
+            self.repeat_code = .{ .scancode = scancode, .ext = ext };
+            self.cancelRepeat();
+            self.scheduleRepeat(self.cyclesNow(), self.delay_cycles);
+        } else {
+            // BREAK: only stop if it is the key currently repeating (last-key-wins;
+            // no resume of an earlier-held key).
+            if (self.repeat_code) |rc| {
+                if (rc.scancode == scancode and rc.ext == ext) {
+                    self.repeat_code = null;
+                    self.cancelRepeat();
+                }
+            }
+        }
+    }
+
+    /// The repeat-event callback (called by the machine's `fireDue` at the
+    /// deterministic `fire_cycle`). Re-injects `repeat_code` as a MAKE via the normal
+    /// FIFO/IRQ1 path (E0 prefix first if extended), then reschedules at
+    /// `fire_cycle + rate_cycles` (from `fire_cycle`, NOT `cyclesNow`, so burst
+    /// granularity never drifts the cadence — mirror `onPitCh0Fire`). On a full FIFO
+    /// the repeat is dropped (real keyboards drop on a full buffer) but the cadence
+    /// is preserved.
+    pub fn onRepeatFire(self: *Keyboard, fire_cycle: u64) void {
+        const rc = self.repeat_code orelse return; // race-safe: nothing to repeat
+        if (rc.ext) {
+            // An extended key needs BOTH slots (prefix + code); never strand a lone
+            // 0xE0 (mirror `controller.zig:823`). On no room, skip this repeat.
+            if (self.fifoFree() >= 2) {
+                _ = self.pushScancode(0xE0);
+                _ = self.pushScancode(rc.scancode);
+            }
+        } else {
+            _ = self.pushScancode(rc.scancode); // false on full FIFO: dropped repeat
+        }
+        // Reschedule from the SCHEDULED fire_cycle (cancel-then-schedule).
+        self.cancelRepeat();
+        self.scheduleRepeat(fire_cycle, self.rate_cycles);
+    }
+
+    /// Decode an AT/PS2 `0xF3` typematic byte `0dd rrrrr` into delay/rate cycles
+    /// (the SAME decode the BIOS INT 16h AH=03 path drives). Bits 6-5 = delay index,
+    /// bits 4-0 = rate index.
+    fn setTypematic(self: *Keyboard, byte: u8) void {
+        self.delay_cycles = msToCycles(DELAY_MS[(byte >> 5) & 0x03]);
+        self.rate_cycles = msToCycles(PERIOD_MS[byte & 0x1F]);
+    }
+
+    /// Public entry for the BIOS INT 16h AH=03 path (same decode as port 0x60 0xF3).
+    pub fn setTypematicByte(self: *Keyboard, byte: u8) void {
+        self.setTypematic(byte);
+    }
+
+    // -----------------------------------------------------------------------
     // Port 0x60 (data) write — a device command OR a pending parameter byte.
     // -----------------------------------------------------------------------
     fn writeData(self: *Keyboard, v: u8) void {
@@ -226,7 +397,8 @@ pub const Keyboard = struct {
                 _ = self.pushResponse(RESP_ACK);
                 return;
             },
-            .kbd_typematic => { // the rate/delay param after 0xF3 — ACK it.
+            .kbd_typematic => { // the rate/delay param after 0xF3 — decode + ACK.
+                self.setTypematic(v);
                 self.pending = .none;
                 _ = self.pushResponse(RESP_ACK);
                 return;
@@ -353,6 +525,11 @@ pub const Keyboard = struct {
         output_port: u8,
         last_response: u8,
         pending: PendingParam,
+        // Typematic config (the live repeat event itself rides the SCHEDULER
+        // snapshot, not this struct — so no `next_repeat_cycle` here).
+        repeat_code: ?RepeatCode,
+        delay_cycles: u64,
+        rate_cycles: u64,
     };
     pub fn snapshot(self: *const Keyboard) Snapshot {
         return .{
@@ -365,6 +542,9 @@ pub const Keyboard = struct {
             .output_port = self.output_port,
             .last_response = self.last_response,
             .pending = self.pending,
+            .repeat_code = self.repeat_code,
+            .delay_cycles = self.delay_cycles,
+            .rate_cycles = self.rate_cycles,
         };
     }
     pub fn restore(self: *Keyboard, snap: Snapshot) void {
@@ -377,5 +557,8 @@ pub const Keyboard = struct {
         self.output_port = snap.output_port;
         self.last_response = snap.last_response;
         self.pending = snap.pending;
+        self.repeat_code = snap.repeat_code;
+        self.delay_cycles = snap.delay_cycles;
+        self.rate_cycles = snap.rate_cycles;
     }
 };

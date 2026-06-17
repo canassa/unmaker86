@@ -126,6 +126,11 @@ pub const Services = struct {
 /// The machine's stable id for the PIT as a scheduler event source (M-D11).
 pub const PIT_SOURCE_ID: u16 = 1;
 
+/// The machine's stable id for the keyboard (typematic auto-repeat) as a scheduler
+/// event source (M-D11). Stable across snapshot/restore so the live repeat event
+/// round-trips and `fireDue` re-binds it to `kbd.onRepeatFire`.
+pub const KBD_SOURCE_ID: u16 = 2;
+
 /// The machine-level run/stop reason (M-D13) — a superset of the CPU's
 /// `StopReason { normal, halted, shutdown }`.
 pub const StopReason = enum {
@@ -314,6 +319,17 @@ pub const Machine = struct {
         //      restore exactly like the PIT/speaker pointers.
         self.kbd.raise_ctx = &self.pic;
         self.kbd.raise_fn = picRaiseThunk;
+        // (d2a) keyboard typematic auto-repeat scheduler seam: schedule/cancel a
+        //       repeat event on the machine scheduler (mirror the PIT ch0 seam).
+        //       The cycle back-pointer feeds the "now" the first repeat is scheduled
+        //       from. Re-bound on restore exactly like the PIT/speaker pointers; the
+        //       live repeat event itself rides the scheduler snapshot.
+        self.kbd.cycles = &self.cpu.st.cycles;
+        self.kbd.sched = .{
+            .ctx = self,
+            .schedule = kbdSchedThunk,
+            .cancel = kbdCancelThunk,
+        };
         // (e) the host-serviced BIOS + DOS + the CallbackSink aggregate (D2/D12).
         self.bios.init(&self.cpu);
         self.dos.init(&self.cpu);
@@ -479,6 +495,16 @@ pub const Machine = struct {
         const self: *Machine = @ptrCast(@alignCast(ctx));
         self.sched.cancel(PIT_SOURCE_ID, .pit_ch0);
     }
+    /// Keyboard typematic schedule seam: the keyboard passes CYCLES directly (an
+    /// ms→cycle conversion, not a PIT-tick count), so no `ticksToCycles`.
+    fn kbdSchedThunk(ctx: *anyopaque, from: u64, delta_cycles: u64) void {
+        const self: *Machine = @ptrCast(@alignCast(ctx));
+        self.sched.schedule(from, delta_cycles, KBD_SOURCE_ID, .kbd_repeat, 0);
+    }
+    fn kbdCancelThunk(ctx: *anyopaque) void {
+        const self: *Machine = @ptrCast(@alignCast(ctx));
+        self.sched.cancel(KBD_SOURCE_ID, .kbd_repeat);
+    }
 
     // -----------------------------------------------------------------------
     // Reset (Phase 1) — deterministic power-on for every subsystem.
@@ -563,6 +589,7 @@ pub const Machine = struct {
             switch (ev.kind) {
                 .pit_ch0 => self.pit.onPitCh0Fire(ev.fire_cycle),
                 .pit_ch1, .pit_ch2 => {}, // not wired in this plan (ch0 only)
+                .kbd_repeat => self.kbd.onRepeatFire(ev.fire_cycle),
             }
         }
     }

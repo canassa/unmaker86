@@ -131,6 +131,35 @@ pub fn Int16(comptime Cpu: type) type {
                 0x02 => { // GET SHIFT FLAGS -> AL = FLAGS1
                     cpu.st.setReg8(0, bda.kbShiftFlags());
                 },
+                0x03 => { // SET TYPEMATIC RATE AND DELAY
+                    // Real BIOS routes AH=03 to the keyboard's 0xF3 command
+                    // (bios_keyboard.cpp:1424-1434): AL=00 → byte 0x20 (set default);
+                    // AL=05 → byte ((BH&3)<<5) | (BL&0x1F). zdos drives the SAME
+                    // 8042 path via the bus ports (write 0xF3, then the byte) so the
+                    // keyboard device decodes it through the one decode site, then
+                    // drains the two ACK bytes the command produced (the real BIOS
+                    // reads them too — leaving them in the FIFO would be wrong).
+                    const al = cpu.st.getReg8(0);
+                    const byte: u8 = switch (al) {
+                        0x00 => 0x20, // set default (500 ms / ~30 cps)
+                        0x05 => blk: {
+                            const bh = cpu.st.getReg8(7); // BH = delay code (0-3)
+                            const bl = cpu.st.getReg8(3); // BL = rate code (0-31)
+                            break :blk (@as(u8, bh & 0x03) << 5) | (bl & 0x1F);
+                        },
+                        else => {
+                            // Other subfunctions (e.g. AL=01..04 individual set) are
+                            // not modeled — surface the gap, don't fake.
+                            bios.unsupported(cpu, br, 0x16);
+                            return;
+                        },
+                    };
+                    const bus = cpu.bus;
+                    bus.portOut8(0x60, 0xF3); // 0xF3 = set typematic rate/delay
+                    _ = bus.portIn8(0x60); // drain the command ACK (0xFA)
+                    bus.portOut8(0x60, byte); // the decoded rate/delay byte
+                    _ = bus.portIn8(0x60); // drain the param ACK (0xFA)
+                },
                 else => bios.unsupported(cpu, br, 0x16),
             }
         }

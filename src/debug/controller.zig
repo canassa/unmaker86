@@ -823,7 +823,13 @@ pub const Controller = struct {
             if (self.m.kbd.fifoFree() < 2) return false;
             _ = self.m.kbd.pushScancode(0xE0);
         }
-        return self.m.kbd.pushScancode(code);
+        if (!self.m.kbd.pushScancode(code)) return false;
+        // Drive the keyboard's typematic state machine from this CLEAN make/break
+        // edge (NOT by re-parsing raw FIFO bytes): a make arms auto-repeat (after the
+        // delay), a break of the held key cancels it. Cycle-scheduled, never host
+        // time — KEYSTONE: with no key held, no event is ever scheduled.
+        self.m.kbd.noteEdge(scancode, make, ext);
+        return true;
     }
 
     /// Inject a mouse event into the INT 33h driver state (Model A,
