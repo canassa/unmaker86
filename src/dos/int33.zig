@@ -449,13 +449,27 @@ pub fn Int33(comptime Cpu: type) type {
             set_dy: bool,
             set_buttons: bool,
         ) void {
-            if (set_dx) self.applyRelAxis(dx, RATIO_X, self.senv_x_val, &self.precise_pixel_x, &self.precise_mickey_x, &self.mickey_x, true);
-            if (set_dy) self.applyRelAxis(dy, RATIO_Y, self.senv_y_val, &self.precise_pixel_y, &self.precise_mickey_y, &self.mickey_y, false);
+            if (set_dx) self.applyRelAxis(dx, RATIO_X, self.senv_x_val, &self.precise_pixel_x, &self.precise_mickey_x, &self.mickey_x, true, false);
+            if (set_dy) self.applyRelAxis(dy, RATIO_Y, self.senv_y_val, &self.precise_pixel_y, &self.precise_mickey_y, &self.mickey_y, false, false);
             if (set_buttons) self.buttons = buttons;
         }
 
+        /// Advance ONLY the AX=0Bh mickey counters from a relative delta — NOT the
+        /// cursor position. Used by the live SEAMLESS path: the absolute write owns
+        /// the position, and the relative channel feeds mickeys only, matching dosbox
+        /// `update_mickeys_on_move` (mouseif_dos_driver.cpp:1224, whose dx/dy position
+        /// out-params the seamless path discards). Applying BOTH would double-count the
+        /// same physical motion and break 1:1 absolute tracking (plans/mouse-input.md
+        /// §3 — "relative → mickeys, absolute → position").
+        fn accumulateMickeys(self: *Self, dx: i16, dy: i16) void {
+            self.applyRelAxis(dx, RATIO_X, self.senv_x_val, &self.precise_pixel_x, &self.precise_mickey_x, &self.mickey_x, true, true);
+            self.applyRelAxis(dy, RATIO_Y, self.senv_y_val, &self.precise_pixel_y, &self.precise_mickey_y, &self.mickey_y, false, true);
+        }
+
         /// One axis of `injectRelative`. `is_x` selects which clamped-position
-        /// setter to drive when whole cursor pixels are consumed.
+        /// setter to drive when whole cursor pixels are consumed. `mickeys_only`
+        /// skips the cursor-position update entirely (the seamless path, where the
+        /// absolute write owns position) — only the AX=0Bh mickey counter advances.
         fn applyRelAxis(
             self: *Self,
             rel_i: i16,
@@ -465,6 +479,7 @@ pub fn Int33(comptime Cpu: type) type {
             mickey_acc: *i64,
             mickey_ctr: *i16,
             comptime is_x: bool,
+            comptime mickeys_only: bool,
         ) void {
             const rel: i64 = rel_i;
 
@@ -498,17 +513,21 @@ pub fn Int33(comptime Cpu: type) type {
             }
 
             // Cursor: accumulate sub-pixel, consume WHOLE pixels (trunc toward 0).
-            pixel_acc.* += pixel_inc;
-            const whole_px = truncScaled(pixel_acc.*);
-            if (whole_px != 0) {
-                pixel_acc.* -= whole_px * SCALE;
-                const new_pos: i64 = @as(i64, if (is_x) self.x else self.y) + whole_px;
-                const clamped: i16 = @intCast(std.math.clamp(
-                    new_pos,
-                    @as(i64, if (is_x) self.min_x else self.min_y),
-                    @as(i64, if (is_x) self.max_x else self.max_y),
-                ));
-                if (is_x) self.x = clamped else self.y = clamped;
+            // Skipped for the seamless/mickeys-only path — position there comes solely
+            // from the absolute write (no double-apply of the same motion).
+            if (!mickeys_only) {
+                pixel_acc.* += pixel_inc;
+                const whole_px = truncScaled(pixel_acc.*);
+                if (whole_px != 0) {
+                    pixel_acc.* -= whole_px * SCALE;
+                    const new_pos: i64 = @as(i64, if (is_x) self.x else self.y) + whole_px;
+                    const clamped: i16 = @intCast(std.math.clamp(
+                        new_pos,
+                        @as(i64, if (is_x) self.min_x else self.min_y),
+                        @as(i64, if (is_x) self.max_x else self.max_y),
+                    ));
+                    if (is_x) self.x = clamped else self.y = clamped;
+                }
             }
 
             // Mickey counter: accumulate sub-mickey, advance once |precise| >= 0.6,
@@ -668,7 +687,7 @@ pub fn Int33(comptime Cpu: type) type {
         }
 
         /// Map a normalized Q16 value (0..0x1_0000 == [0,1]) into the virtual range
-        /// `[min, max]` with ROUND-TO-NEAREST: `((q16 * span) + 0x8000) >> 16 + min`
+        /// `[min, max]` with ROUND-TO-NEAREST: `min + (((q16 * span) + 0x8000) >> 16)`
         /// (plans/mouse-input.md LOCKED minor). `span = max - min`. Saturates a q16 at
         /// or above 0x1_0000 to `max` (so a browser nx=1.0 reaches the full edge, not
         /// max-1 from truncation). All integer; no float.
@@ -724,13 +743,15 @@ pub fn Int33(comptime Cpu: type) type {
             }
 
             // RELATIVE (the TRUE mickey channel): feed the raw movement deltas through
-            // the existing fixed-point mickey path (AX=0B). Saturate i32 → i16 (a single
-            // browser movement event over one slice cannot exceed i16; the saturate is
-            // just defensive against a pathological summed burst).
+            // the fixed-point mickey path (AX=0B) — MICKEYS ONLY, never the cursor
+            // position (the absolute write above owns position; applying both would
+            // double-count the same motion, matching dosbox's seamless split). Saturate
+            // i32 → i16 (a single browser movement event over one slice cannot exceed
+            // i16; the saturate is just defensive against a pathological summed burst).
             if (req.set_rel) {
                 const dx16: i16 = @intCast(std.math.clamp(req.dx, -32768, 32767));
                 const dy16: i16 = @intCast(std.math.clamp(req.dy, -32768, 32767));
-                self.injectRelative(dx16, dy16, 0, true, true, false);
+                self.accumulateMickeys(dx16, dy16);
             }
 
             // BUTTONS: latest mask (applied once, independent of motion).

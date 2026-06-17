@@ -690,6 +690,40 @@ test "live mouse seamless: relative deltas drive AX=0B mickeys (true channel), z
     try std.testing.expectEqual(@as(u16, 0), r2.dx);
 }
 
+test "live mouse seamless: COMBINED abs+rel fold — position tracks absolute (no double-apply), mickeys still accumulate" {
+    // The REAL browser fold sends BOTH a Q16 absolute AND the movementX/Y relative
+    // on every move. Position MUST come from the absolute ALONE (dosbox seamless +
+    // LOCKED §3); the relative feeds AX=0B mickeys only. A regression guard for the
+    // double-apply bug where injectRelative also advanced the cursor position.
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    m.bus.writePhys8(BDA_VIDEO_MODE_PHYS, 0x13);
+    m.dos.mouse.afterNewVideoMode(&m.cpu);
+
+    // Mid-screen absolute (→ x=320, y=100 in mode 13h) WITH a chunky relative delta
+    // that, if double-applied, would push the position well past the target.
+    m.dos.mouse.injectSeamless(&m.cpu, &m.svc.bridge, .{
+        .abs_x_q16 = 0x8000,
+        .abs_y_q16 = 0x8000,
+        .dx = 40,
+        .dy = 40,
+        .set_abs = true,
+        .set_rel = true,
+    });
+
+    // Position is EXACTLY the absolute target — the relative did not move the cursor.
+    const pos = guestInt33(m, 0x0003);
+    try std.testing.expectEqual(@as(u16, 320), pos.cx);
+    try std.testing.expectEqual(@as(u16, 100), pos.dx);
+
+    // ...but the relative DID accumulate mickeys (the true AX=0B channel still works).
+    const mick = guestInt33(m, 0x000B);
+    try std.testing.expect(mick.cx != 0 or mick.dx != 0);
+}
+
 // ===========================================================================
 // Input Phase 3 — the INT 33h AX=0Ch event callback. This is what real
 // Betrayal at Krondor requires: it installs an AH=0Ch handler and NEVER polls
