@@ -649,6 +649,24 @@ pub fn Int33(comptime Cpu: type) type {
             cpu.st.setReg16(ESI, @bitCast(self.mickey_x));
             cpu.st.setReg16(EDI, @bitCast(self.mickey_y));
 
+            // CLEAR IF for the duration of the callback (restored by the `defer`
+            // above with the rest of eflags). On real hardware the AX=0Ch sub is
+            // reached through the mouse driver's INT 74h/IRQ12 gate, which clears IF
+            // on entry. zdos fires it out of band as a bare `runGuestFarCall`, which
+            // — unlike an INT — does NOT clear IF, so it inherited the foreground's
+            // IF=1 and ran interruptible. That let a hardware IRQ (e.g. the guest's
+            // fast timer IRQ0) be ACKNOWLEDGED inside the far-call; if the ack lands
+            // on the step that RETFs onto the stop-sentinel, `runGuestFarCall`'s loop
+            // exits (reentry_done) and its unconditional CS:IP/SP restore abandons
+            // the just-entered ISR before its EOI — stranding the PIC in-service bit,
+            // which then blocks all further delivery of that line (the BaK timer
+            // deadlock; plans/mouse-callback-irq-strand.md). The host-driven far-call
+            // owns no interrupt frame and discharges no EOI, so it MUST NOT permit a
+            // maskable IRQ to be delivered inside it; clearing IF closes that window.
+            // A pending IRQ simply stays latched in the PIC IRR and is delivered
+            // normally once IF is restored on return.
+            cpu.st.eflags.iff = false;
+
             br.runGuestFarCall(self.handler_seg, self.handler_off);
         }
 

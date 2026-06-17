@@ -908,3 +908,252 @@ test "input Phase 3: firing the callback is byte-identical across two runs (dete
     // Sanity: the handler actually latched the final relative-move state.
     try std.testing.expect(slot16(a.m, SLOT_BL) & 0xFF == 0b010);
 }
+
+// ===========================================================================
+// PHASE 1 REPRODUCTION (plans/mouse-callback-irq-strand.md) — the PIC timer-IRQ
+// strand. The INT 33h AX=0Ch mouse callback is fired OUT OF BAND as a bare
+// `runGuestFarCall` with the foreground IF (=1 for the BaK spin) and NO PIC/EOI
+// frame discipline. With IF=1 a hardware timer IRQ0 can be acknowledged
+// (master ISR bit0 -> 1) INSIDE the callback's `runGuestFarCall` step loop.
+//
+// The hermetic claim: there is a PIT-IRQ0 due-cycle offset, landing inside the
+// callback window, at which `runGuestFarCall` returns with master ISR bit0 STUCK
+// set and never EOI'd — exactly the live BaK deadlock state (isr=1, irr=1,
+// getPendingInterrupt()==null, timer dead). We SWEEP every offset across the
+// window and assert the CORRECT (no-strand) behavior, so the test goes RED at
+// the stranding offset(s).
+//
+// Wiring (machine-level, the real paths only):
+//  - A guest INT 08h ISR planted in RAM: INC a known RAM counter, EOI to the
+//    master (OUT 0x20,0x20), IRET. IVT[8] -> it. (A faithful self-EOI timer ISR
+//    like BaK's own, whose exit is CORRECT.)
+//  - A multi-instruction AX=0Ch mouse handler (many NOPs so a timer IRQ has
+//    boundaries to land on mid-callback), then RETF. Installed via the REAL
+//    INT 33h AX=0Ch service. Event mask armed for all events.
+//  - The PIT ch0 IRQ0 scheduled (via the real scheduler seam the PIT uses) to
+//    come due at cycles_now + delta, swept across the whole callback window.
+//  - Foreground IF=1.
+//  - The callback fired the live way: `injectAndFire` -> fireEventCallback ->
+//    runGuestFarCall.
+// ===========================================================================
+
+// A second handler segment so this repro never collides with plantMouseHandler's
+// HANDLER_SEG latch slots.
+const STRAND_HANDLER_SEG: u16 = 0x4000;
+const STRAND_HANDLER_OFF: u16 = 0x0010;
+
+// A guest INT 08h timer ISR seg:off and its RAM tick-counter slot (a separate
+// segment so it can't alias the handler or the IVT).
+const STRAND_ISR_SEG: u16 = 0x5000;
+const STRAND_ISR_OFF: u16 = 0x0010;
+const STRAND_TICK_SLOT: u16 = 0x0000; // word counter at STRAND_ISR_SEG:0
+
+// Plant a multi-instruction AX=0Ch handler: a run of NOPs (a wide window for the
+// timer IRQ to land on a boundary), then RETF. No memory writes — we only care
+// about the PIC strand, not the latched args.
+fn plantStrandHandler(m: *Machine) void {
+    const base = (@as(u32, STRAND_HANDLER_SEG) << 4) + STRAND_HANDLER_OFF;
+    var code: [33]u8 = undefined;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) code[i] = 0x90; // NOP x32 (wide boundary window)
+    code[32] = 0xCB; // RETF
+    for (code, 0..) |c, k| m.bus.writePhys8(base + @as(u32, @intCast(k)), c);
+}
+
+// Install the strand handler via the REAL INT 33h AX=0Ch service.
+fn installStrandHandler(m: *Machine, mask: u16) void {
+    asmInt67(m, &.{
+        0xB9, @truncate(mask), @truncate(mask >> 8), // MOV CX,mask
+        0xB8, @truncate(STRAND_HANDLER_SEG), @truncate(STRAND_HANDLER_SEG >> 8), // MOV AX,seg
+        0x8E, 0xC0, // MOV ES,AX
+        0xBA, @truncate(STRAND_HANDLER_OFF), @truncate(STRAND_HANDLER_OFF >> 8), // MOV DX,off
+        0xB8, 0x0C, 0x00, // MOV AX,0x000C
+        0xCD, 0x33, // INT 33h
+        0xF4, // HLT
+    });
+}
+
+// Plant a faithful self-EOI guest INT 08h timer ISR and point IVT[8] at it:
+//   FF 06 <slot>   INC word [STRAND_TICK_SLOT]   (DS-relative; DS == ISR seg)
+//   B0 20          MOV AL,0x20
+//   E6 20          OUT 0x20,AL                    (non-specific EOI to master)
+//   CF             IRET
+// It establishes its own DS (PUSH CS; POP DS) so the INC hits STRAND_ISR_SEG.
+fn plantTimerIsr(m: *Machine) void {
+    const base = (@as(u32, STRAND_ISR_SEG) << 4) + STRAND_ISR_OFF;
+    const code = [_]u8{
+        0x0E, // PUSH CS
+        0x1F, // POP DS                  ; DS = STRAND_ISR_SEG
+        0xFF, 0x06, @truncate(STRAND_TICK_SLOT), @truncate(STRAND_TICK_SLOT >> 8), // INC word [slot]
+        0xB0, 0x20, // MOV AL,0x20
+        0xE6, 0x20, // OUT 0x20,AL       ; EOI master
+        0xCF, // IRET
+    };
+    for (code, 0..) |c, i| m.bus.writePhys8(base + @as(u32, @intCast(i)), c);
+    // Zero the tick counter so a stale value can't masquerade as a tick.
+    m.bus.writePhys16((@as(u32, STRAND_ISR_SEG) << 4) + STRAND_TICK_SLOT, 0);
+    // Point IVT[8] (idtr_base==0 after post -> vector*4 = 0x20) at the ISR.
+    m.bus.writePhys16(0x08 * 4 + 0, STRAND_ISR_OFF);
+    m.bus.writePhys16(0x08 * 4 + 2, STRAND_ISR_SEG);
+}
+
+fn tickCount(m: *Machine) u16 {
+    return m.bus.readPhys16((@as(u32, STRAND_ISR_SEG) << 4) + STRAND_TICK_SLOT);
+}
+
+// Schedule a single PIT ch0 IRQ0 to come due exactly `delta` cycles in the
+// future, using the SAME scheduler seam the PIT's armCh0 uses (source_id =
+// PIT_SOURCE_ID, kind = .pit_ch0). We drive ch0 in mode 0 (one-shot) so the
+// machine's fireDue -> onPitCh0Fire raises IRQ0 once and does NOT auto re-arm,
+// giving us a single, precisely-placed timer interrupt for the sweep.
+const PIT_SOURCE_ID = machine_mod.PIT_SOURCE_ID;
+
+// Arm a tight foreground spin (JMP $) at CODE_SEG:0 with a valid stack and IF=1,
+// NOT halted — the BaK spin context the out-of-band callback fires into.
+fn setStrandForeground(m: *Machine) void {
+    m.cpu.loadSegment(.cs, CODE_SEG);
+    m.cpu.st.eip = 0;
+    m.cpu.loadSegment(.ss, CODE_SEG);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.esp), 0xFF00);
+    m.bus.writePhys8((@as(u32, CODE_SEG) << 4) + 0, 0xEB); // JMP $
+    m.bus.writePhys8((@as(u32, CODE_SEG) << 4) + 1, 0xFE);
+    m.cpu.st.eflags.iff = true;
+    m.cpu.st.halted = false;
+}
+
+fn scheduleOneShotIrq0(m: *Machine, delta: u64) void {
+    m.sched.cancel(PIT_SOURCE_ID, .pit_ch0); // drop any live ch0 event
+    // Mode 0 one-shot so onPitCh0Fire raises IRQ0 once without re-arming.
+    m.pit.channels[0].mode = .mode0;
+    m.pit.channels[0].reload = 1000; // any non-degenerate reload (unused for delta here)
+    m.sched.schedule(m.cpu.st.cycles, delta, PIT_SOURCE_ID, .pit_ch0, 0);
+}
+
+test "live mouse: AX=0Ch callback must not strand a hardware IRQ in-service (timer nested at the sentinel boundary, cycle sweep)" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    plantStrandHandler(m);
+    installStrandHandler(m, 0x7F); // arm for all events
+    plantTimerIsr(m);
+
+    // post() already programmed the PIC (IRQ0 unmasked). Confirm the preconditions
+    // the BaK spin had: IRQ0 unmasked, nothing yet in service.
+    try std.testing.expectEqual(@as(u8, 0), m.pic.master.imr & 0x01); // IRQ0 unmasked
+    try std.testing.expectEqual(@as(u8, 0), m.pic.master.isr & 0x01); // nothing in service
+
+    // post() armed the BIOS default ~18.2 Hz periodic IRQ0. Cancel it + make ch0
+    // inactive so the ONLY timer interrupt during the sweep is the one we place
+    // (otherwise the default period dominates the window measurement). Each sweep
+    // iteration re-arms its own one-shot via scheduleOneShotIrq0.
+    m.sched.cancel(PIT_SOURCE_ID, .pit_ch0);
+    m.pit.channels[0].mode = .inactive;
+
+    // A valid foreground (CS:SS:SP) with IF=1, NOT halted — installStrandHandler's
+    // HLT left the CPU halted; the far-call must execute, not idle.
+    setStrandForeground(m);
+
+    // Find the callback's cycle WIDTH so we can sweep the whole window. Fire once
+    // with NO timer scheduled to measure how many cycles the far-call costs (just
+    // the planted handler's instructions — the sentinel-step boundary is its end).
+    const probe_before = m.cpu.st.cycles;
+    m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
+        .x = 100,
+        .y = 100,
+        .buttons = 0b001,
+        .set_x = true,
+        .set_y = true,
+        .set_buttons = true,
+    });
+    const window = m.cpu.st.cycles - probe_before;
+    try std.testing.expect(window > 0);
+
+    // Sweep the IRQ0 due-cycle across [1 .. window + slack]. At EACH offset:
+    //   * arm a foreground spin with IF=1,
+    //   * schedule the one-shot IRQ0 at cycles_now + delta,
+    //   * fire the callback the live way,
+    //   * assert the CORRECT post-state: master ISR bit0 CLEAR, and the timer is
+    //     still LIVE (a subsequent scheduled IRQ0 delivers and bumps the counter).
+    var strand_offsets: [64]u64 = undefined;
+    var n_strands: usize = 0;
+
+    var delta: u64 = 1;
+    const sweep_end = window + 8;
+    while (delta <= sweep_end) : (delta += 1) {
+        // Fresh PIC/CPU interrupt preconditions for this offset. Clear any
+        // residue from the previous iteration so each offset is independent.
+        m.pic.master.isr = 0;
+        m.pic.master.irr = 0;
+        m.pic.slave.isr = 0;
+        m.pic.slave.irr = 0;
+        m.bus.writePhys16((@as(u32, STRAND_ISR_SEG) << 4) + STRAND_TICK_SLOT, 0);
+
+        // Foreground: a tight JMP $ spin at a fixed seg:off, IF=1 (the BaK spin).
+        setStrandForeground(m);
+
+        // Schedule the timer IRQ0 to land at cycles_now + delta (inside/around the
+        // callback window), then fire the callback OUT OF BAND like the live path.
+        scheduleOneShotIrq0(m, delta);
+        m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
+            .dx = 3,
+            .dy = -2,
+            .set_dx = true,
+            .set_dy = true,
+        });
+
+        // --- Observe the PIC state immediately after the out-of-band callback ---
+        const isr_after = m.pic.master.isr & 0x01;
+
+        // CORRECT behavior: bit0 must NOT be stuck in-service. Either the IRQ0 was
+        // not yet acked (still pending in IRR, to be delivered by the foreground),
+        // or it was acked AND its ISR ran its EOI to completion -> isr clear.
+        if (isr_after != 0) {
+            // Strand candidate. Confirm it is the LIVE deadlock state: prove the
+            // timer is DEAD — step the foreground (IF=1, IRQ0 unmasked, the spin)
+            // and a freshly scheduled IRQ0 can NOT deliver (the equal-rank
+            // re-pending IRQ0 is blocked by the in-service bit -> counter frozen).
+            const irr_after = m.pic.master.irr & 0x01;
+            const ticks_before = tickCount(m);
+            // Schedule another IRQ0 and let the foreground spin run well past it.
+            scheduleOneShotIrq0(m, 4);
+            _ = m.runCycles(2000);
+            const ticks_after = tickCount(m);
+            const irr_repended = m.pic.master.irr & 0x01; // the re-pending IRQ0
+            const pending = m.pic.getPendingInterrupt();
+
+            if (n_strands < strand_offsets.len) strand_offsets[n_strands] = delta;
+            n_strands += 1;
+            std.debug.print(
+                "STRAND at delta={d}: post-callback isr&1={d} irr&1={d} | after re-pend+spin: isr&1={d} irr&1={d} ticks {d}->{d} (frozen={}) getPendingInterrupt={any}\n",
+                .{ delta, isr_after, irr_after, m.pic.master.isr & 1, irr_repended, ticks_before, ticks_after, ticks_after == ticks_before, pending },
+            );
+        }
+    }
+
+    if (n_strands > 0) {
+        std.debug.print("REGRESSION: IRQ strand at {d} offset(s) in [1..{d}]; first={d}\n", .{ n_strands, sweep_end, strand_offsets[0] });
+    }
+
+    // THE ASSERTION (correct behavior): NO offset may leave the timer IRQ0 stuck
+    // in-service. RED here == the strand reproduced.
+    //
+    // OBSERVED (current code, RED): offsets delta=129..132 strand. At each, the
+    // diagnostics confirmed the exact mechanism — vector 0x08 (IRQ0) WAS delivered
+    // INSIDE the callback (cpu.st.last_delivered.vector==8, seq incremented: the
+    // ISR was ENTERED, ackIrq set master.isr bit0), but `runGuestFarCall`'s
+    // unconditional CS:IP/SP restore returned the CPU to the FOREGROUND spin
+    // (CS:IP back at CODE_SEG:0) BEFORE the ISR ran its `OUT 0x20,0x20` EOI. The
+    // in-service bit is stranded. After a fresh IRQ0 re-pends, the master sits at
+    // isr&1=1 AND irr&1=1 with getPendingInterrupt()==null (equal-rank IRQ0 blocked
+    // by the in-service bit — pic.zig pendingLine rank gate) and the tick counter
+    // is FROZEN — byte-for-byte the live BaK deadlock (plan §0/§1).
+    //
+    // The stranding offsets are the cycles at which the timer IRQ0 first becomes
+    // due ON THE STOP-SENTINEL step of runGuestFarCall: cpu.step() runs the
+    // sentinel via executeOne (which sets reentry_done=true), THEN serviceInterrupts
+    // acks+delivers IRQ0 at that same boundary; the loop sees reentry_done and
+    // exits, restoring CS:IP and abandoning the just-entered ISR (bridge.zig:705-714).
+    try std.testing.expectEqual(@as(usize, 0), n_strands);
+}

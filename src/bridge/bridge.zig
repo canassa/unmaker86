@@ -673,6 +673,18 @@ pub fn Bridge(comptime Cpu: type) type {
             const save_dec = cpu.dec;
             const save_start_eip = cpu.instr_start_eip;
             const save_done = self.reentry_done;
+            // The injected far-call must EXECUTE regardless of whether the parked
+            // foreground was halted (HLT) — this is a forced host->guest subroutine,
+            // not the foreground resuming. On real hardware the hardware IRQ that
+            // delivers such a callback (e.g. INT 74h/IRQ12 for the mouse sub) also
+            // WAKES the CPU from HLT; model that by clearing `halted` for the run and
+            // restoring it after. Without this, a halted foreground + a callback fired
+            // with IF=0 (see int33.fireEventCallback) would spin the step loop forever
+            // (the HLT gate in interrupts.step only un-halts via a *wakeable* IRQ,
+            // which needs IF=1) — it previously "worked" only by the accident of an
+            // ambient IF=1 + a pending timer IRQ un-halting it.
+            const save_halted = cpu.st.halted;
+            cpu.st.halted = false;
 
             // (2) Push the far-return frame onto SS:SP pointing at the stop
             // sentinel slot. Real-mode far CALL pushes CS first, then IP (so IP is
@@ -712,6 +724,7 @@ pub fn Bridge(comptime Cpu: type) type {
             cpu.dec = save_dec;
             cpu.instr_start_eip = save_start_eip;
             self.reentry_done = save_done;
+            cpu.st.halted = save_halted; // resume the foreground's HLT, if any
         }
 
         /// The stop-sentinel handler (D3): sets `reentry_done`. The CPU's Grp4 arm
