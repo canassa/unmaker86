@@ -21,14 +21,20 @@ fn freeVga(alloc: std.mem.Allocator, v: *Vga) void {
 }
 
 test "retrace timing constants resolve to the canonical 70.086 Hz frame" {
-    // The constants are comptime-pinned in vga.zig; assert they are reachable via
-    // `devices.Vga.*` (no new test-module import) and match the canonical figures.
+    // VGA frame geometry pins (Phase 1): the periods are now DEVICE-TIME values
+    // and the former comptime asserts in vga.zig moved here as RUNTIME checks
+    // evaluated at the default mult 12. At mult 12 device-time == nominal cycles,
+    // so the canonical figures are exact.
     try std.testing.expectEqual(@as(u64, 204_293), Vga.FRAME_CYCLES);
     try std.testing.expectEqual(@as(u64, 454), Vga.LINE_CYCLES);
     try std.testing.expectEqual(@as(u64, 181), Vga.HDE_CYCLES);
-    // Effective refresh: 14_318_184 / 204_293 = 70.086 Hz (integer hundredths = 7008).
+    // Effective refresh ≈ 70.086 Hz (integer hundredths). This identity is
+    // mult-INVARIANT (CPU_CLOCK_HZ and FRAME_CYCLES scale together), but floor
+    // division means a legal mult can land ±1 hundredth off — so check with a ±1
+    // rounding band (plans/configurable-cpu-clock.md, LOCKED §"VGA comptime").
     const timing = @import("timing");
-    try std.testing.expectEqual(@as(u64, 7008), timing.CPU_CLOCK_HZ * 100 / Vga.FRAME_CYCLES);
+    const refresh_centi = timing.CPU_CLOCK_HZ * 100 / Vga.FRAME_CYCLES;
+    try std.testing.expect(refresh_centi >= 7007 and refresh_centi <= 7009);
 }
 
 // ---------------------------------------------------------------------------

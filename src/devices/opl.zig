@@ -74,12 +74,18 @@ const Timer = struct {
     /// re-synced past each elapsed interval by `update`).
     start_cycle: u64 = 0,
 
-    /// Interval to overflow, in CPU cycles: (256 - counter) ticks * micros/tick.
-    /// Integer: cycles = ticks * micros * CPU_CLOCK_HZ / 1_000_000. The product
-    /// fits u64 comfortably (256 * 320 * 14_318_184 < 2^41).
-    fn intervalCycles(self: *const Timer) u64 {
+    /// Interval to overflow, in DEVICE-TIME units (Phase 1 device-time seam): the
+    /// OPL tick rate is real-time-anchored, so the period lives in the mult-
+    /// independent device-time domain. `interval = (256 - counter) ticks * micros *
+    /// CPU_CLOCK_HZ / 1_000_000`. Device-time == nominal cycles at the reference
+    /// mult, so this is byte-identical to the former cycle interval; the elapsed
+    /// CPU span it is compared against is converted CPU→device-time at each phase
+    /// site. The product fits u64 comfortably (256 * 320 * 14_318_184 < 2^41).
+    fn intervalDeviceTime(self: *const Timer) u64 {
         const ticks: u64 = 256 - @as(u64, self.counter);
-        return ticks * self.micros * timing.CPU_CLOCK_HZ / 1_000_000;
+        // us→device-time with the multiply BEFORE the divide (exact floor on the
+        // whole product, identical to the former cycle interval math).
+        return timing.usToDeviceTime(ticks * self.micros);
     }
 
     /// dosbox-x `Timer::Update(time)`: if the interval has elapsed, re-sync `start`
@@ -87,14 +93,16 @@ const Timer = struct {
     /// Pure function of the cycle ledger.
     fn update(self: *Timer, now: u64) void {
         if (!self.enabled) return;
-        const interval = self.intervalCycles();
+        const interval = self.intervalDeviceTime(); // device-time
         if (interval == 0) return; // degenerate; never overflows
         if (now < self.start_cycle) return; // clock went backwards (restore): no-op
-        const elapsed = now - self.start_cycle;
+        // Phase math in DEVICE-TIME (Phase 1 seam): convert the elapsed CPU span
+        // CPU→device-time and compare to the device-time interval. Identity at the
+        // pinned mult 12. The re-synced boundary remainder is converted back to a
+        // CPU span before subtracting from `now` (`start_cycle` stays CPU cycles).
+        const elapsed = timing.cpuToDevice(now - self.start_cycle);
         if (elapsed >= interval) {
-            // Re-sync start to the last interval boundary (mirrors the fmod in
-            // dosbox-x's Update so repeated reads stay phase-stable).
-            self.start_cycle = now - (elapsed % interval);
+            self.start_cycle = now - timing.deviceToCpu(elapsed % interval);
             if (!self.masked) self.overflow = true;
         }
     }
@@ -106,9 +114,9 @@ const Timer = struct {
     fn wouldOverflow(self: *const Timer, now: u64) bool {
         if (self.overflow) return true;
         if (!self.enabled or self.masked) return false;
-        const interval = self.intervalCycles();
+        const interval = self.intervalDeviceTime(); // device-time
         if (interval == 0 or now < self.start_cycle) return false;
-        return (now - self.start_cycle) >= interval;
+        return timing.cpuToDevice(now - self.start_cycle) >= interval;
     }
 
     /// reg 2 / reg 3 write: set the reload value. dosbox re-syncs (Update) before

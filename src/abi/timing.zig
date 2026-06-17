@@ -29,6 +29,60 @@ pub const CPU_CLOCK_HZ: u64 = PIT_TICK_RATE * 12;
 pub const cycles_num: u64 = 12;
 pub const cycles_den: u64 = 1;
 
+// ---------------------------------------------------------------------------
+// Device-time domain (Phase 1 of the live-CPU-clock work — `plans/configurable-
+// cpu-clock.md`, approach B). Real-time-anchored devices (PIT, VGA, speaker,
+// OPL, keyboard typematic) schedule events and compute phase in a *mult-
+// independent* DEVICE-TIME unit, NOT in CPU cycles. The CPU:device-time
+// multiplier (= `cycles_num`, CPU cycles per device-time unit) converts
+// device-time <-> CPU-cycles ONLY at the run-loop / scheduler boundary. Once a
+// future phase lets `mult` vary at runtime, device events + phases stay put
+// (no re-arm) and only this conversion factor changes.
+//
+// DEVICE-TIME UNIT = "nominal cycles" = CPU cycles at the REFERENCE mult
+// (`REF_MULT` == `cycles_num` == 12). This is the finest unit that keeps EVERY
+// existing period constant (VGA `FRAME_CYCLES`, OPL µs intervals, the speaker
+// PWM window, keyboard ms->cycles, the PIT reload x12) an exact integer. At the
+// pinned mult 12 the device-time<->CPU-cycle conversion is the IDENTITY, so
+// Phase 1 is byte-identical to the pre-seam cycle ledger (no golden moves).
+
+/// The reference CPU:device-time multiplier (CPU cycles per device-time unit).
+/// Pinned to `cycles_num` (12) in Phase 1; a future phase makes the *active*
+/// mult a runtime value while this stays the device-time unit's anchor.
+pub const REF_MULT: u64 = cycles_num;
+
+comptime {
+    // Device-time == nominal cycles at the reference mult: the conversions below
+    // are the identity at Phase 1. (A divergence here would move every golden.)
+    std.debug.assert(REF_MULT == cycles_num);
+}
+
+/// Convert a DEVICE-TIME span into CPU cycles at the reference mult. Identity at
+/// Phase 1 (`REF_MULT == cycles_num == 12`); integer-exact, no floats, no host
+/// time. The seam a future runtime `mult` plugs into (`dt * mult / REF_MULT`).
+pub fn deviceToCpu(device_time: u64) u64 {
+    return device_time * cycles_num / REF_MULT;
+}
+
+/// Convert a CPU-cycle span into DEVICE-TIME at the reference mult. Identity at
+/// Phase 1; the inverse boundary conversion (`cyc * REF_MULT / mult`).
+pub fn cpuToDevice(cpu_cycles: u64) u64 {
+    return cpu_cycles * REF_MULT / cycles_num;
+}
+
+/// Convert milliseconds into DEVICE-TIME units. `device_time = ms * CPU_CLOCK_HZ
+/// / 1000` — identical to the former ms->cycles math because device-time ==
+/// nominal cycles at the reference mult. Integer, no floats, no host time.
+pub fn msToDeviceTime(ms: u64) u64 {
+    return ms * CPU_CLOCK_HZ / 1000;
+}
+
+/// Convert microseconds into DEVICE-TIME units: `device_time = us * CPU_CLOCK_HZ
+/// / 1_000_000`. Identical to the former µs->cycles math (OPL timer intervals).
+pub fn usToDeviceTime(us: u64) u64 {
+    return us * CPU_CLOCK_HZ / 1_000_000;
+}
+
 /// The PINNED emulated wall-clock epoch (D13): `1993-01-01 00:00:00`. ALL
 /// DOS/BIOS-visible date/time (INT 21h AH=2A/2C, INT 1Ah, the DTA find record,
 /// AH=57 file date-time, directory timestamps) derive from this fixed epoch plus
@@ -49,14 +103,18 @@ comptime {
     std.debug.assert(cycles_den != 0);
 }
 
-/// Convert `ticks` PIT ticks into CPU cycles using integer math + a carried
-/// fractional remainder (M-D8). The remainder accumulator is owned by the caller
-/// (the PIT channel) and snapshotted, so cycle drift is reproducible and bounded.
+/// Convert `ticks` PIT ticks into DEVICE-TIME units using integer math + a
+/// carried fractional remainder (M-D8). The remainder accumulator is owned by
+/// the caller (the scheduler) and snapshotted, so drift is reproducible and
+/// bounded.
 ///
-/// `delta_cycles = (ticks * cycles_num + *remainder) / cycles_den`
-/// `*remainder   = (ticks * cycles_num + *remainder) % cycles_den`
+/// `delta = (ticks * cycles_num + *remainder) / cycles_den`
+/// `*remainder = (ticks * cycles_num + *remainder) % cycles_den`
 ///
-/// No floats, no host time — a pure integer function of (ticks, remainder).
+/// Because device-time == nominal cycles at the reference mult, this is exactly
+/// the former PIT ticks->cycles conversion (the result is now interpreted as
+/// device-time and converted to CPU cycles at the scheduler boundary — identity
+/// at Phase 1). No floats, no host time — pure integer fn of (ticks, remainder).
 pub fn ticksToCycles(ticks: u64, remainder: *u64) u64 {
     const total = ticks * cycles_num + remainder.*;
     remainder.* = total % cycles_den;
@@ -99,6 +157,29 @@ test "cyclesToTicks floors at the pinned ratio" {
     try std.testing.expectEqual(@as(u64, 1), cyclesToTicks(12));
     try std.testing.expectEqual(@as(u64, 1), cyclesToTicks(23)); // sub-tick floored
     try std.testing.expectEqual(@as(u64, 2), cyclesToTicks(24));
+}
+
+test "device-time<->CPU conversions are the identity at the pinned mult 12" {
+    // Phase 1 invariant: REF_MULT == cycles_num so both boundary conversions are
+    // the identity (the no-op gate — any divergence moves every golden).
+    try std.testing.expectEqual(@as(u64, 0), deviceToCpu(0));
+    try std.testing.expectEqual(@as(u64, 12), deviceToCpu(12));
+    try std.testing.expectEqual(@as(u64, 204_293), deviceToCpu(204_293));
+    try std.testing.expectEqual(@as(u64, 0), cpuToDevice(0));
+    try std.testing.expectEqual(@as(u64, 14_318_184), cpuToDevice(14_318_184));
+    // Round-trip is exact for every value at the reference mult.
+    var v: u64 = 1;
+    while (v < 1_000_000) : (v *= 7) {
+        try std.testing.expectEqual(v, deviceToCpu(cpuToDevice(v)));
+        try std.testing.expectEqual(v, cpuToDevice(deviceToCpu(v)));
+    }
+}
+
+test "ms/us -> device-time match the former cycle math (device-time == nominal cycles)" {
+    try std.testing.expectEqual(500 * CPU_CLOCK_HZ / 1000, msToDeviceTime(500));
+    try std.testing.expectEqual(33 * CPU_CLOCK_HZ / 1000, msToDeviceTime(33));
+    try std.testing.expectEqual(80 * CPU_CLOCK_HZ / 1_000_000, usToDeviceTime(80));
+    try std.testing.expectEqual(320 * CPU_CLOCK_HZ / 1_000_000, usToDeviceTime(320));
 }
 
 test "ticksToCycles carries a remainder for a hypothetical non-integer ratio" {

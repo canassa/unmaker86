@@ -185,7 +185,14 @@ pub const Machine = struct {
     // Scheduler contract (M-D2) — the CPU queries this on HLT.
     // -----------------------------------------------------------------------
     pub fn nextEventCycle(self: *Machine) u64 {
-        return self.sched.nextEventCycle();
+        // The scheduler keys on DEVICE-TIME (Phase 1 seam); the CPU/run-loop
+        // consume this as a CPU cycle (they compare it to cpu.st.cycles). Convert
+        // device-time→CPU at the boundary, preserving the empty-queue sentinel
+        // (maxInt) verbatim (`deviceToCpu(maxInt)` would overflow). Identity at
+        // the pinned mult 12, so the returned cycle is byte-identical to today.
+        const dt = self.sched.nextEventCycle();
+        if (dt == std.math.maxInt(u64)) return dt;
+        return timing.deviceToCpu(dt);
     }
 
     // -----------------------------------------------------------------------
@@ -486,20 +493,29 @@ pub const Machine = struct {
         const pic: *Pic = @ptrCast(@alignCast(ctx));
         pic.raiseIrq(line);
     }
+    /// PIT ch0 schedule seam — the DEVICE-TIME boundary (Phase 1). The PIT works
+    /// in CPU cycles (`from` == cpu.st.cycles, its counter read-back domain) and a
+    /// PIT-native tick count; the SCHEDULER keys on device-time. We convert the
+    /// anchor `from` CPU→device-time and `ticks`→device-time (`ticksToCycles` now
+    /// yields device-time, the remainder carried in the scheduler). At the pinned
+    /// mult 12 both conversions are the identity, so the scheduled device-time
+    /// fire point is byte-identical to the former cycle fire point.
     fn schedThunk(ctx: *anyopaque, from: u64, ticks: u64, val: u32) void {
         const self: *Machine = @ptrCast(@alignCast(ctx));
-        const delta = timing.ticksToCycles(ticks, &self.sched.remainder);
-        self.sched.schedule(from, delta, PIT_SOURCE_ID, .pit_ch0, val);
+        const delta = timing.ticksToCycles(ticks, &self.sched.remainder); // device-time
+        self.sched.schedule(timing.cpuToDevice(from), delta, PIT_SOURCE_ID, .pit_ch0, val);
     }
     fn cancelThunk(ctx: *anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(ctx));
         self.sched.cancel(PIT_SOURCE_ID, .pit_ch0);
     }
-    /// Keyboard typematic schedule seam: the keyboard passes CYCLES directly (an
-    /// ms→cycle conversion, not a PIT-tick count), so no `ticksToCycles`.
-    fn kbdSchedThunk(ctx: *anyopaque, from: u64, delta_cycles: u64) void {
+    /// Keyboard typematic schedule seam — the DEVICE-TIME boundary (Phase 1). The
+    /// keyboard expresses its delay/rate as DEVICE-TIME spans (an ms→device-time
+    /// conversion), so `delta_device` is already device-time; only the anchor
+    /// `from` (cpu.st.cycles) is converted CPU→device-time. Identity at mult 12.
+    fn kbdSchedThunk(ctx: *anyopaque, from: u64, delta_device: u64) void {
         const self: *Machine = @ptrCast(@alignCast(ctx));
-        self.sched.schedule(from, delta_cycles, KBD_SOURCE_ID, .kbd_repeat, 0);
+        self.sched.schedule(timing.cpuToDevice(from), delta_device, KBD_SOURCE_ID, .kbd_repeat, 0);
     }
     fn kbdCancelThunk(ctx: *anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(ctx));
@@ -584,12 +600,18 @@ pub const Machine = struct {
     /// the device callback resolved from `(source_id, kind)` (M-D11). Timing-
     /// neutral (M-D7).
     pub fn fireDue(self: *Machine) void {
-        const now = self.cpu.st.cycles;
-        while (self.sched.popDue(now)) |ev| {
+        // The scheduler keys on DEVICE-TIME (Phase 1 seam): convert the CPU cycle
+        // ledger CPU→device-time to find due events, and convert each popped
+        // event's device-time `fire_cycle` back to a CPU cycle before handing it
+        // to the device callback (the PIT/keyboard re-arm in their CPU-cycle
+        // domain). Identity at the pinned mult 12 → byte-identical firing.
+        const now_dt = timing.cpuToDevice(self.cpu.st.cycles);
+        while (self.sched.popDue(now_dt)) |ev| {
+            const fire_cpu = timing.deviceToCpu(ev.fire_cycle);
             switch (ev.kind) {
-                .pit_ch0 => self.pit.onPitCh0Fire(ev.fire_cycle),
+                .pit_ch0 => self.pit.onPitCh0Fire(fire_cpu),
                 .pit_ch1, .pit_ch2 => {}, // not wired in this plan (ch0 only)
-                .kbd_repeat => self.kbd.onRepeatFire(ev.fire_cycle),
+                .kbd_repeat => self.kbd.onRepeatFire(fire_cpu),
             }
         }
     }

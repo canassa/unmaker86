@@ -13,6 +13,7 @@ const std = @import("std");
 const machine_mod = @import("machine");
 const cpu_mod = @import("cpu");
 const dos_mod = @import("dos");
+const timing = @import("timing");
 
 const Machine = machine_mod.Machine;
 const Reg32 = cpu_mod.state.Reg32;
@@ -1026,7 +1027,10 @@ fn scheduleOneShotIrq0(m: *Machine, delta: u64) void {
     // Mode 0 one-shot so onPitCh0Fire raises IRQ0 once without re-arming.
     m.pit.channels[0].mode = .mode0;
     m.pit.channels[0].reload = 1000; // any non-degenerate reload (unused for delta here)
-    m.sched.schedule(m.cpu.st.cycles, delta, PIT_SOURCE_ID, .pit_ch0, 0);
+    // The scheduler keys on device-time (Phase 1 seam): anchor + delta cross the
+    // boundary CPU→device-time (identity at the pinned mult 12, but kept explicit
+    // so the test schedules in the scheduler's actual domain).
+    m.sched.schedule(timing.cpuToDevice(m.cpu.st.cycles), timing.cpuToDevice(delta), PIT_SOURCE_ID, .pit_ch0, 0);
 }
 
 test "live mouse: AX=0Ch callback must not strand a hardware IRQ in-service (timer nested at the sentinel boundary, cycle sweep)" {

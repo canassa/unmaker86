@@ -85,11 +85,14 @@ pub const Speaker = struct {
         // bit4: the ~66.6us refresh toggle. dosbox uses wall-clock
         // (fmod(PIC_FullIndex(),0.030)>0.015 ms-domain); zdos derives the SAME
         // square wave from the cycle ledger: high in the second half of each
-        // 0.030ms window. 0.030ms = 0.030e-3 s * CPU_CLOCK_HZ cycles. Integer:
-        // window = CPU_CLOCK_HZ * 30 / 1_000_000 cycles; high iff phase >= half.
-        const window: u64 = timing.CPU_CLOCK_HZ * 30 / 1_000_000;
+        // 0.030ms window. This refresh rate is real-time-anchored, so the window
+        // + phase live in the mult-independent DEVICE-TIME domain (Phase 1 seam):
+        // window = CPU_CLOCK_HZ * 30 / 1_000_000 device-time units; the ledger is
+        // converted CPU→device-time before the phase modulo. Device-time ==
+        // nominal cycles at the reference mult, so this is byte-identical today.
+        const window: u64 = timing.usToDeviceTime(30);
         if (window != 0) {
-            const phase = self.cyclesNow() % window;
+            const phase = timing.cpuToDevice(self.cyclesNow()) % window;
             if (phase >= window / 2) v |= 0x10;
         }
         return v;

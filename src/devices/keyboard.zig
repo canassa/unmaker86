@@ -74,10 +74,14 @@ const PERIOD_MS = [32]u64{
     133, 149, 167, 182, 200, 217, 233, 250, 270, 303, 333, 370, 400, 435, 476, 500,
 };
 
-/// Convert milliseconds to CPU cycles on the pinned emulated clock (M-D8a). Integer
-/// math, no host time, no floats — `cycles = ms * CPU_CLOCK_HZ / 1000`.
-fn msToCycles(ms: u64) u64 {
-    return ms * timing.CPU_CLOCK_HZ / 1000;
+/// Convert milliseconds to DEVICE-TIME units (Phase 1 device-time seam). The
+/// typematic delay/rate are real-time-anchored periods, so they live in the
+/// mult-independent device-time domain; the scheduler keys on device-time and the
+/// machine converts the fire point to CPU cycles at the boundary. Device-time ==
+/// nominal cycles at the reference mult, so this is byte-identical to the former
+/// ms→cycles math (`ms * CPU_CLOCK_HZ / 1000`). Integer, no host time, no floats.
+fn msToDeviceTime(ms: u64) u64 {
+    return timing.msToDeviceTime(ms);
 }
 
 /// The currently-repeating key (the last make still held). `scancode` is the set-1
@@ -158,9 +162,9 @@ pub const Keyboard = struct {
     repeat_code: ?RepeatCode = null,
     /// Initial-delay before the first repeat, in CPU cycles (decoded from `0xF3` /
     /// INT 16h AH=03; default 500 ms).
-    delay_cycles: u64 = msToCycles(500),
+    delay_cycles: u64 = msToDeviceTime(500),
     /// Inter-repeat period, in CPU cycles (default 33 ms ≈ 30 cps).
-    rate_cycles: u64 = msToCycles(33),
+    rate_cycles: u64 = msToDeviceTime(33),
 
     // ---- back-pointers wired by the machine at `wire` (M-D1) — NOT snapshotted;
     //      re-bound on restore exactly like `raise_*` ----
@@ -364,8 +368,8 @@ pub const Keyboard = struct {
     /// (the SAME decode the BIOS INT 16h AH=03 path drives). Bits 6-5 = delay index,
     /// bits 4-0 = rate index.
     fn setTypematic(self: *Keyboard, byte: u8) void {
-        self.delay_cycles = msToCycles(DELAY_MS[(byte >> 5) & 0x03]);
-        self.rate_cycles = msToCycles(PERIOD_MS[byte & 0x1F]);
+        self.delay_cycles = msToDeviceTime(DELAY_MS[(byte >> 5) & 0x03]);
+        self.rate_cycles = msToDeviceTime(PERIOD_MS[byte & 0x1F]);
     }
 
     /// Public entry for the BIOS INT 16h AH=03 path (same decode as port 0x60 0xF3).

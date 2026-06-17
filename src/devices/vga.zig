@@ -200,23 +200,25 @@ pub const Vga = struct {
     pub const VRSTART_LINE: u64 = 412; // vertical retrace pulse start (lines)
     pub const VREND_LINE: u64 = 414; // vertical retrace pulse end
 
-    /// Frame period in CPU cycles: CPU_CLOCK_HZ * HTOTAL_DOTS * VTOTAL_LINES / DOT_CLOCK_HZ.
+    /// Frame period in DEVICE-TIME units (Phase 1 device-time seam): the VGA dot
+    /// clock is real-time-anchored, so the frame/line/active spans live in the
+    /// mult-independent device-time domain. `FRAME_CYCLES = CPU_CLOCK_HZ *
+    /// HTOTAL_DOTS * VTOTAL_LINES / DOT_CLOCK_HZ`. Device-time == nominal cycles at
+    /// the reference mult, so these are byte-identical to the former cycle spans;
+    /// `statusReg1Peek` converts the ledger CPU→device-time before the phase math.
     pub const FRAME_CYCLES: u64 = timing.CPU_CLOCK_HZ * HTOTAL_DOTS * VTOTAL_LINES / DOT_CLOCK_HZ;
-    /// One scanline in CPU cycles: FRAME_CYCLES / VTOTAL_LINES (floor).
+    /// One scanline in device-time units: FRAME_CYCLES / VTOTAL_LINES (floor).
     pub const LINE_CYCLES: u64 = FRAME_CYCLES / VTOTAL_LINES;
-    /// The active (display-enable high) span of a scanline, in CPU cycles.
+    /// The active (display-enable high) span of a scanline, in device-time units.
     pub const HDE_CYCLES: u64 = timing.CPU_CLOCK_HZ * HDE_DOTS / DOT_CLOCK_HZ;
 
-    comptime {
-        // Pin against the CANONICAL target, not a re-derivation that could
-        // rubber-stamp a wrong input (mirrors src/abi/timing.zig:45-50). A future
-        // edit to the geometry above that drifts off the 70.086 Hz frame fails here.
-        std.debug.assert(FRAME_CYCLES == 204_293);
-        std.debug.assert(LINE_CYCLES == 454);
-        std.debug.assert(HDE_CYCLES == 181);
-        // Effective refresh ≈ 70.08 Hz: 14_318_184 * 100 / 204_293 = 7008.
-        std.debug.assert(timing.CPU_CLOCK_HZ * 100 / FRAME_CYCLES == 7008);
-    }
+    // The geometry pins moved from a `comptime {}` block to a RUNTIME self-test
+    // (`vga.zig` "VGA frame geometry pins ..." below). Once a future phase makes
+    // the active mult a runtime value the frame period is no longer a comptime
+    // constant, and floor division means a naive exact assert could trip on a
+    // legal mult — so the canonical-target pins (and the mult-invariant 70.086 Hz
+    // refresh identity) are checked at the default mult 12 WITH a ±1 rounding band
+    // (plans/configurable-cpu-clock.md, LOCKED §"VGA comptime asserts").
 
     /// The one fixed VRAM block. Heap-allocated up-front (it is large) and freed
     /// at deinit, zero-filled at reset (determinism). NOT inlined into the struct.
@@ -925,7 +927,13 @@ pub const Vga = struct {
     /// directive: snapshot-before == snapshot-after).
     pub fn statusReg1Peek(self: *const Vga, cycles_now: u64) u8 {
         _ = self;
-        const into_frame = cycles_now % FRAME_CYCLES; // 0 .. FRAME_CYCLES-1 (anchored at cycle 0)
+        // Phase from cycle 0 in DEVICE-TIME (Phase 1 seam): convert the CPU ledger
+        // CPU→device-time, then take the frame/line phase against the device-time
+        // periods. Identity at the pinned mult 12, so the retrace/display bits are
+        // byte-identical; a future runtime mult keeps the phase continuous (the
+        // VGA dot clock is independent of the CPU clock — no anchor re-arm).
+        const now_dt = timing.cpuToDevice(cycles_now);
+        const into_frame = now_dt % FRAME_CYCLES; // 0 .. FRAME_CYCLES-1 (anchored at cycle 0)
         const scanline = into_frame / LINE_CYCLES; // 0 .. 449 (449 is harmless, see §3.2)
         const into_line = into_frame % LINE_CYCLES; // 0 .. LINE_CYCLES-1
 

@@ -420,6 +420,9 @@ pub const Controller = struct {
     fn permanentlyHalted(self: *const Controller) bool {
         const st = &self.m.cpu.st;
         if (!st.halted) return false;
+        // The scheduler keys on device-time (Phase 1 seam), but this only tests
+        // the empty-queue sentinel (maxInt), which is domain-invariant — so the
+        // raw scheduler value is fine here (no CPU-cycle conversion needed).
         if (self.m.sched.nextEventCycle() != std.math.maxInt(u64)) return false;
         if (st.pending_fault != null) return false;
         if (st.nmi_pending() and !st.nmi_in_service) return false;
