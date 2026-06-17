@@ -121,14 +121,14 @@ pub const PitChannel = struct {
     /// per-channel, so the side-effect-free device reader can compute OUT for any
     /// channel without the (non-const, Pit-level) port path. `Pit.outBit`
     /// delegates here so the two never drift.
-    pub fn outBitAt(self: *const PitChannel, cycles_now: u64) bool {
+    pub fn outBitAt(self: *const PitChannel, cycles_now: u64, mult: u64) bool {
         if (self.mode == .inactive) return false;
         const period = self.reloadTicks();
         if (period == 0) return self.output;
         // A LOW gate forces OUT HIGH on the rate/square modes (counter frozen).
         if (!self.gate and (self.mode == .mode2 or self.mode == .mode3)) return true;
         const ref = if (self.gate) cycles_now else self.gate_off_cycle;
-        const elapsed_ticks = timing.cyclesToTicks(ref -% self.last_arm_cycle);
+        const elapsed_ticks = timing.cyclesToTicks(ref -% self.last_arm_cycle, mult);
         switch (self.mode) {
             .mode3 => {
                 const half = period / 2;
@@ -143,14 +143,14 @@ pub const PitChannel = struct {
         }
     }
 
-    pub fn liveCounter(self: *const PitChannel, cycles_now: u64) u16 {
+    pub fn liveCounter(self: *const PitChannel, cycles_now: u64, mult: u64) u16 {
         const period = self.reloadTicks();
         if (period == 0) return 0;
         // A LOW gate freezes the counter (8254): time stops advancing the count
         // at the instant the gate dropped (timer.cpp read_counter:331).
         const ref = if (self.gate) cycles_now else self.gate_off_cycle;
         const elapsed_cycles = ref -% self.last_arm_cycle;
-        const elapsed_ticks = timing.cyclesToTicks(elapsed_cycles);
+        const elapsed_ticks = timing.cyclesToTicks(elapsed_cycles, mult);
         switch (self.mode) {
             .mode2, .mode3 => {
                 const into = elapsed_ticks % period;
@@ -171,6 +171,12 @@ pub const Pit = struct {
     // ---- back-pointers wired by the machine at `wire` (M-D1) ----
     sched: ?SchedulerApi = null,
     cycles: ?*const u64 = null, // points at cpu.st.cycles (the single time source)
+    /// The active CPU:PIT multiplier (Phase 2) — points at `&machine.clock.mult`,
+    /// bound at `wire`, re-bound on `restore`. The counter read-back (`liveCounter`/
+    /// `outBitAt`) converts an elapsed CPU span → PIT ticks at this live ratio
+    /// (`cyclesToTicks(span, mult)`). Defaults to `timing.DEFAULT_MULT` (12) when
+    /// unbound so a stand-alone Pit (tests) keeps the former 12/1 behavior.
+    mult: ?*const u64 = null,
     raise_ctx: ?*anyopaque = null,
     raise_fn: ?RaiseFn = null,
 
@@ -180,6 +186,10 @@ pub const Pit = struct {
 
     fn cyclesNow(self: *const Pit) u64 {
         return (self.cycles orelse return 0).*;
+    }
+
+    fn multNow(self: *const Pit) u64 {
+        return (self.mult orelse return timing.DEFAULT_MULT).*;
     }
 
     fn raiseIrq0(self: *Pit) void {
@@ -272,7 +282,7 @@ pub const Pit = struct {
         const access_bits: u8 = (v >> 4) & 0x03;
         if (access_bits == 0) {
             // Counter-latch command: snapshot the live counter for a stable read.
-            ch.read_latch = ch.liveCounter(self.cyclesNow());
+            ch.read_latch = ch.liveCounter(self.cyclesNow(), self.multNow());
             ch.latched = true;
             ch.read_lohi_phase = 0;
             return;
@@ -351,7 +361,7 @@ pub const Pit = struct {
             ch.status_latched = false;
             return ch.status_value;
         }
-        const value: u16 = if (ch.latched) ch.read_latch else ch.liveCounter(self.cyclesNow());
+        const value: u16 = if (ch.latched) ch.read_latch else ch.liveCounter(self.cyclesNow(), self.multNow());
         switch (ch.access) {
             .lobyte => {
                 if (ch.latched) ch.latched = false;
@@ -385,7 +395,7 @@ pub const Pit = struct {
             if ((v & (@as(u8, 1) << @intCast(chan + 1))) == 0) continue;
             const ch = &self.channels[chan];
             if (latch_count and !ch.latched) {
-                ch.read_latch = ch.liveCounter(self.cyclesNow());
+                ch.read_latch = ch.liveCounter(self.cyclesNow(), self.multNow());
                 ch.latched = true;
                 ch.read_lohi_phase = 0;
             }
@@ -424,7 +434,7 @@ pub const Pit = struct {
     /// NOT the scheduled IRQ0 period (M-D8: IRQ0 period = R for both 2 and 3).
     fn outBit(self: *Pit, chan: usize) bool {
         // Single source of truth: the pure per-channel `outBitAt` (above).
-        return self.channels[chan].outBitAt(self.cyclesNow());
+        return self.channels[chan].outBitAt(self.cyclesNow(), self.multNow());
     }
 
     // -----------------------------------------------------------------------

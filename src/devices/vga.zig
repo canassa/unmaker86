@@ -298,6 +298,13 @@ pub const Vga = struct {
     /// (0x3DA/0x3BA) retrace + display-enable bits are derived from it. NOT
     /// snapshotted (a host pointer; re-bound by the machine, like the PIT/speaker).
     cycles: ?*const u64 = null,
+    /// The active CPU:PIT multiplier (Phase 2) — points at `&machine.clock.mult`,
+    /// bound at `wire`, re-bound on `restore`. `statusReg1Peek` converts the elapsed
+    /// CPU ledger → device-time at this live ratio before the frame/line phase math
+    /// (the VGA dot clock is independent of the CPU clock). Defaults to
+    /// `timing.DEFAULT_MULT` (12) when unbound (stand-alone tests). NOT snapshotted
+    /// (a host pointer; re-bound by the machine, like `cycles`).
+    mult: ?*const u64 = null,
 
     /// Attribute-controller (port 0x3C0) address/data flip-flop, in the *index*
     /// (address) phase when `true` (D-RT3). Reading 0x3DA/0x3BA resets it to the
@@ -418,6 +425,10 @@ pub const Vga = struct {
     /// test `Vga` that never set `.cycles`).
     fn cyclesNow(self: *const Vga) u64 {
         return (self.cycles orelse return 0).*;
+    }
+
+    fn multNow(self: *const Vga) u64 {
+        return (self.mult orelse return timing.DEFAULT_MULT).*;
     }
 
     // =======================================================================
@@ -926,13 +937,12 @@ pub const Vga = struct {
     /// THIS so an inspect never perturbs `attr_flip_flop_is_index` (the prime
     /// directive: snapshot-before == snapshot-after).
     pub fn statusReg1Peek(self: *const Vga, cycles_now: u64) u8 {
-        _ = self;
-        // Phase from cycle 0 in DEVICE-TIME (Phase 1 seam): convert the CPU ledger
+        // Phase from cycle 0 in DEVICE-TIME (Phase 1/2 seam): convert the CPU ledger
         // CPU→device-time, then take the frame/line phase against the device-time
         // periods. Identity at the pinned mult 12, so the retrace/display bits are
         // byte-identical; a future runtime mult keeps the phase continuous (the
         // VGA dot clock is independent of the CPU clock — no anchor re-arm).
-        const now_dt = timing.cpuToDevice(cycles_now);
+        const now_dt = timing.cpuToDevice(cycles_now, self.multNow());
         const into_frame = now_dt % FRAME_CYCLES; // 0 .. FRAME_CYCLES-1 (anchored at cycle 0)
         const scanline = into_frame / LINE_CYCLES; // 0 .. 449 (449 is harmless, see §3.2)
         const into_line = into_frame % LINE_CYCLES; // 0 .. LINE_CYCLES-1

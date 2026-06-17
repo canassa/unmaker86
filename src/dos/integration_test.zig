@@ -1030,7 +1030,7 @@ fn scheduleOneShotIrq0(m: *Machine, delta: u64) void {
     // The scheduler keys on device-time (Phase 1 seam): anchor + delta cross the
     // boundary CPU→device-time (identity at the pinned mult 12, but kept explicit
     // so the test schedules in the scheduler's actual domain).
-    m.sched.schedule(timing.cpuToDevice(m.cpu.st.cycles), timing.cpuToDevice(delta), PIT_SOURCE_ID, .pit_ch0, 0);
+    m.sched.schedule(timing.cpuToDevice(m.cpu.st.cycles, m.clock.mult), timing.cpuToDevice(delta, m.clock.mult), PIT_SOURCE_ID, .pit_ch0, 0);
 }
 
 test "live mouse: AX=0Ch callback must not strand a hardware IRQ in-service (timer nested at the sentinel boundary, cycle sweep)" {

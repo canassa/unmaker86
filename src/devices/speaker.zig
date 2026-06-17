@@ -62,6 +62,11 @@ pub const Speaker = struct {
     pit: ?*Pit = null,
     /// Points at cpu.st.cycles (the single time source) for the refresh bit.
     cycles: ?*const u64 = null,
+    /// The active CPU:PIT multiplier (Phase 2) — points at `&machine.clock.mult`,
+    /// bound at `wire`, re-bound on `restore`. The refresh-bit phase converts the
+    /// elapsed CPU ledger → device-time at this live ratio. Defaults to
+    /// `timing.DEFAULT_MULT` (12) when unbound (stand-alone tests).
+    mult: ?*const u64 = null,
 
     pub fn reset(self: *Speaker) void {
         self.port_61_data = 0;
@@ -72,6 +77,10 @@ pub const Speaker = struct {
 
     fn cyclesNow(self: *const Speaker) u64 {
         return (self.cycles orelse return 0).*;
+    }
+
+    fn multNow(self: *const Speaker) u64 {
+        return (self.mult orelse return timing.DEFAULT_MULT).*;
     }
 
     /// read_p61 (keyboard.cpp:724), MCH_VGA path.
@@ -92,7 +101,7 @@ pub const Speaker = struct {
         // nominal cycles at the reference mult, so this is byte-identical today.
         const window: u64 = timing.usToDeviceTime(30);
         if (window != 0) {
-            const phase = timing.cpuToDevice(self.cyclesNow()) % window;
+            const phase = timing.cpuToDevice(self.cyclesNow(), self.multNow()) % window;
             if (phase >= window / 2) v |= 0x10;
         }
         return v;

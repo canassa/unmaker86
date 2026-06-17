@@ -123,6 +123,24 @@ pub const Services = struct {
     }
 };
 
+/// The active CPU:PIT clock configuration (Phase 2 of the live-CPU-clock work —
+/// `plans/configurable-cpu-clock.md`, approach B). `mult` is the RUNTIME CPU:PIT
+/// multiplier (CPU cycles per PIT tick / per device-time unit) — the live value
+/// that the device-time↔CPU-cycle boundary conversions read (`timing.deviceToCpu`/
+/// `cpuToDevice`/`cyclesToTicks` take it as a param), replacing the former
+/// comptime `cycles_num`. It is GUEST-AFFECTING state: a different `mult` shifts
+/// where PIT/VGA/OPL events land relative to guest code (the IRQ/guest
+/// interleaving), so the byte state at cycle N depends on it → it MUST ride the
+/// machine snapshot. It defaults to `timing.DEFAULT_MULT` (12), at which the
+/// boundary conversions are the IDENTITY and the whole cycle ledger is
+/// byte-identical to Phase 1. Devices reach the live `mult` via a `*const u64`
+/// back-pointer (`&self.clock.mult`) bound at `wire`, re-bound on `restore` (the
+/// existing `self.pit.cycles = &self.cpu.st.cycles` pattern); the VALUE rides the
+/// snapshot. POD — `cycles_den` stays 1 (integer mult, exact, zero drift).
+pub const ClockConfig = struct {
+    mult: u64 = timing.DEFAULT_MULT,
+};
+
 /// The machine's stable id for the PIT as a scheduler event source (M-D11).
 pub const PIT_SOURCE_ID: u16 = 1;
 
@@ -162,6 +180,10 @@ pub const Machine = struct {
     /// AD15.DRV). Overflow is derived from the cycle ledger (wired below).
     opl: Opl = .{},
     sched: Scheduler = .{},
+    /// The active CPU:PIT clock config (Phase 2). Machine-owned VALUE, snapshotted;
+    /// devices read `&self.clock.mult` via a back-pointer bound at `wire`. Defaults
+    /// to mult 12 → byte-identical to Phase 1.
+    clock: ClockConfig = .{},
     cpu: Cpu = undefined,
     /// The host-serviced BIOS + DOS + the CallbackSink aggregate (D2/D12).
     bios: Bios = .{},
@@ -192,7 +214,7 @@ pub const Machine = struct {
         // the pinned mult 12, so the returned cycle is byte-identical to today.
         const dt = self.sched.nextEventCycle();
         if (dt == std.math.maxInt(u64)) return dt;
-        return timing.deviceToCpu(dt);
+        return timing.deviceToCpu(dt, self.clock.mult);
     }
 
     // -----------------------------------------------------------------------
@@ -301,6 +323,12 @@ pub const Machine = struct {
         // (d) scheduler-callback binding: PIT raise -> &self.pic; PIT schedule/
         //     cancel -> &self (the machine, which owns the scheduler).
         self.pit.cycles = &self.cpu.st.cycles;
+        // (d0) The active CPU:PIT multiplier (Phase 2) — devices that convert an
+        //      elapsed CPU span ↔ device-time / PIT ticks read it via `&self.clock.
+        //      mult`, bound here and re-bound on `restore`, exactly like `cycles`.
+        //      The VALUE rides the machine snapshot; the pointer never is. At the
+        //      default mult 12 every conversion is the identity (byte-identical).
+        self.pit.mult = &self.clock.mult;
         self.pit.raise_ctx = &self.pic;
         self.pit.raise_fn = picRaiseThunk;
         self.pit.sched = .{
@@ -313,14 +341,17 @@ pub const Machine = struct {
         //      time). Re-bound on restore exactly like the PIT's pointers.
         self.speaker.pit = &self.pit;
         self.speaker.cycles = &self.cpu.st.cycles;
+        self.speaker.mult = &self.clock.mult; // (d0) live mult, like the PIT
         // (d1b) VGA cycle back-pointer: the Input Status Register #1 (0x3DA/0x3BA)
         //       retrace + display-enable bits are derived from the cycle ledger,
         //       not host time. Re-bound on restore exactly like the PIT/speaker.
         self.vga.cycles = &self.cpu.st.cycles;
+        self.vga.mult = &self.clock.mult; // (d0) live mult, like the PIT
         // (d3) OPL2 cycle back-pointer: the timer-overflow state read back through
         //      the status register (port 0x388) is derived from the cycle ledger,
         //      not host time. Re-bound on restore exactly like the PIT/speaker/VGA.
         self.opl.cycles = &self.cpu.st.cycles;
+        self.opl.mult = &self.clock.mult; // (d0) live mult, like the PIT
         // (d2) 8042 keyboard controller back-pointer: it asserts IRQ1 through the
         //      PIC (the same `picRaiseThunk` the PIT uses for IRQ0). Re-bound on
         //      restore exactly like the PIT/speaker pointers.
@@ -502,8 +533,8 @@ pub const Machine = struct {
     /// fire point is byte-identical to the former cycle fire point.
     fn schedThunk(ctx: *anyopaque, from: u64, ticks: u64, val: u32) void {
         const self: *Machine = @ptrCast(@alignCast(ctx));
-        const delta = timing.ticksToCycles(ticks, &self.sched.remainder); // device-time
-        self.sched.schedule(timing.cpuToDevice(from), delta, PIT_SOURCE_ID, .pit_ch0, val);
+        const delta = timing.ticksToCycles(ticks, &self.sched.remainder); // device-time (mult-independent)
+        self.sched.schedule(timing.cpuToDevice(from, self.clock.mult), delta, PIT_SOURCE_ID, .pit_ch0, val);
     }
     fn cancelThunk(ctx: *anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(ctx));
@@ -515,7 +546,7 @@ pub const Machine = struct {
     /// `from` (cpu.st.cycles) is converted CPU→device-time. Identity at mult 12.
     fn kbdSchedThunk(ctx: *anyopaque, from: u64, delta_device: u64) void {
         const self: *Machine = @ptrCast(@alignCast(ctx));
-        self.sched.schedule(timing.cpuToDevice(from), delta_device, KBD_SOURCE_ID, .kbd_repeat, 0);
+        self.sched.schedule(timing.cpuToDevice(from, self.clock.mult), delta_device, KBD_SOURCE_ID, .kbd_repeat, 0);
     }
     fn kbdCancelThunk(ctx: *anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(ctx));
@@ -605,9 +636,9 @@ pub const Machine = struct {
         // event's device-time `fire_cycle` back to a CPU cycle before handing it
         // to the device callback (the PIT/keyboard re-arm in their CPU-cycle
         // domain). Identity at the pinned mult 12 → byte-identical firing.
-        const now_dt = timing.cpuToDevice(self.cpu.st.cycles);
+        const now_dt = timing.cpuToDevice(self.cpu.st.cycles, self.clock.mult);
         while (self.sched.popDue(now_dt)) |ev| {
-            const fire_cpu = timing.deviceToCpu(ev.fire_cycle);
+            const fire_cpu = timing.deviceToCpu(ev.fire_cycle, self.clock.mult);
             switch (ev.kind) {
                 .pit_ch0 => self.pit.onPitCh0Fire(fire_cpu),
                 .pit_ch1, .pit_ch2 => {}, // not wired in this plan (ch0 only)
@@ -712,6 +743,14 @@ pub const Machine = struct {
         dos_ret_type: u8,
         dos_terminated: bool,
         shutdown: bool,
+        /// The active CPU:PIT clock config (Phase 2). The `mult` VALUE is
+        /// guest-affecting state (it sets where device events land relative to
+        /// guest code), so it rides the snapshot; the device `*const u64`
+        /// back-pointers are re-bound by `wire`/`restore`, never serialized. At the
+        /// default mult 12 this is just `{ .mult = 12 }`, so the snapshot is
+        /// byte-identical to the pre-Phase-2 format only in VALUE — the struct
+        /// gained a field (an in-memory `Machine.Snapshot`, not a wire golden).
+        clock: ClockConfig,
     };
 
     pub fn snapshot(self: *const Machine) Snapshot {
@@ -735,6 +774,7 @@ pub const Machine = struct {
             .dos_ret_type = self.dos.ret_type,
             .dos_terminated = self.dos.terminated,
             .shutdown = self.shutdown,
+            .clock = self.clock,
         };
     }
 
@@ -760,5 +800,23 @@ pub const Machine = struct {
         self.dos.ret_type = snap.dos_ret_type;
         self.dos.terminated = snap.dos_terminated;
         self.shutdown = snap.shutdown;
+        // The clock VALUE rides the snapshot (guest-affecting state); the device
+        // `*const u64` back-pointers into `&self.clock.mult` are stable across this
+        // (the ClockConfig is an embedded field, its address unchanged by a value
+        // write), so they need no re-bind here. `wire` (re-run before restore in
+        // the snapshot→restore contract) binds them; we only overwrite the VALUE.
+        self.clock = snap.clock;
+    }
+
+    /// INTERNAL test-only seam (Phase 2): set the active CPU:PIT multiplier. There
+    /// is deliberately NO command/API wiring in Phase 2 — this exists ONLY so tests
+    /// can exercise the runtime mult path (snapshot round-trip, per-config
+    /// determinism) before Phase 3 adds `Command.set_clock`. Writing the VALUE does
+    /// not move the embedded `clock` field, so the device back-pointers stay valid.
+    /// Determinism note: a real live change must apply at a serialized cycle
+    /// boundary (Phase 3); this raw setter makes no such guarantee and is test-only.
+    pub fn setClockMult(self: *Machine, mult: u64) void {
+        std.debug.assert(mult >= 1);
+        self.clock.mult = mult;
     }
 };

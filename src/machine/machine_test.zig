@@ -489,3 +489,183 @@ test "typematic snapshot: arm mid-delay, restore, continue → same cadence" {
     const fired = fireKbdReptsUntil(m2, msToCycles(500) + 3 * msToCycles(33));
     try std.testing.expectEqual(@as(u32, 4), fired); // delay + 3 periods (k=0..3)
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2 of the live-CPU-clock work (plans/configurable-cpu-clock.md, approach
+// B): the CPU:PIT multiplier is now a RUNTIME value (`Machine.clock.mult`) held
+// in machine state + snapshotted, defaulting to 12 (byte-identical to Phase 1).
+// These tests prove: (1) the default-mult runtime path reproduces the Phase-1
+// fire cycles exactly (identity gate); (2) the clock VALUE rides the snapshot;
+// (3) a given mult is deterministic, and a different mult is guest-affecting.
+// No command/API is wired (that is Phase 3) — the internal `setClockMult` seam
+// drives the non-default config.
+// ---------------------------------------------------------------------------
+
+/// Set up an IRQ0-driven scripted program: a periodic PIT ch0 (mode 2, reload R)
+/// raises IRQ0; the handler `INC byte [0x2000]; IRET`; the main thread sits in
+/// `STI; JMP $` so it stays interruptible. The number of handler runs (RAM[0x2000])
+/// and the IRQ/main interleaving depend on the IRQ fire cycle = R * mult, so the
+/// final state is a deterministic function of `mult`.
+fn armIrq0Counter(m: *Machine, reload: u8) void {
+    m.programDefaultPic(); // unmask IRQ0/1/2, master vector base 0x08
+    // Real-mode IVT[8] (IRQ0) -> 0x0100:0x0000.
+    m.bus.writePhys8(8 * 4 + 0, 0x00); // IP lo
+    m.bus.writePhys8(8 * 4 + 1, 0x00); // IP hi
+    m.bus.writePhys8(8 * 4 + 2, 0x00); // CS lo (0x0100)
+    m.bus.writePhys8(8 * 4 + 3, 0x01); // CS hi
+    // Handler at 0x0100:0 -> phys 0x1000:
+    //   FE 06 00 20  INC byte ptr [0x2000]   ; bump the run counter
+    //   B0 20        MOV AL, 0x20            ; non-specific EOI
+    //   E6 20        OUT 0x20, AL            ; clear the PIC ISR so IRQ0 re-arms
+    //   CF           IRET
+    // Without the EOI the first IRQ0's in-service bit blocks every later IRQ0.
+    m.bus.writePhys8(0x1000, 0xFE);
+    m.bus.writePhys8(0x1001, 0x06);
+    m.bus.writePhys8(0x1002, 0x00);
+    m.bus.writePhys8(0x1003, 0x20);
+    m.bus.writePhys8(0x1004, 0xB0);
+    m.bus.writePhys8(0x1005, 0x20);
+    m.bus.writePhys8(0x1006, 0xE6);
+    m.bus.writePhys8(0x1007, 0x20);
+    m.bus.writePhys8(0x1008, 0xCF);
+    // Main thread at 0:0x0500: STI; JMP $ (FB EB FD -> the JMP targets itself).
+    m.cpu.loadSegment(.cs, 0);
+    m.cpu.loadSegment(.ds, 0);
+    m.cpu.loadSegment(.ss, 0);
+    m.cpu.st.setReg16(4, 0x7000); // SP — a sane real-mode stack for IRET frames
+    m.cpu.st.eip = 0x0500;
+    m.bus.writePhys8(0x0500, 0xFB); // STI
+    m.bus.writePhys8(0x0501, 0xEB); // JMP rel8
+    m.bus.writePhys8(0x0502, 0xFD); // -3 -> back to the STI (re-arm IF each loop)
+    // Program ch0 mode 2 (rate generator), reload R -> periodic IRQ0.
+    m.bus.portOut8(0x43, 0x34); // ch0, lobyte/hibyte, mode 2, binary
+    m.bus.portOut8(0x40, reload);
+    m.bus.portOut8(0x40, 0x00);
+}
+
+fn runIrq0Config(alloc: std.mem.Allocator, mult: u64, target: u64) !Machine.Snapshot {
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    m.setClockMult(mult);
+    armIrq0Counter(m, 0x14); // reload 20 ticks
+    _ = m.runCycles(target);
+    return m.snapshot();
+}
+
+test "Phase 2: default mult is 12 and the runtime path reproduces the Phase-1 fire cycle (identity)" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    // Power-on default — held in machine state, snapshotted.
+    try std.testing.expectEqual(@as(u64, 12), m.clock.mult);
+    try std.testing.expectEqual(@as(u64, 12), m.snapshot().clock.mult);
+
+    // Same setup as "HLT fast-forward" above: ch0 mode 2 reload 10. At the default
+    // mult the next-event CPU cycle is reload*mult = 10*12 = 120, byte-identical to
+    // Phase 1's comptime conversion.
+    m.programDefaultPic();
+    m.bus.portOut8(0x43, 0x34);
+    m.bus.portOut8(0x40, 0x0A);
+    m.bus.portOut8(0x40, 0x00);
+    try std.testing.expectEqual(@as(u64, 120), m.nextEventCycle());
+}
+
+test "Phase 2: the clock mult rides the snapshot (round-trip byte-identical at a non-default mult)" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    m.setClockMult(24); // internal test seam (no API in Phase 2)
+    armIrq0Counter(m, 0x14);
+    _ = m.runCycles(20_000); // populate device + RAM state at mult 24
+
+    const snap = m.snapshot();
+    try std.testing.expectEqual(@as(u64, 24), snap.clock.mult);
+    const ram_copy = try alloc.dupe(u8, m.bus.ram);
+    defer alloc.free(ram_copy);
+
+    // Restore into a FRESH machine (default mult 12) — the VALUE must override it,
+    // and the device back-pointers (re-bound by `wire`) must read the restored 24.
+    const m2 = try makeMachine(alloc);
+    defer {
+        m2.deinit();
+        alloc.destroy(m2);
+    }
+    try std.testing.expectEqual(@as(u64, 12), m2.clock.mult); // starts at the default
+    m2.restore(snap);
+    @memcpy(m2.bus.ram, ram_copy);
+
+    try std.testing.expectEqual(@as(u64, 24), m2.clock.mult); // VALUE rode the snapshot
+    // Re-snapshotting the restored machine is byte-identical (clock + all derived
+    // device/scheduler state round-trip).
+    const s2 = m2.snapshot();
+    try expectStateEqual(snap.cpu_state, s2.cpu_state);
+    try std.testing.expectEqualDeep(snap.clock, s2.clock);
+    try std.testing.expectEqualDeep(snap.pit, s2.pit);
+    try std.testing.expectEqualDeep(snap.sched, s2.sched);
+    try std.testing.expectEqual(m.bus.readPhys8(0x2000), m2.bus.readPhys8(0x2000));
+    // The PIT live counter (a mult-derived read-back) is identical post-restore:
+    // wire re-bound `pit.mult` to the restored machine's `&clock.mult` (== 24).
+    try std.testing.expectEqual(
+        m.pit.channels[0].liveCounter(m.cpu.st.cycles, m.clock.mult),
+        m2.pit.channels[0].liveCounter(m2.cpu.st.cycles, m2.clock.mult),
+    );
+}
+
+test "Phase 2: per-config determinism — same mult reproduces; different mult is guest-affecting" {
+    const alloc = std.testing.allocator;
+    const target: u64 = 30_000;
+
+    // Two runs at the default mult 12 to the same cycle -> byte-identical.
+    const a12 = try runIrq0Config(alloc, 12, target);
+    const b12 = try runIrq0Config(alloc, 12, target);
+    try expectStateEqual(a12.cpu_state, b12.cpu_state);
+    try std.testing.expectEqualDeep(a12.sched, b12.sched);
+    try std.testing.expectEqualDeep(a12.pit, b12.pit);
+
+    // Two runs at the non-default mult 24 to the same cycle -> byte-identical to
+    // EACH OTHER (deterministic at the non-default config — the Phase 3 foundation).
+    const a24 = try runIrq0Config(alloc, 24, target);
+    const b24 = try runIrq0Config(alloc, 24, target);
+    try expectStateEqual(a24.cpu_state, b24.cpu_state);
+    try std.testing.expectEqualDeep(a24.sched, b24.sched);
+    try std.testing.expectEqualDeep(a24.pit, b24.pit);
+
+    // ...but mult 24 DIFFERS from mult 12 at the same cycle (mult is guest-affecting:
+    // the IRQ0 fires at reload*mult, so the handler ran a different number of times
+    // and the IRQ/main interleaving differs). RAM[0x2000] is the handler run count.
+    {
+        const m12 = try makeMachine(alloc);
+        defer {
+            m12.deinit();
+            alloc.destroy(m12);
+        }
+        m12.setClockMult(12);
+        armIrq0Counter(m12, 0x14);
+        _ = m12.runCycles(target);
+        const c12 = m12.bus.readPhys8(0x2000);
+
+        const m24 = try makeMachine(alloc);
+        defer {
+            m24.deinit();
+            alloc.destroy(m24);
+        }
+        m24.setClockMult(24);
+        armIrq0Counter(m24, 0x14);
+        _ = m24.runCycles(target);
+        const c24 = m24.bus.readPhys8(0x2000);
+
+        // mult 12 fires IRQ0 twice as often as mult 24 (event = reload*mult), so the
+        // handler ran more times at mult 12 — proving mult changes guest computation.
+        try std.testing.expect(c12 != c24);
+        try std.testing.expect(c12 > c24);
+    }
+}

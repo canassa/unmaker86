@@ -246,8 +246,8 @@ pub const DevPitChannel = struct {
     bcd: bool,
     reload: u32, // effective reload (0 programmed -> 65536)
     gate: bool,
-    counter: u16, // computed: liveCounter(cyclesNow)
-    output: bool, // computed: outBitAt(cyclesNow)
+    counter: u16, // computed: liveCounter(cyclesNow, multNow)
+    output: bool, // computed: outBitAt(cyclesNow, multNow)
     latched: bool,
     status_latched: bool,
     new_mode: bool,
@@ -264,7 +264,7 @@ pub const DevPit = struct {
 pub const DevSpeaker = struct {
     port_b: u8, // the 0x61 latch (speaker.port_61_data)
     ch2_gate: bool,
-    ch2_out: bool, // computed: pit ch2 outBitAt(cyclesNow)
+    ch2_out: bool, // computed: pit ch2 outBitAt(cyclesNow, multNow)
 };
 
 pub const DevVga = struct {
@@ -1014,6 +1014,7 @@ pub const Controller = struct {
     /// and after, and zero cycles are charged (the prime directive).
     pub fn devicesSnapshot(self: *const Controller) DevicesSnapshot {
         const cyclesNow = self.m.cpu.st.cycles;
+        const multNow = self.m.clock.mult; // active CPU:PIT mult (Phase 2)
 
         // ---- A20 (the thing that was invisible during the EXEPACK bug) ----
         const a20: DevA20 = .{
@@ -1031,8 +1032,8 @@ pub const Controller = struct {
                 .bcd = ch.bcd,
                 .reload = if (ch.reload == 0) 65536 else ch.reload,
                 .gate = ch.gate,
-                .counter = ch.liveCounter(cyclesNow),
-                .output = ch.outBitAt(cyclesNow),
+                .counter = ch.liveCounter(cyclesNow, multNow),
+                .output = ch.outBitAt(cyclesNow, multNow),
                 .latched = ch.latched,
                 .status_latched = ch.status_latched,
                 .new_mode = ch.new_mode,
@@ -1069,7 +1070,7 @@ pub const Controller = struct {
         const speaker: DevSpeaker = .{
             .port_b = self.m.speaker.snapshot().port_61_data,
             .ch2_gate = self.m.pit.channels[2].gate,
-            .ch2_out = self.m.pit.channels[2].outBitAt(cyclesNow),
+            .ch2_out = self.m.pit.channels[2].outBitAt(cyclesNow, multNow),
         };
 
         // ---- AdLib / OPL2 timer + (computed) status ----
@@ -1114,6 +1115,7 @@ pub const Controller = struct {
     /// flip-flop reset). `null` => no stable shadow is defined for that port.
     pub fn ioShadow(self: *const Controller, port: u16) ?u8 {
         const cyclesNow = self.m.cpu.st.cycles;
+        const multNow = self.m.clock.mult; // active CPU:PIT mult (Phase 2)
         const vsnap = self.m.vga.snapshot();
         const ksnap = self.m.kbd.snapshot();
         return switch (port) {
@@ -1135,15 +1137,15 @@ pub const Controller = struct {
             0xA0 => if (self.m.pic.slave.read_isr) self.m.pic.slave.isr else self.m.pic.slave.irr,
             0xA1 => self.m.pic.slave.imr,
             // PIT counters: the low byte of the live counter (best-defined shadow).
-            0x40 => @truncate(self.m.pit.channels[0].liveCounter(cyclesNow)),
-            0x41 => @truncate(self.m.pit.channels[1].liveCounter(cyclesNow)),
-            0x42 => @truncate(self.m.pit.channels[2].liveCounter(cyclesNow)),
+            0x40 => @truncate(self.m.pit.channels[0].liveCounter(cyclesNow, multNow)),
+            0x41 => @truncate(self.m.pit.channels[1].liveCounter(cyclesNow, multNow)),
+            0x42 => @truncate(self.m.pit.channels[2].liveCounter(cyclesNow, multNow)),
             // 8042 data: the FIFO head WITHOUT popping (or last response if empty).
             0x60 => if (ksnap.fifo_count > 0) ksnap.fifo[ksnap.fifo_head] else ksnap.last_response,
             // KBC port B: the 0x61 latch with bit5 reflecting computed ch2 OUT.
             0x61 => blk: {
                 var v = self.m.speaker.snapshot().port_61_data;
-                if (self.m.pit.channels[2].outBitAt(cyclesNow)) v |= 0x20 else v &= ~@as(u8, 0x20);
+                if (self.m.pit.channels[2].outBitAt(cyclesNow, multNow)) v |= 0x20 else v &= ~@as(u8, 0x20);
                 break :blk v;
             },
             0x64 => ksnap.status, // 8042 status register

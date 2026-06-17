@@ -46,28 +46,45 @@ pub const cycles_den: u64 = 1;
 // pinned mult 12 the device-time<->CPU-cycle conversion is the IDENTITY, so
 // Phase 1 is byte-identical to the pre-seam cycle ledger (no golden moves).
 
-/// The reference CPU:device-time multiplier (CPU cycles per device-time unit).
-/// Pinned to `cycles_num` (12) in Phase 1; a future phase makes the *active*
-/// mult a runtime value while this stays the device-time unit's anchor.
+/// The reference CPU:device-time multiplier (CPU cycles per device-time unit) —
+/// the device-time unit's ANCHOR. The DEVICE-TIME unit is "nominal cycles at the
+/// reference mult" so every real-time-anchored period (VGA `FRAME_CYCLES`, OPL µs
+/// intervals, the speaker PWM window, keyboard ms→device-time, the PIT reload×12)
+/// is a fixed integer INDEPENDENT of the live `mult`. This stays a comptime
+/// constant forever; the *active* CPU:PIT multiplier is a RUNTIME value
+/// (`Machine.clock.mult`, Phase 2) that enters ONLY at the device-time↔CPU-cycle
+/// boundary conversions below. `DEFAULT_MULT` is the power-on / golden value.
 pub const REF_MULT: u64 = cycles_num;
 
+/// The default (power-on) active CPU:PIT multiplier. The runtime `mult`
+/// (`Machine.clock.mult`) initializes to this; at this value the device-time↔
+/// CPU-cycle conversions are the IDENTITY (`REF_MULT == DEFAULT_MULT`) so the
+/// whole cycle ledger is byte-identical to Phase 1 / the pre-seam emulator.
+pub const DEFAULT_MULT: u64 = cycles_num;
+
 comptime {
-    // Device-time == nominal cycles at the reference mult: the conversions below
-    // are the identity at Phase 1. (A divergence here would move every golden.)
+    // Device-time == nominal cycles at the reference mult: the boundary
+    // conversions are the IDENTITY at the default mult. (A divergence here would
+    // move every golden.)
     std.debug.assert(REF_MULT == cycles_num);
+    std.debug.assert(DEFAULT_MULT == REF_MULT);
 }
 
-/// Convert a DEVICE-TIME span into CPU cycles at the reference mult. Identity at
-/// Phase 1 (`REF_MULT == cycles_num == 12`); integer-exact, no floats, no host
-/// time. The seam a future runtime `mult` plugs into (`dt * mult / REF_MULT`).
-pub fn deviceToCpu(device_time: u64) u64 {
-    return device_time * cycles_num / REF_MULT;
+/// Convert a DEVICE-TIME span into CPU cycles at the active `mult`:
+/// `cpu = dt * mult / REF_MULT`. Integer-exact, no floats, no host time. At the
+/// default mult (`mult == REF_MULT == 12`) this is the IDENTITY, so the returned
+/// cycle is byte-identical to Phase 1; at a higher integer mult the CPU runs more
+/// cycles per device-time unit (faster CPU, peripherals keep their device rates).
+pub fn deviceToCpu(device_time: u64, mult: u64) u64 {
+    return device_time * mult / REF_MULT;
 }
 
-/// Convert a CPU-cycle span into DEVICE-TIME at the reference mult. Identity at
-/// Phase 1; the inverse boundary conversion (`cyc * REF_MULT / mult`).
-pub fn cpuToDevice(cpu_cycles: u64) u64 {
-    return cpu_cycles * REF_MULT / cycles_num;
+/// Convert a CPU-cycle span into DEVICE-TIME at the active `mult`, the inverse
+/// boundary conversion: `dt = cyc * REF_MULT / mult`. Integer floor division (the
+/// device-time domain is the finer/anchored unit). Identity at the default mult;
+/// integer-exact, no floats, no host time.
+pub fn cpuToDevice(cpu_cycles: u64, mult: u64) u64 {
+    return cpu_cycles * REF_MULT / mult;
 }
 
 /// Convert milliseconds into DEVICE-TIME units. `device_time = ms * CPU_CLOCK_HZ
@@ -111,22 +128,27 @@ comptime {
 /// `delta = (ticks * cycles_num + *remainder) / cycles_den`
 /// `*remainder = (ticks * cycles_num + *remainder) % cycles_den`
 ///
-/// Because device-time == nominal cycles at the reference mult, this is exactly
-/// the former PIT ticks->cycles conversion (the result is now interpreted as
-/// device-time and converted to CPU cycles at the scheduler boundary — identity
-/// at Phase 1). No floats, no host time — pure integer fn of (ticks, remainder).
+/// Because device-time == nominal cycles at the REFERENCE mult, this uses
+/// `cycles_num` (== `REF_MULT`), NOT the live `mult`: a PIT tick is always
+/// `REF_MULT` device-time units regardless of CPU speed (the device-time domain is
+/// mult-independent — that is the whole point of the seam). The live `mult` enters
+/// only at the device-time→CPU-cycle boundary (`deviceToCpu`). No floats, no host
+/// time — pure integer fn of (ticks, remainder).
 pub fn ticksToCycles(ticks: u64, remainder: *u64) u64 {
     const total = ticks * cycles_num + remainder.*;
     remainder.* = total % cycles_den;
     return total / cycles_den;
 }
 
-/// Convert elapsed CPU `cycles` back into whole PIT ticks (for counter read-back:
-/// the current counter is a pure function of elapsed cycles since the last arm,
-/// M-D8). Integer floor division — sub-tick cycles are masked (at the 12/1 ratio
-/// this matters only once PRM cycle counts land).
-pub fn cyclesToTicks(cyc: u64) u64 {
-    return cyc * cycles_den / cycles_num;
+/// Convert elapsed CPU `cycles` back into whole PIT ticks at the active `mult`
+/// (for the PIT counter read-back: the current counter is a pure function of
+/// elapsed cycles since the last arm, M-D8). `ticks = cyc / mult` — at `mult` CPU
+/// cycles per PIT tick. Integer floor division (sub-tick cycles are masked); at
+/// the default mult 12 this is the former `cyc / 12`, byte-identical. This is the
+/// ONE PIT-side site where the live `mult` (not `REF_MULT`) is the ratio, because
+/// the elapsed span is in CPU cycles, not device-time.
+pub fn cyclesToTicks(cyc: u64, mult: u64) u64 {
+    return cyc / mult;
 }
 
 test "no host time / RNG / float in timing.zig (grep — M-D2)" {
@@ -153,26 +175,37 @@ test "ticksToCycles is exact at the pinned 12/1 ratio (remainder stays 0)" {
     try std.testing.expectEqual(@as(u64, 0), rem);
 }
 
-test "cyclesToTicks floors at the pinned ratio" {
-    try std.testing.expectEqual(@as(u64, 1), cyclesToTicks(12));
-    try std.testing.expectEqual(@as(u64, 1), cyclesToTicks(23)); // sub-tick floored
-    try std.testing.expectEqual(@as(u64, 2), cyclesToTicks(24));
+test "cyclesToTicks floors at the default mult" {
+    try std.testing.expectEqual(@as(u64, 1), cyclesToTicks(12, DEFAULT_MULT));
+    try std.testing.expectEqual(@as(u64, 1), cyclesToTicks(23, DEFAULT_MULT)); // sub-tick floored
+    try std.testing.expectEqual(@as(u64, 2), cyclesToTicks(24, DEFAULT_MULT));
+    // At a doubled mult one PIT tick spans 24 CPU cycles.
+    try std.testing.expectEqual(@as(u64, 1), cyclesToTicks(24, 24));
+    try std.testing.expectEqual(@as(u64, 0), cyclesToTicks(23, 24));
 }
 
-test "device-time<->CPU conversions are the identity at the pinned mult 12" {
-    // Phase 1 invariant: REF_MULT == cycles_num so both boundary conversions are
-    // the identity (the no-op gate — any divergence moves every golden).
-    try std.testing.expectEqual(@as(u64, 0), deviceToCpu(0));
-    try std.testing.expectEqual(@as(u64, 12), deviceToCpu(12));
-    try std.testing.expectEqual(@as(u64, 204_293), deviceToCpu(204_293));
-    try std.testing.expectEqual(@as(u64, 0), cpuToDevice(0));
-    try std.testing.expectEqual(@as(u64, 14_318_184), cpuToDevice(14_318_184));
-    // Round-trip is exact for every value at the reference mult.
+test "device-time<->CPU conversions are the identity at the default mult 12" {
+    // The no-op gate: REF_MULT == DEFAULT_MULT so both boundary conversions are
+    // the identity at the default (any divergence moves every golden).
+    try std.testing.expectEqual(@as(u64, 0), deviceToCpu(0, DEFAULT_MULT));
+    try std.testing.expectEqual(@as(u64, 12), deviceToCpu(12, DEFAULT_MULT));
+    try std.testing.expectEqual(@as(u64, 204_293), deviceToCpu(204_293, DEFAULT_MULT));
+    try std.testing.expectEqual(@as(u64, 0), cpuToDevice(0, DEFAULT_MULT));
+    try std.testing.expectEqual(@as(u64, 14_318_184), cpuToDevice(14_318_184, DEFAULT_MULT));
+    // Round-trip is exact for every value at the default mult.
     var v: u64 = 1;
     while (v < 1_000_000) : (v *= 7) {
-        try std.testing.expectEqual(v, deviceToCpu(cpuToDevice(v)));
-        try std.testing.expectEqual(v, cpuToDevice(deviceToCpu(v)));
+        try std.testing.expectEqual(v, deviceToCpu(cpuToDevice(v, DEFAULT_MULT), DEFAULT_MULT));
+        try std.testing.expectEqual(v, cpuToDevice(deviceToCpu(v, DEFAULT_MULT), DEFAULT_MULT));
     }
+}
+
+test "device-time->CPU scales with a non-default mult (faster CPU)" {
+    // At a doubled mult the CPU runs 2x the cycles per device-time unit; the
+    // inverse floors. Exact when mult divides REF_MULT*dt evenly.
+    try std.testing.expectEqual(@as(u64, 24), deviceToCpu(12, 24));
+    try std.testing.expectEqual(@as(u64, 408_586), deviceToCpu(204_293, 24));
+    try std.testing.expectEqual(@as(u64, 6), cpuToDevice(12, 24)); // 12 * 12 / 24
 }
 
 test "ms/us -> device-time match the former cycle math (device-time == nominal cycles)" {

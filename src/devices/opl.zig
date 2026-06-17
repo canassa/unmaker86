@@ -91,18 +91,19 @@ const Timer = struct {
     /// dosbox-x `Timer::Update(time)`: if the interval has elapsed, re-sync `start`
     /// to the most recent interval boundary and (when unmasked) latch overflow.
     /// Pure function of the cycle ledger.
-    fn update(self: *Timer, now: u64) void {
+    fn update(self: *Timer, now: u64, mult: u64) void {
         if (!self.enabled) return;
         const interval = self.intervalDeviceTime(); // device-time
         if (interval == 0) return; // degenerate; never overflows
         if (now < self.start_cycle) return; // clock went backwards (restore): no-op
-        // Phase math in DEVICE-TIME (Phase 1 seam): convert the elapsed CPU span
-        // CPU→device-time and compare to the device-time interval. Identity at the
-        // pinned mult 12. The re-synced boundary remainder is converted back to a
-        // CPU span before subtracting from `now` (`start_cycle` stays CPU cycles).
-        const elapsed = timing.cpuToDevice(now - self.start_cycle);
+        // Phase math in DEVICE-TIME (Phase 1/2 seam): convert the elapsed CPU span
+        // CPU→device-time (at the live `mult`) and compare to the device-time
+        // interval. Identity at the default mult 12. The re-synced boundary
+        // remainder is converted back to a CPU span before subtracting from `now`
+        // (`start_cycle` stays CPU cycles, the device's read-back domain).
+        const elapsed = timing.cpuToDevice(now - self.start_cycle, mult);
         if (elapsed >= interval) {
-            self.start_cycle = now - timing.deviceToCpu(elapsed % interval);
+            self.start_cycle = now - timing.deviceToCpu(elapsed % interval, mult);
             if (!self.masked) self.overflow = true;
         }
     }
@@ -111,12 +112,12 @@ const Timer = struct {
     /// (Either already latched, or the interval has elapsed and it is unmasked.)
     /// Pure function of (state, now) — used by the observability peek, not the
     /// real read path (the real read latches via `update`).
-    fn wouldOverflow(self: *const Timer, now: u64) bool {
+    fn wouldOverflow(self: *const Timer, now: u64, mult: u64) bool {
         if (self.overflow) return true;
         if (!self.enabled or self.masked) return false;
         const interval = self.intervalDeviceTime(); // device-time
         if (interval == 0 or now < self.start_cycle) return false;
-        return timing.cpuToDevice(now - self.start_cycle) >= interval;
+        return timing.cpuToDevice(now - self.start_cycle, mult) >= interval;
     }
 
     /// reg 2 / reg 3 write: set the reload value. dosbox re-syncs (Update) before
@@ -165,6 +166,11 @@ pub const Opl = struct {
     /// Points at cpu.st.cycles (the single time source). Overflow is derived from
     /// it, never from host time. Re-bound on restore.
     cycles: ?*const u64 = null,
+    /// The active CPU:PIT multiplier (Phase 2) — points at `&machine.clock.mult`,
+    /// bound at `wire`, re-bound on `restore`. The OPL phase math converts an
+    /// elapsed CPU span ↔ device-time at this live ratio. Defaults to
+    /// `timing.DEFAULT_MULT` (12) when unbound (stand-alone tests).
+    mult: ?*const u64 = null,
 
     pub fn reset(self: *Opl) void {
         self.reg_index = 0;
@@ -176,14 +182,19 @@ pub const Opl = struct {
         return (self.cycles orelse return 0).*;
     }
 
+    fn multNow(self: *const Opl) u64 {
+        return (self.mult orelse return timing.DEFAULT_MULT).*;
+    }
+
     /// Read the OPL status register (port 0x388). dosbox-x `Chip::Read`: timer-1
     /// overflow -> 0x40|0x80, timer-2 overflow -> 0x20|0x80. Updates the timers
     /// from the ledger first (side-effect-free w.r.t. the ledger — it only mutates
     /// the device's own latched-overflow state, as the real chip does on any read).
     fn readStatus(self: *Opl) u8 {
         const now = self.cyclesNow();
-        self.timer1.update(now);
-        self.timer2.update(now);
+        const mult = self.multNow();
+        self.timer1.update(now, mult);
+        self.timer2.update(now, mult);
         var v: u8 = 0;
         if (self.timer1.overflow) v |= 0x40 | 0x80;
         if (self.timer2.overflow) v |= 0x20 | 0x80;
@@ -196,9 +207,10 @@ pub const Opl = struct {
     /// contract). Pure function of the cycle ledger + current timer state.
     pub fn statusPeek(self: *const Opl) u8 {
         const now = self.cyclesNow();
+        const mult = self.multNow();
         var v: u8 = 0;
-        if (self.timer1.wouldOverflow(now)) v |= 0x40 | 0x80;
-        if (self.timer2.wouldOverflow(now)) v |= 0x20 | 0x80;
+        if (self.timer1.wouldOverflow(now, mult)) v |= 0x40 | 0x80;
+        if (self.timer2.wouldOverflow(now, mult)) v |= 0x20 | 0x80;
         return v;
     }
 
@@ -229,13 +241,14 @@ pub const Opl = struct {
     /// accepted and dropped (no synthesis — D2).
     fn writeData(self: *Opl, val: u8) void {
         const now = self.cyclesNow();
+        const mult = self.multNow();
         switch (self.reg_index) {
             0x02 => { // timer-1 reload
-                self.timer1.update(now);
+                self.timer1.update(now, mult);
                 self.timer1.setCounter(val);
             },
             0x03 => { // timer-2 reload
-                self.timer2.update(now);
+                self.timer2.update(now, mult);
                 self.timer2.setCounter(val);
             },
             0x04 => { // timer control
