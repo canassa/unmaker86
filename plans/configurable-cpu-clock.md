@@ -93,7 +93,7 @@ device-time periods, not the mult directly. Worker reaches it via worker→contr
   (label "CPU ≈N MHz" derived); pacer derives slice from runtime `cpu_clock_hz`. With (B) the live
   change is trivial (no re-arm) — verify VGA/speaker phase continuity + `(cycle,mult)` determinism.
 
-### Phase 3 outcome (SHIPPED, with one BLOCKER surfaced — do not re-run blind)
+### Phase 3 outcome (SHIPPED — the surfaced BLOCKER is now RESOLVED, see below)
 SHIPPED: `Command.set_clock`/`clock_get` → `Controller.setCpuMult`/`clockMult` → `Machine.setClockMult`
 (clamps `[1, MAX_MULT=55]`); `POST`/`GET /api/cpu/clock` (integer `{mult}` or `{mhz}`, integer-only
 wire, derived `cpu_hz`/`mhz`/`slice_cycles`); the pacer paces at the DEVICE clock — `PACER_TARGET_HZ`
@@ -104,18 +104,32 @@ identical pre/post; full suite + oracle green, NO re-mint). `(cycle,mult)` repla
 the scheduler-side NO-RE-ARM holds (a pending PIT event keeps its device-time fire point); timer WALL
 rate invariant to mult (live BaK: ~17 ticks/s at BOTH mult 12 and 24 while CPU cyc/s doubled).
 
-**BLOCKER — VGA/speaker phase + scheduler "now" are NOT continuous across a live change.** Phases 1-2
-shipped the SHORTCUT `cpuToDevice(absolute_cpu_cycles, mult)` instead of the LOCKED design's continuous
-`device_time` ACCUMULATOR (locked point 1). At a fixed mult both agree (byte-identical goldens), but a
-mid-run mult change RETRO-SCALES the absolute cycle history: at cycle 123457 device-time is 123457 @
-mult 12 but 61728 @ mult 24 → a ~30%-of-a-frame VGA-retrace phase JUMP (and the scheduler's `now_dt`
-reference jumps the same way). It is a ONE-SHOT fidelity glitch at the instant of the change (a retrace
-tear / PIT phase hiccup), STILL fully deterministic given `(cycle,mult)` — NOT a determinism break.
-The faithful fix is the device_time accumulator (advance a machine-owned `device_time` by
-`cpu_delta*REF_MULT/mult` per step with a remainder, snapshot it, and have every device read it instead
-of recomputing from absolute cycles) — that is Phase-1-scope (touches the hot run loop + every device
-phase read + the snapshot format), NOT the rejected per-device anchor fields (approach A). Deliberately
-NOT papered over. Until then the knob works but glitches once per change.
+**BLOCKER RESOLVED — the continuous `device_time` accumulator shipped (locked point 1).** The SHORTCUT
+`cpuToDevice(absolute_cpu_cycles, mult)` was REPLACED by a machine-owned, CONTINUOUS `device_time`
+accumulator (`Machine.device_time` + `dt_remainder` + a `dt_accounted_cpu` high-water mark, all
+snapshotted). `device_time` advances LAZILY off the cycle ledger via `Machine.syncDeviceTime`
+(idempotent on the high-water mark, so re-entrant `runGuestInt`/host-trap nested steps account each
+cycle EXACTLY ONCE — no double-count), with an integer remainder carry (`timing.advanceDeviceTime`:
+`total = cpu_delta*REF_MULT + rem; advance = total/mult; rem = total%mult`). It is synced at every
+device-time read site — `fireDue`, `nextEventCycle`, the schedule anchors (`cpuAnchorToDevice`) — and
+BEFORE a `setClockMult` (so the span up to the change is accounted at the OLD rate). Devices read the
+continuous "now" via a `&device_time` + `&dt_accounted_cpu` back-pointer pair (`deviceTimeNow` ==
+committed accumulator + the uncommitted tail), so a mid-instruction port read is current WITHOUT a
+per-port sync — and crucially NOT a recompute from absolute cycles and NOT per-device anchor fields
+(rejected approach A): it reads the ONE shared machine accumulator. The reverse boundary
+(`nextEventCycle`/`fireDue`/`schedThunk`) converts the device-time DELTA from `device_time`, never the
+absolute counter. The OPL timer anchor moved to device-time (`start_dt`) so its phase math is a pure
+device-time delta.
+
+A live mult change now only changes the FUTURE advance RATE; `device_time` itself does NOT jump, so the
+VGA/speaker retrace phase + the scheduler "now" stay CONTINUOUS at the instant of the change. **GATE 1**
+(default mult 12 byte-identical): full suite (626/626) + BaK to 50M cycles byte-identical to `4cc766d`,
+NO golden re-minted (at mult 12 `device_time == cpu.st.cycles`, remainder 0). **GATE 2** (continuity): a
+new test captures `device_time` + the VGA Input-Status-1 retrace byte just before and just after a
+`setClockMult` at the SAME cpu cycle — they are EQUAL (the shortcut showed a 123457→61728 jump; that
+contrast is asserted in the same test). Snapshot round-trips
+`device_time`/`dt_remainder`/`dt_accounted_cpu` byte-identically, incl. after a mid-run mult change.
+Still fully deterministic given `(cycle,mult)`. The knob no longer glitches on a change.
 
 ---
 

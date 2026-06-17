@@ -1027,10 +1027,11 @@ fn scheduleOneShotIrq0(m: *Machine, delta: u64) void {
     // Mode 0 one-shot so onPitCh0Fire raises IRQ0 once without re-arming.
     m.pit.channels[0].mode = .mode0;
     m.pit.channels[0].reload = 1000; // any non-degenerate reload (unused for delta here)
-    // The scheduler keys on device-time (Phase 1 seam): anchor + delta cross the
-    // boundary CPU→device-time (identity at the pinned mult 12, but kept explicit
-    // so the test schedules in the scheduler's actual domain).
-    m.sched.schedule(timing.cpuToDevice(m.cpu.st.cycles, m.clock.mult), timing.cpuToDevice(delta, m.clock.mult), PIT_SOURCE_ID, .pit_ch0, 0);
+    // The scheduler keys on DEVICE-TIME: anchor at the machine's continuous
+    // device-time accumulator (the LOCKED-design "now"); the delta crosses the
+    // CPU→device-time boundary (identity at the pinned mult 12). At mult 12
+    // device_time == cpu.st.cycles, so this is byte-identical.
+    m.sched.schedule(m.device_time, timing.cpuToDevice(delta, m.clock.mult), PIT_SOURCE_ID, .pit_ch0, 0);
 }
 
 test "live mouse: AX=0Ch callback must not strand a hardware IRQ in-service (timer nested at the sentinel boundary, cycle sweep)" {

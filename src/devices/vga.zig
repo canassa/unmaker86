@@ -305,6 +305,21 @@ pub const Vga = struct {
     /// `timing.DEFAULT_MULT` (12) when unbound (stand-alone tests). NOT snapshotted
     /// (a host pointer; re-bound by the machine, like `cycles`).
     mult: ?*const u64 = null,
+    /// The CONTINUOUS device-time accumulator (`&machine.device_time`) — the
+    /// LOCKED-design fix. `statusReg1Peek` reads "now" from THIS (device-time
+    /// directly), NOT from a recompute off `cpu.st.cycles` (the removed SHORTCUT,
+    /// which made the retrace phase JUMP on a live mult change). Bound at `wire`,
+    /// re-bound on restore, like `cycles`/`mult`; the VALUE rides the machine
+    /// snapshot. At mult 12 it equals `cpu.st.cycles`. Defaults to `null` (stand-alone
+    /// tests fall back to the cycle-derived phase via `cyclesNow`).
+    device_time: ?*const u64 = null,
+    /// The machine's `dt_accounted_cpu` high-water mark (the cpu cycle up to which
+    /// `device_time` is committed). `deviceTimeNow` adds the UNCOMMITTED tail
+    /// (`cyclesNow - dt_accounted`, converted at `mult`) so a mid-instruction port
+    /// read sees a CURRENT device-time without the machine syncing on every port
+    /// access. This reads the SAME machine accumulator (NOT a per-device anchor):
+    /// device_time(committed) + the small tail. At mult 12 the sum == cpu.st.cycles.
+    dt_accounted: ?*const u64 = null,
 
     /// Attribute-controller (port 0x3C0) address/data flip-flop, in the *index*
     /// (address) phase when `true` (D-RT3). Reading 0x3DA/0x3BA resets it to the
@@ -429,6 +444,21 @@ pub const Vga = struct {
 
     fn multNow(self: *const Vga) u64 {
         return (self.mult orelse return timing.DEFAULT_MULT).*;
+    }
+
+    /// The current DEVICE-TIME "now" — read from the machine's CONTINUOUS
+    /// accumulator (the LOCKED-design fix) when wired; else (a stand-alone test Vga
+    /// with no `device_time` back-pointer) fall back to converting the cycle ledger
+    /// at the current mult, preserving the former behavior. Identity at mult 12.
+    pub fn deviceTimeNow(self: *const Vga) u64 {
+        if (self.device_time) |dt| {
+            // Committed accumulator + the uncommitted tail since the high-water mark,
+            // so a mid-instruction read is CURRENT (the machine syncs lazily). At
+            // mult 12 this equals cpu.st.cycles exactly (tail == cyclesNow - mark).
+            const acc = self.dt_accounted orelse return dt.*;
+            return dt.* + timing.cpuToDevice(self.cyclesNow() - acc.*, self.multNow());
+        }
+        return timing.cpuToDevice(self.cyclesNow(), self.multNow());
     }
 
     // =======================================================================
@@ -928,7 +958,7 @@ pub const Vga = struct {
         self.attr_flip_flop_is_index = true;
         // The status BYTE itself is pure `f(cycles)` — computed by the non-mutating
         // peek so the live read and the debugger's device reader share the bit math.
-        return self.statusReg1Peek(self.cyclesNow());
+        return self.statusReg1Peek(self.deviceTimeNow());
     }
 
     /// The Input Status #1 byte as a PURE function of `cycles_now` — the exact bit
@@ -936,13 +966,17 @@ pub const Vga = struct {
     /// reset). The side-effect-free device reader (`/api/devices`, `/api/io`) calls
     /// THIS so an inspect never perturbs `attr_flip_flop_is_index` (the prime
     /// directive: snapshot-before == snapshot-after).
-    pub fn statusReg1Peek(self: *const Vga, cycles_now: u64) u8 {
-        // Phase from cycle 0 in DEVICE-TIME (Phase 1/2 seam): convert the CPU ledger
-        // CPU→device-time, then take the frame/line phase against the device-time
-        // periods. Identity at the pinned mult 12, so the retrace/display bits are
-        // byte-identical; a future runtime mult keeps the phase continuous (the
-        // VGA dot clock is independent of the CPU clock — no anchor re-arm).
-        const now_dt = timing.cpuToDevice(cycles_now, self.multNow());
+    pub fn statusReg1Peek(self: *const Vga, now_dt: u64) u8 {
+        _ = self; // pure fn of (now_dt, the comptime CRTC timing consts); kept a
+        // method for the `self.m.vga.statusReg1Peek(...)` call sites.
+        // Phase from cycle 0 in DEVICE-TIME: `now_dt` is the CONTINUOUS device-time
+        // accumulator (the LOCKED-design fix — `deviceTimeNow`), NOT a recompute off
+        // the absolute cycle counter (the removed SHORTCUT, which made this phase
+        // JUMP on a live mult change). The frame/line phase is taken against the
+        // device-time periods. Identity at the pinned mult 12 (device_time ==
+        // cpu.st.cycles), so the retrace/display bits are byte-identical; across a
+        // live mult change the phase stays CONTINUOUS (the VGA dot clock is
+        // independent of the CPU clock — no anchor re-arm).
         const into_frame = now_dt % FRAME_CYCLES; // 0 .. FRAME_CYCLES-1 (anchored at cycle 0)
         const scanline = into_frame / LINE_CYCLES; // 0 .. 449 (449 is harmless, see §3.2)
         const into_line = into_frame % LINE_CYCLES; // 0 .. LINE_CYCLES-1

@@ -1080,7 +1080,7 @@ pub const Controller = struct {
             .dac_write_index = vsnap.dac_write_index,
             .dac_pel_index = vsnap.dac_pel_index,
             .dac_state = vsnap.dac_state,
-            .input_status1 = self.m.vga.statusReg1Peek(cyclesNow),
+            .input_status1 = self.m.vga.statusReg1Peek(self.m.vga.deviceTimeNow()),
             .latch = vsnap.latch,
             .palette = vsnap.dac_rgb, // server nulls this when ?palette not set
         };
@@ -1139,7 +1139,7 @@ pub const Controller = struct {
         const ksnap = self.m.kbd.snapshot();
         return switch (port) {
             // VGA Input Status #1 — computed retrace/display bits (no flip-flop reset).
-            0x3DA, 0x3BA => self.m.vga.statusReg1Peek(cyclesNow),
+            0x3DA, 0x3BA => self.m.vga.statusReg1Peek(self.m.vga.deviceTimeNow()),
             0x3C6 => vsnap.pel_mask, // PEL mask
             0x3C7 => @intFromEnum(vsnap.dac_state), // DAC state (read/write)
             0x3C8 => vsnap.dac_write_index,

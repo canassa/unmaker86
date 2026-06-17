@@ -108,6 +108,43 @@ pub fn cpuToDevice(cpu_cycles: u64, mult: u64) u64 {
     return cpu_cycles * REF_MULT / mult;
 }
 
+/// Advance the continuous `device_time` accumulator by the DEVICE-TIME delta that
+/// corresponds to a `cpu_delta` CPU-cycle span just charged at the active `mult`,
+/// carrying the fractional remainder EXACTLY (no tick lost or doubled). This is the
+/// machine-owned "device-time now" advance (`plans/configurable-cpu-clock.md`,
+/// LOCKED point 1) — the CONTINUOUS accumulator the run loop carries instead of
+/// re-deriving "now" from the absolute cycle counter (which JUMPS on a live `mult`
+/// change). The math is the exact integer form of `cpu_delta * REF_MULT / mult`
+/// with the `% mult` carried in `*remainder`:
+///
+/// `total = cpu_delta * REF_MULT + *remainder`
+/// `advance = total / mult`  ;  `*remainder = total % mult`
+///
+/// At the default mult (`mult == REF_MULT == 12`) every advance equals `cpu_delta`
+/// and the remainder stays 0 forever, so `device_time` tracks `cpu.st.cycles`
+/// byte-identically. After a live `mult` change ONLY the future advance RATE
+/// changes — `device_time` itself stays continuous (no discontinuity). No floats,
+/// no host time. Used for BOTH the per-instruction step AND the HLT/idle
+/// fast-forward jump (a large `cpu_delta`), so the ledger has no hole.
+pub fn advanceDeviceTime(cpu_delta: u64, mult: u64, remainder: *u64) u64 {
+    const total = cpu_delta * REF_MULT + remainder.*;
+    remainder.* = total % mult;
+    return total / mult;
+}
+
+/// The inverse of `advanceDeviceTime` for a FUTURE event: convert a DEVICE-TIME
+/// delta (`event_devtime - device_time`, the remaining device-time until the event)
+/// into the CPU-cycle delta to run, at the active `mult`: `cyc = dt_delta * mult /
+/// REF_MULT`. The run-loop boundary adds this to the CPU-cycle "now"
+/// (`cpu.st.cycles`) to get the absolute "run until" cycle. Integer-exact (a future
+/// event's remaining device-time × an integer mult divides REF_MULT exactly at the
+/// default; floors otherwise, matching `deviceToCpu`). Identity at the default
+/// mult. No floats, no host time. This is the continuity-preserving replacement for
+/// recomputing the target from the absolute cycle counter.
+pub fn deviceDeltaToCpu(dt_delta: u64, mult: u64) u64 {
+    return dt_delta * mult / REF_MULT;
+}
+
 /// Convert milliseconds into DEVICE-TIME units. `device_time = ms * CPU_CLOCK_HZ
 /// / 1000` — identical to the former ms->cycles math because device-time ==
 /// nominal cycles at the reference mult. Integer, no floats, no host time.
@@ -243,6 +280,64 @@ test "ms/us -> device-time match the former cycle math (device-time == nominal c
     try std.testing.expectEqual(33 * CPU_CLOCK_HZ / 1000, msToDeviceTime(33));
     try std.testing.expectEqual(80 * CPU_CLOCK_HZ / 1_000_000, usToDeviceTime(80));
     try std.testing.expectEqual(320 * CPU_CLOCK_HZ / 1_000_000, usToDeviceTime(320));
+}
+
+test "advanceDeviceTime is the identity with a 0 remainder at the default mult" {
+    // GATE 1: at mult 12 device_time tracks cpu.st.cycles exactly — every advance
+    // equals the cpu delta and the remainder never leaves 0.
+    var rem: u64 = 0;
+    var dt: u64 = 0;
+    var cyc: u64 = 0;
+    const deltas = [_]u64{ 1, 3, 7, 21, 100, 65536, 1_000_000 };
+    for (deltas) |d| {
+        dt += advanceDeviceTime(d, DEFAULT_MULT, &rem);
+        cyc += d;
+        try std.testing.expectEqual(@as(u64, 0), rem);
+        try std.testing.expectEqual(cyc, dt); // device_time == cpu.st.cycles
+    }
+}
+
+test "advanceDeviceTime is continuous + exact across a live mult change" {
+    // GATE 2 math: device_time advances continuously; a mult change only alters the
+    // FUTURE advance rate. The running sum equals the exact rational sum of each
+    // segment's cpu_delta * REF_MULT / mult with the remainder carried losslessly.
+    var rem: u64 = 0;
+    var dt: u64 = 0;
+    // Segment 1: mult 12, 1000 cycles -> +1000 dt (identity), rem 0.
+    dt += advanceDeviceTime(1000, 12, &rem);
+    try std.testing.expectEqual(@as(u64, 1000), dt);
+    try std.testing.expectEqual(@as(u64, 0), rem);
+    // Segment 2: mult 24, 1000 cycles -> 1000*12/24 = 500 dt, rem 0.
+    dt += advanceDeviceTime(1000, 24, &rem);
+    try std.testing.expectEqual(@as(u64, 1500), dt);
+    try std.testing.expectEqual(@as(u64, 0), rem);
+    // Segment 3: mult 5 (REF_MULT 12 not divisible) — exercise the carry. Each cycle
+    // adds 12/5; over 5 cycles that is exactly 12 dt with the remainder returning to 0.
+    var i: u64 = 0;
+    var seg: u64 = 0;
+    while (i < 5) : (i += 1) seg += advanceDeviceTime(1, 5, &rem);
+    try std.testing.expectEqual(@as(u64, 12), seg); // 5 * 12 / 5 == 12 exactly
+    try std.testing.expectEqual(@as(u64, 0), rem);
+    // The accumulator carry means no device-time is ever lost or doubled: the sum of
+    // per-cycle advances equals the bulk advance.
+    var rem_a: u64 = 0;
+    var rem_b: u64 = 0;
+    var bulk = advanceDeviceTime(7, 5, &rem_a);
+    var per: u64 = 0;
+    i = 0;
+    while (i < 7) : (i += 1) per += advanceDeviceTime(1, 5, &rem_b);
+    try std.testing.expectEqual(bulk, per);
+    try std.testing.expectEqual(rem_a, rem_b);
+    bulk = 0;
+}
+
+test "deviceDeltaToCpu is the run-until inverse; identity at the default mult" {
+    try std.testing.expectEqual(@as(u64, 0), deviceDeltaToCpu(0, DEFAULT_MULT));
+    try std.testing.expectEqual(@as(u64, 1000), deviceDeltaToCpu(1000, DEFAULT_MULT));
+    // At a doubled mult the CPU runs 2x the cycles to cover the same device-time span.
+    try std.testing.expectEqual(@as(u64, 2000), deviceDeltaToCpu(1000, 24));
+    // It matches deviceToCpu for a delta (both are the device-time->cpu boundary).
+    try std.testing.expectEqual(deviceToCpu(1000, 24), deviceDeltaToCpu(1000, 24));
 }
 
 test "ticksToCycles carries a remainder for a hypothetical non-integer ratio" {

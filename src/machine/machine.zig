@@ -184,6 +184,36 @@ pub const Machine = struct {
     /// devices read `&self.clock.mult` via a back-pointer bound at `wire`. Defaults
     /// to mult 12 → byte-identical to Phase 1.
     clock: ClockConfig = .{},
+    /// The CONTINUOUS device-time "now" accumulator (the LOCKED-design fix — see
+    /// `plans/configurable-cpu-clock.md` point 1 + the resolved Phase-3 BLOCKER).
+    /// It advances as the CPU executes (every site that advances `cpu.st.cycles`
+    /// also advances this, via `timing.advanceDeviceTime`), so a live `mult` change
+    /// only changes the FUTURE advance rate — `device_time` itself stays continuous
+    /// (no VGA/speaker phase or scheduler-"now" jump). Devices read it via a
+    /// `*const u64` back-pointer (`&self.device_time`) bound at `wire`/`restore`, as
+    /// device-time-NOW, instead of re-deriving it from the absolute cycle counter
+    /// (the removed SHORTCUT). It is guest-affecting / path-dependent state (a mult
+    /// change makes it diverge from `cpu.st.cycles`), so it rides the snapshot. At
+    /// the default mult 12 it equals `cpu.st.cycles` at all times (the remainder
+    /// stays 0) → byte-identical to Phase 1, no golden moves.
+    device_time: u64 = 0,
+    /// The integer fractional-remainder carry for the `cpu→device` advance
+    /// (`timing.advanceDeviceTime`): the `% mult` left over each advance, carried
+    /// EXACTLY so no device-time is ever lost or doubled (no floats). At mult 12 it
+    /// is always 0. Path-dependent state → snapshotted alongside `device_time`.
+    dt_remainder: u64 = 0,
+    /// The high-water mark of `cpu.st.cycles` up to which `device_time` has already
+    /// been advanced (`syncDeviceTime`). The CPU is the SOLE writer of the cycle
+    /// ledger, and it advances in MANY spots (per-instruction base, interrupt/fault
+    /// delivery, host-trap charges, the HLT fast-forward) AND re-entrantly (a host
+    /// trap runs nested machine steps via `runGuestInt`). Advancing `device_time`
+    /// off a per-step before/after delta would DOUBLE-COUNT the nested cycles. This
+    /// high-water mark makes the advance idempotent: each call converts only the
+    /// span the ledger has grown PAST the mark, so nested + outer steps account each
+    /// cycle exactly ONCE. It is a pure shadow of `cpu.st.cycles` (snapshotted so a
+    /// restore resumes the mark); at mult 12 `device_time == dt_accounted_cpu ==
+    /// cpu.st.cycles`.
+    dt_accounted_cpu: u64 = 0,
     cpu: Cpu = undefined,
     /// The host-serviced BIOS + DOS + the CallbackSink aggregate (D2/D12).
     bios: Bios = .{},
@@ -206,15 +236,43 @@ pub const Machine = struct {
     // -----------------------------------------------------------------------
     // Scheduler contract (M-D2) — the CPU queries this on HLT.
     // -----------------------------------------------------------------------
+    /// Advance the CONTINUOUS device-time accumulator to mirror the cycle ledger up
+    /// to the current `cpu.st.cycles` (the LOCKED-design fix). Idempotent via the
+    /// `dt_accounted_cpu` high-water mark: it converts ONLY the span the ledger has
+    /// grown past the mark (so re-entrant/nested steps each account a cycle exactly
+    /// once — no double-count) and carries the fractional remainder exactly. At mult
+    /// 12 every advance equals the cpu-cycle delta and the remainder stays 0, so
+    /// `device_time == cpu.st.cycles` byte-identically. A live mult change only
+    /// changes the FUTURE advance rate — `device_time` stays continuous (no jump).
+    /// MUST be called before any device-time read so devices + the scheduler see a
+    /// current, continuous "now".
+    pub fn syncDeviceTime(self: *Machine) void {
+        const now = self.cpu.st.cycles;
+        if (now <= self.dt_accounted_cpu) return;
+        const delta = now - self.dt_accounted_cpu;
+        self.dt_accounted_cpu = now;
+        self.device_time += timing.advanceDeviceTime(delta, self.clock.mult, &self.dt_remainder);
+    }
+
     pub fn nextEventCycle(self: *Machine) u64 {
-        // The scheduler keys on DEVICE-TIME (Phase 1 seam); the CPU/run-loop
-        // consume this as a CPU cycle (they compare it to cpu.st.cycles). Convert
-        // device-time→CPU at the boundary, preserving the empty-queue sentinel
-        // (maxInt) verbatim (`deviceToCpu(maxInt)` would overflow). Identity at
-        // the pinned mult 12, so the returned cycle is byte-identical to today.
+        // The scheduler keys on DEVICE-TIME; the CPU/run-loop consume this as a CPU
+        // cycle (they compare it to cpu.st.cycles). Convert at the boundary using
+        // the CONTINUOUS device-time accumulator (the LOCKED-design fix): the next
+        // event's CPU cycle is the cpu-cycle NOW plus the cpu-cycle span covering the
+        // REMAINING device-time until the event — `cpu.st.cycles + (event_dt -
+        // device_time) * mult / REF_MULT`. Because both "nows" advance together,
+        // this is CONTINUOUS across a live mult change (only the future span's rate
+        // changes); the removed SHORTCUT (`deviceToCpu(absolute_dt)`) JUMPED. The
+        // empty-queue sentinel (maxInt) is preserved verbatim. Identity at the
+        // pinned mult 12 (device_time == cpu.st.cycles, mult == REF_MULT) so the
+        // returned cycle is byte-identical to today.
+        self.syncDeviceTime(); // device_time current before the boundary conversion
         const dt = self.sched.nextEventCycle();
         if (dt == std.math.maxInt(u64)) return dt;
-        return timing.deviceToCpu(dt, self.clock.mult);
+        // An event due at-or-before now (dt <= device_time) maps to the current
+        // cycle (no negative span). fireDue drains those; this guards the run-until.
+        if (dt <= self.device_time) return self.cpu.st.cycles;
+        return self.cpu.st.cycles + timing.deviceDeltaToCpu(dt - self.device_time, self.clock.mult);
     }
 
     // -----------------------------------------------------------------------
@@ -342,16 +400,27 @@ pub const Machine = struct {
         self.speaker.pit = &self.pit;
         self.speaker.cycles = &self.cpu.st.cycles;
         self.speaker.mult = &self.clock.mult; // (d0) live mult, like the PIT
+        // (d0a) The CONTINUOUS device-time accumulator (the LOCKED-design fix):
+        //       real-time-anchored device PHASE reads "now" from this, NOT from a
+        //       recompute off the absolute cycle counter (which jumps on a live mult
+        //       change). Bound here + re-bound on restore, like `cycles`/`mult`; the
+        //       VALUE rides the snapshot. At mult 12 it equals cpu.st.cycles.
+        self.speaker.device_time = &self.device_time;
+        self.speaker.dt_accounted = &self.dt_accounted_cpu; // (d0a) high-water mark for the tail
         // (d1b) VGA cycle back-pointer: the Input Status Register #1 (0x3DA/0x3BA)
         //       retrace + display-enable bits are derived from the cycle ledger,
         //       not host time. Re-bound on restore exactly like the PIT/speaker.
         self.vga.cycles = &self.cpu.st.cycles;
         self.vga.mult = &self.clock.mult; // (d0) live mult, like the PIT
+        self.vga.device_time = &self.device_time; // (d0a) continuous device-time now
+        self.vga.dt_accounted = &self.dt_accounted_cpu; // (d0a) high-water mark for the tail
         // (d3) OPL2 cycle back-pointer: the timer-overflow state read back through
         //      the status register (port 0x388) is derived from the cycle ledger,
         //      not host time. Re-bound on restore exactly like the PIT/speaker/VGA.
         self.opl.cycles = &self.cpu.st.cycles;
         self.opl.mult = &self.clock.mult; // (d0) live mult, like the PIT
+        self.opl.device_time = &self.device_time; // (d0a) continuous device-time now
+        self.opl.dt_accounted = &self.dt_accounted_cpu; // (d0a) high-water mark for the tail
         // (d2) 8042 keyboard controller back-pointer: it asserts IRQ1 through the
         //      PIC (the same `picRaiseThunk` the PIT uses for IRQ0). Re-bound on
         //      restore exactly like the PIT/speaker pointers.
@@ -534,7 +603,26 @@ pub const Machine = struct {
     fn schedThunk(ctx: *anyopaque, from: u64, ticks: u64, val: u32) void {
         const self: *Machine = @ptrCast(@alignCast(ctx));
         const delta = timing.ticksToCycles(ticks, &self.sched.remainder); // device-time (mult-independent)
-        self.sched.schedule(timing.cpuToDevice(from, self.clock.mult), delta, PIT_SOURCE_ID, .pit_ch0, val);
+        self.sched.schedule(self.cpuAnchorToDevice(from), delta, PIT_SOURCE_ID, .pit_ch0, val);
+    }
+    /// Convert a CPU-cycle scheduling ANCHOR (the PIT/keyboard pass `cpu.st.cycles`
+    /// at a fresh arm, or the `fire_cpu` from `fireDue` at a periodic re-arm) into a
+    /// DEVICE-TIME anchor, RELATIVE to the continuous accumulator (the LOCKED-design
+    /// fix) — NOT via an absolute recompute (the removed SHORTCUT). The device-time
+    /// anchor is the current `device_time` plus the device-time span of the
+    /// cpu-cycle delta from now: `device_time + (anchor - cpu.st.cycles) *
+    /// REF_MULT / mult`. An anchor at-or-before now (the common case: now, or a past
+    /// fire point) subtracts the device-time the accumulator has already run past, so
+    /// a periodic re-arm chains from the event's EXACT device-time fire point and the
+    /// cadence stays continuous across a live mult change. Identity at mult 12
+    /// (device_time == cpu.st.cycles) → byte-identical scheduling.
+    fn cpuAnchorToDevice(self: *Machine, anchor_cpu: u64) u64 {
+        self.syncDeviceTime(); // device_time current before relating an anchor to it
+        const now_cpu = self.cpu.st.cycles;
+        if (anchor_cpu >= now_cpu) {
+            return self.device_time + timing.cpuToDevice(anchor_cpu - now_cpu, self.clock.mult);
+        }
+        return self.device_time - timing.cpuToDevice(now_cpu - anchor_cpu, self.clock.mult);
     }
     fn cancelThunk(ctx: *anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(ctx));
@@ -546,7 +634,7 @@ pub const Machine = struct {
     /// `from` (cpu.st.cycles) is converted CPU→device-time. Identity at mult 12.
     fn kbdSchedThunk(ctx: *anyopaque, from: u64, delta_device: u64) void {
         const self: *Machine = @ptrCast(@alignCast(ctx));
-        self.sched.schedule(timing.cpuToDevice(from, self.clock.mult), delta_device, KBD_SOURCE_ID, .kbd_repeat, 0);
+        self.sched.schedule(self.cpuAnchorToDevice(from), delta_device, KBD_SOURCE_ID, .kbd_repeat, 0);
     }
     fn kbdCancelThunk(ctx: *anyopaque) void {
         const self: *Machine = @ptrCast(@alignCast(ctx));
@@ -571,6 +659,10 @@ pub const Machine = struct {
         self.vga.reset(); // zero VRAM + DAC + indices (deterministic power-on)
         self.opl.reset(); // OPL2 timers + reg index to power-on (no overflow)
         self.sched.reset();
+        // Device-time accumulator back to power-on (= the cpu cycle 0 it tracks).
+        self.device_time = 0;
+        self.dt_remainder = 0;
+        self.dt_accounted_cpu = 0;
         self.shutdown = false;
         // Re-init the host-serviced state (the callback ids + routing are re-
         // established by `post`; ids stay stable since registration order is fixed).
@@ -631,14 +723,21 @@ pub const Machine = struct {
     /// the device callback resolved from `(source_id, kind)` (M-D11). Timing-
     /// neutral (M-D7).
     pub fn fireDue(self: *Machine) void {
-        // The scheduler keys on DEVICE-TIME (Phase 1 seam): convert the CPU cycle
-        // ledger CPU→device-time to find due events, and convert each popped
-        // event's device-time `fire_cycle` back to a CPU cycle before handing it
-        // to the device callback (the PIT/keyboard re-arm in their CPU-cycle
-        // domain). Identity at the pinned mult 12 → byte-identical firing.
-        const now_dt = timing.cpuToDevice(self.cpu.st.cycles, self.clock.mult);
+        // The scheduler keys on DEVICE-TIME: "now" is the CONTINUOUS device-time
+        // accumulator (the LOCKED-design fix) — NOT recomputed from the absolute
+        // cycle counter (the removed SHORTCUT, which JUMPED on a live mult change).
+        // Each popped event's device-time `fire_cycle` is converted back to a CPU
+        // cycle for the device callback (the PIT/keyboard re-arm in their CPU-cycle
+        // domain): the cpu-cycle now MINUS the cpu span for the device-time the
+        // accumulator has run PAST the fire point (`device_time - fire_cycle`), so
+        // it lands on the cpu cycle that corresponds to the event's device-time.
+        // Identity at the pinned mult 12 (device_time == cpu.st.cycles) → the
+        // fire cycle is byte-identical to today.
+        self.syncDeviceTime(); // device_time current before draining due events
+        const now_dt = self.device_time;
         while (self.sched.popDue(now_dt)) |ev| {
-            const fire_cpu = timing.deviceToCpu(ev.fire_cycle, self.clock.mult);
+            const past_dt = now_dt - ev.fire_cycle; // device-time already elapsed past the fire point
+            const fire_cpu = self.cpu.st.cycles - timing.deviceDeltaToCpu(past_dt, self.clock.mult);
             switch (ev.kind) {
                 .pit_ch0 => self.pit.onPitCh0Fire(fire_cpu),
                 .pit_ch1, .pit_ch2 => {}, // not wired in this plan (ch0 only)
@@ -751,6 +850,18 @@ pub const Machine = struct {
         /// byte-identical to the pre-Phase-2 format only in VALUE — the struct
         /// gained a field (an in-memory `Machine.Snapshot`, not a wire golden).
         clock: ClockConfig,
+        /// The CONTINUOUS device-time accumulator + its fractional-remainder carry
+        /// (the LOCKED-design fix). Both are path-dependent / guest-affecting state
+        /// (after a live mult change `device_time` diverges from `cpu.st.cycles`, and
+        /// the remainder records the exact sub-unit carry), so they MUST ride the
+        /// snapshot or a restore would resume devices at the wrong phase. At the
+        /// default mult 12 these are `{ device_time = cpu.st.cycles, dt_remainder = 0 }`.
+        device_time: u64,
+        dt_remainder: u64,
+        /// The cycle-ledger high-water mark for the lazy device-time advance — a
+        /// shadow of `cpu.st.cycles`. Snapshotted so a restore resumes the mark and
+        /// the next `syncDeviceTime` advances the correct (non-double-counted) span.
+        dt_accounted_cpu: u64,
     };
 
     pub fn snapshot(self: *const Machine) Snapshot {
@@ -775,6 +886,9 @@ pub const Machine = struct {
             .dos_terminated = self.dos.terminated,
             .shutdown = self.shutdown,
             .clock = self.clock,
+            .device_time = self.device_time,
+            .dt_remainder = self.dt_remainder,
+            .dt_accounted_cpu = self.dt_accounted_cpu,
         };
     }
 
@@ -806,6 +920,13 @@ pub const Machine = struct {
         // write), so they need no re-bind here. `wire` (re-run before restore in
         // the snapshot→restore contract) binds them; we only overwrite the VALUE.
         self.clock = snap.clock;
+        // The continuous device-time accumulator + remainder ride the snapshot
+        // (path-dependent state); restoring them resumes every device at the exact
+        // phase it had, even after a mid-run mult change. The device `*const u64`
+        // back-pointers into `&self.device_time` are stable across this value write.
+        self.device_time = snap.device_time;
+        self.dt_remainder = snap.dt_remainder;
+        self.dt_accounted_cpu = snap.dt_accounted_cpu;
     }
 
     /// Set the active CPU:PIT multiplier (Phase 3 — the real live-clock setter). The
@@ -828,6 +949,12 @@ pub const Machine = struct {
     /// recordable/replayable as `(cycle, mult)`. The default mult (12) is never
     /// changed by the determinism harness, so every golden stays byte-identical.
     pub fn setClockMult(self: *Machine, mult: u64) u64 {
+        // Account the device-time accrued up to THIS cycle at the OLD rate BEFORE the
+        // change, so the change only affects the FUTURE advance rate — `device_time`
+        // stays continuous at the instant of the change (the continuity guarantee /
+        // GATE 2). Without this, the unaccounted span since the last sync would be
+        // converted at the new rate (a one-shot phase hiccup).
+        self.syncDeviceTime();
         const applied = std.math.clamp(mult, @as(u64, 1), timing.MAX_MULT);
         self.clock.mult = applied;
         return applied;

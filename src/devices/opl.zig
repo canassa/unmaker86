@@ -35,10 +35,11 @@
 //! Reg 3 = timer-2 reload (8-bit; interval = (256-reload) * 320us).
 //!
 //! Determinism (CLAUDE prime directive): a timer's overflow is a pure function of
-//! the u64 CYCLE LEDGER (`start_cycle`, `interval_cycles`) — never the host wall
-//! clock (CLAUDE #2). dosbox-x derives the same overflow from `PIC_FullIndex()`
-//! (ms wall time); zdos derives it from elapsed CPU cycles via the shared
-//! `timing` leaf, so the AdLib probe's pass/fail is reproducible run-to-run.
+//! the machine's CONTINUOUS DEVICE-TIME accumulator (`start_dt` + the device-time
+//! interval) — never the host wall clock (CLAUDE #2). dosbox-x derives the same
+//! overflow from `PIC_FullIndex()` (ms wall time); zdos derives it from the
+//! device-time domain via the shared `timing` leaf, so the AdLib probe's pass/fail
+//! is reproducible run-to-run AND continuous across a live CPU-clock change.
 //! All device state is plain and zero at reset (CLAUDE #5).
 //!
 //! Cycle cost (CLAUDE hard-constraint #1): port I/O is charged by the CPU's
@@ -70,9 +71,14 @@ const Timer = struct {
     masked: bool = false,
     /// Latched overflow flag. Set lazily by `update`, cleared by reset/mask/start.
     overflow: bool = false,
-    /// The cycle at which the current interval started (synced on start, and
-    /// re-synced past each elapsed interval by `update`).
-    start_cycle: u64 = 0,
+    /// The DEVICE-TIME at which the current interval started (synced on start, and
+    /// re-synced past each elapsed interval by `update`). Stored in DEVICE-TIME (the
+    /// LOCKED-design fix), NOT CPU cycles: elapsed = `device_time_now - start_dt` is
+    /// then a pure device-time delta with NO mult conversion, so it stays CONTINUOUS
+    /// across a live mult change (the removed SHORTCUT converted a CPU-cycle delta at
+    /// the live mult, which JUMPED on a change). At mult 12 device-time == cpu cycles,
+    /// so this is byte-identical to the former cycle anchor.
+    start_dt: u64 = 0,
 
     /// Interval to overflow, in DEVICE-TIME units (Phase 1 device-time seam): the
     /// OPL tick rate is real-time-anchored, so the period lives in the mult-
@@ -91,19 +97,20 @@ const Timer = struct {
     /// dosbox-x `Timer::Update(time)`: if the interval has elapsed, re-sync `start`
     /// to the most recent interval boundary and (when unmasked) latch overflow.
     /// Pure function of the cycle ledger.
-    fn update(self: *Timer, now: u64, mult: u64) void {
+    /// `now` is DEVICE-TIME (the machine's continuous accumulator). dosbox-x
+    /// `Timer::Update(time)`: if the interval has elapsed, re-sync `start_dt` to the
+    /// most recent interval boundary and (when unmasked) latch overflow.
+    fn update(self: *Timer, now_dt: u64) void {
         if (!self.enabled) return;
         const interval = self.intervalDeviceTime(); // device-time
         if (interval == 0) return; // degenerate; never overflows
-        if (now < self.start_cycle) return; // clock went backwards (restore): no-op
-        // Phase math in DEVICE-TIME (Phase 1/2 seam): convert the elapsed CPU span
-        // CPU→device-time (at the live `mult`) and compare to the device-time
-        // interval. Identity at the default mult 12. The re-synced boundary
-        // remainder is converted back to a CPU span before subtracting from `now`
-        // (`start_cycle` stays CPU cycles, the device's read-back domain).
-        const elapsed = timing.cpuToDevice(now - self.start_cycle, mult);
+        if (now_dt < self.start_dt) return; // clock went backwards (restore): no-op
+        // Phase math entirely in DEVICE-TIME (the LOCKED-design fix): elapsed is a
+        // pure device-time delta — NO mult conversion — so it is continuous across a
+        // live mult change. The re-synced boundary keeps the sub-interval remainder.
+        const elapsed = now_dt - self.start_dt;
         if (elapsed >= interval) {
-            self.start_cycle = now - timing.deviceToCpu(elapsed % interval, mult);
+            self.start_dt = now_dt - (elapsed % interval);
             if (!self.masked) self.overflow = true;
         }
     }
@@ -112,12 +119,12 @@ const Timer = struct {
     /// (Either already latched, or the interval has elapsed and it is unmasked.)
     /// Pure function of (state, now) — used by the observability peek, not the
     /// real read path (the real read latches via `update`).
-    fn wouldOverflow(self: *const Timer, now: u64, mult: u64) bool {
+    fn wouldOverflow(self: *const Timer, now_dt: u64) bool {
         if (self.overflow) return true;
         if (!self.enabled or self.masked) return false;
         const interval = self.intervalDeviceTime(); // device-time
-        if (interval == 0 or now < self.start_cycle) return false;
-        return timing.cpuToDevice(now - self.start_cycle, mult) >= interval;
+        if (interval == 0 or now_dt < self.start_dt) return false;
+        return (now_dt - self.start_dt) >= interval; // pure device-time delta
     }
 
     /// reg 2 / reg 3 write: set the reload value. dosbox re-syncs (Update) before
@@ -128,11 +135,11 @@ const Timer = struct {
 
     /// Control bit0/bit1 = 1: start the timer (only re-syncs `start` when it was
     /// not already running, matching dosbox-x `Start`).
-    fn start(self: *Timer, now: u64) void {
+    fn start(self: *Timer, now_dt: u64) void {
         if (!self.enabled) {
             self.enabled = true;
             self.overflow = false;
-            self.start_cycle = now;
+            self.start_dt = now_dt;
         }
     }
 
@@ -171,6 +178,17 @@ pub const Opl = struct {
     /// elapsed CPU span ↔ device-time at this live ratio. Defaults to
     /// `timing.DEFAULT_MULT` (12) when unbound (stand-alone tests).
     mult: ?*const u64 = null,
+    /// The CONTINUOUS device-time accumulator (`&machine.device_time`) — the
+    /// LOCKED-design fix. The timers anchor + compare in DEVICE-TIME read from THIS,
+    /// NOT from a recompute off `cpu.st.cycles` (the removed SHORTCUT, which made the
+    /// overflow phase JUMP on a live mult change). Bound at `wire`, re-bound on
+    /// restore, like `cycles`/`mult`. `null` (stand-alone tests) falls back to the
+    /// cycle-derived device-time. At mult 12 it equals `cpu.st.cycles`.
+    device_time: ?*const u64 = null,
+    /// The machine's `dt_accounted_cpu` high-water mark — `deviceTimeNow` adds the
+    /// uncommitted tail (`cyclesNow - dt_accounted`) so a mid-instruction read is
+    /// current. Same machine accumulator, not a per-device anchor.
+    dt_accounted: ?*const u64 = null,
 
     pub fn reset(self: *Opl) void {
         self.reg_index = 0;
@@ -186,15 +204,25 @@ pub const Opl = struct {
         return (self.mult orelse return timing.DEFAULT_MULT).*;
     }
 
+    /// The current DEVICE-TIME "now" — from the machine's CONTINUOUS accumulator
+    /// (the LOCKED-design fix) when wired; else (stand-alone test) fall back to
+    /// converting the cycle ledger at the current mult. Identity at mult 12.
+    fn deviceTimeNow(self: *const Opl) u64 {
+        if (self.device_time) |dt| {
+            const acc = self.dt_accounted orelse return dt.*;
+            return dt.* + timing.cpuToDevice(self.cyclesNow() - acc.*, self.multNow());
+        }
+        return timing.cpuToDevice(self.cyclesNow(), self.multNow());
+    }
+
     /// Read the OPL status register (port 0x388). dosbox-x `Chip::Read`: timer-1
     /// overflow -> 0x40|0x80, timer-2 overflow -> 0x20|0x80. Updates the timers
     /// from the ledger first (side-effect-free w.r.t. the ledger — it only mutates
     /// the device's own latched-overflow state, as the real chip does on any read).
     fn readStatus(self: *Opl) u8 {
-        const now = self.cyclesNow();
-        const mult = self.multNow();
-        self.timer1.update(now, mult);
-        self.timer2.update(now, mult);
+        const now = self.deviceTimeNow();
+        self.timer1.update(now);
+        self.timer2.update(now);
         var v: u8 = 0;
         if (self.timer1.overflow) v |= 0x40 | 0x80;
         if (self.timer2.overflow) v |= 0x20 | 0x80;
@@ -206,11 +234,10 @@ pub const Opl = struct {
     /// read DOES latch, so this is debug-only — it mirrors `/api/io`'s shadow
     /// contract). Pure function of the cycle ledger + current timer state.
     pub fn statusPeek(self: *const Opl) u8 {
-        const now = self.cyclesNow();
-        const mult = self.multNow();
+        const now = self.deviceTimeNow();
         var v: u8 = 0;
-        if (self.timer1.wouldOverflow(now, mult)) v |= 0x40 | 0x80;
-        if (self.timer2.wouldOverflow(now, mult)) v |= 0x20 | 0x80;
+        if (self.timer1.wouldOverflow(now)) v |= 0x40 | 0x80;
+        if (self.timer2.wouldOverflow(now)) v |= 0x20 | 0x80;
         return v;
     }
 
@@ -240,15 +267,14 @@ pub const Opl = struct {
     /// this register-trace model; all other registers (FM operator params) are
     /// accepted and dropped (no synthesis — D2).
     fn writeData(self: *Opl, val: u8) void {
-        const now = self.cyclesNow();
-        const mult = self.multNow();
+        const now = self.deviceTimeNow();
         switch (self.reg_index) {
             0x02 => { // timer-1 reload
-                self.timer1.update(now, mult);
+                self.timer1.update(now);
                 self.timer1.setCounter(val);
             },
             0x03 => { // timer-2 reload
-                self.timer2.update(now, mult);
+                self.timer2.update(now);
                 self.timer2.setCounter(val);
             },
             0x04 => { // timer control

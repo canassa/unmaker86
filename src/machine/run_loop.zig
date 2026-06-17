@@ -48,8 +48,12 @@ pub fn step(m: *Machine) StepOutcome {
     // 1. Fire due events (raises IRR bits at the deterministic boundary, M-D6).
     m.fireDue();
 
-    // 2. Run the CPU one step.
+    // 2. Run the CPU one step. The CPU is the sole writer of `cpu.st.cycles`; the
+    //    continuous device-time accumulator is advanced lazily by `syncDeviceTime`
+    //    (called at every device-time read + below) off the cycle high-water mark,
+    //    so re-entrant/nested steps account each cycle exactly once (no double-count).
     const r = m.cpu.step();
+    m.syncDeviceTime();
 
     // 3. Handle the stop reason.
     switch (r.stop_reason) {
@@ -61,7 +65,10 @@ pub fn step(m: *Machine) StepOutcome {
         .halted => {
             // HLT fast-forward (D11). The CPU returned idle-to-next-event in
             // r.cycles_consumed; the canonical target is nextEventCycle().
-            const next = m.sched.nextEventCycle();
+            // nextEventCycle() converts the next event's DEVICE-TIME fire point to a
+            // CPU cycle via the continuous accumulator (delta from device_time), so
+            // the idle target is continuous across a live mult change.
+            const next = m.nextEventCycle();
             if (next == std.math.maxInt(u64)) {
                 // No scheduled events: permanent halt iff the CPU is not wakeable.
                 // Mirror the CPU's actual wake rule by re-stepping: a wakeable CPU
@@ -76,7 +83,11 @@ pub fn step(m: *Machine) StepOutcome {
             }
             // Fast-forward through the idle span to the next event cycle. The CPU
             // is the sole ledger writer (cpu.fastForwardIdle), never the machine.
+            // The idle jump advances `cpu.st.cycles` by a LARGE delta; `syncDeviceTime`
+            // then advances the accumulator by the converted delta (the HLT-path
+            // correctness point — skipping it would desync device_time from the ledger).
             m.cpu.fastForwardIdle(next);
+            m.syncDeviceTime();
             return cont_outcome;
         },
     }

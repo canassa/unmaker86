@@ -67,6 +67,17 @@ pub const Speaker = struct {
     /// elapsed CPU ledger → device-time at this live ratio. Defaults to
     /// `timing.DEFAULT_MULT` (12) when unbound (stand-alone tests).
     mult: ?*const u64 = null,
+    /// The CONTINUOUS device-time accumulator (`&machine.device_time`) — the
+    /// LOCKED-design fix. The refresh-bit phase reads "now" from THIS (device-time
+    /// directly), NOT from a recompute off `cpu.st.cycles` (the removed SHORTCUT,
+    /// which made the PWM phase JUMP on a live mult change). Bound at `wire`,
+    /// re-bound on restore, like `cycles`/`mult`. `null` (stand-alone tests) falls
+    /// back to the cycle-derived phase. At mult 12 it equals `cpu.st.cycles`.
+    device_time: ?*const u64 = null,
+    /// The machine's `dt_accounted_cpu` high-water mark — `deviceTimeNow` adds the
+    /// uncommitted tail (`cyclesNow - dt_accounted`) so a mid-instruction read is
+    /// current. Same machine accumulator, not a per-device anchor.
+    dt_accounted: ?*const u64 = null,
 
     pub fn reset(self: *Speaker) void {
         self.port_61_data = 0;
@@ -81,6 +92,17 @@ pub const Speaker = struct {
 
     fn multNow(self: *const Speaker) u64 {
         return (self.mult orelse return timing.DEFAULT_MULT).*;
+    }
+
+    /// The current DEVICE-TIME "now" — from the machine's CONTINUOUS accumulator
+    /// (the LOCKED-design fix) when wired; else (stand-alone test) fall back to
+    /// converting the cycle ledger at the current mult. Identity at mult 12.
+    fn deviceTimeNow(self: *const Speaker) u64 {
+        if (self.device_time) |dt| {
+            const acc = self.dt_accounted orelse return dt.*;
+            return dt.* + timing.cpuToDevice(self.cyclesNow() - acc.*, self.multNow());
+        }
+        return timing.cpuToDevice(self.cyclesNow(), self.multNow());
     }
 
     /// read_p61 (keyboard.cpp:724), MCH_VGA path.
@@ -101,7 +123,7 @@ pub const Speaker = struct {
         // nominal cycles at the reference mult, so this is byte-identical today.
         const window: u64 = timing.usToDeviceTime(30);
         if (window != 0) {
-            const phase = timing.cpuToDevice(self.cyclesNow(), self.multNow()) % window;
+            const phase = self.deviceTimeNow() % window;
             if (phase >= window / 2) v |= 0x10;
         }
         return v;

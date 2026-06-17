@@ -36,13 +36,25 @@ fn fireKbdReptsUntil(m: *Machine, until_cycle: u64) u32 {
     while (true) {
         const next = m.nextEventCycle();
         if (next > until_cycle) break;
-        m.cpu.st.cycles = next;
+        advanceLedger(m, next);
         const before = m.kbd.fifo_count;
         m.fireDue();
         if (m.kbd.fifo_count > before) fired += 1; // a repeat pushed a byte
     }
-    m.cpu.st.cycles = until_cycle;
+    advanceLedger(m, until_cycle);
     return fired;
+}
+
+/// Test-only: advance the cycle ledger to `to` (mirrors the run loop / HLT
+/// fast-forward, which advance `cpu.st.cycles`). These tests drive
+/// `fireDue`/`nextEventCycle` directly instead of going through `run_loop.step`;
+/// those calls lazily catch the continuous `device_time` accumulator up to the new
+/// ledger via the machine's `syncDeviceTime` high-water mark, so the test only sets
+/// the cycle ledger here (no manual device_time poke — that would double-advance).
+/// Never rewinds.
+fn advanceLedger(m: *Machine, to: u64) void {
+    if (to <= m.cpu.st.cycles) return;
+    m.cpu.st.cycles = to;
 }
 
 fn makeMachine(alloc: std.mem.Allocator) !*Machine {
@@ -407,7 +419,7 @@ test "typematic Stunts: extra makes are idempotent; break ends the hold" {
     const first = m.nextEventCycle();
     // A redundant make of the SAME key restarts the delay (last-key-wins) but keeps
     // exactly one live event — never an assert (cancel-then-schedule).
-    m.cpu.st.cycles = 50;
+    advanceLedger(m, 50);
     injectKey(m, 0x48, true, true);
     try std.testing.expectEqual(@as(u64, 50 + msToCycles(500)), m.nextEventCycle());
     try std.testing.expect(m.nextEventCycle() != first);
@@ -469,7 +481,7 @@ test "typematic snapshot: arm mid-delay, restore, continue → same cadence" {
     m.cpu.st.cycles = 0;
     injectKey(m, 0x1E, true, false); // arm; first repeat at 500 ms
     // Snapshot mid-delay (no repeat has fired yet).
-    m.cpu.st.cycles = msToCycles(100);
+    advanceLedger(m, msToCycles(100));
     const snap = m.snapshot();
     const ram_copy = try alloc.dupe(u8, m.bus.ram);
     defer alloc.free(ram_copy);
@@ -677,17 +689,16 @@ test "Phase 2: per-config determinism — same mult reproduces; different mult i
 // PIT/keyboard event keeps its DEVICE-TIME fire point in the queue; only the
 // device-time→CPU conversion changes for the FUTURE. The test below proves this.
 //
-// PHASE CONTINUITY (KNOWN BLOCKER — see plans/configurable-cpu-clock.md, locked
+// PHASE CONTINUITY (BLOCKER RESOLVED — see plans/configurable-cpu-clock.md, locked
 // design point 1): the LOCKED design requires a CONTINUOUS `device_time` ACCUMULATOR
 // so the VGA/speaker phase + the scheduler "now" reference stay continuous across a
-// change. Phases 1-2 shipped the SHORTCUT `cpuToDevice(absolute_cpu_cycles, mult)`
-// instead — byte-identical at the fixed default mult 12, but NOT continuous when the
-// mult changes mid-run (the absolute cycle history is retro-scaled by the new mult).
-// At cycle 123457 the device-time is 123457 @ mult 12 but 61728 @ mult 24 → a ~30%
-// frame-phase JUMP. This is a one-shot fidelity glitch at the instant of the change
-// (a VGA-retrace tear / PIT phase hiccup); it is STILL fully deterministic given
-// `(cycle, mult)`. The faithful fix is the device_time accumulator (Phase-1-scope),
-// NOT per-device anchor fields (rejected approach A). DELIBERATELY NOT papered over.
+// live mult change. The SHORTCUT (`cpuToDevice(absolute_cpu_cycles, mult)`) was
+// REPLACED by the machine-owned `device_time` accumulator (advanced by the run loop
+// every step + the HLT fast-forward, with an integer remainder carry). Now a mult
+// change only changes the FUTURE advance RATE; `device_time` itself does NOT jump, so
+// the VGA retrace phase + the scheduler "now" reference are continuous at the instant
+// of the change. GATE 2 below proves it (the shortcut would have failed it). Still
+// fully deterministic given `(cycle, mult)`.
 // ---------------------------------------------------------------------------
 
 test "Phase 3: a scripted (cycle, mult) change replays byte-identically across two runs" {
@@ -742,14 +753,122 @@ test "Phase 3: a pending PIT event keeps its device-time fire point across a mul
     // A live mult change must NOT touch the scheduler — the event keeps its
     // device-time fire point (the crystal kept counting). Only the device-time→CPU
     // conversion changes for the FUTURE: the scheduler queue is untouched.
+    const dt_now = m.device_time;
+    const cyc_now = m.cpu.st.cycles;
     _ = m.setClockMult(24);
     const fire_dt_after = m.sched.nextEventCycle();
     try std.testing.expectEqual(fire_dt_before, fire_dt_after);
 
-    // ...and the CPU cycle the event now lands at is the device-time fire point
-    // scaled by the NEW mult (a faster CPU runs more cycles before the same
-    // device-time elapses) — no re-arm, just the new conversion ratio for the
-    // FUTURE. There is exactly ONE such event (no double-arm from the change).
+    // ...and the CPU cycle the event now lands at is the cpu-cycle NOW plus the
+    // REMAINING device-time until the event scaled by the NEW mult (the continuous
+    // accumulator formula — a faster CPU runs more cycles before the same remaining
+    // device-time elapses). This is CONTINUOUS: the absolute device-time history is
+    // NOT retro-scaled (the removed SHORTCUT did `deviceToCpu(absolute_dt, 24)`,
+    // which JUMPED). There is exactly ONE such event (no double-arm from the change).
     const next_cpu = m.nextEventCycle();
-    try std.testing.expectEqual(timing.deviceToCpu(fire_dt_before, 24), next_cpu);
+    const expect_cpu = cyc_now + timing.deviceDeltaToCpu(fire_dt_before - dt_now, 24);
+    try std.testing.expectEqual(expect_cpu, next_cpu);
+}
+
+// ---------------------------------------------------------------------------
+// GATE 2 — the continuity fix actually works (the missing Phase-3 gate). A live
+// mult change keeps `device_time` (and the VGA retrace phase derived from it)
+// CONTINUOUS: captured at the SAME cpu cycle just before and just after the change
+// they are EQUAL — only the FUTURE advance rate changes. The removed SHORTCUT
+// (`cpuToDevice(absolute_cpu_cycles, mult)`) would show a JUMP here (123457 @ mult
+// 12 vs 61728 @ mult 24), so this is the proof the BLOCKER is resolved.
+// ---------------------------------------------------------------------------
+test "GATE 2: device_time + VGA retrace phase are CONTINUOUS across a live mult change" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    // Run a while so the cycle history is large (the shortcut's retro-scale grows
+    // with the absolute history — this is where it would tear).
+    armIrq0Counter(m, 0x14);
+    _ = m.runCycles(123_456);
+
+    // Capture device_time + the VGA Input-Status-1 retrace phase at this instant.
+    const dt_before = m.device_time;
+    const cyc_before = m.cpu.st.cycles;
+    const vga_before = m.vga.statusReg1Peek(m.vga.deviceTimeNow());
+
+    // The live change applies at THIS cpu cycle (no cycles run between).
+    _ = m.setClockMult(24);
+
+    // device_time is UNCHANGED at the instant of the change (only its future advance
+    // rate changed) — the continuity guarantee. The cpu cycle is also unchanged.
+    try std.testing.expectEqual(dt_before, m.device_time);
+    try std.testing.expectEqual(cyc_before, m.cpu.st.cycles);
+    // The VGA retrace phase is derived from the (continuous) device_time, so it does
+    // NOT jump — the byte is identical before and after the change.
+    const vga_after = m.vga.statusReg1Peek(m.vga.deviceTimeNow());
+    try std.testing.expectEqual(vga_before, vga_after);
+
+    // Contrast (the shortcut's discontinuity, proving this test would have caught
+    // the bug): the OLD "now" recomputed from the absolute cycle counter DOES jump
+    // across the change — different device-time for the SAME cpu cycle.
+    const shortcut_before = timing.cpuToDevice(cyc_before, 12);
+    const shortcut_after = timing.cpuToDevice(cyc_before, 24);
+    try std.testing.expect(shortcut_before != shortcut_after); // the JUMP the fix removes
+    // ...and the accumulator does NOT exhibit that jump:
+    try std.testing.expect(m.device_time == dt_before);
+}
+
+test "GATE 1: at the default mult 12 device_time tracks cpu.st.cycles exactly" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    armIrq0Counter(m, 0x14);
+    // Run in several bursts, including past HLT idle jumps; at mult 12 the device-time
+    // accumulator must equal the cpu cycle ledger at all times, with a 0 remainder.
+    const bursts = [_]u64{ 1, 100, 5_000, 50_000, 200_000 };
+    for (bursts) |n| {
+        _ = m.runCycles(n);
+        try std.testing.expectEqual(m.cpu.st.cycles, m.device_time);
+        try std.testing.expectEqual(@as(u64, 0), m.dt_remainder);
+    }
+}
+
+test "GATE: device_time + remainder round-trip a snapshot, incl. after a mid-run mult change" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    armIrq0Counter(m, 0x14);
+    _ = m.runCycles(10_000);
+    _ = m.setClockMult(7); // non-integer-divisor mult -> a non-zero remainder forms
+    _ = m.runCycles(33_333);
+    const dt = m.device_time;
+    const rem = m.dt_remainder;
+    const cyc = m.cpu.st.cycles;
+    const snap = m.snapshot();
+    const ram_copy = try alloc.dupe(u8, m.bus.ram);
+    defer alloc.free(ram_copy);
+
+    const m2 = try makeMachine(alloc);
+    defer {
+        m2.deinit();
+        alloc.destroy(m2);
+    }
+    m2.restore(snap);
+    @memcpy(m2.bus.ram, ram_copy);
+    // The accumulator + remainder + mult survive the round-trip byte-identically.
+    try std.testing.expectEqual(dt, m2.device_time);
+    try std.testing.expectEqual(rem, m2.dt_remainder);
+    try std.testing.expectEqual(cyc, m2.cpu.st.cycles);
+    try std.testing.expectEqual(@as(u64, 7), m2.clock.mult);
+    // ...and continuing both runs in lock-step keeps device_time identical (the
+    // restore resumed the exact phase + remainder, so the future advance matches).
+    _ = m.runCycles(20_000);
+    _ = m2.runCycles(20_000);
+    try std.testing.expectEqual(m.device_time, m2.device_time);
+    try std.testing.expectEqual(m.dt_remainder, m2.dt_remainder);
 }
