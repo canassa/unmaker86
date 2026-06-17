@@ -26,14 +26,6 @@
 <div id="hud" class="hud">
   <span id="status" class="status pending">connecting&hellip;</span>
   <span id="info" class="info"></span>
-  <!-- Emulation-speed knob: retunes the pacer's slice size live via
-       POST /api/run/start {slice_cycles}. Effective wall speed ≈ slice/10ms;
-       labelled in MHz (slice = MHz * 10000). Does NOT affect determinism. -->
-  <label id="speed" class="speed" title="Emulation speed (wall-clock); does not affect determinism">
-    <span class="speed-label">speed</span>
-    <input id="speed-range" type="range" min="5" max="200" step="5" value="25">
-    <span id="speed-val" class="speed-val">25 MHz</span>
-  </label>
 </div>
 
 <script src="app.js"></script>
