@@ -94,3 +94,31 @@ body {
 .info {
   color: #8990a0;
 }
+
+/* Emulation-speed knob (pushed to the right of the HUD). */
+.speed {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #8990a0;
+  cursor: pointer;
+}
+
+.speed-label {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.8rem;
+}
+
+#speed-range {
+  width: 9rem;
+  accent-color: #8ce99a;
+  cursor: pointer;
+}
+
+.speed-val {
+  min-width: 4.5rem;
+  text-align: right;
+  color: #c8cdd6;
+}

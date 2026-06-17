@@ -528,6 +528,42 @@ void main() {
   canvas.addEventListener("contextmenu", function (e) { e.preventDefault(); });
 
   // ===================================================================
+  // Speed knob — retunes the pacer's slice size live (wall-clock speed only,
+  // NOT determinism). Effective cycles/sec ≈ slice_cycles * 100, so we label it
+  // in MHz with slice_cycles = MHz * 10000 (25 MHz == the 250000 default slice).
+  // ===================================================================
+  var CYCLES_PER_MHZ = 10000; // slice_cycles per 1 MHz at the ~10 ms slice cadence
+
+  function setupSpeedKnob() {
+    var range = document.getElementById("speed-range");
+    var valEl = document.getElementById("speed-val");
+    if (!range || !valEl) return;
+
+    function render(mhz) { valEl.textContent = mhz + " MHz"; }
+
+    function apply(mhz) {
+      render(mhz);
+      postJSON("/api/run/start", { slice_cycles: mhz * CYCLES_PER_MHZ });
+    }
+
+    range.addEventListener("input", function () { apply(parseInt(range.value, 10)); });
+
+    // Sync the slider to the server's CURRENT slice on load (so the knob reflects
+    // reality and a reconnect doesn't silently reset the displayed speed).
+    fetch("/api/run/status")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (s) {
+        if (!s || typeof s.slice_cycles !== "number") return;
+        var mhz = Math.round(s.slice_cycles / CYCLES_PER_MHZ);
+        var min = parseInt(range.min, 10), max = parseInt(range.max, 10);
+        if (mhz < min) mhz = min; else if (mhz > max) mhz = max;
+        range.value = String(mhz);
+        render(mhz);
+      })
+      .catch(function () { /* leave the default 25 MHz display */ });
+  }
+
+  // ===================================================================
   // Boot
   // ===================================================================
   function main() {
@@ -540,6 +576,7 @@ void main() {
     }
     requestAnimationFrame(renderLoop);
     connect();
+    setupSpeedKnob();
     canvas.focus();
   }
 

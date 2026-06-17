@@ -71,18 +71,24 @@ pub const RunControl = struct {
     /// argument. The pacer/server pass their own `Io` to the gated queue separately.
     io: Io,
 
-    /// Default slice size: pinned-CPU cycles for ~10 ms of wall-clock (§5). The
-    /// pinned emulated rate is `timing.cpu_clock_hz`; ~10 ms keeps input/control
-    /// latency low (one slice's wall-time) while staying well above per-instruction
-    /// overhead. A caller can override via `/api/run/start {slice_cycles}`.
+    /// Default slice size: the guest cycles executed per ~10 ms wall-clock tick
+    /// (§5). The pacer runs one slice then sleeps the rest of the tick, so this sets
+    /// the effective WALL-CLOCK speed (cycles/sec ≈ `slice_cycles * 100`), NOT guest
+    /// determinism (paced ≡ unpaced — `run_pacer.zig`). ~10 ms keeps input/control
+    /// latency low (one slice's wall-time). A caller (e.g. the player's speed knob)
+    /// retunes it live via `/api/run/start {slice_cycles}`.
     pub const DEFAULT_SLICE_CYCLES: u64 = SLICE_CYCLES_10MS;
     pub const DEFAULT_FPS: u32 = 30;
 
-    /// The pinned 386SX emulated clock (mirrors `abi/timing.zig`'s `cpu_clock_hz`;
-    /// inlined as a literal so this clockless leaf imports no timing module). BaK's
-    /// target. 10 ms at this rate:
-    const CPU_CLOCK_HZ: u64 = 25_000_000;
-    const SLICE_CYCLES_10MS: u64 = CPU_CLOCK_HZ / 100; // 250_000
+    /// The pacer's WALL-CLOCK throughput target — how many guest cycles we aim to
+    /// execute per real second (25 MHz, a 386-class "feel"). This is DELIBERATELY
+    /// SEPARATE from `abi/timing.zig`'s `CPU_CLOCK_HZ` (14.32 MHz, the determinism-
+    /// pinned PIT/device clock that the cycle ledger keys on): this one only scales
+    /// how fast wall-time advances and may be retuned per session; it does NOT affect
+    /// reproducibility. (Named distinctly so it is not mistaken for the device clock —
+    /// they are not, and need not be, equal.)
+    const PACER_TARGET_HZ: u64 = 25_000_000;
+    const SLICE_CYCLES_10MS: u64 = PACER_TARGET_HZ / 100; // 250_000 (10 ms @ 25 MHz)
 
     pub fn getOwner(self: *const RunControl) RunOwner {
         return @enumFromInt(self.owner.load(.acquire));
