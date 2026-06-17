@@ -31,6 +31,7 @@ const cpu_mod = @import("cpu");
 const q = @import("queue.zig");
 const worker_mod = @import("worker.zig");
 const run_control = @import("run_control.zig");
+const live_mouse_mod = @import("live_mouse.zig");
 const wire = @import("json_wire.zig");
 const scancodes = @import("bios").scancodes;
 const png = @import("png.zig");
@@ -138,6 +139,13 @@ pub const Server = struct {
     /// `armed`. Server-owned (allocated once at `init`, like `render`).
     run_control: *run_control.RunControl,
 
+    /// The coalesced LIVE-mouse record (plans/mouse-input.md, LOCKED §1). Host-side
+    /// ARRIVAL state — NOT machine state, NOT snapshotted. The mouse POST handler folds
+    /// each move in non-blocking (no queue submit); the pacer drains it at the slice
+    /// boundary via `input_mouse_fold`, which the worker holds a `*LiveMouseState` for.
+    /// Server-owned (allocated once at `init`, a stable pointer the worker + pacer hold).
+    live_mouse: *live_mouse_mod.LiveMouseState,
+
     /// A pre-shutdown hook invoked ONCE before the worker `shutdown_worker` sentinel
     /// (shutdown ordering §9.1: stop + join any host producer — the run-pacer — so its
     /// submit cannot race the sentinel). Type-agnostic (opaque ctx + fn) so the server
@@ -176,6 +184,11 @@ pub const Server = struct {
         const rc = try gpa.create(run_control.RunControl);
         rc.* = run_control.RunControl.init(io);
         errdefer gpa.destroy(rc);
+        // The coalesced live-mouse record (clockless, float-free POD). Heap-allocated
+        // ONCE so the worker + pacer hold stable pointers across the lifetime.
+        const lm = try gpa.create(live_mouse_mod.LiveMouseState);
+        lm.* = live_mouse_mod.LiveMouseState.init(io);
+        errdefer gpa.destroy(lm);
         // The shared latest-frame buffer (~308 KiB) + the stream hub: allocated ONCE so
         // the host pacer + stream threads hold stable pointers across the lifetime.
         const frame = try gpa.create(sf.SharedFrame);
@@ -193,6 +206,7 @@ pub const Server = struct {
             .arena = std.heap.ArenaAllocator.init(gpa),
             .render = render,
             .run_control = rc,
+            .live_mouse = lm,
             .shared_frame = frame,
             .stream_hub = hub,
         };
@@ -210,6 +224,7 @@ pub const Server = struct {
         self.arena.deinit();
         self.gpa.destroy(self.render);
         self.gpa.destroy(self.run_control);
+        self.gpa.destroy(self.live_mouse);
         self.gpa.destroy(self.shared_frame);
         self.gpa.destroy(self.stream_hub);
     }
@@ -224,6 +239,15 @@ pub const Server = struct {
     /// queue (`queueRef`); it never dereferences the run-controller handle.
     pub fn runControl(self: *Server) *run_control.RunControl {
         return self.run_control;
+    }
+
+    /// The coalesced live-mouse record (for the host pacer to poll its dirty seq and
+    /// submit `input_mouse_fold`). Valid for the server's lifetime; the pacer reaches
+    /// the machine ONLY via the gated queue, never through this handle's machine state
+    /// (the record IS host-side, so reading its atomic-free fields is done UNDER ITS
+    /// MUTEX in `takeFold` on the worker — the pacer just submits the fold command).
+    pub fn liveMouse(self: *Server) *live_mouse_mod.LiveMouseState {
+        return self.live_mouse;
     }
 
     /// The command queue (for the host pacer to submit `run_slice` via the submit-gate).
@@ -250,7 +274,7 @@ pub const Server = struct {
         // pointer is stable). Done in `bind` — BEFORE the pacer starts or any client
         // connects — so `produceFrame`/`hasClients` never read an uninitialized hub.
         self.wireStream();
-        const w: worker_mod.Worker = .{ .queue = &self.queue, .ctrl = self.ctrl, .mount_dir = self.mount_dir, .io = self.io, .render = self.render };
+        const w: worker_mod.Worker = .{ .queue = &self.queue, .ctrl = self.ctrl, .mount_dir = self.mount_dir, .io = self.io, .render = self.render, .live_mouse = self.live_mouse };
         self.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
 
         const addr: net.IpAddress = .{ .ip4 = .loopback(self.port) };
@@ -795,6 +819,42 @@ pub const Server = struct {
         if (!self.requireJson(req, is_json, body)) return;
         var r: wire.MouseReq = .{};
         if (body.len > 0) r = self.parseBody(wire.MouseReq, body) orelse return self.badJson(req);
+
+        // --- LIVE coalesced path (plans/mouse-input.md, LOCKED §1/§2/§3) ---
+        // Any Q16-normalized absolute (`nx_q16`/`ny_q16`) or the true relative channel
+        // (`mdx`/`mdy`) marks this as a LIVE browser event. It folds NON-BLOCKING into
+        // the `LiveMouseState` record (overwrite abs, sum rel, latest buttons) and
+        // returns immediately — NO command queue, NO submit-gate, NO slice wait (the
+        // latency fix). The pacer drains it at the next slice boundary via
+        // `input_mouse_fold`. The buttons on a live event ride into the SAME record
+        // (the browser sends `{nx_q16,ny_q16,buttons}` for a click). Determinism: this
+        // touches no machine cycle; with no POSTs the record stays clean and the fold
+        // arm is a no-op (byte-identical to today).
+        const is_live = r.nx_q16 != null or r.ny_q16 != null or r.mdx != null or r.mdy != null;
+        if (is_live) {
+            // Q16 absolute is set as a PAIR (both axes) — a partial absolute can't map.
+            if ((r.nx_q16 != null) != (r.ny_q16 != null)) {
+                return self.respondError(req, .bad_request, "bad_request", "give both nx_q16 and ny_q16, or neither");
+            }
+            const set_abs = r.nx_q16 != null;
+            const set_rel = r.mdx != null or r.mdy != null;
+            const set_buttons = r.buttons != null;
+            const nx = @min(r.nx_q16 orelse 0, @as(u32, 0x1_0000));
+            const ny = @min(r.ny_q16 orelse 0, @as(u32, 0x1_0000));
+            self.live_mouse.ingest(
+                nx,
+                ny,
+                r.mdx orelse 0,
+                r.mdy orelse 0,
+                r.buttons orelse 0,
+                set_abs,
+                set_rel,
+                set_buttons,
+            );
+            return self.respondJson(req, .ok, "{\"ok\":true}");
+        }
+
+        // --- SCRIPTED / deterministic path (unchanged; input-injection.md §5.2) ---
         // Absolute vs relative are mutually exclusive PER AXIS (§5.2): mixing an
         // absolute set with a relative delta on the SAME axis is ambiguous -> 400.
         if (r.x != null and r.dx != null) {

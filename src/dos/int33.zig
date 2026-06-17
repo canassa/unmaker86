@@ -174,10 +174,14 @@ pub fn Int33(comptime Cpu: type) type {
             return @as(u16, @bitCast(self.y)) & self.gran_y;
         }
 
-        /// Mouse_AfterNewVideoMode + Mouse_Reset (mouse.cpp:1422/1570): derive the
-        /// per-mode range + granularity from the CURRENT BDA video mode, then center
-        /// the cursor and clear buttons/mickeys.
-        fn reset(self: *Self, cpu: *Cpu) void {
+        /// Derive the per-mode cursor RANGE (min/max) + granularity from the CURRENT
+        /// BDA video mode (Mouse_AfterNewVideoMode, mouse.cpp:1422; dosbox-staging
+        /// MOUSEDOS_AfterNewVideoMode, mouseif_dos_driver.cpp:1011). Shared by `reset`
+        /// and `afterNewVideoMode` so the two paths derive an IDENTICAL range — the
+        /// driver is the single source of truth for the range the API-layer live-mouse
+        /// fold scales against (plans/mouse-input.md §5.3/§7). Does NOT touch the
+        /// cursor position, buttons, handler, or mickeys; callers decide that.
+        fn deriveRangeFromMode(self: *Self, cpu: *Cpu) void {
             const mode = cpu.bus.readPhys8(BDA_VIDEO_MODE_PHYS);
 
             // Defaults for the non-SVGA path (mode <= 0x13), mouse.cpp:1436-1441.
@@ -207,6 +211,34 @@ pub fn Int33(comptime Cpu: type) type {
                 },
                 else => {}, // unhandled mode keeps the 639x479 default
             }
+        }
+
+        /// INT 10h AH=00 set-mode hook (Mouse_AfterNewVideoMode, mouse.cpp:1422;
+        /// dosbox-staging MOUSEDOS_AfterNewVideoMode, mouseif_dos_driver.cpp:1011).
+        /// Re-derives the per-mode range + granularity WITHOUT resetting the cursor
+        /// position, buttons, or the installed AX=0Ch handler — exactly what dosbox
+        /// does on a mode change (it does NOT re-center or drop the handler). Reclamps
+        /// the live position into the new range (the "Battle Chess wants this" reclamp,
+        /// shared with AX=07/08). This closes the pre-existing gap (plans/mouse-input.md
+        /// §7): before, the INT 33h range only followed an AX=00/21 reset, never a bare
+        /// INT 10h mode-set — so "scale by the driver's live max" was wrong for a guest
+        /// that set the mode without re-resetting the mouse. Hooked from the machine
+        /// facade (`Services.dispatchCallback`) after the BIOS services AH=00, since
+        /// `src/bios` is below `src/dos` and cannot reach the driver directly.
+        pub fn afterNewVideoMode(self: *Self, cpu: *Cpu) void {
+            self.deriveRangeFromMode(cpu);
+            // Reclamp the live position into the (possibly shrunk) range.
+            if (self.x > self.max_x) self.x = self.max_x;
+            if (self.x < self.min_x) self.x = self.min_x;
+            if (self.y > self.max_y) self.y = self.max_y;
+            if (self.y < self.min_y) self.y = self.min_y;
+        }
+
+        /// Mouse_AfterNewVideoMode + Mouse_Reset (mouse.cpp:1422/1570): derive the
+        /// per-mode range + granularity from the CURRENT BDA video mode, then center
+        /// the cursor and clear buttons/mickeys.
+        fn reset(self: *Self, cpu: *Cpu) void {
+            self.deriveRangeFromMode(cpu);
 
             // Mouse_Reset (mouse.cpp:1570): center cursor, clear buttons/handler.
             self.x = @intCast(@divTrunc(@as(i32, self.max_x) + 1, 2));
@@ -634,6 +666,95 @@ pub fn Int33(comptime Cpu: type) type {
             const condition = conditionMask(old_btn, self.buttons, moved);
             self.fireEventCallback(cpu, br, condition);
         }
+
+        /// Map a normalized Q16 value (0..0x1_0000 == [0,1]) into the virtual range
+        /// `[min, max]` with ROUND-TO-NEAREST: `((q16 * span) + 0x8000) >> 16 + min`
+        /// (plans/mouse-input.md LOCKED minor). `span = max - min`. Saturates a q16 at
+        /// or above 0x1_0000 to `max` (so a browser nx=1.0 reaches the full edge, not
+        /// max-1 from truncation). All integer; no float.
+        fn q16ToVirtual(q16: u32, min: i16, max: i16) i16 {
+            const span: i64 = @as(i64, max) - @as(i64, min);
+            if (span <= 0) return min;
+            const q: i64 = @min(@as(i64, q16), @as(i64, 0x1_0000));
+            const scaled: i64 = @divTrunc(q * span + 0x8000, 0x1_0000);
+            return @intCast(@as(i64, min) + scaled);
+        }
+
+        /// LIVE-MOUSE SEAMLESS fold (plans/mouse-input.md §5, LOCKED §1/§2/§3). The
+        /// low-latency browser path: the API/worker side coalesces a stream of moves
+        /// into ONE sample (`live_mouse.zig`) and forwards it here as PLAIN INTEGERS.
+        /// This is the `move_cursor_seamless` analogue (dosbox-staging
+        /// mouseif_dos_driver.cpp:1304): the ABSOLUTE position is written DIRECTLY to
+        /// the driver's internal position (so AX=03 pollers track the host cursor 1:1),
+        /// and the mickeys come from the browser's TRUE relative channel (`movementX/Y`),
+        /// fed through the EXISTING `injectRelative` fixed-point path — NOT derived from
+        /// the absolute Δ (LOCKED §3 — faithful to dosbox, which uses `x_rel` for the
+        /// mickeys and `x_abs` only for position).
+        ///
+        ///   - `abs_x_q16`/`abs_y_q16`: normalized [0,1] in Q16; the server owns the
+        ///     ×range mapping HERE via the driver's LIVE `min/max` (per-mode, so a mode
+        ///     change can't desync — LOCKED §2/§7). Applied only when `set_abs`.
+        ///   - `dx`/`dy`: the raw summed `movementX/Y` (i32; saturated to i16 for the
+        ///     mickey path). Applied only when `set_rel`.
+        ///   - `buttons`: latest mask. Applied only when `set_buttons`.
+        ///
+        /// Fires the AX=0Ch callback ONCE for the combined transition; `moved` is
+        /// derived from EITHER a position change OR a mickey-counter change (so a
+        /// sub-granularity drag — which moves mickeys without crossing the granularity
+        /// mask on `self.x` — still latches EV_MOVED; LOCKED minor). The far-call
+        /// self-charges its cycles via `runGuestFarCall` (no ledger hole).
+        pub fn injectSeamless(
+            self: *Self,
+            cpu: *Cpu,
+            br: *Bridge,
+            req: SeamlessReq,
+        ) void {
+            const old_btn = self.buttons;
+            const old_x = self.x;
+            const old_y = self.y;
+            const old_mx = self.mickey_x;
+            const old_my = self.mickey_y;
+
+            // ABSOLUTE: write the driver's internal position directly (range-clamped,
+            // read back verbatim by AX=03). Map Q16 → the driver's LIVE virtual range.
+            if (req.set_abs) {
+                const xv = q16ToVirtual(req.abs_x_q16, self.min_x, self.max_x);
+                const yv = q16ToVirtual(req.abs_y_q16, self.min_y, self.max_y);
+                self.injectAbsolute(xv, yv, 0, true, true, false);
+            }
+
+            // RELATIVE (the TRUE mickey channel): feed the raw movement deltas through
+            // the existing fixed-point mickey path (AX=0B). Saturate i32 → i16 (a single
+            // browser movement event over one slice cannot exceed i16; the saturate is
+            // just defensive against a pathological summed burst).
+            if (req.set_rel) {
+                const dx16: i16 = @intCast(std.math.clamp(req.dx, -32768, 32767));
+                const dy16: i16 = @intCast(std.math.clamp(req.dy, -32768, 32767));
+                self.injectRelative(dx16, dy16, 0, true, true, false);
+            }
+
+            // BUTTONS: latest mask (applied once, independent of motion).
+            if (req.set_buttons) self.buttons = req.buttons;
+
+            const moved = (self.x != old_x) or (self.y != old_y) or
+                (self.mickey_x != old_mx) or (self.mickey_y != old_my);
+            const condition = conditionMask(old_btn, self.buttons, moved);
+            self.fireEventCallback(cpu, br, condition);
+        }
+
+        /// The coalesced live-mouse sample (plain integers — mirrors
+        /// `api.LiveMouseState.Fold`). The Q16 absolute is range-agnostic; the relative
+        /// deltas are the browser's true `movementX/Y` channel.
+        pub const SeamlessReq = struct {
+            abs_x_q16: u32 = 0,
+            abs_y_q16: u32 = 0,
+            dx: i32 = 0,
+            dy: i32 = 0,
+            buttons: u16 = 0,
+            set_abs: bool = false,
+            set_rel: bool = false,
+            set_buttons: bool = false,
+        };
 
         /// Inject request — mirrors the API `MouseInject` shape so the worker can
         /// forward one POST /api/input/mouse straight through.

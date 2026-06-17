@@ -444,43 +444,60 @@ void main() {
     sendKey(m[0], m[1], false); // break edge (server forms code|0x80)
   });
 
-  // ---- mouse ----
-  // Absolute mapping (no Pointer Lock): client coords -> guest pixels. The canvas
-  // element fills the stage but the frame is drawn object-fit:contain (letterboxed,
-  // aspect preserved), so we map against the CONTAINED image rect, not the full
-  // element rect — otherwise the letterbox bands would skew the coordinates.
+  // ---- mouse (LIVE coalesced path, plans/mouse-input.md LOCKED §2/§3/§4) ----
+  // Send a Q16-NORMALIZED absolute over the CONTAINED image rect (object-fit:contain
+  // letterbox-aware geometry, reused below) so the SERVER scales by the driver's live
+  // per-mode range (0–639 in mode 13h) — the half-speed-X fix (the old path mapped to
+  // 320 guest px). The mickeys come from the browser's TRUE relative channel
+  // (movementX/movementY), sent ALONGSIDE the absolute as integers — NOT derived from
+  // the absolute Δ. The server folds these non-blocking into LiveMouseState and the
+  // pacer drains them at the slice boundary (≤ one slice latency).
+  const Q16 = 65536;
   let lastButtons = 0;
   let mouseThrottle = false; // ~rAF-rate throttle for mousemove
 
-  function guestCoords(e) {
+  // Normalize client coords -> [0,1] Q16 over the CONTAINED (letterboxed) image rect.
+  // The displayed image is the largest gw:gh rectangle that fits `rect`, centered
+  // (object-fit:contain); mapping against that rect (not the full element) keeps the
+  // letterbox bands from skewing the coordinates. `texW/texH` (the guest resolution)
+  // only sets the IMAGE ASPECT for the contain math — the OUTPUT is normalized, so the
+  // half-speed-X bug (mapping to 320 px) is gone. Falls back to the canvas aspect
+  // before the first frame (texW/texH == 0).
+  function guestCoordsNorm(e) {
     const rect = canvas.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return null;
     const gw = texW || canvas.width;
     const gh = texH || canvas.height;
-    // The displayed image is the largest gw:gh rectangle that fits `rect`,
-    // centered (object-fit:contain). Compute its size + letterbox offsets.
     const scale = Math.min(rect.width / gw, rect.height / gh);
     const dispW = gw * scale, dispH = gh * scale;
     const offX = (rect.width - dispW) / 2, offY = (rect.height - dispH) / 2;
-    let gx = Math.round((e.clientX - rect.left - offX) / scale);
-    let gy = Math.round((e.clientY - rect.top - offY) / scale);
-    if (gx < 0) gx = 0; else if (gx >= gw) gx = gw - 1;
-    if (gy < 0) gy = 0; else if (gy >= gh) gy = gh - 1;
-    return { x: gx, y: gy };
+    let nx = (e.clientX - rect.left - offX) / dispW;
+    let ny = (e.clientY - rect.top - offY) / dispH;
+    nx = Math.min(1, Math.max(0, nx));
+    ny = Math.min(1, Math.max(0, ny));
+    // [0,1] -> Q16 integer (the wire is integer; no float crosses to the server).
+    return { nx_q16: Math.round(nx * Q16), ny_q16: Math.round(ny * Q16) };
   }
 
   canvas.addEventListener("mousemove", function (e) {
     if (mouseThrottle) return;
     mouseThrottle = true;
     requestAnimationFrame(function () { mouseThrottle = false; });
-    const c = guestCoords(e);
+    const c = guestCoordsNorm(e);
     if (!c) return;
-    postJSON("/api/input/mouse", { x: c.x, y: c.y });
+    // movementX/movementY: the browser's TRUE relative channel (integers). Sent
+    // alongside the Q16 absolute so the guest's AX=0B mickeys reflect real motion.
+    postJSON("/api/input/mouse", {
+      nx_q16: c.nx_q16,
+      ny_q16: c.ny_q16,
+      mdx: e.movementX | 0,
+      mdy: e.movementY | 0,
+    });
   });
 
   // DOM MouseEvent.buttons mask: bit0 left(1), bit1 right(2), bit2 middle(4).
   // The server's mouse `buttons` mask: bit0 left, bit1 right, bit2 middle
-  // (json_wire.zig:99) — same bit assignment, so we forward bit-for-bit (masking
+  // (json_wire.zig) — same bit assignment, so we forward bit-for-bit (masking
   // off DOM's back/forward bits 3/4 which the guest has no concept of).
   function domButtonsToGuest(domButtons) {
     let b = 0;
@@ -492,10 +509,13 @@ void main() {
 
   function sendButtons(e) {
     e.preventDefault();
-    const c = guestCoords(e);
+    const c = guestCoordsNorm(e);
     lastButtons = domButtonsToGuest(e.buttons);
-    const body = { buttons: lastButtons };
-    if (c) { body.x = c.x; body.y = c.y; }
+    // A click carries the Q16 absolute too (so the latched position is current). If the
+    // rect isn't measurable yet, send buttons alone (still routes to the live path
+    // because we tag it with a zero-movement delta marker).
+    const body = { buttons: lastButtons, mdx: 0, mdy: 0 };
+    if (c) { body.nx_q16 = c.nx_q16; body.ny_q16 = c.ny_q16; }
     postJSON("/api/input/mouse", body);
   }
 

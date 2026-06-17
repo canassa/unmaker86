@@ -30,6 +30,12 @@ const api_sources = [_][]const u8{
     // lives in `src/host/run_pacer.zig`, OUTSIDE this embedded set (§5.1a). Embedding
     // it here proves no clock affordance crept into the api coordination state.
     @embedFile("run_control.zig"),
+    // The live coalesced mouse ingest record (plans/mouse-input.md, LOCKED §1/§6).
+    // CLOCKLESS + FLOAT-FREE by design: a mutex-guarded POD with Q16 integer fixed-
+    // point (no host float types), the no-timeout `lockUncancelable` variant only. Embedding
+    // it here proves the live mouse path added no clock/float affordance to any api
+    // source — the keystone determinism posture (no live input ⇒ no fold ⇒ zero cycles).
+    @embedFile("live_mouse.zig"),
     // The live video-stream side (Phase 3). CLOCKLESS by design: the shared-frame
     // producer/copy and the per-connection stream threads carry NO host clock — the fps
     // sampling cadence is decided by the pacer in `src/host/run_pacer.zig` (outside this

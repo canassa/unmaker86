@@ -20,6 +20,7 @@ const json_wire = @import("json_wire.zig");
 const worker = @import("worker.zig");
 const server = @import("server.zig");
 const run_control = @import("run_control.zig");
+const live_mouse = @import("live_mouse.zig");
 const stream = @import("stream.zig");
 const shared_frame = @import("shared_frame.zig");
 
@@ -51,6 +52,12 @@ pub const RunControl = run_control.RunControl;
 pub const RunOwner = run_control.RunOwner;
 pub const StopTag = run_control.StopTag;
 
+// ---- the live coalesced mouse ingest record (plans/mouse-input.md, LOCKED §1) ----
+// Host-side ARRIVAL state (NOT machine state, NOT snapshotted). The mouse POST handler
+// folds each move in non-blocking; the pacer drains it at the slice boundary via
+// `input_mouse_fold` → `Controller.injectMouseSeamless`.
+pub const LiveMouseState = live_mouse.LiveMouseState;
+
 // ---- the live video stream (Phase 3): shared latest-frame + per-conn threads ----
 // All host-side observation through the gated queue (cycle-neutral peek). The host
 // pacer drives the producer via `StreamHub.produceFrame` each fps tick.
@@ -64,6 +71,7 @@ test {
     _ = worker;
     _ = server;
     _ = run_control;
+    _ = live_mouse;
     _ = stream;
     _ = shared_frame;
     _ = @import("json_wire_test.zig");

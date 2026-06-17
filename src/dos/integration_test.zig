@@ -576,6 +576,121 @@ test "input Phase 2: guest reads an injected position back via INT 33h AX=0003 (
 }
 
 // ===========================================================================
+// Live-mouse SEAMLESS fold (plans/mouse-input.md §5/§7, LOCKED §2/§3/§7). The
+// browser POSTs a NORMALIZED Q16 absolute (+ true movementX/Y relative); the
+// fold writes the absolute through the driver's LIVE per-mode range and feeds
+// the relative deltas to the real mickey path. These prove the three things the
+// review locked: (D) the half-speed-X fix — a full-scale Q16 reaches the FAR
+// edge of the per-mode range (638 in mode 13h), not the middle (~319) as the old
+// guest-pixel mapping did; (A/B) the §7 fix — the INT 33h range FOLLOWS a video
+// mode change, both at the driver level and end-to-end through the real INT 10h
+// AH=00 hook; (C) AX=0B mickeys come from the true relative channel and zero on
+// read. All exercise the same real driver the browser fold calls.
+// ===========================================================================
+
+const BDA_VIDEO_MODE_PHYS: u32 = 0x0449;
+
+test "live mouse seamless: Q16 absolute maps to the per-mode range (mode 13h half-speed-X fix)" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    // Put the driver in mode 13h's range (max_x=639, max_y=199, gran_x=0xfffe).
+    m.bus.writePhys8(BDA_VIDEO_MODE_PHYS, 0x13);
+    m.dos.mouse.afterNewVideoMode(&m.cpu);
+
+    // Full-scale Q16 (≈1.0) → the FAR edge of the X range: 639 masked by the
+    // even-X granularity 0xfffe = 638; Y full-scale → 199. THIS is the fix: the
+    // old browser mapping sent guest pixels 0..319, so a full-right move capped at
+    // 319 (the middle of the 0..639 driver range) — half-speed X.
+    m.dos.mouse.injectSeamless(&m.cpu, &m.svc.bridge, .{
+        .abs_x_q16 = 0xFFFF,
+        .abs_y_q16 = 0xFFFF,
+        .set_abs = true,
+    });
+    const far = guestInt33(m, 0x0003);
+    try std.testing.expectEqual(@as(u16, 638), far.cx);
+    try std.testing.expectEqual(@as(u16, 199), far.dx);
+
+    // Mid-scale Q16 (0.5) → ~320 — i.e. the value the OLD code wrongly produced at
+    // FULL right. Proves the scale now spans the whole range, not half of it.
+    m.dos.mouse.injectSeamless(&m.cpu, &m.svc.bridge, .{
+        .abs_x_q16 = 0x8000,
+        .abs_y_q16 = 0x8000,
+        .set_abs = true,
+    });
+    const mid = guestInt33(m, 0x0003);
+    try std.testing.expectEqual(@as(u16, 320), mid.cx);
+}
+
+test "live mouse seamless §7: INT 33h range follows a mode change (driver level)" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    // Mode 0x12 (640x480 16-color): max_y=479, gran_x=0xffff.
+    m.bus.writePhys8(BDA_VIDEO_MODE_PHYS, 0x12);
+    m.dos.mouse.afterNewVideoMode(&m.cpu);
+    try std.testing.expectEqual(@as(i16, 639), m.dos.mouse.max_x);
+    try std.testing.expectEqual(@as(i16, 479), m.dos.mouse.max_y);
+    try std.testing.expectEqual(@as(u16, 0xffff), m.dos.mouse.gran_x);
+
+    // Switch to 13h: the range MUST follow (max_y shrinks to 199, X granularity
+    // becomes even). Before this fix the range only followed an AX=00/21 reset.
+    m.bus.writePhys8(BDA_VIDEO_MODE_PHYS, 0x13);
+    m.dos.mouse.afterNewVideoMode(&m.cpu);
+    try std.testing.expectEqual(@as(i16, 639), m.dos.mouse.max_x);
+    try std.testing.expectEqual(@as(i16, 199), m.dos.mouse.max_y);
+    try std.testing.expectEqual(@as(u16, 0xfffe), m.dos.mouse.gran_x);
+}
+
+test "live mouse seamless §7: a REAL INT 10h AH=00 set-mode re-derives the range (machine hook)" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    // Corrupt the range with sentinels so the assertion proves the hook RE-DERIVED
+    // it (not that it happened to already be correct).
+    m.dos.mouse.max_x = 111;
+    m.dos.mouse.max_y = 999;
+    m.dos.mouse.gran_x = 0xffff;
+
+    // Drive the REAL BIOS set-mode (MOV AX,0013h ; INT 10h ; HLT). The machine
+    // facade fires `afterNewVideoMode` after the BIOS services AH=00 (machine.zig
+    // §7 hook) — no direct driver call here.
+    asmInt67(m, &.{
+        0xB8, 0x13, 0x00, // MOV AX, 0013h
+        0xCD, 0x10, // INT 10h
+        0xF4, // HLT
+    });
+    try std.testing.expectEqual(@as(i16, 639), m.dos.mouse.max_x);
+    try std.testing.expectEqual(@as(i16, 199), m.dos.mouse.max_y);
+    try std.testing.expectEqual(@as(u16, 0xfffe), m.dos.mouse.gran_x);
+}
+
+test "live mouse seamless: relative deltas drive AX=0B mickeys (true channel), zero on read" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    // A relative-only seamless fold (the browser's movementX/Y) must accumulate
+    // mickeys via the SAME fixed-point path as a scripted injectRelative — not be
+    // derived from an absolute delta.
+    m.dos.mouse.injectSeamless(&m.cpu, &m.svc.bridge, .{ .dx = 20, .dy = -15, .set_rel = true });
+    try std.testing.expect(m.dos.mouse.mickey_x != 0 or m.dos.mouse.mickey_y != 0);
+
+    const r1 = guestInt33(m, 0x000B);
+    try std.testing.expect(r1.cx != 0 or r1.dx != 0); // accumulated mickeys
+    const r2 = guestInt33(m, 0x000B);
+    try std.testing.expectEqual(@as(u16, 0), r2.cx); // zeroed on the first read
+    try std.testing.expectEqual(@as(u16, 0), r2.dx);
+}
+
+// ===========================================================================
 // Input Phase 3 — the INT 33h AX=0Ch event callback. This is what real
 // Betrayal at Krondor requires: it installs an AH=0Ch handler and NEVER polls
 // AX=03, so injected movement/clicks reach it ONLY by firing this far-call.

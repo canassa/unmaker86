@@ -33,6 +33,7 @@ const RequestCtx = api.RequestCtx;
 const RunControl = api.RunControl;
 const StopTag = api.StopTag;
 const StreamHub = api.StreamHub;
+const LiveMouseState = api.LiveMouseState;
 
 /// One paced free-run driver. Created by the server with a `*CommandQueue` (to submit
 /// `run_slice` via the submit-gate), the shared `*RunControl` (the clockless arm flag
@@ -48,6 +49,15 @@ pub const RunPacer = struct {
     /// through the gated queue + a clockless copy into the shared frame). The pacer's
     /// clock decides the SAMPLE CADENCE; the producer itself is clockless.
     hub: ?*StreamHub = null,
+
+    /// The coalesced LIVE-mouse record (plans/mouse-input.md, LOCKED §1/§5). Optional:
+    /// null in the pacer's own unit tests (which only prove paced≡unpaced). Set by the
+    /// server when the live-mouse path is wired. Each slice the pacer ALWAYS submits one
+    /// `input_mouse_fold` through the gated queue — the race-free gate is on the worker
+    /// side (`takeFold()` returns null UNDER THE MUTEX when clean), so a no-input slice
+    /// folds zero guest cycles. This bounds live-mouse delivery latency to ≤ one slice
+    /// (~10 ms) on EMULATED-time cadence (the slice boundary), never the host clock.
+    live_mouse: ?*LiveMouseState = null,
 
     thread: ?std.Thread = null,
 
@@ -146,6 +156,20 @@ pub const RunPacer = struct {
                 self.sample_tick = 0;
                 hub.produceFrame();
             }
+        }
+
+        // Live-mouse fold (plans/mouse-input.md §4, LOCKED §5): ALWAYS submit one
+        // `input_mouse_fold` per slice through the same gated queue. The race-free gate
+        // lives on the worker (`takeFold()` returns null UNDER THE MUTEX when the record
+        // is clean), so this is a no-op — ZERO guest cycles — unless a POST made the
+        // record dirty. This is the ONLY place the live fold reaches the worker; it rides
+        // the slice boundary (an EMULATED-time cadence — the fold's cycle position is a
+        // fixed function of `slice_cycles`, NOT of when the POST arrived), bounding live
+        // delivery latency to ≤ one slice. The keystone determinism invariant holds: no
+        // POST ⇒ clean record ⇒ null fold ⇒ byte-identical to a run without this submit.
+        if (self.live_mouse != null) {
+            var fold_ctx: RequestCtx = .{ .cmd = .input_mouse_fold };
+            _ = self.queue.submit(&fold_ctx);
         }
 
         // Sleep the rest of the tick (host pacing ONLY — never alters slice size or

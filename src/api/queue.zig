@@ -110,6 +110,15 @@ pub const Command = union(enum) {
     /// carries the fully-resolved `MouseInject` (absolute x/y, relative dx/dy,
     /// buttons, each gated by a `set_*` flag).
     input_mouse: debug.MouseInject,
+    /// Drain the coalesced LIVE-mouse record and fold it into the INT 33h driver
+    /// (plans/mouse-input.md, LOCKED §1/§5). No payload — the worker reads the
+    /// server-owned `*LiveMouseState` it holds (reached like `render`/`mount`, NOT via
+    /// the Command, so the queue stays pointer-free). The pacer ALWAYS submits this
+    /// each slice; the arm is a NO-OP (zero guest cycles, no `runUntilEvent`) unless
+    /// `takeFold()` returns a dirty sample — the determinism keystone. When dirty it
+    /// forwards PLAIN INTEGERS to `Controller.injectMouseSeamless` (the abs write +
+    /// the true-relative mickeys + the AX=0Ch callback, each self-charging cycles).
+    input_mouse_fold: void,
     /// Read the guest's accumulated CON (stdout/stderr) output — what the program
     /// has printed so far. Side-effect-free (no clear-on-read); the worker copies the
     /// device buffer into the response POD.

@@ -174,6 +174,11 @@ pub fn main(init: std.process.Init) !void {
             // buffer for the per-connection stream threads. The hub's pointers are wired
             // by `server.serve()` → `wireStream()` before any client connects.
             .hub = server.streamHub(),
+            // The coalesced LIVE-mouse record (plans/mouse-input.md, LOCKED §1/§5): each
+            // slice the pacer submits one `input_mouse_fold` (a worker-side no-op unless
+            // a POST made the record dirty), draining the browser cursor at ≤ one slice
+            // latency on emulated-time cadence.
+            .live_mouse = server.liveMouse(),
         };
         pacer.start() catch |err| {
             var buf: [128]u8 = undefined;

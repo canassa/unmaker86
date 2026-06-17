@@ -102,12 +102,31 @@ pub const KeyReq = struct {
 /// `fire_callback` is accepted for forward-compat (the AX=000C event callback is
 /// Phase 3) and is a no-op in this phase.
 pub const MouseReq = struct {
+    // --- the SCRIPTED / deterministic path (unchanged; input-injection.md §5.2) ---
+    // Absolute guest-virtual position (x/y) or relative driver-units (dx/dy). These
+    // drive `Command.input_mouse` → `Controller.injectMouse` (the byte-reproducible
+    // seam the oracle + tests rely on). LEFT EXACTLY AS-IS.
     x: ?i16 = null,
     y: ?i16 = null,
     dx: ?i16 = null,
     dy: ?i16 = null,
     buttons: ?u16 = null,
     fire_callback: bool = true,
+
+    // --- the LIVE coalesced browser path (plans/mouse-input.md, LOCKED §2/§3) ---
+    // Q16 normalized absolute over the CONTAINED image rect (0..65536 == [0,1]). The
+    // SERVER scales these by the driver's LIVE per-mode `max_x/max_y` at fold time, so
+    // the wire stays mode-agnostic and the half-speed-X bug is fixed (the old `x/y`
+    // mapped to 320 guest px, not the driver's 0–639). INTEGER ONLY — never a host
+    // float (the `src/api` determinism grep bans float types).
+    nx_q16: ?u32 = null,
+    ny_q16: ?u32 = null,
+    // The browser's TRUE relative channel (`movementX/movementY`), as integers. Fed
+    // into the EXISTING fixed-point mickey path (AX=0B) — the real mickey source, NOT
+    // derived from the absolute Δ (LOCKED §3). Carried as i32 (movement can exceed i16
+    // over a burst before a fold; the driver saturates to i16 for the mickey math).
+    mdx: ?i32 = null,
+    mdy: ?i32 = null,
 };
 
 /// `PATCH /api/cpu/reg` — a single valid `std.json` tagged union (§B.4/G2). One

@@ -862,6 +862,47 @@ pub const Controller = struct {
         });
     }
 
+    /// LIVE-MOUSE seamless inject (plans/mouse-input.md, LOCKED §1). The coalesced
+    /// browser-mouse fold path: the API/worker side drains `api.LiveMouseState` and
+    /// forwards ONE sample as PLAIN INTEGERS (NO api type crosses this seam — `src/api`
+    /// is ABOVE `src/debug`, so a `*LiveMouseState` field would be a circular import).
+    /// `abs_*_q16` is the normalized [0,1] absolute (the driver owns the ×range
+    /// mapping, per-mode); `dx`/`dy` are the browser's TRUE `movementX/Y` relative
+    /// channel (the real mickey source, not derived from the absolute Δ); `buttons` is
+    /// the latest mask. Forwards to `Int33.injectSeamless`, which writes the absolute
+    /// directly (AX=03 tracks 1:1), feeds the relative through the existing fixed-point
+    /// mickey path (AX=0B), and fires the AX=0Ch callback once. The far-call
+    /// self-charges every instruction (no ledger hole). Like `injectMouse`, this runs
+    /// on the worker (the machine owner) at a command boundary.
+    ///
+    /// Determinism (the keystone): this is reached ONLY from the live `input_mouse_fold`
+    /// arm, which the pacer submits per slice and which is a NO-OP unless the api-layer
+    /// `LiveMouseState` is dirty (a real POST arrived). No live input ⇒ no fold ⇒ this
+    /// is never called ⇒ zero added cycles ⇒ byte-identical to today.
+    pub fn injectMouseSeamless(
+        self: *Controller,
+        abs_x_q16: u32,
+        abs_y_q16: u32,
+        dx: i32,
+        dy: i32,
+        buttons: u16,
+        set_abs: bool,
+        set_rel: bool,
+        set_buttons: bool,
+    ) void {
+        const mouse = &self.m.dos.mouse;
+        mouse.injectSeamless(&self.m.cpu, &self.m.svc.bridge, .{
+            .abs_x_q16 = abs_x_q16,
+            .abs_y_q16 = abs_y_q16,
+            .dx = dx,
+            .dy = dy,
+            .buttons = buttons,
+            .set_abs = set_abs,
+            .set_rel = set_rel,
+            .set_buttons = set_buttons,
+        });
+    }
+
     // -----------------------------------------------------------------------
     // Session reset (Phase 3, open question #5 resolved: included in M1).
     // -----------------------------------------------------------------------

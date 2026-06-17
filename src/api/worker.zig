@@ -18,6 +18,9 @@ const cpu_mod = @import("cpu");
 const q = @import("queue.zig");
 const json_wire = @import("json_wire.zig");
 const png = @import("png.zig");
+const live_mouse = @import("live_mouse.zig");
+
+const LiveMouseState = live_mouse.LiveMouseState;
 
 const Controller = debug.Controller;
 const Seg = cpu_mod.Seg;
@@ -89,7 +92,7 @@ fn inSlab(ctrl: *const Controller, start: u32, len: u32) bool {
 /// Dispatch exactly one command to one `Controller` method. Pure mapping; the only
 /// state it touches is via `ctrl` (the worker owns it) and `ctx.scratch` (the
 /// mem_write bytes, copied in by the handler before submit).
-pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render: ?*RenderBuffers) Response {
+pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render: ?*RenderBuffers, live: ?*LiveMouseState) Response {
     return switch (ctx.cmd) {
         // ---- run / step ----------------------------------------------------
         .run => |c| .{ .stop = ctrl.runUntilEvent(c.cycle_cap) },
@@ -150,6 +153,7 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
             ctrl.injectMouse(c);
             break :blk .ok;
         },
+        .input_mouse_fold => foldLiveMouse(ctrl, live),
 
         // ---- session -------------------------------------------------------
         .console_get => consoleResp(ctrl),
@@ -193,6 +197,30 @@ fn inputKey(ctrl: *Controller, c: anytype) Response {
     if (c.shift) {
         if (!ctrl.injectScancode(SC_LSHIFT, false, false)) return .{ .err = .input_buffer_full };
     }
+    return .ok;
+}
+
+/// Drain the coalesced LIVE-mouse record into the INT 33h driver (plans/mouse-input.md,
+/// LOCKED §1/§5). The pacer ALWAYS submits `input_mouse_fold` each slice; this is the
+/// race-free gate: `takeFold()` returns null UNDER THE MUTEX when the record is clean,
+/// so a no-input slice runs NO machine work (zero added cycles — the determinism
+/// keystone) and a dirty slice forwards ONE coalesced sample as PLAIN INTEGERS to
+/// `Controller.injectMouseSeamless` (the abs write + true-relative mickeys + the AX=0Ch
+/// callback, each self-charging cycles via `runGuestFarCall`). No-op when `live` is null
+/// (headless/test builds never wire a record).
+fn foldLiveMouse(ctrl: *Controller, live: ?*LiveMouseState) Response {
+    const lm = live orelse return .ok;
+    const fold = lm.takeFold() orelse return .ok; // clean ⇒ zero guest cycles
+    ctrl.injectMouseSeamless(
+        fold.abs_x_q16,
+        fold.abs_y_q16,
+        fold.dx,
+        fold.dy,
+        fold.buttons,
+        fold.set_abs,
+        fold.set_rel,
+        fold.set_buttons,
+    );
     return .ok;
 }
 
@@ -443,6 +471,10 @@ pub const Worker = struct {
     /// The server-owned render buffers for `GET /api/framebuffer` (B1). Null in a test
     /// harness that never drives a capture; a `framebuffer_get` then fails loud.
     render: ?*RenderBuffers = null,
+    /// The server-owned coalesced LIVE-mouse record (plans/mouse-input.md, LOCKED §1).
+    /// Null in headless/test builds (the keystone: no record ⇒ the fold arm is a no-op
+    /// ⇒ zero added cycles ⇒ byte-identical to today). Set by the server at `--serve`.
+    live_mouse: ?*LiveMouseState = null,
 
     pub fn run(self: Worker) void {
         const mount: MountSource = .{ .dir = self.mount_dir, .io = self.io };
@@ -452,7 +484,7 @@ pub const Worker = struct {
                 self.queue.complete(ctx, .ok);
                 return;
             }
-            const resp = drainOne(self.ctrl, ctx, mount, self.render);
+            const resp = drainOne(self.ctrl, ctx, mount, self.render, self.live_mouse);
             self.queue.complete(ctx, resp);
         }
     }

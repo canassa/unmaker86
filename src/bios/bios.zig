@@ -143,6 +143,15 @@ pub fn Bios(comptime Cpu: type) type {
             return .unhandled;
         }
 
+        /// True iff `id` is the INT 10h (video) callback id. The machine facade uses
+        /// this to hook the INT 33h mouse range-update after a BIOS set-mode (AH=00) —
+        /// `src/bios` is below `src/dos`, so the cross-module call is made up in
+        /// `Services` (which owns both), gated by this predicate (plans/mouse-input.md
+        /// §7; mirrors dosbox calling MOUSEDOS_AfterNewVideoMode from int10).
+        pub fn isInt10(self: *Self, id: u8) bool {
+            return self.ids.get(.int10) == id;
+        }
+
         /// The CallbackSink routes BIOS-owned ids here. Switch id -> INT, then the
         /// per-INT handler switches on AH (D7). The synthetic base cost is already
         /// charged by the sink; byte-proportional services add their own.

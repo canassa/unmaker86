@@ -101,7 +101,22 @@ pub const Services = struct {
         _ = self.bridge.chargeBase(id);
         switch (self.owner[id]) {
             .stop => self.bridge.onStopSentinel(),
-            .bios => self.bios.dispatch(id, self.cpu, &self.bridge),
+            .bios => {
+                // Capture AH BEFORE the handler (the BIOS may clobber it) so the
+                // post-dispatch set-mode hook sees the REQUESTED function.
+                const ah_before = self.cpu.st.getReg8(4);
+                self.bios.dispatch(id, self.cpu, &self.bridge);
+                // INT 10h AH=00 (set video mode) — re-derive the INT 33h mouse range
+                // from the new BDA mode (plans/mouse-input.md §7; dosbox calls
+                // MOUSEDOS_AfterNewVideoMode from int10). `src/bios` can't reach the
+                // driver (it is below `src/dos`), so the facade makes the call: the
+                // BDA video-mode byte is already updated by `setMode`, and the driver
+                // re-derives range/granularity + reclamps position WITHOUT a full
+                // reset (cursor/handler preserved, matching dosbox).
+                if (ah_before == 0x00 and self.bios.isInt10(id)) {
+                    self.dos.mouse.afterNewVideoMode(self.cpu);
+                }
+            },
             .dos => self.dos.dispatch(id, self.cpu, &self.bridge),
             .none => std.debug.panic("callback id {d} dispatched with no owner", .{id}),
         }
