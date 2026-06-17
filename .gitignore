@@ -2,6 +2,9 @@
 .zig-cache/
 zig-out/
 
+# Local game data for manual runs (copyrighted; never committed)
+/games/
+
 # TTM black-box screenshot artifacts (the staged work dir is under zig-out/)
 /ttm-shots/
 
