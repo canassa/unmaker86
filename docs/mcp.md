@@ -229,9 +229,9 @@ curl -s http://127.0.0.1:8099/mcp -H 'content-type: application/json' -d \
 
 ## Notes
 
-- **Framebuffer / images are not exposed over MCP in v1.** A frame is a 64 KiB–1.2 MiB
-  binary that the HTTP `/api/framebuffer` route streams raw; it does not fit the JSON-RPC
-  text/image result within the fixed response buffers. Use the HTTP framebuffer route for
-  pixels.
+- **Images:** the `screenshot` tool exposes the rendered frame as an MCP image content
+  block (a base64 PNG, streamed with an exact `Content-Length` so it never buffers). The
+  **raw** framebuffer (index/rgba binary, 64 KiB–1.2 MiB) is not exposed over MCP — it does
+  not fit a JSON-RPC result; use the HTTP `/api/framebuffer` route for raw pixels.
 - Every tool maps to the same worker `q.Command` the HTTP API uses; the JSON bodies are
   pinned byte-identical to the matching HTTP route by the equivalence tests.

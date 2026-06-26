@@ -92,7 +92,7 @@ pub const tools = [_]Tool{
         .name = "add_breakpoint",
         .description = "Add a breakpoint. kind is a tagged union, e.g. {\"execution_address\":{\"linear\":N}} or {\"cycle\":{\"at_cycle\":N}}.",
         .input_schema =
-        \\{"type":"object","properties":{"kind":{"type":"object","description":"the discriminated BreakpointKind"},"one_shot":{"type":"boolean","default":false}},"required":["kind"],"additionalProperties":false}
+        \\{"type":"object","properties":{"kind":{"description":"the discriminated BreakpointKind; give exactly one arm. Only execution_address and cycle fire today (interrupt=Phase 4, memory=Phase 5, io deferred); the rest parse but the worker reports not_implemented.","oneOf":[{"type":"object","properties":{"execution_address":{"type":"object","properties":{"linear":{"type":"integer","minimum":0,"description":"linear (physical) address; fires after a step when linear(CS:IP)==linear"}},"required":["linear"]}},"required":["execution_address"],"additionalProperties":false},{"type":"object","properties":{"cycle":{"type":"object","properties":{"at_cycle":{"type":"integer","minimum":0,"description":"fires at the first step boundary where cpu.cycles>=at_cycle"}},"required":["at_cycle"]}},"required":["cycle"],"additionalProperties":false},{"type":"object","properties":{"interrupt":{"type":"object","properties":{"vector":{"type":"integer","minimum":0,"maximum":255,"description":"interrupt vector (0..255) delivered this step"}},"required":["vector"]}},"required":["interrupt"],"additionalProperties":false},{"type":"object","properties":{"memory":{"type":"object","properties":{"linear":{"type":"integer","minimum":0,"description":"window start (linear/physical)"},"len":{"type":"integer","minimum":0,"description":"window length in bytes"},"access":{"type":"string","enum":["read","write","access"],"description":"access class to trap"}},"required":["linear","len","access"]}},"required":["memory"],"additionalProperties":false},{"type":"object","properties":{"io":{"type":"object","properties":{"port":{"type":"integer","minimum":0,"maximum":65535,"description":"I/O port (0..65535)"},"access":{"type":"string","enum":["read","write","access"]}},"required":["port","access"]}},"required":["io"],"additionalProperties":false}]},"one_shot":{"type":"boolean","default":false,"description":"auto-disable after it fires once"}},"required":["kind"],"additionalProperties":false}
         ,
     },
     .{
@@ -122,7 +122,7 @@ pub const tools = [_]Tool{
         .name = "set_register",
         .description = "Set a register/segment/flags. Provide exactly one arm: {reg32|reg16|reg8|seg:{name,value}} or {eip:{value}} or {flags:{cf,zf,...}}.",
         .input_schema =
-        \\{"type":"object","oneOf":[{"properties":{"reg32":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"integer"}},"required":["name","value"]}},"required":["reg32"]},{"properties":{"reg16":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"integer"}},"required":["name","value"]}},"required":["reg16"]},{"properties":{"reg8":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"integer"}},"required":["name","value"]}},"required":["reg8"]},{"properties":{"seg":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"integer"}},"required":["name","value"]}},"required":["seg"]},{"properties":{"eip":{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}},"required":["eip"]},{"properties":{"flags":{"type":"object"}},"required":["flags"]}]}
+        \\{"type":"object","oneOf":[{"properties":{"reg32":{"type":"object","properties":{"name":{"type":"string","enum":["eax","ecx","edx","ebx","esp","ebp","esi","edi"],"description":"32-bit GPR (lowercase)"},"value":{"type":"integer","minimum":0,"maximum":4294967295,"description":"new 32-bit value"}},"required":["name","value"]}},"required":["reg32"]},{"properties":{"reg16":{"type":"object","properties":{"name":{"type":"string","enum":["ax","cx","dx","bx","sp","bp","si","di"],"description":"16-bit GPR (lowercase)"},"value":{"type":"integer","minimum":0,"maximum":65535,"description":"new 16-bit value (>65535 is rejected)"}},"required":["name","value"]}},"required":["reg16"]},{"properties":{"reg8":{"type":"object","properties":{"name":{"type":"string","enum":["al","cl","dl","bl","ah","ch","dh","bh"],"description":"8-bit GPR (lowercase)"},"value":{"type":"integer","minimum":0,"maximum":255,"description":"new 8-bit value (>255 is rejected)"}},"required":["name","value"]}},"required":["reg8"]},{"properties":{"seg":{"type":"object","properties":{"name":{"type":"string","enum":["es","cs","ss","ds","fs","gs"],"description":"segment register (lowercase)"},"value":{"type":"integer","minimum":0,"maximum":65535,"description":"new selector (>65535 is rejected)"}},"required":["name","value"]}},"required":["seg"]},{"properties":{"eip":{"type":"object","properties":{"value":{"type":"integer","minimum":0,"maximum":4294967295,"description":"new instruction pointer"}},"required":["value"]}},"required":["eip"]},{"properties":{"flags":{"type":"object","description":"EFLAGS bits; omitted bits set to false. Unknown keys are ignored.","properties":{"cf":{"type":"boolean"},"pf":{"type":"boolean"},"af":{"type":"boolean"},"zf":{"type":"boolean"},"sf":{"type":"boolean"},"df":{"type":"boolean"},"of":{"type":"boolean"},"iff":{"type":"boolean"},"tf":{"type":"boolean"},"nt":{"type":"boolean"},"rf":{"type":"boolean"},"vm":{"type":"boolean"},"ac":{"type":"boolean"}}}},"required":["flags"]}]}
         ,
     },
     // --- memory ---
@@ -130,42 +130,42 @@ pub const tools = [_]Tool{
         .name = "read_memory",
         .description = "Read len bytes of physical guest memory starting at phys; returns lowercase hex.",
         .input_schema =
-        \\{"type":"object","properties":{"phys":{"type":"integer","minimum":0,"description":"physical byte address"},"len":{"type":"integer","minimum":1,"description":"number of bytes to read"}},"required":["phys","len"],"additionalProperties":false}
+        \\{"type":"object","properties":{"phys":{"type":"integer","minimum":0,"description":"physical byte address"},"len":{"type":"integer","minimum":1,"maximum":4096,"description":"number of bytes to read (<=4096, the MAX_MEM_CHUNK cap)"}},"required":["phys","len"],"additionalProperties":false}
         ,
     },
     .{
         .name = "write_memory",
         .description = "Write the hex-encoded bytes `data` at physical address phys.",
         .input_schema =
-        \\{"type":"object","properties":{"phys":{"type":"integer","minimum":0},"data":{"type":"string","description":"lowercase/uppercase hex, even length"}},"required":["phys","data"],"additionalProperties":false}
+        \\{"type":"object","properties":{"phys":{"type":"integer","minimum":0,"description":"physical byte address"},"data":{"type":"string","maxLength":8192,"description":"lowercase/uppercase hex, even length; up to 4096 bytes (8192 hex chars)"}},"required":["phys","data"],"additionalProperties":false}
         ,
     },
     .{
         .name = "read_memory_seg",
         .description = "Read len bytes from a real-mode seg:off (seg is a segment-register name: cs/ds/es/ss/fs/gs); returns lowercase hex.",
         .input_schema =
-        \\{"type":"object","properties":{"seg":{"type":"string","description":"segment register name"},"off":{"type":"integer","minimum":0},"len":{"type":"integer","minimum":1}},"required":["seg","off","len"],"additionalProperties":false}
+        \\{"type":"object","properties":{"seg":{"type":"string","enum":["es","cs","ss","ds","fs","gs"],"description":"segment register name (lowercase)"},"off":{"type":"integer","minimum":0,"description":"offset within the segment"},"len":{"type":"integer","minimum":1,"maximum":4096,"description":"number of bytes to read (<=4096, the MAX_MEM_CHUNK cap)"}},"required":["seg","off","len"],"additionalProperties":false}
         ,
     },
     .{
         .name = "write_memory_seg",
         .description = "Write hex-encoded `data` at a real-mode seg:off (seg is a segment-register name).",
         .input_schema =
-        \\{"type":"object","properties":{"seg":{"type":"string"},"off":{"type":"integer","minimum":0},"data":{"type":"string","description":"hex, even length"}},"required":["seg","off","data"],"additionalProperties":false}
+        \\{"type":"object","properties":{"seg":{"type":"string","enum":["es","cs","ss","ds","fs","gs"],"description":"segment register name (lowercase)"},"off":{"type":"integer","minimum":0,"description":"offset within the segment"},"data":{"type":"string","maxLength":8192,"description":"hex, even length; up to 4096 bytes (8192 hex chars)"}},"required":["seg","off","data"],"additionalProperties":false}
         ,
     },
     .{
         .name = "search_memory",
         .description = "Search guest RAM for a byte needle. Give exactly one of pattern (hex) or ascii (literal text). Optional start/len window and max hit cap.",
         .input_schema =
-        \\{"type":"object","properties":{"pattern":{"type":"string","description":"hex needle (mutually exclusive with ascii)"},"ascii":{"type":"string","description":"literal text needle (mutually exclusive with pattern)"},"start":{"type":"integer","minimum":0},"len":{"type":"integer","minimum":0,"description":"0 = to slab end"},"max":{"type":"integer","minimum":0,"description":"0 = default cap"}},"oneOf":[{"required":["pattern"]},{"required":["ascii"]}],"additionalProperties":false}
+        \\{"type":"object","properties":{"pattern":{"type":"string","minLength":2,"maxLength":8192,"description":"hex needle, even length, 1..4096 bytes (mutually exclusive with ascii)"},"ascii":{"type":"string","minLength":1,"maxLength":4096,"description":"literal text needle, 1..4096 bytes (mutually exclusive with pattern)"},"start":{"type":"integer","minimum":0,"description":"physical start of the search window"},"len":{"type":"integer","minimum":0,"description":"window length in bytes; 0 = to slab end"},"max":{"type":"integer","minimum":0,"maximum":65535,"description":"max hits to return; 0 = default cap"}},"oneOf":[{"required":["pattern"]},{"required":["ascii"]}],"additionalProperties":false}
         ,
     },
     .{
         .name = "disassemble",
         .description = "Disassemble a window of instructions. Origin precedence: linear, else seg(+off), else the live CS:EIP. count defaults to 16 (1..64).",
         .input_schema =
-        \\{"type":"object","properties":{"linear":{"type":"integer","minimum":0,"description":"linear origin (wins over seg)"},"seg":{"type":"integer","minimum":0,"description":"real-mode segment selector"},"off":{"type":"integer","minimum":0,"description":"offset within seg"},"count":{"type":"integer","minimum":1,"maximum":64,"default":16}},"additionalProperties":false}
+        \\{"type":"object","properties":{"linear":{"type":"integer","minimum":0,"description":"linear origin (wins over seg)"},"seg":{"type":"integer","minimum":0,"maximum":65535,"description":"real-mode segment selector"},"off":{"type":"integer","minimum":0,"description":"offset within seg"},"count":{"type":"integer","minimum":1,"maximum":64,"default":16,"description":"instructions to decode (1..64, the MAX_DISASM_INSNS cap)"}},"additionalProperties":false}
         ,
     },
     // --- inspection ---
@@ -188,14 +188,14 @@ pub const tools = [_]Tool{
         .name = "read_devices",
         .description = "Read the grouped chipset/A20/device snapshot. palette=true widens the VGA DAC palette; device selects one group (a20/pic/pit/vga/kbc/speaker/opl/ems).",
         .input_schema =
-        \\{"type":"object","properties":{"palette":{"type":"boolean","default":false},"device":{"type":"string","enum":["a20","pic","pit","vga","kbc","speaker","opl","ems"]}},"additionalProperties":false}
+        \\{"type":"object","properties":{"palette":{"type":"boolean","default":false,"description":"widen the VGA DAC palette in the vga group"},"device":{"type":"string","enum":["a20","pic","pit","vga","kbc","speaker","opl","ems"],"description":"select one device group; omit for the whole snapshot"}},"additionalProperties":false}
         ,
     },
     .{
         .name = "read_stack",
         .description = "Read `count` 16-bit words from the top of the guest stack (SS:SP).",
         .input_schema =
-        \\{"type":"object","properties":{"count":{"type":"integer","minimum":0,"maximum":65535}},"required":["count"],"additionalProperties":false}
+        \\{"type":"object","properties":{"count":{"type":"integer","minimum":0,"maximum":256,"description":"number of 16-bit words to read (<=256, the MAX_STACK_WORDS cap)"}},"required":["count"],"additionalProperties":false}
         ,
     },
     .{
@@ -229,7 +229,7 @@ pub const tools = [_]Tool{
         .name = "input_mouse",
         .description = "Inject a scripted/deterministic mouse event: absolute x/y, relative dx/dy (mutually exclusive per axis), and/or a buttons mask. At least one field required.",
         .input_schema =
-        \\{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"},"buttons":{"type":"integer","minimum":0}},"additionalProperties":false}
+        \\{"type":"object","properties":{"x":{"type":"integer","minimum":-32768,"maximum":32767,"description":"absolute X (exclusive with dx)"},"y":{"type":"integer","minimum":-32768,"maximum":32767,"description":"absolute Y (exclusive with dy)"},"dx":{"type":"integer","minimum":-32768,"maximum":32767,"description":"relative X motion (exclusive with x)"},"dy":{"type":"integer","minimum":-32768,"maximum":32767,"description":"relative Y motion (exclusive with y)"},"buttons":{"type":"integer","minimum":0,"maximum":65535,"description":"button mask: bit0 left, bit1 right, bit2 middle"}},"additionalProperties":false}
         ,
     },
     // --- clock / lifecycle ---
@@ -242,7 +242,7 @@ pub const tools = [_]Tool{
         .name = "set_clock",
         .description = "Set the CPU speed. Give exactly one of mult (the CPU:PIT multiplier) or mhz (converted to the nearest mult). The worker clamps to [1, max_mult].",
         .input_schema =
-        \\{"type":"object","properties":{"mult":{"type":"integer","minimum":1},"mhz":{"type":"integer","minimum":1}},"additionalProperties":false}
+        \\{"type":"object","properties":{"mult":{"type":"integer","minimum":1,"description":"CPU:PIT multiplier (cpu_hz = PIT_TICK_RATE * mult); the worker clamps to [1,55]"},"mhz":{"type":"integer","minimum":1,"description":"target speed in MHz, converted to the nearest mult; effectively capped near 66 MHz by the [1,55] clamp"}},"additionalProperties":false}
         ,
     },
     .{
@@ -841,6 +841,29 @@ test "mapRegSet: enum resolution + width range checks" {
     const ovf = mapRegSet(.{ .reg8 = .{ .name = "al", .value = 256 } });
     try std.testing.expect(ovf == .fail);
     try std.testing.expectEqualStrings("out_of_range", ovf.fail.code);
+}
+
+test "schema enums match the runtime acceptors (set_register names + device groups)" {
+    // Every register name the `set_register` schema advertises MUST resolve through
+    // `mapRegSet` (and an off-enum name MUST fail) — so the declared `enum` can never
+    // drift from what the mapper accepts.
+    inline for (.{ "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi" }) |n|
+        try std.testing.expect(mapRegSet(.{ .reg32 = .{ .name = n, .value = 0 } }) == .ok);
+    inline for (.{ "ax", "cx", "dx", "bx", "sp", "bp", "si", "di" }) |n|
+        try std.testing.expect(mapRegSet(.{ .reg16 = .{ .name = n, .value = 0 } }) == .ok);
+    inline for (.{ "al", "cl", "dl", "bl", "ah", "ch", "dh", "bh" }) |n|
+        try std.testing.expect(mapRegSet(.{ .reg8 = .{ .name = n, .value = 0 } }) == .ok);
+    inline for (.{ "es", "cs", "ss", "ds", "fs", "gs" }) |n|
+        try std.testing.expect(mapRegSet(.{ .seg = .{ .name = n, .value = 0 } }) == .ok);
+    // Off-enum names are rejected (the -32602 the schema now declares).
+    try std.testing.expect(mapRegSet(.{ .reg32 = .{ .name = "rax", .value = 0 } }) == .fail);
+    try std.testing.expect(mapRegSet(.{ .seg = .{ .name = "xs", .value = 0 } }) == .fail);
+
+    // The `read_devices` schema `enum` MUST equal the single-source-of-truth list.
+    const declared = [_][]const u8{ "a20", "pic", "pit", "vga", "kbc", "speaker", "opl", "ems" };
+    try std.testing.expectEqual(device_groups.len, declared.len);
+    inline for (declared) |g| try std.testing.expect(isDeviceGroup(g));
+    try std.testing.expect(!isDeviceGroup("nope"));
 }
 
 test "mapDisasm: precedence + count bound" {
