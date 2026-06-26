@@ -144,7 +144,7 @@ pub const tools = [_]Tool{
         .name = "set_register",
         .description = "Set a register/segment/flags. Provide exactly one arm: {reg32|reg16|reg8|seg:{name,value}} or {eip:{value}} or {flags:{cf,zf,...}}.",
         .input_schema =
-        \\{"type":"object","oneOf":[{"properties":{"reg32":{"type":"object","properties":{"name":{"type":"string","enum":["eax","ecx","edx","ebx","esp","ebp","esi","edi"],"description":"32-bit GPR (lowercase)"},"value":{"type":"integer","minimum":0,"maximum":4294967295,"description":"new 32-bit value"}},"required":["name","value"]}},"required":["reg32"]},{"properties":{"reg16":{"type":"object","properties":{"name":{"type":"string","enum":["ax","cx","dx","bx","sp","bp","si","di"],"description":"16-bit GPR (lowercase)"},"value":{"type":"integer","minimum":0,"maximum":65535,"description":"new 16-bit value (>65535 is rejected)"}},"required":["name","value"]}},"required":["reg16"]},{"properties":{"reg8":{"type":"object","properties":{"name":{"type":"string","enum":["al","cl","dl","bl","ah","ch","dh","bh"],"description":"8-bit GPR (lowercase)"},"value":{"type":"integer","minimum":0,"maximum":255,"description":"new 8-bit value (>255 is rejected)"}},"required":["name","value"]}},"required":["reg8"]},{"properties":{"seg":{"type":"object","properties":{"name":{"type":"string","enum":["es","cs","ss","ds","fs","gs"],"description":"segment register (lowercase)"},"value":{"type":"integer","minimum":0,"maximum":65535,"description":"new selector (>65535 is rejected)"}},"required":["name","value"]}},"required":["seg"]},{"properties":{"eip":{"type":"object","properties":{"value":{"type":"integer","minimum":0,"maximum":4294967295,"description":"new instruction pointer"}},"required":["value"]}},"required":["eip"]},{"properties":{"flags":{"type":"object","description":"EFLAGS bits; omitted bits set to false. Unknown keys are ignored.","properties":{"cf":{"type":"boolean"},"pf":{"type":"boolean"},"af":{"type":"boolean"},"zf":{"type":"boolean"},"sf":{"type":"boolean"},"df":{"type":"boolean"},"of":{"type":"boolean"},"iff":{"type":"boolean"},"tf":{"type":"boolean"},"nt":{"type":"boolean"},"rf":{"type":"boolean"},"vm":{"type":"boolean"},"ac":{"type":"boolean"}}}},"required":["flags"]}]}
+        \\{"type":"object","properties":{"reg32":{"type":"object","properties":{"name":{"type":"string","enum":["eax","ecx","edx","ebx","esp","ebp","esi","edi"],"description":"32-bit GPR (lowercase)"},"value":{"type":"integer","minimum":0,"maximum":4294967295,"description":"new 32-bit value"}},"required":["name","value"]},"reg16":{"type":"object","properties":{"name":{"type":"string","enum":["ax","cx","dx","bx","sp","bp","si","di"],"description":"16-bit GPR (lowercase)"},"value":{"type":"integer","minimum":0,"maximum":65535,"description":"new 16-bit value (>65535 is rejected)"}},"required":["name","value"]},"reg8":{"type":"object","properties":{"name":{"type":"string","enum":["al","cl","dl","bl","ah","ch","dh","bh"],"description":"8-bit GPR (lowercase)"},"value":{"type":"integer","minimum":0,"maximum":255,"description":"new 8-bit value (>255 is rejected)"}},"required":["name","value"]},"seg":{"type":"object","properties":{"name":{"type":"string","enum":["es","cs","ss","ds","fs","gs"],"description":"segment register (lowercase)"},"value":{"type":"integer","minimum":0,"maximum":65535,"description":"new selector (>65535 is rejected)"}},"required":["name","value"]},"eip":{"type":"object","properties":{"value":{"type":"integer","minimum":0,"maximum":4294967295,"description":"new instruction pointer"}},"required":["value"]},"flags":{"type":"object","description":"EFLAGS bits; omitted bits set to false. Unknown keys are ignored.","properties":{"cf":{"type":"boolean"},"pf":{"type":"boolean"},"af":{"type":"boolean"},"zf":{"type":"boolean"},"sf":{"type":"boolean"},"df":{"type":"boolean"},"of":{"type":"boolean"},"iff":{"type":"boolean"},"tf":{"type":"boolean"},"nt":{"type":"boolean"},"rf":{"type":"boolean"},"vm":{"type":"boolean"},"ac":{"type":"boolean"}}}},"additionalProperties":false}
         ,
     },
     // --- memory ---
@@ -180,7 +180,7 @@ pub const tools = [_]Tool{
         .name = "search_memory",
         .description = "Search guest RAM for a byte needle. Give exactly one of pattern (hex) or ascii (literal text). Optional start/len window and max hit cap.",
         .input_schema =
-        \\{"type":"object","properties":{"pattern":{"type":"string","minLength":2,"maxLength":8192,"description":"hex needle, even length, 1..4096 bytes (mutually exclusive with ascii)"},"ascii":{"type":"string","minLength":1,"maxLength":4096,"description":"literal text needle, 1..4096 bytes (mutually exclusive with pattern)"},"start":{"type":"integer","minimum":0,"description":"physical start of the search window"},"len":{"type":"integer","minimum":0,"description":"window length in bytes; 0 = to slab end"},"max":{"type":"integer","minimum":0,"maximum":65535,"description":"max hits to return; 0 = default cap"}},"oneOf":[{"required":["pattern"]},{"required":["ascii"]}],"additionalProperties":false}
+        \\{"type":"object","properties":{"pattern":{"type":"string","minLength":2,"maxLength":8192,"description":"hex needle, even length, 1..4096 bytes; exactly one of pattern or ascii (mutually exclusive)"},"ascii":{"type":"string","minLength":1,"maxLength":4096,"description":"literal text needle, 1..4096 bytes; exactly one of pattern or ascii (mutually exclusive)"},"start":{"type":"integer","minimum":0,"description":"physical start of the search window"},"len":{"type":"integer","minimum":0,"description":"window length in bytes; 0 = to slab end"},"max":{"type":"integer","minimum":0,"maximum":65535,"description":"max hits to return; 0 = default cap"}},"additionalProperties":false}
         ,
     },
     .{
@@ -346,36 +346,25 @@ pub fn writeToolsList(w: *std.Io.Writer) std.Io.Writer.Error!void {
 
 /// Emit a per-machine tool's inputSchema with the optional `machine` property injected at
 /// the TOP level (multi-machine plan §3 — so a strict client neither rejects nor is misled
-/// about the routing arg). Every catalog schema begins with `SCHEMA_HEAD` (`{"type":
-/// "object",`); the rest either opens with a top-level `"properties":{…}` (most tools) or
-/// with `"oneOf":[…]` (`set_register`, which has no top-level properties). Two cases, no
-/// duplicate-key hazard:
-///   - top-level properties present → splice `MACHINE_PROP,` right after `"properties":{`
-///     (the comma is omitted when the original object is EMPTY, e.g. `SCHEMA_EMPTY`);
-///   - no top-level properties (oneOf-first) → wrap a fresh `"properties":{MACHINE_PROP},`
-///     in front of the rest (the oneOf arms allow the extra key — none is closed).
-/// PURE string work over the hand-authored ASCII schema; no allocation, no host time.
+/// about the routing arg). EVERY catalog schema now opens with `SCHEMA_HEAD` immediately
+/// followed by a top-level `"properties":{…}` (no tool uses a top-level `oneOf`/`anyOf`/
+/// `allOf`, which the Claude tool-schema validator rejects). So there is exactly one case:
+/// splice `MACHINE_PROP` right after `"properties":{` (with a separating comma unless the
+/// original object is EMPTY, e.g. `SCHEMA_EMPTY`). PURE string work over the hand-authored
+/// ASCII schema; no allocation, no host time.
 fn writeSchemaWithMachine(w: *std.Io.Writer, schema: []const u8) std.Io.Writer.Error!void {
-    // Defensive: a schema that does not match the expected prefix is emitted verbatim
-    // (never corrupted). Every catalog schema DOES match, so this is belt-and-suspenders.
-    if (!std.mem.startsWith(u8, schema, SCHEMA_HEAD)) return w.writeAll(schema);
-    try w.writeAll(SCHEMA_HEAD);
-    const rest = schema[SCHEMA_HEAD.len..];
-    const props_key = "\"properties\":{";
-    if (std.mem.startsWith(u8, rest, props_key)) {
-        try w.writeAll(props_key);
-        try w.writeAll(MACHINE_PROP);
-        const after = rest[props_key.len..];
-        // A non-empty original properties object (next char is not the closing `}`) needs a
-        // separator before its first key; an empty `{}` does not.
-        if (after.len != 0 and after[0] != '}') try w.writeAll(",");
-        try w.writeAll(after);
-    } else {
-        try w.writeAll(props_key);
-        try w.writeAll(MACHINE_PROP);
-        try w.writeAll("},");
-        try w.writeAll(rest);
-    }
+    const head_with_props = SCHEMA_HEAD ++ "\"properties\":{";
+    // Defensive: a schema that does not open with `{"type":"object","properties":{` is
+    // emitted verbatim (never corrupted). Every catalog schema DOES match, so this is
+    // belt-and-suspenders.
+    if (!std.mem.startsWith(u8, schema, head_with_props)) return w.writeAll(schema);
+    try w.writeAll(head_with_props);
+    try w.writeAll(MACHINE_PROP);
+    const after = schema[head_with_props.len..];
+    // A non-empty original properties object (next char is not the closing `}`) needs a
+    // separator before its first key; an empty `{}` does not.
+    if (after.len != 0 and after[0] != '}') try w.writeAll(",");
+    try w.writeAll(after);
 }
 
 // ===========================================================================
@@ -1004,12 +993,35 @@ test "schema numeric caps + union/struct shapes track their runtime sources" {
         try std.testing.expectEqual(@typeInfo(debug.BreakpointKind).@"union".fields.len, oneof.items.len);
     }
 
-    // `set_register`'s flags arm MUST name every FlagsPayload bool (so a new flag forces a
-    // schema update). The names are quoted property keys; an off-by-name flag fails here.
+    // `set_register` is now a FLAT object (no top-level oneOf — the Claude tool-schema
+    // validator drops a top-level oneOf, which silently hid this tool from the model). Pin
+    // the flat shape: NO top-level oneOf/anyOf/allOf; one optional property per union arm;
+    // and the `flags` arm names every FlagsPayload bool (a new flag forces a schema update).
     {
-        const sr = find("set_register").?.input_schema;
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, find("set_register").?.input_schema, .{});
+        defer p.deinit();
+        try std.testing.expect(p.value.object.get("oneOf") == null);
+        try std.testing.expect(p.value.object.get("anyOf") == null);
+        try std.testing.expect(p.value.object.get("allOf") == null);
+        const props = p.value.object.get("properties").?.object;
+        inline for (.{ "reg32", "reg16", "reg8", "seg", "eip", "flags" }) |arm|
+            try std.testing.expect(props.get(arm) != null);
+        const flags = props.get("flags").?.object.get("properties").?.object;
         inline for (@typeInfo(wire.FlagsPayload).@"struct".fields) |f|
-            try std.testing.expect(std.mem.indexOf(u8, sr, "\"" ++ f.name ++ "\"") != null);
+            try std.testing.expect(flags.get(f.name) != null);
+    }
+
+    // `search_memory` is likewise FLAT (no top-level oneOf): pattern/ascii are optional
+    // properties; the exactly-one rule is runtime-enforced (`buildSearchTool`), not schema.
+    {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, find("search_memory").?.input_schema, .{});
+        defer p.deinit();
+        try std.testing.expect(p.value.object.get("oneOf") == null);
+        try std.testing.expect(p.value.object.get("anyOf") == null);
+        try std.testing.expect(p.value.object.get("allOf") == null);
+        const props = p.value.object.get("properties").?.object;
+        try std.testing.expect(props.get("pattern") != null);
+        try std.testing.expect(props.get("ascii") != null);
     }
 }
 
