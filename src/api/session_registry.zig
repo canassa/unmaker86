@@ -16,13 +16,20 @@
 //! (where `src/host` is visible). Keeping the registry in `api` keeps it inside the
 //! determinism grep-gate (it carries NO host clock, NO RNG, NO float).
 //!
+//! Lifecycle / cap (agent-provisioning-plan §9): the system starts EMPTY (no default machine)
+//! or with one auto-provisioned default; an agent `provision_machine`s machines on demand and
+//! `deprovision`s them. Reclamation is EXPLICIT-`deprovision` (the `destroy` primitive; the
+//! `DELETE /mcp` HTTP alias routes here too). At `MAX_SESSIONS` a `create` returns
+//! `SessionLimitReached` (the caller maps it to `machine_limit_reached`) — there is NO
+//! time/LRU eviction (it would inject host scheduling into which machine survives). A model
+//! that lost a handle recovers via the read-only `list_machines` tool, not an eviction sweep.
+//!
 //! Determinism (CLAUDE prime directive): session ids are minted from a monotonic counter
-//! (`zdos-sess-<seq>`), NEVER a clock/RNG. GC is explicit `DELETE` (primary) with LRU
-//! BY REQUEST COUNT as the documented safety net — NEVER a timed sweep. Each session's
-//! guest advances only inside its own worker via its own `queue.submit`; sessions share
-//! no mutable state, so each stays individually cycle-deterministic. The registry mutex
-//! guards ONLY the map + counters (clockless `Io.Mutex`/`Io.Condition`, the same
-//! no-timeout variants the queue uses); it touches no machine cycle.
+//! (`zdos-sess-<seq>`), NEVER a clock/RNG. Reclamation is explicit `deprovision`/`destroy`,
+//! NEVER a timed sweep. Each session's guest advances only inside its own worker via its own
+//! `queue.submit`; sessions share no mutable state, so each stays individually cycle-
+//! deterministic. The registry mutex guards ONLY the map + counters (clockless `Io.Mutex`/
+//! `Io.Condition`, the same no-timeout variants the queue uses); it touches no machine cycle.
 //!
 //! Stable-address discipline (machine.zig:8-20; the worker captures `&session.queue` and
 //! `session.ctrl`): every minted `Machine`, `Controller`, and `Session` is its OWN
@@ -87,7 +94,11 @@ pub const SessionRegistry = struct {
     /// The monotonic id counter — the deterministic source of `zdos-sess-<seq>` (§4.4a).
     /// Never reused, so ids are unique per process even across create/destroy churn.
     next_seq: u64 = 0,
-    /// The monotonic REQUEST counter (LRU key source, §4.3). Bumped on every `resolve`.
+    /// A monotonic REQUEST counter, bumped on every `resolve` and stamped onto the resolved
+    /// session's `last_request_seq`. RESERVED bookkeeping only: no LRU/time eviction ships
+    /// (agent-provisioning-plan §9 — reclamation is explicit `deprovision`; recovery is
+    /// `list_machines`), so nothing READS this today. Kept (clockless, monotonic) so a future
+    /// operability feature has a deterministic recency key without a host clock.
     lru_seq: u64 = 0,
 
     /// The resource cap (multi-machine plan §9). At ~21 MiB/session (the EMS slab

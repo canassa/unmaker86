@@ -74,11 +74,11 @@ const TestServer = struct {
     }
 
     fn start(self: *TestServer) !void {
-        self.srv.session.ctrl = &self.ctrl;
+        self.srv.session.?.ctrl = &self.ctrl;
         const w = struct {
             fn run(s: *Server) void {
                 const worker = @import("worker.zig");
-                const ww: worker.Worker = .{ .queue = &s.session.queue, .ctrl = s.session.ctrl, .render = s.session.render };
+                const ww: worker.Worker = .{ .queue = &s.session.?.queue, .ctrl = s.session.?.ctrl, .render = s.session.?.render };
                 ww.run();
             }
         };
@@ -88,7 +88,7 @@ const TestServer = struct {
     fn deinit(self: *TestServer) void {
         // Shut the worker down via the sentinel, join, then free.
         var ctx: q.RequestCtx = .{ .cmd = .shutdown_worker };
-        _ = self.srv.session.queue.submit(&ctx);
+        _ = self.srv.session.?.queue.submit(&ctx);
         self.worker.join();
         self.srv.deinit();
         destroy(self.alloc, self.m);

@@ -137,10 +137,12 @@ test "off-worker grep (R2): server.zig touches no machine/controller state off t
     // state), and everything else goes through submit(). (The needle is the source
     // form — the body literal is escaped in server.zig.)
     try std.testing.expect(std.mem.indexOf(u8, server_src, "zdos-m2") != null);
-    // Reaches the queue through the default session now (Phase 1 `Session` extraction):
-    // `self.queue.submit` became `self.session.queue.submit`. Same assertion intent —
-    // every machine access still goes through the gated `submit()`.
-    try std.testing.expect(std.mem.indexOf(u8, server_src, "self.session.queue.submit") != null);
+    // Reaches the queue through the (now OPTIONAL) default session: the Phase-1 `Session`
+    // extraction made `self.queue.submit` → `self.session.queue.submit`, and the EMPTY-START
+    // inversion made the field `?*Session` so the `/api/*` handlers deref `self.session.?.queue.
+    // submit` (guarded by the dispatch 409). Same assertion intent — every machine access still
+    // goes through the gated `submit()`.
+    try std.testing.expect(std.mem.indexOf(u8, server_src, "self.session.?.queue.submit") != null);
 }
 
 test "reflection: Command/Response carry no pointer or host-time fields" {

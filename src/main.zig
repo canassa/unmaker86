@@ -36,12 +36,15 @@ pub fn main(init: std.process.Init) !void {
     // Controller and stops the run deterministically at the first instruction
     // boundary at/after cycle N, dumping a CPU snapshot — instead of running to
     // termination. The default path (no flag) is unchanged.
-    const usage = "usage: zig build run -- [--break-cycle N | --serve PORT] <PROGRAM.COM|PROGRAM.EXE> [args...]\n";
+    const usage = "usage: zig build run -- [--break-cycle N <PROGRAM> | --serve PORT [PROGRAM]] <PROGRAM.COM|PROGRAM.EXE> [args...]\n";
     var args_it: std.process.Args.Iterator = .init(init.minimal.args);
     _ = args_it.next(); // skip argv[0]
     var break_cycle: ?u64 = null;
     var serve_port: ?u16 = null;
-    var first = args_it.next() orelse {
+    // The guest program path. NULL only on the EMPTY-START path (`--serve PORT` with no
+    // program) — every other mode requires a program and exits below if it is missing.
+    var path: ?[]const u8 = null;
+    const first = args_it.next() orelse {
         try stderr.writeStreamingAll(io, usage);
         std.process.exit(2);
     };
@@ -54,7 +57,7 @@ pub fn main(init: std.process.Init) !void {
             try stderr.writeStreamingAll(io, "zdos: --break-cycle expects a non-negative integer\n");
             std.process.exit(2);
         };
-        first = args_it.next() orelse {
+        path = args_it.next() orelse {
             try stderr.writeStreamingAll(io, usage);
             std.process.exit(2);
         };
@@ -67,17 +70,54 @@ pub fn main(init: std.process.Init) !void {
             try stderr.writeStreamingAll(io, "zdos: --serve expects a port number (1-65535)\n");
             std.process.exit(2);
         };
-        first = args_it.next() orelse {
-            try stderr.writeStreamingAll(io, usage);
-            std.process.exit(2);
-        };
-        // --break-cycle and --serve are mutually exclusive (one or the other path).
-        if (std.mem.eql(u8, first, "--break-cycle")) {
-            try stderr.writeStreamingAll(io, "zdos: --serve and --break-cycle are mutually exclusive\n");
-            std.process.exit(2);
+        // The PROGRAM is OPTIONAL under `--serve` (the EMPTY-START inversion, agent-
+        // provisioning-plan §6): `--serve PORT` with no program starts EMPTY (no default
+        // machine — an agent provisions machines on demand); `--serve PORT PROGRAM` auto-
+        // provisions the default machine exactly as before.
+        if (args_it.next()) |tok| {
+            // --break-cycle and --serve are mutually exclusive (one or the other path).
+            if (std.mem.eql(u8, tok, "--break-cycle")) {
+                try stderr.writeStreamingAll(io, "zdos: --serve and --break-cycle are mutually exclusive\n");
+                std.process.exit(2);
+            }
+            path = tok;
         }
+    } else {
+        path = first;
     }
-    const path = first;
+
+    // ---- EMPTY-START: `--serve PORT` with no program (agent-provisioning-plan §6) -------
+    // Stand up an EMPTY server — no default machine, no worker, no pacer, no stream. An
+    // MCP-client agent provisions machines on demand over `/mcp` (`provision_machine`) and
+    // drives each by the `machine` tool arg; `/api/health` answers off-worker meanwhile. This
+    // returns before any machine/dir/boot work below (which is the default-machine path only).
+    if (path == null) {
+        const port = serve_port.?; // path is null ONLY on the --serve empty path
+        var server = try api_mod.Server.initEmpty(gpa, io, port);
+        defer server.deinit();
+        server.bind() catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "zdos: --serve bind failed: {t}\n", .{err}) catch "zdos: --serve bind failed\n";
+            try stderr.writeStreamingAll(io, msg);
+            std.process.exit(1);
+        };
+        var sbuf: [96]u8 = undefined;
+        const banner = std.fmt.bufPrint(&sbuf, "\n[zdos] listening 127.0.0.1:{d}\n", .{server.boundPort()}) catch "\n[zdos] listening\n";
+        try stderr.writeStreamingAll(io, banner);
+        var mbuf: [128]u8 = undefined;
+        const mcp_banner = std.fmt.bufPrint(&mbuf, "[zdos] mcp endpoint: POST http://127.0.0.1:{d}/mcp (empty start — provision_machine to begin)\n", .{server.boundPort()}) catch "[zdos] mcp endpoint: POST /mcp (empty start)\n";
+        try stderr.writeStreamingAll(io, mcp_banner);
+        // No host run-pacer: a minted machine is debugger-driven only (agent-provisioning-plan
+        // §13), and there is no default machine to pace. Just run the accept loop.
+        server.serve() catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "zdos: --serve failed: {t}\n", .{err}) catch "zdos: --serve failed\n";
+            try stderr.writeStreamingAll(io, msg);
+            std.process.exit(1);
+        };
+        return;
+    }
+    const program = path.?; // non-null on every non-empty-start path
 
     // Any remaining host args become the guest DOS command tail (space-joined),
     // e.g. `... -- TCC.EXE -IINCLUDE HELLO.C` runs TCC with that command line.
@@ -97,9 +137,9 @@ pub fn main(init: std.process.Init) !void {
     const cmdtail = tail_buf[0..tail_len];
 
     // Split into a host directory (mounted as DOS drive C:) and the file name.
-    const sep = std.mem.lastIndexOfScalar(u8, path, '/');
-    const dir_path = if (sep) |s| path[0..s] else ".";
-    const file_name = if (sep) |s| path[s + 1 ..] else path;
+    const sep = std.mem.lastIndexOfScalar(u8, program, '/');
+    const dir_path = if (sep) |s| program[0..s] else ".";
+    const file_name = if (sep) |s| program[s + 1 ..] else program;
 
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| {
         var buf: [256]u8 = undefined;

@@ -17,12 +17,20 @@ POST http://127.0.0.1:<PORT>/mcp
 Content-Type: application/json
 ```
 
-`/mcp` rides the existing `--serve PORT` (there is no separate flag/port):
+`/mcp` rides the existing `--serve PORT` (there is no separate flag/port). The **program is
+optional**: with it, the default machine is booted; without it, the server starts **empty** and
+an agent provisions machines on demand.
 
 ```sh
+# default machine (back-compat):
 zig-out/bin/zdos --serve 8099 examples/HELLO.COM
 # [zdos] listening 127.0.0.1:8099
 # [zdos] mcp endpoint: POST http://127.0.0.1:8099/mcp
+
+# empty start (provision_machine to begin):
+zig-out/bin/zdos --serve 8099
+# [zdos] listening 127.0.0.1:8099
+# [zdos] mcp endpoint: POST http://127.0.0.1:8099/mcp (empty start — provision_machine to begin)
 ```
 
 One POST carries exactly one JSON-RPC request. The connection is closed after each
@@ -35,7 +43,7 @@ The standard MCP handshake:
 
 | method | reply |
 |---|---|
-| `initialize` | `result` with `protocolVersion` (`2025-06-18`), `serverInfo {name,version}`, `capabilities {tools:{}}`. The response also carries an `Mcp-Session-Id` header (see *Sessions* below). |
+| `initialize` | a **pure handshake**: `result` with `protocolVersion` (`2025-06-18`), `serverInfo {name,version}`, `capabilities {tools:{}}`. MCP is **stateless** — `initialize` mints **nothing** and issues **no** `Mcp-Session-Id` header. Create a machine with the `provision_machine` tool (see *Machines* below); drive it with the `machine` tool argument. |
 | `notifications/initialized` (any `notifications/*`) | a notification has no `id` → **HTTP 202, empty body** (fire-and-forget). |
 | `tools/list` | `result {tools:[{name, description, inputSchema}, ...]}` — the full catalog below. |
 | `tools/call` | run one tool → a tool `result` (or, for a protocol failure, a JSON-RPC `error`). |
@@ -79,6 +87,19 @@ with an exact `Content-Length`, so the response never buffers the (up to ~1.6 Mi
 ## Tool catalog
 
 `arguments` is a JSON object; omit it (or pass `{}`) for the no-argument tools.
+
+Every **per-machine** tool (everything except the three machine-lifecycle tools below) takes an
+optional `"machine":"<handle>"` argument selecting which machine to drive. Omit it to drive the
+**default** machine (when one exists, i.e. `--serve PORT PROGRAM`); in empty-start mode (`--serve
+PORT`) a per-machine call with no `machine` returns the `no_machine` tool error — `provision_machine`
+first. See *Machines* below.
+
+### Machine lifecycle (machine-agnostic — no `machine` arg)
+| tool | arguments | does |
+|---|---|---|
+| `provision_machine` | `{mount_dir, file, cmdtail?, drive?=2, cpu?:{mult\|mhz}}` | open `mount_dir` as a DOS drive, boot `file`, and create a fresh in-process-isolated machine + worker. Returns `{machine, drive, mult, live_machines, max_machines}` — `machine` is the `zdos-sess-<N>` **handle** you thread into later calls. Errors: a missing file / bad dir / bad cpu → `-32602`; at the cap → the `machine_limit_reached` tool error; OOM / unrunnable image → `-32603`. |
+| `deprovision` | `{machine}` | destroy that machine (stop + join its worker, free its ~21 MiB + close its owned mount fd). Returns `{machine, deleted, live_machines}`. An unknown handle → the `unknown_machine` tool error. |
+| `list_machines` | `{}` | read-only: `{machines:[{machine,file,drive,mult,cycles}], live_machines, max_machines}` — recover/reclaim after a lost handle. Exposes handles/metadata only, never another machine's guest memory. |
 
 ### Execution control
 | tool | arguments | does |
@@ -175,35 +196,57 @@ out of range), not the call.
 Tool error codes: `breakpoint_table_full`, `no_such_breakpoint`, `address_out_of_range`,
 `out_of_range`, `bad_request`, `not_implemented`, `load_failed`, `input_buffer_full`.
 
-## Sessions
+## Machines
 
 zdos is **multi-tenant**: one process runs several emulated machines concurrently (the
-Model-B registry), each IN-PROCESS isolated — its own RAM/CPU/devices, its own worker
-thread, its own guest cycle stream (per-machine determinism is preserved — cross-session
-scheduling changes only wall-clock latency, never any guest's instruction stream). The
-machines are **not** isolated on the host filesystem: they share one writable mount dir,
-a caller-managed external input (host-FS isolation is the caller's responsibility).
+registry), each IN-PROCESS isolated — its own RAM/CPU/devices, its own worker thread, its
+own guest cycle stream (per-machine determinism is preserved — cross-machine scheduling
+changes only wall-clock latency, never any guest's instruction stream). **MCP is stateless:**
+there is **no** `Mcp-Session-Id` and `initialize` is a pure handshake — the model selects a
+machine by the `machine` tool **argument** (the LLM cannot set HTTP headers, so routing cannot
+live in one).
 
-- **Default session.** At `--serve` startup one **default machine** is booted, behind the
-  fixed id `zdos-mcp-singleton`. A client that never calls `initialize`, or sends a blank
-  / `zdos-mcp-singleton` `Mcp-Session-Id`, drives this one machine — the shipped
-  single-machine behavior is unchanged.
-- **`initialize` mints a session.** Each MCP `initialize` provisions a **fresh, in-process-
-  isolated booted machine** (same program + the same shared host mount as the default) and returns its new id
-  `zdos-sess-<N>` in the `Mcp-Session-Id` response header (`<N>` is a monotonic counter —
-  deterministic, no clock/RNG). Subsequent requests carrying that id route to that machine.
-- **`tools/call` routes by id.** A known minted id reaches its machine; a blank / singleton
-  id reaches the default. An **unknown or destroyed** id returns **HTTP 404** (re-`initialize`
-  to get a fresh one) — matching the MCP Streamable-HTTP convention.
-- **`DELETE /mcp`** with an `Mcp-Session-Id` tears that minted session down (stops + joins
-  its worker, frees its machine), races-free against in-flight requests on it. The default
-  session is process-owned and cannot be deleted (404).
-- **HTTP `/api/*`** drives the default session by default; an optional `X-Zdos-Session`
-  header routes a `/api/*` request to a named minted session (an unknown id → 404), so the
-  HTTP debugger can address the same machines MCP `initialize` mints.
-- **Cap.** At most `MAX_SESSIONS` (8) minted sessions live at once (each ≈ 21 MiB, the EMS
-  slab dominating). At the cap a new `initialize` is rejected rather than evicting an in-use
-  session; `DELETE` a session to free a slot.
+**Two start modes.**
+
+- **`--serve PORT PROGRAM` (default machine).** One **default machine** is booted at startup
+  (internal handle `zdos-mcp-singleton`). A per-machine `tools/call` with **no** `machine` arg
+  drives it — the shipped single-machine behavior, unchanged.
+- **`--serve PORT` (empty start).** **No** default machine. A per-machine `tools/call` with no
+  `machine` arg returns the `no_machine` tool error; `provision_machine` first. `/api/health`
+  still answers (off-worker); any other blank `/api/*` request returns **409** until a machine
+  exists.
+
+**Provisioning.**
+
+- **`provision_machine`** boots a machine and returns its `zdos-sess-<N>` **handle** in the tool
+  *result* (`<N>` is a monotonic counter — deterministic, no clock/RNG). Thread that handle into
+  later calls as `"machine":"zdos-sess-<N>"`.
+- **`deprovision {machine}`** (or **`DELETE /mcp`** with the handle as the `Mcp-Session-Id`
+  header — an HTTP alias) tears a machine down (stops + joins its worker, frees its ~21 MiB,
+  closes its owned mount fd), race-free against in-flight requests. A per-machine call on a
+  destroyed handle → the `unknown_machine` tool error. The default machine is process-owned and
+  cannot be deprovisioned.
+- **`list_machines`** recovers a lost handle (read-only handles/metadata).
+- **Cap.** At most `MAX_SESSIONS` (8) machines live at once (each ≈ 21 MiB, the EMS slab
+  dominating). At the cap, `provision_machine` returns `machine_limit_reached` rather than
+  evicting an in-use machine — `deprovision` (or `list_machines`) to reclaim. There is **no**
+  time/LRU eviction (it would inject host scheduling into which machine survives).
+
+**HTTP `/api/*`.** HTTP clients *do* control headers, so the HTTP surface keeps the optional
+`X-Zdos-Session` header: absent → the default machine (back-compat); a provisioned handle → that
+machine; an unknown handle → 404. (Only the MCP/LLM path needs arg-based routing.)
+
+### Determinism caveat — the mount dir
+
+A provisioned machine's guest state at cycle N equals the same program launched via `--serve
+PORT PROGRAM` (the missing pacer affects only host pacing cadence, never the cycle trajectory).
+**But the mount dir is an input, not zdos state:** the guest *writes* to it mid-run (INT 21h), so
+its bytes are an output the first run mutates — cycle-reproducibility holds only for a mount that
+is **byte-stable** for the whole run (restoring it to its pre-run bytes is an external
+responsibility). And per-machine reproducibility holds only for a **non-shared-writable** mount:
+two machines pointed at one writable dir interleave their INT 21h reads/writes under the host
+scheduler, voiding reproducibility for both. Distinct per-machine mount dirs (the natural
+provisioning) are isolated and reproducible.
 
 ## Examples
 

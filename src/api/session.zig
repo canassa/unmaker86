@@ -198,9 +198,12 @@ pub const LoadRecipe = struct {
 /// `SessionRegistry` (Phase 3) will own N of these by pointer. Every member here was
 /// a `Server` field before — the allocation/teardown discipline is unchanged.
 pub const Session = struct {
-    /// The transport-routing identity (multi-machine plan §4.4). The default session's
-    /// id is the fixed `zdos-mcp-singleton` (so a client that never `initialize`s keeps
-    /// the shipped behavior); a registry-minted session gets `zdos-sess-<seq>`.
+    /// The transport-routing identity (multi-machine plan §4.4). The DEFAULT session's id is the
+    /// fixed `zdos-mcp-singleton` — its INTERNAL handle, used by the HTTP `/api/*` resolver
+    /// (a blank or singleton `X-Zdos-Session` → the default) and by `DELETE /mcp`'s reject-the-
+    /// default guard. It is NOT minted or echoed over MCP (which is stateless — agent-
+    /// provisioning-plan §4). A registry-PROVISIONED session gets a `zdos-sess-<seq>` handle,
+    /// returned in the `provision_machine` tool result and threaded back as the `machine` arg.
     id: SessionId = .{},
 
     /// The Controller over the heap-pinned, `wire()`'d Machine. A pointer FIELD —
@@ -231,10 +234,11 @@ pub const Session = struct {
     refs: u32 = 0,
     pending_destroy: bool = false,
 
-    /// LRU bookkeeping (multi-machine plan §4.3): the registry stamps this with its
-    /// monotonic request counter on every `resolve`, so eviction (the safety net for an
-    /// abandoned session) is by request-COUNT — fully deterministic, NEVER a wall-clock
-    /// sweep (which the determinism grep bans).
+    /// RESERVED recency bookkeeping (agent-provisioning-plan §9): the registry stamps this with
+    /// its monotonic request counter on every `resolve`. NO LRU/time eviction ships — reclamation
+    /// is explicit `deprovision` and recovery is `list_machines` — so nothing READS this today.
+    /// Kept (clockless, monotonic) so a future operability feature has a deterministic recency
+    /// key with no wall clock (which the determinism grep bans).
     last_request_seq: u64 = 0,
 
     /// The program-load recipe + the host mount dir, held so a `POST /api/load`

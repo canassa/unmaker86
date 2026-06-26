@@ -97,11 +97,11 @@ const TestServer = struct {
     }
 
     fn start(self: *TestServer) !void {
-        self.srv.session.ctrl = &self.ctrl;
+        self.srv.session.?.ctrl = &self.ctrl;
         const w = struct {
             fn run(s: *Server) void {
                 const worker = @import("worker.zig");
-                const ww: worker.Worker = .{ .queue = &s.session.queue, .ctrl = s.session.ctrl, .render = s.session.render };
+                const ww: worker.Worker = .{ .queue = &s.session.?.queue, .ctrl = s.session.?.ctrl, .render = s.session.?.render };
                 ww.run();
             }
         };
@@ -110,7 +110,7 @@ const TestServer = struct {
 
     fn deinit(self: *TestServer) void {
         var ctx: q.RequestCtx = .{ .cmd = .shutdown_worker };
-        _ = self.srv.session.queue.submit(&ctx);
+        _ = self.srv.session.?.queue.submit(&ctx);
         self.worker.join();
         self.srv.deinit();
         self.m.deinit();
@@ -238,7 +238,7 @@ test "same-session concurrency storm: screenshot + run/step + load stays sound" 
     try std.testing.expect(!fail.load(.acquire));
 
     // (d) the recipe never tore: `file[1]` and `cmdtail[1]` are the SAME thread digit.
-    const recipe = ts.srv.session.recipe;
+    const recipe = ts.srv.session.?.recipe;
     try std.testing.expect(recipe.file_len >= 2 and recipe.cmdtail_len >= 2);
     try std.testing.expectEqual(recipe.file[1], recipe.cmdtail[1]);
 
@@ -363,13 +363,13 @@ test "pacer liveness: a stalled capture does NOT freeze the guest (cycles keep a
     // The pacer's job WHILE the capture write is outstanding: `produceFrame` (takes
     // `session.lock` — would DEADLOCK pre-fix) + a run slice; the cycle counter must
     // strictly increase every tick. Frozen pre-fix; live post-fix.
-    var prev = cycleNow(&ts.srv.session.queue);
+    var prev = cycleNow(&ts.srv.session.?.queue);
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         hub.produceFrame(); // proves the lock is free during the capture's wire write
         var rctx: q.RequestCtx = .{ .cmd = .{ .run = .{ .cycle_cap = 2000 } } };
-        _ = ts.srv.session.queue.submit(&rctx);
-        const now = cycleNow(&ts.srv.session.queue);
+        _ = ts.srv.session.?.queue.submit(&rctx);
+        const now = cycleNow(&ts.srv.session.?.queue);
         try std.testing.expect(now > prev); // STRICTLY increasing — the guest advanced
         prev = now;
     }

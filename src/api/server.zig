@@ -163,16 +163,24 @@ pub const Server = struct {
     port: u16,
     net_server: ?net.Server = null,
 
-    /// The single default `Session` (multi-machine plan §4.1, Phase 1). Holds the
-    /// per-machine state that used to be `Server` fields directly — the Controller
-    /// pointer, the load recipe + mount dir, the command queue + worker thread, the
-    /// clockless `run_control`, the live-mouse record, the render buffers, and the
-    /// shared-frame / stream-hub. Held BY VALUE so the inline `queue`'s address is
-    /// stable for the worker once the `Server` is at its final address (the worker is
-    /// spawned only in `bind`, after that point). The HTTP/MCP handlers reach all of
-    /// this through `defaultSession()` (or `self.session.*`); Phase 3 routes `/mcp` through
-    /// the `registry` below while `/api/*` and the blank/singleton MCP id stay on THIS one.
-    session: Session,
+    /// The OPTIONAL single default `Session` (multi-machine plan §4.1; the EMPTY-START
+    /// inversion, agent-provisioning-plan §6). Holds the per-machine state that used to be
+    /// `Server` fields directly — the Controller pointer, the load recipe + mount dir, the
+    /// command queue + worker thread, the clockless `run_control`, the live-mouse record,
+    /// the render buffers, and the shared-frame / stream-hub. Held BY VALUE so the inline
+    /// `queue`'s address is stable for the worker once the `Server` is at its final address
+    /// (the worker is spawned only in `bind`, after that point).
+    ///
+    /// `--serve PORT PROGRAM` auto-provisions this default (the back-compat path, byte-
+    /// identical to before). `--serve PORT` (no program) starts EMPTY: `session = null`, no
+    /// default worker, no pacer, no stream — an agent then `provision_machine`s machines into
+    /// the `registry` and drives them by the `machine` tool arg. EVERY `self.session` deref
+    /// is therefore guarded for the null (empty) case: `defaultSession()` returns `?*Session`,
+    /// the per-machine `/api/*` handlers are gated by a 409 in `dispatch`, and the stream-
+    /// upgrade path rejects when there is no default. The HTTP/MCP handlers reach this through
+    /// `defaultSession()`; `/mcp` per-machine tools route through the `registry` by the
+    /// `machine` arg, while `/api/*` (blank `X-Zdos-Session`) and the singleton id stay here.
+    session: ?Session = null,
 
     /// The N-session registry (multi-machine plan §4, Phase 3). Owns the registry-minted
     /// sessions (one per MCP `initialize`), each with its OWN machine + worker. The
@@ -232,55 +240,86 @@ pub const Server = struct {
         };
     }
 
-    /// The single default session (multi-machine plan §6, Phase 1): the `/api/*`
-    /// routes all drive it, and a blank/absent `Mcp-Session-Id` resolves here. Returns
-    /// a stable `*Session` (the Server is at rest before any worker holds these
-    /// addresses). Phase 3 replaces this with a registry lookup keyed by `sid`.
-    pub fn defaultSession(self: *Server) *Session {
-        return &self.session;
+    /// Stand up an EMPTY server (the `--serve PORT` empty-start mode, agent-provisioning-plan
+    /// §6): NO default session, NO default worker, NO pacer, NO stream. An MCP-client agent
+    /// then `provision_machine`s machines into the registry on demand and drives each by the
+    /// `machine` tool arg; `deprovision` frees them. The registry is still pre-sized to the cap
+    /// so a mid-flight provision never fails on a map allocation. `bind`/`serve`/`deinit` all
+    /// guard `self.session == null`, so the listener runs (and `/api/health` answers, off-
+    /// worker) with no machine present until one is provisioned.
+    pub fn initEmpty(gpa: std.mem.Allocator, io: Io, port: u16) !Server {
+        var registry = SessionRegistry.init(gpa, io);
+        try registry.prealloc();
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .port = port,
+            .session = null,
+            .registry = registry,
+        };
     }
 
-    /// Finish wiring the stream hub. Called after `init` (when the Server — and so the
-    /// inline Session — has its FINAL address) so the hub's `*CommandQueue`/`*RunControl`/
-    /// `*RenderBuffers`/`*SharedFrame` point at the stable session-owned instances (the
-    /// queue lives INLINE in the Session, so its address is only stable once at rest).
+    /// The OPTIONAL single default session (multi-machine plan §6; EMPTY-START, §6): the
+    /// `/api/*` routes drive it, and a blank/absent `X-Zdos-Session`/singleton id resolves
+    /// here. Returns a stable `*Session` when a default machine is provisioned (the Server is
+    /// at rest before any worker holds these addresses), or `null` in empty-start mode
+    /// (`--serve PORT` with no program) — every caller guards the null.
+    pub fn defaultSession(self: *Server) ?*Session {
+        if (self.session) |*s| return s;
+        return null;
+    }
+
+    /// Finish wiring the default session's stream hub. Called after `init` (when the Server —
+    /// and so the inline Session — has its FINAL address) so the hub's `*CommandQueue`/
+    /// `*RunControl`/`*RenderBuffers`/`*SharedFrame` point at the stable session-owned
+    /// instances (the queue lives INLINE in the Session, so its address is only stable once at
+    /// rest). A no-op in empty-start mode (no default session to wire).
     pub fn wireStream(self: *Server) void {
-        self.session.wireStream(self.io);
+        if (self.session) |*s| s.wireStream(self.io);
     }
 
     pub fn deinit(self: *Server) void {
         // Tear down every registry-minted session FIRST (stop + join each worker, free its
         // machine + buffers). Safe + leak-free here: `serve()` has already stopped the
         // accept loop and joined all connection threads, so no thread still holds a minted
-        // `*Session` (no refcount wait needed). Then free the default session's heap blocks.
+        // `*Session` (no refcount wait needed). Then free the default session's heap blocks
+        // (only when one was provisioned — empty-start mode has no default to free).
         self.registry.deinit();
-        self.session.deinit(self.gpa);
+        if (self.session) |*s| s.deinit(self.gpa);
     }
 
-    /// The stream hub (for the host pacer to drive the frame producer each fps tick).
+    // INVARIANT for the four pacer/stream accessors below: they are called ONLY by
+    // `main.zig`'s default-machine wiring (the host run-pacer + live stream), which runs
+    // exclusively on the `--serve PORT PROGRAM` path AFTER a default session exists. The
+    // empty-start path (`--serve PORT`) never constructs a pacer, so it never calls these.
+    // The `.?` therefore asserts a guaranteed-provisioned default, never a live null-deref.
+
+    /// The default session's stream hub (for the host pacer to drive the frame producer each
+    /// fps tick). Default-machine mode only (see the invariant above).
     pub fn streamHub(self: *Server) *stream_mod.StreamHub {
-        return self.session.stream_hub;
+        return self.session.?.stream_hub;
     }
 
-    /// The shared run-control block (for the host pacer to poll the arm flag). Valid
-    /// for the server's lifetime. The pacer reaches the machine ONLY via the gated
-    /// queue (`queueRef`); it never dereferences the run-controller handle.
+    /// The default session's run-control block (for the host pacer to poll the arm flag).
+    /// Default-machine mode only. The pacer reaches the machine ONLY via the gated queue
+    /// (`queueRef`); it never dereferences the run-controller handle.
     pub fn runControl(self: *Server) *run_control.RunControl {
-        return self.session.run_control;
+        return self.session.?.run_control;
     }
 
-    /// The coalesced live-mouse record (for the host pacer to poll its dirty seq and
-    /// submit `input_mouse_fold`). Valid for the server's lifetime; the pacer reaches
-    /// the machine ONLY via the gated queue, never through this handle's machine state
-    /// (the record IS host-side, so reading its atomic-free fields is done UNDER ITS
-    /// MUTEX in `takeFold` on the worker — the pacer just submits the fold command).
+    /// The default session's coalesced live-mouse record (for the host pacer to poll its dirty
+    /// seq and submit `input_mouse_fold`). Default-machine mode only; the pacer reaches the
+    /// machine ONLY via the gated queue, never through this handle's machine state (the record
+    /// IS host-side, so reading its atomic-free fields is done UNDER ITS MUTEX in `takeFold` on
+    /// the worker — the pacer just submits the fold command).
     pub fn liveMouse(self: *Server) *live_mouse_mod.LiveMouseState {
-        return self.session.live_mouse;
+        return self.session.?.live_mouse;
     }
 
-    /// The command queue (for the host pacer to submit `run_slice` via the submit-gate).
+    /// The default session's command queue (for the host pacer to submit `run_slice` via the
+    /// submit-gate). Default-machine mode only.
     pub fn queueRef(self: *Server) *q.CommandQueue {
-        return &self.session.queue;
+        return &self.session.?.queue;
     }
 
     /// Bind, spawn the worker, and run the accept loop until shutdown (= `bind` then
@@ -298,12 +337,18 @@ pub const Server = struct {
     /// `getsockname`, `Io/Threaded.zig:11828`). Split out of `run` so a caller (the
     /// `--serve 0` path) can PRINT the resolved port BEFORE the blocking accept loop.
     pub fn bind(self: *Server) !void {
-        // Wire the stream hub now that the Server is at its final address (its `&self.session.queue`
-        // pointer is stable). Done in `bind` — BEFORE the pacer starts or any client
-        // connects — so `produceFrame`/`hasClients` never read an uninitialized hub.
-        self.wireStream();
-        const w: worker_mod.Worker = .{ .queue = &self.session.queue, .ctrl = self.session.ctrl, .mount_dir = self.session.mount_dir, .io = self.io, .render = self.session.render, .live_mouse = self.session.live_mouse };
-        self.session.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
+        // Spawn the default worker + wire its stream hub ONLY when a default machine exists.
+        // In empty-start mode (`--serve PORT`, no program) there is no default session, no
+        // default worker, and no stream — the listener still binds below so the agent can
+        // `provision_machine` over `/mcp` (and `/api/health` answers off-worker). Wiring is
+        // done here — BEFORE the pacer starts or any client connects — so `produceFrame`/
+        // `hasClients` never read an uninitialized hub. (`&session.queue` is stable now that
+        // the Server is at its final address.)
+        if (self.session) |*s| {
+            s.wireStream(self.io);
+            const w: worker_mod.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl, .mount_dir = s.mount_dir, .io = self.io, .render = s.render, .live_mouse = s.live_mouse };
+            s.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
+        }
 
         const addr: net.IpAddress = .{ .ip4 = .loopback(self.port) };
         self.net_server = try addr.listen(self.io, .{ .reuse_address = true });
@@ -377,12 +422,16 @@ pub const Server = struct {
         }
         // §9.1 ordering: THEN stop-flag + shutdown sockets + join ALL stream threads,
         // so no stream producer/consumer can be mid-`submit` when the sentinel goes in.
-        self.session.stream_hub.shutdown();
-        // Drain the worker with the shutdown sentinel, then join.
-        var ctx: q.RequestCtx = .{ .cmd = .shutdown_worker };
-        _ = self.session.queue.submit(&ctx);
-        if (self.session.worker_thread) |t| t.join();
-        self.session.worker_thread = null;
+        // Empty-start mode has no default worker/stream — nothing to drain or join here
+        // (the registry's minted workers are torn down separately in `deinit`).
+        if (self.session) |*s| {
+            s.stream_hub.shutdown();
+            // Drain the worker with the shutdown sentinel, then join.
+            var ctx: q.RequestCtx = .{ .cmd = .shutdown_worker };
+            _ = s.queue.submit(&ctx);
+            if (s.worker_thread) |t| t.join();
+            s.worker_thread = null;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -417,8 +466,22 @@ pub const Server = struct {
             // post-handshake protocol is raw WS frames). We must capture the key into the
             // request frame; `respondWebSocket` reads it immediately, before any body
             // reader invalidates head strings.
-            if (self.session.stream_hub.upgrade(&request, stream.*, key)) return true; // claimed
-            return false; // rejected (503) — handler wrote the error; loop closes socket
+            //
+            // EMPTY-START guard (agent-provisioning-plan §6/§13): `/api/stream` binds ONLY the
+            // DEFAULT machine's `stream_hub` (a minted machine is debugger-driven and cannot be
+            // streamed — the §13 invariant). With no default session there is nothing to stream,
+            // so reject the upgrade with 409 (a guaranteed null-deref otherwise, since this runs
+            // BEFORE any routing). The loop then closes the socket.
+            if (self.session) |*s| {
+                if (s.stream_hub.upgrade(&request, stream.*, key)) return true; // claimed
+                return false; // rejected (503) — handler wrote the error; loop closes socket
+            }
+            request.respond("{\"error\":{\"code\":\"no_machine\",\"message\":\"no machine provisioned; provision_machine first\"}}", .{
+                .status = .conflict,
+                .keep_alive = false,
+                .extra_headers = &json_content_type,
+            }) catch {};
+            return false;
         }
 
         // Per-connection request scratch (§3.4/§5.2): ~192 KiB of JSON/transport work
@@ -592,11 +655,16 @@ pub const Conn = struct {
     /// The shared listener (for the session resolver seam, `resolveSession`). Borrowed;
     /// the Server outlives every connection.
     server: *Server,
-    /// The routed session the `/api/*` handlers drive. Initialized to the DEFAULT session in
-    /// `Conn.init`; `dispatch` re-points it at the `X-Zdos-Session`-named session (Phase 4
-    /// §6 option B) for the duration of one request, holding a refcount. `/mcp` does NOT use
-    /// this field — it re-resolves its own session from `Mcp-Session-Id` via `resolveSession`.
-    session: *Session,
+    /// The OPTIONAL routed session the `/api/*` handlers drive. Initialized to the DEFAULT
+    /// session in `Conn.init` — which is `null` in empty-start mode (`--serve PORT`, no default
+    /// machine). `dispatch` re-points it at the `X-Zdos-Session`-named session for the duration
+    /// of one request, holding a refcount. A per-machine `/api/*` op with this still `null` is
+    /// refused with 409 ("no machine provisioned") in `dispatch` BEFORE any handler runs, so
+    /// every `self.session.?` deref in the `/api/*` handlers is a checked invariant, never a
+    /// live null-deref. `/api/health` answers WITHOUT touching this field (off-worker). `/mcp`
+    /// does NOT use this field — its per-machine tools route by the `machine` arg (stateless
+    /// MCP), and `DELETE /mcp` resolves the registry by its `Mcp-Session-Id` header directly.
+    session: ?*Session,
 
     /// Per-request arena (parsed-JSON working memory), `reset(.retain_capacity)` per
     /// request exactly as the old `Server.arena` was. Owned by this connection.
@@ -634,7 +702,7 @@ pub const Conn = struct {
 
     /// Build a fresh per-connection context. The big scratch arrays stay `undefined`
     /// (filled on use); only the arena needs a backing allocator (the thread-safe gpa).
-    fn init(server: *Server, session: *Session) Conn {
+    fn init(server: *Server, session: ?*Session) Conn {
         return .{
             .server = server,
             .session = session,
@@ -747,37 +815,50 @@ pub const Conn = struct {
         const path = if (qmark) |i| target[0..i] else target;
         const query = if (qmark) |i| target[i + 1 ..] else "";
 
+        // --- `/api/health` FIRST: answers regardless of machine state (EMPTY-START §7) ---
+        // Off-worker, reads ZERO machine state (a constant body) — §A.3a — so it needs NO
+        // session routing and answers even in empty-start mode (no default machine). Slotted
+        // ABOVE the session-routing block so a session-less server still reports liveness.
+        if (std.mem.eql(u8, path, "/api/health")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            self.respondJson(req, .ok, "{\"ok\":true,\"version\":\"zdos-m2\"}");
+            return;
+        }
+
         // --- HTTP `/api/*` session routing (multi-machine plan §6 option B, Phase 4) ---
         // An optional `X-Zdos-Session` header selects which machine this `/api/*` request
         // drives. ABSENT/blank → the DEFAULT session (the mandatory back-compat path: every
         // shipped client + test sends no header and is byte-for-byte unchanged). A KNOWN
         // minted id → that session, with its in-flight refcount BUMPED for the WHOLE request
-        // (the `defer release` below) so a concurrent `DELETE /mcp` cannot free it mid-flight
-        // — the exact resolve→defer-release discipline the MCP `tools/call` path uses. An
+        // (the `defer release` below) so a concurrent `deprovision`/`DELETE /mcp` cannot free
+        // it mid-flight — the exact resolve→defer-release discipline the MCP path uses. An
         // explicit but UNKNOWN/destroyed id → 404 (a typo must NOT silently fall through to
-        // the default and mutate the wrong machine; the MCP path likewise rejects an unknown
-        // id). `resolveSession` already maps blank/singleton → default un-refcounted (so the
-        // `release` is a no-op on it), so the seam is SHARED with `/mcp`, not duplicated. The
-        // header is captured only for `/api/` paths (so `api_session_len` is 0 for `/mcp` and
-        // static routes), and `/mcp` re-resolves its OWN session below, leaving the routed
-        // `self.session` as the default for that path.
+        // the default and mutate the wrong machine). `resolveSession` maps blank/singleton →
+        // default un-refcounted (so the `release` is a no-op on it). The header is captured
+        // only for `/api/` paths (so `api_session_len` is 0 for `/mcp` and static routes), and
+        // `/mcp` routes by the `machine` arg, leaving the routed `self.session` as the default.
         if (self.api_session_len > 0) {
             const routed = self.resolveSession(self.api_session_buf[0..self.api_session_len]) orelse
-                return self.respondError(req, .not_found, "unknown_session", "unknown or destroyed X-Zdos-Session; mint one via MCP initialize");
+                return self.respondError(req, .not_found, "unknown_session", "unknown or destroyed X-Zdos-Session; provision_machine first");
             self.session = routed;
         }
         // Drop the in-flight ref at request end (no-op for the default session, which is
-        // process-owned and never refcounted). Registered AFTER the resolve so the unknown-id
-        // early-return above — which took no ref — does not under-flow the refcount.
-        defer self.server.registry.release(self.session);
+        // process-owned and never refcounted; a no-op too when `session` is null in empty-start
+        // mode). Registered AFTER the resolve so the unknown-id early-return above — which took
+        // no ref — does not under-flow the refcount.
+        defer if (self.session) |s| self.server.registry.release(s);
 
-        // --- session / status / health ---
-        if (std.mem.eql(u8, path, "/api/health")) {
-            if (method != .GET) return self.methodNotAllowed(req);
-            // OFF-WORKER, reads ZERO machine state (constant body) — §A.3a.
-            self.respondJson(req, .ok, "{\"ok\":true,\"version\":\"zdos-m2\"}");
-            return;
+        // --- EMPTY-START reconciliation (agent-provisioning-plan §7): a per-machine `/api/*`
+        // op with NO resolved machine (empty-start mode + blank/absent `X-Zdos-Session`) → 409.
+        // `/api/health` already answered above; every OTHER `/api/*` route below derefs the
+        // session, so refuse here BEFORE any handler runs. (Only `/api/` paths are gated; `/mcp`
+        // and the static UI routes do not read `self.session`.) After this guard every
+        // `self.session.?` in the `/api/*` handlers is a checked invariant, never a live deref.
+        if (std.mem.startsWith(u8, path, "/api/") and self.session == null) {
+            return self.respondError(req, .conflict, "no_machine", "no machine provisioned; provision_machine first");
         }
+
+        // --- status ---
         if (std.mem.eql(u8, path, "/api/status")) {
             if (method != .GET) return self.methodNotAllowed(req);
             return self.submitAndRespond(req, .status);
@@ -1066,7 +1147,7 @@ pub const Conn = struct {
             slice_cycles = r.slice_cycles orelse 0;
             fps = r.fps orelse 0;
         }
-        if (!self.session.run_control.start(slice_cycles, fps)) {
+        if (!self.session.?.run_control.start(slice_cycles, fps)) {
             return self.respondError(req, .conflict, "run_in_flight", "a debugger run is in flight; cannot start the paced run");
         }
         self.respondRunStatus(req);
@@ -1075,7 +1156,7 @@ pub const Conn = struct {
     /// `POST /api/run/stop` — disarm the pacer (owner=idle); return the run status
     /// (incl. the stop cycle). A stopped machine stays inspectable/steppable.
     fn handleRunStop(self: *Conn, req: *http.Server.Request) void {
-        self.session.run_control.stop();
+        self.session.?.run_control.stop();
         self.respondRunStatus(req);
     }
 
@@ -1090,12 +1171,12 @@ pub const Conn = struct {
     fn respondRunStatus(self: *Conn, req: *http.Server.Request) void {
         // Fetch the live machine cycle via the worker (off-worker reads are banned).
         var ctx: q.RequestCtx = .{ .cmd = .status };
-        const resp = self.session.queue.submit(&ctx);
+        const resp = self.session.?.queue.submit(&ctx);
         const cycle: u64 = switch (resp) {
             .status => |st| st.cycles,
-            else => self.session.run_control.lastCycle(),
+            else => self.session.?.run_control.lastCycle(),
         };
-        const rc = self.session.run_control;
+        const rc = self.session.?.run_control;
         const owner = rc.getOwner();
         var w = std.Io.Writer.fixed(self.resp_buf[0..]);
         const ok = blk: {
@@ -1131,7 +1212,7 @@ pub const Conn = struct {
     /// can sync its knob. Reads the mult via the worker (sole reader of machine state).
     fn handleCpuSpeedGet(self: *Conn, req: *http.Server.Request) void {
         var ctx: q.RequestCtx = .{ .cmd = .clock_get };
-        const resp = self.session.queue.submit(&ctx);
+        const resp = self.session.?.queue.submit(&ctx);
         switch (resp) {
             .clock => |mult| self.respondCpuSpeed(req, mult),
             .err => |code| self.respondErrCode(req, code),
@@ -1166,7 +1247,7 @@ pub const Conn = struct {
 
         // Apply at the serialized worker boundary; the worker clamps + echoes.
         var ctx: q.RequestCtx = .{ .cmd = .{ .set_clock = .{ .mult = requested } } };
-        const resp = self.session.queue.submit(&ctx);
+        const resp = self.session.?.queue.submit(&ctx);
         const applied: u64 = switch (resp) {
             .clock => |m| m,
             .err => |code| return self.respondErrCode(req, code),
@@ -1176,7 +1257,7 @@ pub const Conn = struct {
         // Retune the pacer slice from the APPLIED mult so the timer wall rate stays
         // correct as the CPU speeds up (§3) — the SHARED `retunePacerSlice` the MCP
         // `set_clock` post-step also calls (anti-drift). Wall-only; no cycle golden moves.
-        retunePacerSlice(self.session, applied);
+        retunePacerSlice(self.session.?, applied);
 
         self.respondCpuSpeed(req, applied);
     }
@@ -1243,7 +1324,7 @@ pub const Conn = struct {
             const set_buttons = r.buttons != null;
             const nx = @min(r.nx_q16 orelse 0, @as(u32, 0x1_0000));
             const ny = @min(r.ny_q16 orelse 0, @as(u32, 0x1_0000));
-            self.session.live_mouse.ingest(
+            self.session.?.live_mouse.ingest(
                 nx,
                 ny,
                 r.mdx orelse 0,
@@ -1296,17 +1377,17 @@ pub const Conn = struct {
         // plus the `load` submit are ONE atomic per-session critical section. Two concurrent
         // loads would otherwise lose-update the recipe AND desync the persisted recipe from
         // the machine state actually loaded. Order `lock` → `submit_gate` (in submit).
-        self.session.lock.lockUncancelable(self.server.io);
-        defer self.session.lock.unlock(self.server.io);
+        self.session.?.lock.lockUncancelable(self.server.io);
+        defer self.session.?.lock.unlock(self.server.io);
         // Start from the server-held recipe; override with any provided fields via the
         // SHARED `LoadRecipe.overlay` (the SAME copy `buildMcpLoad` applies — anti-drift).
-        var recipe = self.session.recipe;
+        var recipe = self.session.?.recipe;
         if (body.len > 0) {
             const r = self.parseBody(wire.LoadReq, body) orelse return self.badJson(req);
             recipe.overlay(r);
         }
         // Persist the updated recipe so a later `POST /api/load {}` re-loads it.
-        self.session.recipe = recipe;
+        self.session.?.recipe = recipe;
         self.submitAndRespond(req, .{ .load = recipe.toCmd() });
     }
 
@@ -1376,7 +1457,7 @@ pub const Conn = struct {
             .fail => |e| return self.respondError(req, .bad_request, e.code, e.message),
             .ok => |c| c,
         } };
-        const resp = self.session.queue.submit(&ctx);
+        const resp = self.session.?.queue.submit(&ctx);
         switch (resp) {
             // `ctx` (hence the decoded needle in scratch) is still owned by us here —
             // submit() blocks until the worker is done — so the `pattern` echo is intact.
@@ -1483,7 +1564,7 @@ pub const Conn = struct {
     fn handleDevices(self: *Conn, req: *http.Server.Request, query: []const u8) void {
         const want_palette = (self.queryU32(query, "palette") orelse 0) != 0;
         var ctx: q.RequestCtx = .{ .cmd = .devices_get };
-        const resp = self.session.queue.submit(&ctx);
+        const resp = self.session.?.queue.submit(&ctx);
         switch (resp) {
             .devices => |d| self.respondDevices(req, d, want_palette),
             .err => |code| self.respondErrCode(req, code),
@@ -1496,7 +1577,7 @@ pub const Conn = struct {
     fn handleDevice(self: *Conn, req: *http.Server.Request, name: []const u8, query: []const u8) void {
         const want_palette = (self.queryU32(query, "palette") orelse 0) != 0;
         var ctx: q.RequestCtx = .{ .cmd = .devices_get };
-        const resp = self.session.queue.submit(&ctx);
+        const resp = self.session.?.queue.submit(&ctx);
         const d = switch (resp) {
             .devices => |d| d,
             .err => |code| return self.respondErrCode(req, code),
@@ -1567,16 +1648,16 @@ pub const Conn = struct {
         // per session. Order `lock` → `run_control.arb` (in begin/end) → `submit_gate` (in
         // submit) — never inverted. The pacer's own `run_control` use takes no `session.lock`,
         // so this never blocks pacer-vs-control arbitration.
-        self.session.lock.lockUncancelable(self.server.io);
-        defer self.session.lock.unlock(self.server.io);
-        const restore = self.session.run_control.beginDebugger();
-        defer self.session.run_control.endDebugger(restore);
+        self.session.?.lock.lockUncancelable(self.server.io);
+        defer self.session.?.lock.unlock(self.server.io);
+        const restore = self.session.?.run_control.beginDebugger();
+        defer self.session.?.run_control.endDebugger(restore);
         var ctx: q.RequestCtx = .{ .cmd = cmd };
         self.submitCtxAndRespond(req, &ctx);
     }
 
     fn submitCtxAndRespond(self: *Conn, req: *http.Server.Request, ctx: *q.RequestCtx) void {
-        const resp = self.session.queue.submit(ctx);
+        const resp = self.session.?.queue.submit(ctx);
         self.serializeResponse(req, resp);
     }
 
@@ -1600,8 +1681,14 @@ pub const Conn = struct {
     /// replies a JSON-RPC error). The returned default session is NOT refcounted (it is
     /// process-owned and never destroyed; `release` is a no-op on it).
     fn resolveSession(self: *Conn, sid: []const u8) ?*Session {
-        const default = self.server.defaultSession();
-        if (sid.len == 0 or default.id.eqlSlice(sid)) return default;
+        if (self.server.defaultSession()) |default| {
+            // A blank id, or the default's own singleton id, → the default session
+            // (un-refcounted; process-owned). Any other id falls through to the registry.
+            if (sid.len == 0 or default.id.eqlSlice(sid)) return default;
+        } else if (sid.len == 0) {
+            // Empty-start mode (no default machine) + a blank selector → nothing to resolve.
+            return null;
+        }
         return self.server.registry.resolve(sid);
     }
 
@@ -1651,23 +1738,19 @@ pub const Conn = struct {
         const params: std.json.Value = obj.get("params") orelse .null;
 
         // --- dispatch on method ---
-        // `initialize`/`tools/list`/notifications are session-AGNOSTIC (initialize MINTS a
-        // session rather than addressing one), so they never resolve. Only `tools/call`
-        // addresses a machine: resolve its `Mcp-Session-Id` HERE (blank/singleton → the
-        // default; a known minted id → that session, refcounted; unknown → a JSON-RPC
-        // error). The refcount pins the session for the whole call so a concurrent
-        // `DELETE /mcp` cannot tear it down mid-flight; `release` drops it on every path.
+        // MCP runs STATELESS (agent-provisioning-plan §2/§4): `initialize` is a PURE handshake
+        // (mints nothing, sets no `Mcp-Session-Id`), and per-machine `tools/call`s route by the
+        // `machine` tool ARGUMENT — NOT a session header (the client library owns the header and
+        // the LLM cannot set it per call). So nothing here resolves the `Mcp-Session-Id` header;
+        // we hand `handleMcpToolCall` the DEFAULT session (or `null` in empty-start mode) as the
+        // base, and IT resolves the `machine` arg / falls back to the default / returns the
+        // `no_machine` guided error. (`DELETE /mcp` still reads the header — it is an HTTP alias
+        // for `deprovision`, addressed by id; HTTP clients do control headers.)
         if (std.mem.startsWith(u8, method, "notifications/")) return self.respondNotificationAck(req);
         if (std.mem.eql(u8, method, "initialize")) return self.respondMcpInitialize(req, id);
         if (std.mem.eql(u8, method, "tools/list")) return self.respondMcpToolsList(req, id);
         if (std.mem.eql(u8, method, "tools/call")) {
-            // An unknown/destroyed session id is HTTP 404 (the MCP Streamable-HTTP convention +
-            // consistency with the `/api/*` unknown-`X-Zdos-Session` 404), NOT a 200 envelope —
-            // the client should re-`initialize` rather than retry the same dead id.
-            const session = self.resolveSession(self.mcp_session_buf[0..self.mcp_session_len]) orelse
-                return self.respondRpcErrorStatus(req, id, .invalid_request, "unknown or destroyed Mcp-Session-Id; call initialize first", .not_found);
-            defer self.server.registry.release(session);
-            return self.handleMcpToolCall(req, id, params, session);
+            return self.handleMcpToolCall(req, id, params, self.server.defaultSession());
         }
         return self.respondRpcError(req, id, .method_not_found, "unknown method");
     }
@@ -1681,9 +1764,16 @@ pub const Conn = struct {
     /// over the wire).
     fn handleMcpDelete(self: *Conn, req: *http.Server.Request) void {
         const sid = self.mcp_session_buf[0..self.mcp_session_len];
-        const default = self.server.defaultSession();
-        if (sid.len == 0 or default.id.eqlSlice(sid)) {
+        // A blank id is never destroyable; the DEFAULT session's own singleton id is process-
+        // owned (torn down by main.zig, never over the wire). In empty-start mode there is no
+        // default, so only the blank-id guard applies. Everything else routes to the registry.
+        if (sid.len == 0) {
             return self.respondError(req, .not_found, "not_found", "no destroyable session for that Mcp-Session-Id");
+        }
+        if (self.server.defaultSession()) |default| {
+            if (default.id.eqlSlice(sid)) {
+                return self.respondError(req, .not_found, "not_found", "no destroyable session for that Mcp-Session-Id");
+            }
         }
         if (!self.server.registry.destroy(sid)) {
             return self.respondError(req, .not_found, "not_found", "no such session");
@@ -1842,7 +1932,7 @@ pub const Conn = struct {
 
     /// `tools/call`: validate `name`+`arguments` → build the worker command → submit →
     /// serialize the result content via the SHARED writeX builders.
-    fn handleMcpToolCall(self: *Conn, req: *http.Server.Request, id: ?mcp.Id, params: std.json.Value, session: *Session) void {
+    fn handleMcpToolCall(self: *Conn, req: *http.Server.Request, id: ?mcp.Id, params: std.json.Value, session: ?*Session) void {
         if (params != .object) return self.respondRpcError(req, id, .invalid_params, "params must be an object");
         const pobj = params.object;
         const name_v = pobj.get("name") orelse return self.respondRpcError(req, id, .invalid_params, "tools/call requires a name");
@@ -1858,22 +1948,26 @@ pub const Conn = struct {
         if (std.mem.eql(u8, name, "deprovision")) return self.handleMcpDeprovision(req, id, args);
         if (std.mem.eql(u8, name, "list_machines")) return self.handleMcpListMachines(req, id);
 
-        // PER-MACHINE routing (multi-machine plan §2/§3): a `machine` handle in the arguments
-        // selects the target machine the model controls; absent → the EXISTING resolution
-        // (the header-resolved `session`, default for a blank header — unchanged back-compat).
-        // A present-but-unknown/destroyed handle is a tool error (the model self-corrects via
-        // list_machines/provision_machine). The override is PINNED for the whole call (its own
-        // refcount + `defer release`), exactly as the header path pins `session` in `handleMcp`.
-        var target = session;
+        // PER-MACHINE routing (agent-provisioning-plan §2/§4 — STATELESS MCP): a `machine`
+        // handle in the arguments selects the target machine the model controls. ABSENT → the
+        // DEFAULT machine (`session`, the `--serve PORT PROGRAM` back-compat path) if one
+        // exists, else the `no_machine` GUIDED tool error (empty-start mode: the agent must
+        // `provision_machine` first — NOT a silent 404, so it self-corrects). A present-but-
+        // unknown/destroyed handle is the `unknown_machine` tool error (recover via
+        // list_machines/provision_machine). A resolved override is PINNED for the whole call
+        // (its own refcount + `defer release`).
+        var target: *Session = undefined;
         var pinned: ?*Session = null;
-        if (args == .object) {
-            if (args.object.get("machine")) |mv| {
-                if (mv != .string) return self.respondRpcError(req, id, .invalid_params, "machine must be a string handle");
-                const s = self.server.registry.resolve(mv.string) orelse
-                    return self.respondMcpToolError(req, id, "unknown_machine", "no live machine with that handle; call list_machines or provision_machine");
-                pinned = s;
-                target = s;
-            }
+        if (args == .object and args.object.get("machine") != null) {
+            const mv = args.object.get("machine").?;
+            if (mv != .string) return self.respondRpcError(req, id, .invalid_params, "machine must be a string handle");
+            const s = self.server.registry.resolve(mv.string) orelse
+                return self.respondMcpToolError(req, id, "unknown_machine", "no live machine with that handle; call list_machines or provision_machine");
+            pinned = s;
+            target = s;
+        } else {
+            target = session orelse
+                return self.respondMcpToolError(req, id, "no_machine", "no machine; call provision_machine first (or pass a machine handle)");
         }
         defer if (pinned) |s| self.server.registry.release(s);
 
@@ -2123,11 +2217,10 @@ pub const Conn = struct {
         self.respondRpcErrorStatus(req, id, code, msg, .ok);
     }
 
-    /// A JSON-RPC `error` envelope at an EXPLICIT HTTP status. Used for the unknown/destroyed
-    /// `Mcp-Session-Id` case on `tools/call`, which returns HTTP 404 (not 200) — matching both
-    /// (a) zdos's own `/api/*` unknown-`X-Zdos-Session` 404 and (b) the MCP Streamable-HTTP
-    /// convention (an unknown session ⇒ 404 ⇒ the client re-`initialize`s). The JSON-RPC
-    /// error body is still carried, so a client that reads the body also gets a typed reason.
+    /// A JSON-RPC `error` envelope at an EXPLICIT HTTP status (the generic form `respondRpcError`
+    /// delegates to with `.ok`). Stateless MCP routes per-machine calls by the `machine` arg, so
+    /// there is no unknown-session 404 on `tools/call` anymore; this stays the one place the HTTP
+    /// status is parameterized for any future non-200 JSON-RPC error reply.
     fn respondRpcErrorStatus(self: *Conn, req: *http.Server.Request, id: ?mcp.Id, code: mcp.RpcError, msg: []const u8, status: http.Status) void {
         var w = std.Io.Writer.fixed(self.resp_buf[0..]);
         mcp.writeErrorEnvelope(&w, id, code, msg) catch {
@@ -2142,63 +2235,14 @@ pub const Conn = struct {
         req.respond("", .{ .status = .accepted, .keep_alive = false }) catch {};
     }
 
-    /// `initialize`: PROVISION a new session in the registry and advertise the protocol
-    /// version + serverInfo + tools capability, echoing the freshly MINTED `zdos-sess-<seq>`
-    /// in the `Mcp-Session-Id` response header (multi-machine plan §7.3). The minted
-    /// session boots the SAME program as the default (its recipe + mount dir) on its own
-    /// machine + worker, so the client drives an independent, isolated guest. At the
-    /// `MAX_SESSIONS` cap a JSON-RPC `internal` error is returned (the §9 reject-don't-evict
-    /// behavior); a program that will not boot is likewise an `internal` error. A client
-    /// that NEVER calls `initialize` keeps using the default session (blank id → default),
-    /// so the shipped single-machine behavior is unchanged.
+    /// `initialize`: a PURE handshake (agent-provisioning-plan §4 — the EMPTY-START / stateless
+    /// inversion). It advertises ONLY the protocol version + serverInfo + tools capability. It
+    /// MINTS no session, reads NO default recipe, and issues NO `Mcp-Session-Id` header — MCP is
+    /// stateless, and a machine is created on demand by the `provision_machine` tool (which
+    /// returns its handle in the tool RESULT), then driven by the `machine` tool arg. This makes
+    /// `initialize` safe in empty-start mode (no default session to read) and identical whether
+    /// or not a default machine exists.
     fn respondMcpInitialize(self: *Conn, req: *http.Server.Request, id: ?mcp.Id) void {
-        const default = self.server.defaultSession();
-        // RECIPE READ span (session.zig CONTRACT): `default.recipe` is a ~143-byte multi-
-        // field `LoadRecipe` and `default.mount_dir` an `Io.Dir`; the locked WRITERS
-        // (`handleLoad`, `buildMcpLoad`) overlay/persist `recipe` under `default.lock`. A
-        // concurrent `POST /api/load` racing this by-value read would TEAR the copy (a
-        // `file`/`file_len` mismatch) → the minted session boots a corrupt program. Hold
-        // `default.lock` ONLY across the copy-out, then UNLOCK before `registry.create`:
-        // `create` takes the registry mutex, and the §13 lock order forbids nesting the
-        // registry mutex under `session.lock` (it would invert `session.lock` →
-        // registry-mutex against the resolve/release ordering). So we never hold the
-        // session lock across `create`.
-        // Copy under the lock in a block so the `defer` unlock fires at the block end —
-        // i.e. BEFORE `create` (preserving the lock order), and robust against a future
-        // edit inserting a fallible/early-returning step between lock and unlock.
-        const recipe, const mount_dir = blk: {
-            default.lock.lockUncancelable(self.server.io);
-            defer default.lock.unlock(self.server.io);
-            break :blk .{ default.recipe, default.mount_dir };
-        };
-        // Clone the default's APPLIED CPU multiplier so the minted session boots at the same
-        // speed the default currently runs at (a faithful clone). Read it via the gated
-        // `clock_get` (cycle-neutral, off-worker reads are banned) on the default's worker.
-        // For a fresh default this is `timing.DEFAULT_MULT` (12) — byte-identical to before
-        // this change, when the minted machine simply inherited the boot-default mult.
-        var cctx: q.RequestCtx = .{ .cmd = .clock_get };
-        const default_mult: u64 = switch (default.queue.submit(&cctx)) {
-            .clock => |mv| mv,
-            else => timing.DEFAULT_MULT,
-        };
-        // The minted session SHARES the default's `mount_dir` (owned + closed by `main.zig`),
-        // so it does NOT own the fd → `owns_mount = false` (closing it on teardown would
-        // double-close `main.zig`'s dir). Only `provision_machine` opens a fresh, owned dir.
-        const created = self.server.registry.create(recipe, mount_dir, default_mult, false) catch |err| switch (err) {
-            error.SessionLimitReached => return self.respondRpcError(req, id, .internal, "session limit reached; DELETE an existing session first"),
-            error.ProgramNotFound => return self.respondRpcError(req, id, .internal, "the program for the new session was not found in the mount"),
-            error.BootFailed => return self.respondRpcError(req, id, .internal, "failed to boot the program for the new session"),
-            error.OutOfMemory => return self.respondRpcError(req, id, .internal, "out of memory provisioning the new session"),
-            // A worker-thread spawn failure (resource exhaustion) is likewise a provisioning failure.
-            else => return self.respondRpcError(req, id, .internal, "failed to provision the new session"),
-        };
-        // The minted id arrives BY VALUE from `create` (the lifetime/UAF fix): `create`
-        // publishes the new `*Session` into the map UN-refcounted, so a concurrent DELETE of
-        // the predictable `zdos-sess-<seq>` id could free it the instant `create` returns. We
-        // therefore NEVER dereference `created.session` here — only the id value, which the
-        // registry snapshotted while it still solely owned the session.
-        const minted_id: SessionId = created.id;
-
         var w = std.Io.Writer.fixed(self.resp_buf[0..]);
         const ok = blk: {
             mcp.writeResultPrefix(&w, id) catch break :blk false;
@@ -2210,11 +2254,7 @@ pub const Conn = struct {
             break :blk true;
         };
         if (!ok) return self.respondRpcError(req, id, .internal, "response too large");
-        const headers = [_]http.Header{
-            .{ .name = "content-type", .value = "application/json; charset=utf-8" },
-            .{ .name = "mcp-session-id", .value = minted_id.slice() },
-        };
-        req.respond(w.buffered(), .{ .status = .ok, .keep_alive = false, .extra_headers = &headers }) catch {};
+        self.respondJson(req, .ok, w.buffered());
     }
 
     /// `tools/list`: emit the static catalog (each `{name,description,inputSchema}`).
@@ -2234,7 +2274,7 @@ pub const Conn = struct {
     /// `?attrs` flag (the flag is NOT part of the command — Finding 5).
     fn submitAndRespondScreen(self: *Conn, req: *http.Server.Request, want_attrs: bool) void {
         var ctx: q.RequestCtx = .{ .cmd = .screen_get };
-        const resp = self.session.queue.submit(&ctx);
+        const resp = self.session.?.queue.submit(&ctx);
         switch (resp) {
             .screen => |sr| self.respondScreen(req, sr, want_attrs),
             .err => |code| self.respondErrCode(req, code),
@@ -2273,10 +2313,10 @@ pub const Conn = struct {
         var fr_copy: q.FramebufferResult = undefined; // POD descriptor, valid past unlock
         var body_len: usize = 0;
         const failure: ?FbFail = blk: {
-            self.session.lock.lockUncancelable(self.server.io);
-            defer self.session.lock.unlock(self.server.io);
+            self.session.?.lock.lockUncancelable(self.server.io);
+            defer self.session.?.lock.unlock(self.server.io);
             var ctx: q.RequestCtx = .{ .cmd = .framebuffer_get };
-            const resp = self.session.queue.submit(&ctx);
+            const resp = self.session.?.queue.submit(&ctx);
             const fr = switch (resp) {
                 .framebuffer => |f| f,
                 .err => |code| break :blk FbFail{ .err_code = code },
@@ -2289,9 +2329,9 @@ pub const Conn = struct {
             // path re-encodes the same peek host-side over the server-owned snapshot
             // (off-worker, cycle-neutral §3.6); index/rgba copy the raw buffer.
             const src: []const u8 = switch (fmt) {
-                .index => self.session.render.index[0..fr.index_len],
-                .rgba => self.session.render.rgba[0..fr.rgba_len],
-                .png => encodePng(self.session.render, fr) orelse
+                .index => self.session.?.render.index[0..fr.index_len],
+                .rgba => self.session.?.render.rgba[0..fr.rgba_len],
+                .png => encodePng(self.session.?.render, fr) orelse
                     break :blk FbFail{ .status = .{ .status = .service_unavailable, .code = "internal", .msg = "PNG encode overflow" } },
             };
             @memcpy(buf[0..src.len], src);

@@ -88,11 +88,11 @@ const TestServer = struct {
     }
 
     fn start(self: *TestServer) !void {
-        self.srv.session.ctrl = &self.ctrl;
+        self.srv.session.?.ctrl = &self.ctrl;
         const w = struct {
             fn run(s: *Server) void {
                 const worker = @import("worker.zig");
-                const ww: worker.Worker = .{ .queue = &s.session.queue, .ctrl = s.session.ctrl, .render = s.session.render };
+                const ww: worker.Worker = .{ .queue = &s.session.?.queue, .ctrl = s.session.?.ctrl, .render = s.session.?.render };
                 ww.run();
             }
         };
@@ -101,7 +101,7 @@ const TestServer = struct {
 
     fn deinit(self: *TestServer) void {
         var ctx: q.RequestCtx = .{ .cmd = .shutdown_worker };
-        _ = self.srv.session.queue.submit(&ctx);
+        _ = self.srv.session.?.queue.submit(&ctx);
         self.worker.join();
         self.srv.deinit(); // also tears down any registry-minted sessions (joins their workers)
         destroy(self.alloc, self.m);
@@ -129,6 +129,17 @@ fn splitResponse(raw: []const u8) Resp {
     const sp = std.mem.indexOfScalar(u8, raw, ' ').?;
     const status = std.fmt.parseInt(u16, raw[sp + 1 .. sp + 4], 10) catch 0;
     return .{ .status = status, .body = body, .raw = raw };
+}
+
+/// Serve one raw HTTP request straight against a `*Server` over in-memory streams (no
+/// `TestServer` wrapper) — used by the EMPTY-START tests, which run a `Server.initEmpty`
+/// with NO default machine/worker.
+fn serveRaw(srv: *Server, raw: []const u8, out: []u8) Resp {
+    var in = std.Io.Reader.fixed(raw);
+    var w = std.Io.Writer.fixed(out);
+    var hs = http.Server.init(&in, &w);
+    srv.serveOne(&hs);
+    return splitResponse(w.buffered());
 }
 
 fn get(ts: *TestServer, path: []const u8, out: []u8) Resp {
@@ -189,7 +200,12 @@ fn sessionHeader(raw: []const u8, dst: []u8) ?[]const u8 {
     return null;
 }
 
-test "initialize provisions a session and echoes a freshly minted zdos-sess id" {
+// NOTE (agent-provisioning-plan §4, the EMPTY-START / stateless inversion): `initialize` is
+// now a PURE handshake — it mints NO session and issues NO `Mcp-Session-Id` header. The
+// "initialize mints / routes by header" coverage these tests used to assert moved onto
+// `provision_machine` + the `machine` tool arg (the minting/routing model that actually ships).
+
+test "initialize is a pure handshake: protocolVersion + capabilities, and mints NO Mcp-Session-Id" {
     var ts = try TestServer.init(std.testing.allocator);
     try ts.start();
     defer ts.deinit();
@@ -199,74 +215,87 @@ test "initialize provisions a session and echoes a freshly minted zdos-sess id" 
     try std.testing.expect(std.mem.indexOf(u8, r.body, "\"protocolVersion\":\"2025-06-18\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.body, "\"capabilities\":{\"tools\":{}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.body, "\"id\":1") != null);
-    // The MINTED session id (multi-machine plan §4.4a) is echoed in the response header.
+    // STATELESS MCP: initialize mints NOTHING and issues NO Mcp-Session-Id header — a machine
+    // is created by provision_machine (handle in the tool RESULT), never by initialize.
     var sbuf: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("zdos-sess-0", sessionHeader(r.raw, &sbuf).?);
+    try std.testing.expect(sessionHeader(r.raw, &sbuf) == null);
 }
 
-test "initialize twice mints two DISTINCT sessions; tools/call routes by Mcp-Session-Id" {
+test "provision_machine mints a fresh zdos-sess handle (the minting initialize used to do)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const h = try provisionHandle(&ts, std.testing.allocator, build_options.examples_dir, "HELLO.COM", "");
+    defer std.testing.allocator.free(h);
+    try std.testing.expect(std.mem.startsWith(u8, h, "zdos-sess-"));
+}
+
+test "provision_machine twice mints two DISTINCT machines; the {machine} arg routes each" {
     var ts = try TestServer.init(std.testing.allocator);
     try ts.start();
     defer ts.deinit();
 
-    var ida_buf: [128]u8 = undefined;
-    var idb_buf: [128]u8 = undefined;
-    const a_raw = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}", null, &obuf);
-    const id_a = try std.testing.allocator.dupe(u8, sessionHeader(a_raw.raw, &ida_buf).?);
-    defer std.testing.allocator.free(id_a);
-    const b_raw = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}", null, &obuf);
-    const id_b = sessionHeader(b_raw.raw, &idb_buf).?;
-    try std.testing.expectEqualStrings("zdos-sess-0", id_a);
-    try std.testing.expectEqualStrings("zdos-sess-1", id_b);
+    // Two provisions of the SAME program → two independent machines with distinct handles
+    // (was "initialize twice mints two distinct"; routing moved from the header to the arg).
+    const a = try provisionHandle(&ts, std.testing.allocator, build_options.examples_dir, "HELLO.COM", "");
+    defer std.testing.allocator.free(a);
+    const b = try provisionHandle(&ts, std.testing.allocator, build_options.examples_dir, "HELLO.COM", "");
+    defer std.testing.allocator.free(b);
+    try std.testing.expect(!std.mem.eql(u8, a, b));
 
-    // Step session A by one instruction (routes to A's machine via its header).
-    _ = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"step\",\"arguments\":{}}}", id_a, &obuf);
-
-    // A advanced; B (a separate booted machine) is still at cycle 0 — isolation.
-    const a_status = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"status\"}}", id_a, &obuf);
-    var anav = try Nav.parse(std.testing.allocator, a_status.body);
-    defer anav.deinit();
-    try std.testing.expect(std.mem.indexOf(u8, toolText(&anav), "\"cycles\":0") == null);
-
-    const b_status = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"status\"}}", id_b, &obuf);
-    var bnav = try Nav.parse(std.testing.allocator, b_status.body);
-    defer bnav.deinit();
-    try std.testing.expect(std.mem.indexOf(u8, toolText(&bnav), "\"cycles\":0") != null);
+    // Step ONLY A (route by its handle); B is a separate booted machine, still at cycle 0.
+    var sbuf: [512]u8 = undefined;
+    const step = std.fmt.bufPrint(&sbuf, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"step\",\"arguments\":{{\"machine\":\"{s}\"}}}}}}", .{a}) catch unreachable;
+    _ = mcpPost(&ts, step, null, &obuf);
+    try std.testing.expect(cyclesVia(&ts, a) > 0);
+    try std.testing.expectEqual(@as(u64, 0), cyclesVia(&ts, b));
 }
 
-test "DELETE /mcp destroys the addressed session; a later tools/call on it errors" {
+test "deprovision destroys the addressed machine; a later tools/call on it is unknown_machine" {
     var ts = try TestServer.init(std.testing.allocator);
     try ts.start();
     defer ts.deinit();
 
-    var id_buf: [128]u8 = undefined;
-    const init_raw = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}", null, &obuf);
-    const id = sessionHeader(init_raw.raw, &id_buf).?;
+    const h = try provisionHandle(&ts, std.testing.allocator, build_options.examples_dir, "HELLO.COM", "");
+    defer std.testing.allocator.free(h);
 
-    // A tools/call on the live session works.
-    const live = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"status\"}}", id, &obuf);
+    var sbuf: [512]u8 = undefined;
+    const stat = std.fmt.bufPrint(&sbuf, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"status\",\"arguments\":{{\"machine\":\"{s}\"}}}}}}", .{h}) catch unreachable;
+    const live = mcpPost(&ts, stat, null, &obuf);
     try std.testing.expectEqual(@as(u16, 200), live.status);
     try std.testing.expect(std.mem.indexOf(u8, live.body, "\"isError\":false") != null);
 
-    // DELETE tears it down.
-    var dreq: [256]u8 = undefined;
-    const draw = std.fmt.bufPrint(&dreq, "DELETE /mcp HTTP/1.1\r\nHost: x\r\nMcp-Session-Id: {s}\r\n\r\n", .{id}) catch unreachable;
-    const del = splitResponse(ts.request(draw, &obuf));
-    try std.testing.expectEqual(@as(u16, 200), del.status);
-    try std.testing.expect(std.mem.indexOf(u8, del.body, "\"deleted\":true") != null);
+    // deprovision via the tool (was "DELETE /mcp destroys").
+    var dbuf: [512]u8 = undefined;
+    const del = std.fmt.bufPrint(&dbuf, "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"deprovision\",\"arguments\":{{\"machine\":\"{s}\"}}}}}}", .{h}) catch unreachable;
+    _ = mcpPost(&ts, del, null, &obuf);
 
-    // A tools/call on the destroyed id is HTTP 404 (the MCP Streamable-HTTP convention:
-    // unknown session ⇒ 404 ⇒ re-`initialize`), carrying the JSON-RPC unknown-session error.
-    const after = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"status\"}}", id, &obuf);
-    try std.testing.expectEqual(@as(u16, 404), after.status);
-    try std.testing.expectEqual(@as(i64, -32600), try rpcErrorCode(after.body, std.testing.allocator));
+    // A later tools/call on the destroyed handle is an unknown_machine tool error (not a crash).
+    const after = mcpPost(&ts, stat, null, &obuf);
+    try std.testing.expectEqual(@as(u16, 200), after.status);
+    try std.testing.expect(std.mem.indexOf(u8, after.body, "unknown_machine") != null);
 }
 
-test "a tools/call with a blank Mcp-Session-Id still reaches the default session" {
+test "DELETE /mcp is an HTTP alias for deprovision (header-addressed by the handle)" {
     var ts = try TestServer.init(std.testing.allocator);
     try ts.start();
     defer ts.deinit();
-    // No header → default session (the NOP machine). Backward-compat with the shipped PoC.
+    const h = try provisionHandle(&ts, std.testing.allocator, build_options.examples_dir, "HELLO.COM", "");
+    defer std.testing.allocator.free(h);
+
+    var dreq: [256]u8 = undefined;
+    const draw = std.fmt.bufPrint(&dreq, "DELETE /mcp HTTP/1.1\r\nHost: x\r\nMcp-Session-Id: {s}\r\n\r\n", .{h}) catch unreachable;
+    const del = splitResponse(ts.request(draw, &obuf));
+    try std.testing.expectEqual(@as(u16, 200), del.status);
+    try std.testing.expect(std.mem.indexOf(u8, del.body, "\"deleted\":true") != null);
+    try std.testing.expectEqual(@as(usize, 0), ts.srv.registry.liveCount());
+}
+
+test "a tools/call with NO machine arg reaches the default machine (back-compat)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    // No machine arg, no header → the default (the NOP machine). The shipped single-machine UX.
     const r = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"status\"}}", null, &obuf);
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expect(std.mem.indexOf(u8, r.body, "\"isError\":false") != null);
@@ -963,12 +992,20 @@ fn statusCycles(ts: *TestServer, session: ?[]const u8, out: []u8) !u64 {
     return @intCast(nav.root.object.get("cycles").?.integer);
 }
 
-/// Mint a fresh session via MCP `initialize`; return its id (caller frees).
+/// Mint a fresh registry-backed machine via `provision_machine` (stateless MCP — `initialize`
+/// no longer mints); return its handle (caller frees). The handle doubles as the `X-Zdos-
+/// Session` value the `/api/*` routing resolves, so these Phase-4 HTTP-routing tests still
+/// exercise a registry-minted machine — now provisioned, not header-minted.
 fn mintSession(ts: *TestServer, out: []u8) ![]const u8 {
-    var idbuf: [64]u8 = undefined;
-    const init_raw = mcpPost(ts, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}", null, out);
-    const id = sessionHeader(init_raw.raw, &idbuf) orelse return error.NoSessionId;
-    return std.testing.allocator.dupe(u8, id);
+    var bbuf: [1024]u8 = undefined;
+    const body = std.fmt.bufPrint(&bbuf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"provision_machine\",\"arguments\":{{\"mount_dir\":\"{s}\",\"file\":\"HELLO.COM\"}}}}}}", .{build_options.examples_dir}) catch unreachable;
+    const r = mcpPost(ts, body, null, out);
+    if (r.status != 200) return error.ProvisionFailed;
+    var nav = try Nav.parse(std.testing.allocator, r.body);
+    defer nav.deinit();
+    const obj = toolObject(&nav);
+    const handle = obj.object.get("machine") orelse return error.NoMachineHandle;
+    return std.testing.allocator.dupe(u8, handle.string);
 }
 
 test "Phase 4: X-Zdos-Session routes /api/* to the minted machine; the default is untouched" {
@@ -1108,99 +1145,13 @@ test "mapCpuSpeed: in-range mhz is byte-identical (14 MHz still maps to the 12 b
     }
 }
 
-// ===========================================================================
-// Finding 3 (HIGH race) regression: MCP `initialize` reads `default.recipe` +
-// `default.mount_dir` UNDER `default.lock`. Pre-fix the by-value copy raced the locked
-// `POST /api/load` writer (`handleLoad`), tearing the multi-field `LoadRecipe` so the
-// minted session booted a corrupt/wrong program. This drives the REAL wire paths: one
-// thread toggles `/api/load` between two distinct WHOLE recipes while the main thread
-// `initialize`s and inspects each minted session's stored recipe. We assert every minted
-// recipe equals ONE of the two wholes (the set of valid outcomes) — never a torn splice;
-// we never assert a specific interleaving (scheduling is legitimately nondeterministic).
-// ===========================================================================
-
-/// Compare only the DEFINED fields (the bytes past `*_len` are `undefined` by design).
-fn recipeEql(a: server_mod.LoadRecipe, b: server_mod.LoadRecipe) bool {
-    return a.drive == b.drive and
-        a.file_len == b.file_len and
-        a.cmdtail_len == b.cmdtail_len and
-        std.mem.eql(u8, a.file[0..a.file_len], b.file[0..b.file_len]) and
-        std.mem.eql(u8, a.cmdtail[0..a.cmdtail_len], b.cmdtail[0..b.cmdtail_len]);
-}
-
-const LoadToggleCtx = struct {
-    ts: *TestServer,
-    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    fn run(c: *LoadToggleCtx) void {
-        var out: [4096]u8 = undefined;
-        var rbuf_a: [512]u8 = undefined;
-        var rbuf_b: [512]u8 = undefined;
-        // Both recipes boot HELLO.COM (so the minted session always boots) but carry a
-        // HOMOGENEOUS command tail of a DIFFERENT char AND a different length — a torn
-        // by-value copy splices A's bytes/len with B's, yielding a recipe equal to NEITHER.
-        const body_a = "{\"drive\":2,\"file\":\"HELLO.COM\",\"cmdtail\":\"" ++ ("A" ** 100) ++ "\"}";
-        const body_b = "{\"drive\":2,\"file\":\"HELLO.COM\",\"cmdtail\":\"" ++ ("B" ** 60) ++ "\"}";
-        const req_a = std.fmt.bufPrint(&rbuf_a, "POST /api/load HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\ncontent-length: {d}\r\n\r\n{s}", .{ body_a.len, body_a }) catch unreachable;
-        const req_b = std.fmt.bufPrint(&rbuf_b, "POST /api/load HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\ncontent-length: {d}\r\n\r\n{s}", .{ body_b.len, body_b }) catch unreachable;
-        var toggle = false;
-        while (!c.stop.load(.acquire)) {
-            _ = c.ts.request(if (toggle) req_b else req_a, &out);
-            toggle = !toggle;
-        }
-    }
-};
-
-test "concurrent /api/load + initialize: every minted session boots ONE WHOLE recipe (no torn read)" {
-    const alloc = std.testing.allocator;
-    var ts = try TestServer.init(alloc);
-    try ts.start();
-    defer ts.deinit();
-
-    const recipe_a = server_mod.LoadRecipe.init(2, "HELLO.COM", "A" ** 100);
-    const recipe_b = server_mod.LoadRecipe.init(2, "HELLO.COM", "B" ** 60);
-
-    // Commit recipe A synchronously FIRST so `default.recipe` is a known whole before any
-    // sampling — the writer then only ever toggles A↔B, so the valid set is exactly {A, B}.
-    // (Without this, the initial empty-cmdtail startup recipe is a third valid whole that
-    // reads as "not A and not B" and would trip the tear check — a false positive.)
-    {
-        const body_a0 = "{\"drive\":2,\"file\":\"HELLO.COM\",\"cmdtail\":\"" ++ ("A" ** 100) ++ "\"}";
-        var rbuf: [512]u8 = undefined;
-        const req0 = std.fmt.bufPrint(&rbuf, "POST /api/load HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\ncontent-length: {d}\r\n\r\n{s}", .{ body_a0.len, body_a0 }) catch unreachable;
-        _ = ts.request(req0, &obuf);
-    }
-
-    var ctx = LoadToggleCtx{ .ts = &ts };
-    const writer = try std.Thread.spawn(.{}, LoadToggleCtx.run, .{&ctx});
-    defer {
-        ctx.stop.store(true, .release);
-        writer.join();
-    }
-
-    var torn = false;
-    var minted: usize = 0;
-    var n: usize = 0;
-    while (n < 100) : (n += 1) {
-        const r = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}", null, &obuf);
-        if (r.status != 200) continue; // a transient provisioning failure → skip (no sample)
-        var idbuf: [128]u8 = undefined;
-        const id = sessionHeader(r.raw, &idbuf) orelse continue;
-        // The minted session's stored recipe IS the snapshot `respondMcpInitialize` copied
-        // out of `default.recipe` — so it is exactly what a torn read would have produced.
-        const sess = ts.srv.registry.resolve(id) orelse continue;
-        const got = sess.recipe;
-        ts.srv.registry.release(sess);
-        if (!recipeEql(got, recipe_a) and !recipeEql(got, recipe_b)) torn = true;
-        minted += 1;
-        // Free the slot so the next initialize mints again (keeps us under MAX_SESSIONS).
-        _ = ts.srv.registry.destroy(id);
-    }
-
-    // The invariant: NO minted session ever saw a torn recipe, and we actually sampled some.
-    try std.testing.expect(!torn);
-    try std.testing.expect(minted > 0);
-}
+// NOTE (agent-provisioning-plan §4): the former "concurrent /api/load + initialize: every
+// minted session boots ONE WHOLE recipe (no torn read)" regression (Finding 3) is RETIRED.
+// It guarded a by-value copy of `default.recipe` inside `respondMcpInitialize`; the EMPTY-START
+// inversion GUTTED that function (initialize no longer reads the default recipe — it mints
+// nothing), so the torn-read code path it exercised no longer exists. `provision_machine`
+// builds its recipe from per-call request ARGS parsed into the per-request arena — never a
+// shared default field — so there is no analogous shared-recipe tear to regress against.
 
 // ===========================================================================
 // Agent-driven machine PROVISIONING (multi-machine plan §3/§8/§11.2) — provision_machine /
@@ -1386,4 +1337,117 @@ test "per-machine routing: an unknown {machine} is an unknown_machine tool error
     const r = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{\"machine\":\"zdos-sess-999\"}}}", null, &obuf);
     try std.testing.expectEqual(@as(u16, 200), r.status);
     try std.testing.expect(std.mem.indexOf(u8, r.body, "unknown_machine") != null);
+}
+
+// ===========================================================================
+// EMPTY-START (agent-provisioning-plan §6/§7): `Server.initEmpty` — NO default machine, NO
+// worker, NO pacer. `/api/health` answers off-worker; a per-machine MCP tool with no machine
+// → the `no_machine` guided error; a blank `/api/*` → 409; provision→drive→deprovision works.
+// ===========================================================================
+
+/// A live EMPTY test server (`Server.initEmpty`): the real registry + listener seam over
+/// in-memory streams, but NO default session/worker. Minted machines (from provision_machine)
+/// each get their own worker, joined by `srv.deinit()`.
+const EmptyServer = struct {
+    alloc: std.mem.Allocator,
+    threaded: *std.Io.Threaded,
+    srv: *Server,
+
+    fn init(alloc: std.mem.Allocator) !EmptyServer {
+        const threaded = try alloc.create(std.Io.Threaded);
+        threaded.* = std.Io.Threaded.init(alloc, .{});
+        const srv = try alloc.create(Server);
+        srv.* = try Server.initEmpty(alloc, threaded.io(), 0);
+        return .{ .alloc = alloc, .threaded = threaded, .srv = srv };
+    }
+    fn deinit(self: *EmptyServer) void {
+        self.srv.deinit(); // tears down any registry-minted sessions (joins their workers)
+        self.alloc.destroy(self.srv);
+        self.threaded.deinit();
+        self.alloc.destroy(self.threaded);
+    }
+};
+
+fn emptyMcp(es: *EmptyServer, body: []const u8, out: []u8) Resp {
+    var req_buf: [2048]u8 = undefined;
+    const raw = std.fmt.bufPrint(&req_buf, "POST /mcp HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\ncontent-length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    return serveRaw(es.srv, raw, out);
+}
+
+fn emptyGet(es: *EmptyServer, path: []const u8, out: []u8) Resp {
+    var req_buf: [256]u8 = undefined;
+    const raw = std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: x\r\n\r\n", .{path}) catch unreachable;
+    return serveRaw(es.srv, raw, out);
+}
+
+test "empty-start: /api/health answers ok with no machine provisioned" {
+    var es = try EmptyServer.init(std.testing.allocator);
+    defer es.deinit();
+    const r = emptyGet(&es, "/api/health", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"ok\":true") != null);
+}
+
+test "empty-start: initialize is still a pure handshake with no machine" {
+    var es = try EmptyServer.init(std.testing.allocator);
+    defer es.deinit();
+    const r = emptyMcp(&es, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"protocolVersion\":\"2025-06-18\"") != null);
+    var sbuf: [128]u8 = undefined;
+    try std.testing.expect(sessionHeader(r.raw, &sbuf) == null);
+}
+
+test "empty-start: a per-machine MCP tool with no machine is the no_machine guided error" {
+    var es = try EmptyServer.init(std.testing.allocator);
+    defer es.deinit();
+    const r = emptyMcp(&es, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"status\"}}", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status); // a tool error is still HTTP 200 (isError result)
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "no_machine") != null);
+}
+
+test "empty-start: a blank /api/* request is 409 (no machine provisioned)" {
+    var es = try EmptyServer.init(std.testing.allocator);
+    defer es.deinit();
+    const r = emptyGet(&es, "/api/status", &obuf);
+    try std.testing.expectEqual(@as(u16, 409), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "no_machine") != null);
+}
+
+test "empty-start: provision -> drive by {machine} -> list -> deprovision all work" {
+    var es = try EmptyServer.init(std.testing.allocator);
+    defer es.deinit();
+
+    // provision a REAL machine even though no default ever existed.
+    var bbuf: [1024]u8 = undefined;
+    const pbody = std.fmt.bufPrint(&bbuf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"provision_machine\",\"arguments\":{{\"mount_dir\":\"{s}\",\"file\":\"HELLO.COM\"}}}}}}", .{build_options.examples_dir}) catch unreachable;
+    const pr = emptyMcp(&es, pbody, &obuf);
+    try std.testing.expectEqual(@as(u16, 200), pr.status);
+    var pnav = try Nav.parse(std.testing.allocator, pr.body);
+    const handle = try std.testing.allocator.dupe(u8, toolObject(&pnav).object.get("machine").?.string);
+    pnav.deinit();
+    defer std.testing.allocator.free(handle);
+    try std.testing.expect(std.mem.startsWith(u8, handle, "zdos-sess-"));
+    try std.testing.expectEqual(@as(usize, 1), es.srv.registry.liveCount());
+
+    // drive it by {machine}: a step on its own worker returns a non-error result.
+    var sbuf: [512]u8 = undefined;
+    const step = std.fmt.bufPrint(&sbuf, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"step\",\"arguments\":{{\"machine\":\"{s}\"}}}}}}", .{handle}) catch unreachable;
+    const sr = emptyMcp(&es, step, &obuf);
+    try std.testing.expectEqual(@as(u16, 200), sr.status);
+    try std.testing.expect(std.mem.indexOf(u8, sr.body, "\"isError\":false") != null);
+
+    // list_machines shows exactly the one live machine.
+    {
+        const lr = emptyMcp(&es, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"list_machines\"}}", &obuf);
+        var lnav = try Nav.parse(std.testing.allocator, lr.body);
+        defer lnav.deinit();
+        try std.testing.expectEqual(@as(i64, 1), toolObject(&lnav).object.get("live_machines").?.integer);
+    }
+
+    // deprovision frees it; the registry is empty again.
+    var dbuf: [512]u8 = undefined;
+    const del = std.fmt.bufPrint(&dbuf, "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{{\"name\":\"deprovision\",\"arguments\":{{\"machine\":\"{s}\"}}}}}}", .{handle}) catch unreachable;
+    _ = emptyMcp(&es, del, &obuf);
+    try std.testing.expectEqual(@as(usize, 0), es.srv.registry.liveCount());
 }
