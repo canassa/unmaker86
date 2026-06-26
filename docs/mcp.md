@@ -144,13 +144,69 @@ first. See *Machines* below.
 | `read_stack` | `{count}` | read `count` 16-bit words from SS:SP. |
 | `read_ivt` | `{vector}` | read one real-mode interrupt vector (0..255): its segment:offset. |
 | `read_console` | `{}` | the guest's accumulated CON output as hex (side-effect-free — no clear-on-read). DOS INT 21h console writes (AH=02/06/09) surface **here**, not on the `read_screen`/`screenshot` text page (see Notes). |
+| `read_mouse` | `{}` | the INT 33h mouse-driver state: cursor `x`/`y` (the AX=3 granularity-masked position), `buttons` mask, the **live** range `min_x`/`max_x`/`min_y`/`max_y` (what the guest set via fn 7/8 — the range `input_mouse`'s `x`/`y` clamp to and `nx`/`ny` normalize against), `visible`, and per-button `press_count`/`release_count` (`[left,right,middle]`). **Pure peek** — does **not** invoke a live INT 33h, so it does **not** clear the AX=5/6 counters. Use it to aim `input_mouse` and verify the result. |
 | `read_io_port` | `{port}` | the non-mutating shadow of one I/O port (never a live, stateful IN). |
 
 ### Input injection (scripted / deterministic)
 | tool | arguments | does |
 |---|---|---|
-| `input_key` | exactly one of `{scancode, make?, ext?}` / `{char}` | inject a key. `char` is a single ASCII char resolved over the real set-1 table. |
-| `input_mouse` | `{x?, y?, dx?, dy?, buttons?}` | inject a scripted mouse event. Absolute (`x`/`y`) vs relative (`dx`/`dy`) are mutually exclusive per axis; at least one field is required. (The live coalesced browser-cursor path is HTTP-only.) |
+| `input_key` | exactly one of `{char, hold_ms?}` / `{scancode, make?, ext?}` | inject a key. `char` (a single ASCII char resolved over the real set-1 table) is a **tap** that **advances the machine**: press → ~100 ms **emulated** dwell → release (see *Clicks & the dwell*), so a guest that level-samples raw key state sees it; it returns the run/stop result. **`hold_ms`** overrides the dwell (`0` = instant make+break). The **`scancode`** form is a single make/break **edge** (cycle-neutral) — use two edges for a sustained hold (or to trigger typematic auto-repeat). |
+| `input_mouse` | `{nx?, ny?, x?, y?, dx?, dy?, buttons?, hold_ms?, release?}` | inject a scripted mouse event. Per axis give **at most one** of `{x\|nx\|dx}` (and `{y\|ny\|dy}`); at least one field is required. **`nx`/`ny`** = NORMALIZED **per-myriad** `0..10000` (`0` = left/top edge, `10000` = right/bottom edge, `5000` = center) — **range-independent**, the robust way to address the screen since a guest may reprogram the range. **`x`/`y`** = the driver's **live** virtual coords; these are **not** framebuffer pixels and the range is whatever the guest set via INT 33h fn 7/8 (default per-mode, e.g. mode 13h `x` 0..639 even × `y` 0..199, but Betrayal at Krondor sets `0..1276 × 0..796`) — read the live range + position back with **`read_mouse`**. **`dx`/`dy`** = relative motion. A **`buttons`** mask is a **click** by default; **`hold_ms`** overrides the dwell and **`release: false`** holds it — see *Clicks & the dwell* below. (The live coalesced browser-cursor path is HTTP-only.) |
+
+#### Clicks & the dwell (level-sampling guests)
+
+Mouse/key **injection adds no `run` of its own** — it updates driver state and (for the
+mouse) fires the INT 33h event callback. One caveat on "cycle-neutral": if the guest has
+installed an INT 33h **AX=0Ch event handler** that this event triggers (per the handler's
+condition mask, e.g. Betrayal at Krondor's), that handler runs **synchronously** and charges
+its own instruction cycles — so a bare inject is strictly cycle-neutral only when no such
+handler fires. What injection never does is *itself* run the machine forward in time. So a
+press immediately followed by a release is invisible to a guest that **level-samples** the
+button — reads "is it down right now" once per video frame / timer tick (e.g. Betrayal at
+Krondor's retrace-spinning menu); the click only registers if the down-state persists across
+one of the guest's sample iterations. (Edge-latched guests that read INT 33h AX=5/6
+press/release counters, and buffered BIOS keystrokes, already catch an instantaneous event.)
+
+The model mirrors **SPICE/QEMU**, where a click is just a `MOUSE_PRESS` + a `MOUSE_RELEASE`
+event with **real wall-clock time passing** in the always-running VM between them — no layer
+synthesizes a hold duration. zdos has no host clock and only runs on demand, so it advances
+that time **explicitly**, and because the press-and-release-with-time-between is the common
+case it makes that the **default**: a `buttons` press **clicks** — it presses, runs the
+machine for a human-realistic dwell of **emulated** time (~100 ms), then releases. A click
+therefore **does advance cycles** and returns the run/stop result (the deterministic cycle
+delta). The dwell → cycles conversion reads the machine's **own configured clock** (`cpu_hz =
+PIT_rate × mult`), so it is deterministic and CPU-speed-independent — the same dwell charges
+proportionally more cycles at a faster `set_clock`, never a hardcoded count. A bare
+`{buttons:1}` therefore **just works** — no manual `run`-tuning, no footgun.
+
+- **~100 ms** is the human-realistic default: one 70 Hz frame ≈ 14 ms, one 18.2 Hz tick ≈
+  55 ms, so 100 ms comfortably covers any per-frame/per-tick sampler and over-holding is
+  harmless to edge-latched guests.
+- **`hold_ms`** overrides the dwell (ms of emulated time). **`hold_ms: 0`** presses and
+  releases at the same cycle (instantaneous; edge-latched guests catch it, level-samplers do
+  not). For the mouse it requires a non-zero `buttons` mask.
+- **`release: false`** opts OUT of the auto-release: set the `buttons` mask **raw and held**
+  (cycle-neutral, no dwell) — the press-and-hold a **drag** needs: press `{buttons:1,
+  release:false}` → move `{dx, buttons:1, release:false}` (with a `run` between) → release
+  `{buttons:0}`. Mutually exclusive with `hold_ms`. `{buttons:0}` always releases all.
+- The **key** `char` form is symmetric: it **defaults to a ~100 ms tap** (so a guest that
+  level-samples raw key *state* — e.g. an action game's movement keys — sees it; the buffered
+  BIOS path sees one char either way, and 100 ms is under the 500 ms typematic-repeat delay so
+  no doubled chars). `hold_ms` overrides; `hold_ms:0` is the instant make+break. For a
+  **sustained** hold (or to trigger typematic auto-repeat) use the raw `{scancode, make:true}`
+  / `{scancode, make:false}` edges — the keyboard's `release:false` analog.
+- **These input calls advance the machine.** A click/tap runs the CPU for its dwell, so the
+  cpu / cycle counter / screen move forward and the call returns the run/stop result — by
+  design (it is the "real time passes while held" of the SPICE model). Motion-only and
+  `release:false`/`{buttons:0}` mouse injects, and raw `scancode` edges, add no `run` of their
+  own — though a mouse inject that fires an installed AX=0Ch handler still charges that
+  handler's cycles (see the caveat above), so "cycle-neutral" means "no dwell run," not
+  necessarily "zero cycles."
+- A click/tap that holds for its **full** dwell reports the stop reason **`dwell_complete`**
+  (a dedicated reason — *not* `cycle_budget_exhausted`, which is the "your `run` hit its cap"
+  signal; the click was **not** truncated). If a **breakpoint** or a program **terminal**
+  fires *during* the dwell, that reason is surfaced instead (and the release is still
+  applied), so a breakpoint coinciding with a click is never masked.
 
 ### Clock / lifecycle
 | tool | arguments | does |

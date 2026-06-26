@@ -34,6 +34,7 @@ pub const Reg16 = controller.Reg16;
 pub const Reg8 = controller.Reg8;
 pub const Region = controller.Region;
 pub const MouseInject = controller.MouseInject;
+pub const MouseSnapshot = controller.MouseSnapshot;
 /// Disassembly window types (`/api/disasm`).
 pub const DisasmInsn = controller.DisasmInsn;
 pub const DisasmResult = controller.DisasmResult;

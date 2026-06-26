@@ -207,6 +207,10 @@ fn recordAndClassify(control: *RunControl, resp: api.Response) Classification {
                 .breakpoint => |b| .{ .breakpoint, b.at_cycle, true },
                 .step_complete => |s| .{ .step_complete, s.at_cycle, false },
                 .cycle_budget_exhausted => |c| .{ .cycle_budget_exhausted, c.at_cycle, false },
+                // A click/tap dwell completion is a WORKER-only outcome (input_mouse/
+                // input_key bounded commands), never a paced run_slice result — mapped
+                // defensively to the budget tag (non-terminal) so the switch stays total.
+                .dwell_complete => |d| .{ .cycle_budget_exhausted, d.at_cycle, false },
                 .target_reached => |t| .{ .target_reached, t.at_cycle, false },
                 .halted_forever => |h| .{ .halted_forever, h.at_cycle, true },
                 .program_terminated => |p| .{ .program_terminated, p.at_cycle, true },

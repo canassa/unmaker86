@@ -235,6 +235,11 @@ pub const tools = [_]Tool{
         .input_schema = SCHEMA_EMPTY,
     },
     .{
+        .name = "read_mouse",
+        .description = "Read the INT 33h mouse-driver state: cursor position (x/y, the granularity-masked POS_X/POS_Y the guest sees via AX=3), button mask (bit0 left, bit1 right, bit2 middle), the LIVE coordinate range (min_x/max_x/min_y/max_y — what the guest set via fn 7/8; the range x/y address and nx/ny normalize against), visibility, and the AX=5/6 press/release counters per button [left,right,middle]. PURE peek: reads the driver struct WITHOUT invoking a live INT 33h, so it does NOT clear the AX=5/6 counters. Use it to aim input_mouse and verify the result. NOTE: press_count/release_count rising proves the DRIVER saw the button edge — NOT that the guest program consumed the click (a level-sampling guest only 'sees' it if the button was held across one of its samples); use a screen/state change to confirm the game acted.",
+        .input_schema = SCHEMA_EMPTY,
+    },
+    .{
         .name = "read_io_port",
         .description = "Read the non-mutating shadow of one I/O port (never issues a live, stateful IN).",
         .input_schema =
@@ -244,16 +249,16 @@ pub const tools = [_]Tool{
     // --- input injection (scripted/deterministic) ---
     .{
         .name = "input_key",
-        .description = "Inject a keyboard key. Give exactly one of scancode (raw set-1, with make/ext) or char (a single ASCII char, resolved to its scancode).",
+        .description = "Inject a keyboard key. Give exactly one of char (a single ASCII char, resolved to its scancode) or scancode (raw set-1, with make/ext). NOTE: the char form ADVANCES THE MACHINE — it is a TAP that presses the key, runs the CPU for a human-realistic dwell (~100 ms of EMULATED time by default) so a guest that LEVEL-SAMPLES raw key state observes it, then releases. So the cpu/cycle/screen state WILL move forward and the tool returns the run/stop result (the cycle delta) — that is expected, not a bug. This is symmetric with a mouse CLICK and is the footgun-free default (the buffered BIOS keystroke path sees one char either way; 100 ms is under the 500 ms typematic-repeat delay, so no doubled chars). hold_ms overrides the dwell; hold_ms:0 makes+breaks at the SAME cycle (the instant, cycle-light escape hatch). For a SUSTAINED hold (hold a movement key; trigger typematic repeat) use the raw scancode form: {scancode, make:true} then later {scancode, make:false} — a single edge that does NOT advance the machine. SPICE is the precedent: a keypress is just KEY_DOWN + KEY_UP events with real time passing between them; zdos advances that emulated time explicitly because it only runs on demand.",
         .input_schema =
-        \\{"type":"object","properties":{"scancode":{"type":"integer","minimum":0,"maximum":255},"char":{"type":"string","minLength":1,"maxLength":1},"make":{"type":"boolean","default":true},"ext":{"type":"boolean","default":false}},"additionalProperties":false}
+        \\{"type":"object","properties":{"char":{"type":"string","minLength":1,"maxLength":1,"description":"a single ASCII char: a TAP (press -> ~100ms emulated dwell -> release). ADVANCES the machine and returns the run/stop result."},"scancode":{"type":"integer","minimum":0,"maximum":255,"description":"raw set-1 scancode: a single make/break EDGE (with make/ext). Cycle-neutral; use two edges for a sustained hold."},"make":{"type":"boolean","default":true},"ext":{"type":"boolean","default":false},"hold_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"char only: override the tap dwell in ms of EMULATED time (default ~100; 0 = instant make+break at the same cycle)."}},"additionalProperties":false}
         ,
     },
     .{
         .name = "input_mouse",
-        .description = "Inject a scripted/deterministic mouse event: absolute x/y, relative dx/dy (mutually exclusive per axis), and/or a buttons mask. At least one field required.",
+        .description = "Inject a scripted/deterministic mouse event. NOTE: a buttons CLICK (the default) ADVANCES THE MACHINE — it presses, runs the CPU for ~100 ms of emulated time, then releases, so the cpu/cycle/screen state WILL move forward and the tool returns the run/stop result; that is expected, not a bug. (Motion-only or release:false injects add no run of their own — but if the event fires an installed INT 33h AX=0Ch handler, that handler runs synchronously and charges its cycles, so 'cycle-neutral' means 'no dwell run', not necessarily 'zero cycles'.) Two ways to address the cursor, plus relative motion and a buttons mask; per axis give at most one of {x|nx|dx} (and {y|ny|dy}); at least one field required. nx/ny: NORMALIZED per-myriad 0..10000 (0=left/top edge, 10000=right/bottom edge, 5000=center) — RANGE-INDEPENDENT, the robust way to address the screen since the guest may reprogram the range. x/y: the driver's LIVE virtual coords (the default per-mode range, e.g. mode 13h x 0..639 even × y 0..199, but a guest may set ANY range via INT 33h fn 7/8, e.g. Betrayal at Krondor → 0..1276 × 0..796) — read the live range + position back with read_mouse. dx/dy: relative motion. CLICK (default): a buttons mask presses, ADVANCES the machine by a human-realistic ~100 ms of EMULATED time (so the click is OBSERVABLE to a guest that LEVEL-SAMPLES the button once per frame/tick — e.g. Betrayal at Krondor's retrace menu), then releases. This DOES advance cycles and returns the run/stop result. A bare {buttons:1} just works — no manual run-tuning. hold_ms overrides the dwell (ms of emulated time; 0 = instant press+release, caught only by edge-latched guests). HOLD/DRAG: release:false sets the buttons mask RAW and HELD with NO auto-release (pure, cycle-neutral) — press {buttons:1,release:false}, move {dx,buttons:1,release:false} (run between), then release with {buttons:0}. hold_ms and release:false are mutually exclusive. SPICE/QEMU is the precedent: a click is just MOUSE_PRESS + MOUSE_RELEASE events with REAL time passing between them in the always-running VM — no synthesized hold; zdos advances that emulated time explicitly because it only runs on demand, and defaults a press to a click because that is the footgun-free common case.",
         .input_schema =
-        \\{"type":"object","properties":{"x":{"type":"integer","minimum":-32768,"maximum":32767,"description":"absolute X (exclusive with dx)"},"y":{"type":"integer","minimum":-32768,"maximum":32767,"description":"absolute Y (exclusive with dy)"},"dx":{"type":"integer","minimum":-32768,"maximum":32767,"description":"relative X motion (exclusive with x)"},"dy":{"type":"integer","minimum":-32768,"maximum":32767,"description":"relative Y motion (exclusive with y)"},"buttons":{"type":"integer","minimum":0,"maximum":65535,"description":"button mask: bit0 left, bit1 right, bit2 middle"}},"additionalProperties":false}
+        \\{"type":"object","properties":{"nx":{"type":"integer","minimum":0,"maximum":10000,"description":"normalized absolute X, per-myriad (0=left edge, 10000=right edge); range-independent (exclusive with x/dx)"},"ny":{"type":"integer","minimum":0,"maximum":10000,"description":"normalized absolute Y, per-myriad (0=top edge, 10000=bottom edge); range-independent (exclusive with y/dy)"},"x":{"type":"integer","minimum":-32768,"maximum":32767,"description":"absolute X in the driver's LIVE virtual coords (exclusive with nx/dx); clamped to the live range (read it via read_mouse)"},"y":{"type":"integer","minimum":-32768,"maximum":32767,"description":"absolute Y in the driver's LIVE virtual coords (exclusive with ny/dy); clamped to the live range"},"dx":{"type":"integer","minimum":-32768,"maximum":32767,"description":"relative X motion (exclusive with x/nx)"},"dy":{"type":"integer","minimum":-32768,"maximum":32767,"description":"relative Y motion (exclusive with y/ny)"},"buttons":{"type":"integer","minimum":0,"maximum":65535,"description":"button mask: bit0 left, bit1 right, bit2 middle. By default a non-zero mask is a CLICK (press -> ~100ms dwell -> release); buttons:0 releases all."},"hold_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"override the click dwell in ms of EMULATED time (default ~100; 0 = instant press+release). Needs a non-zero buttons mask; conflicts with release:false."},"release":{"type":"boolean","default":true,"description":"false = press-and-HOLD: set the buttons mask raw with NO auto-release (cycle-neutral), for drags. Release later with {buttons:0}. Conflicts with hold_ms."}},"additionalProperties":false}
         ,
     },
     // --- clock / lifecycle ---
@@ -467,47 +472,121 @@ pub fn mapRegSet(r: wire.RegSetReq) MapResult(q.RegSetCmd) {
 /// (`scancodes.resolveChar`) — never a fabricated map.
 pub fn mapKey(r: wire.KeyReq) MapResult(q.Command) {
     if (r.scancode != null and r.char != null) return .{ .fail = .{ .code = "bad_request", .message = "give either scancode or char, not both" } };
-    if (r.scancode) |sc| return .{ .ok = .{ .input_key = .{
-        .scancode = sc,
-        .make = r.make,
-        .ext = r.ext,
-        .press = false,
-        .shift = false,
-    } } };
+    if (r.scancode) |sc| {
+        // A raw single edge has no hold (the caller controls make/break explicitly).
+        if (r.hold_ms != null) return .{ .fail = .{ .code = "bad_request", .message = "hold_ms is only valid with char (a full keystroke), not a raw scancode edge" } };
+        return .{ .ok = .{ .input_key = .{
+            .scancode = sc,
+            .make = r.make,
+            .ext = r.ext,
+            .press = false,
+            .shift = false,
+        } } };
+    }
     if (r.char) |ch| {
         if (ch.len != 1) return .{ .fail = .{ .code = "bad_request", .message = "char must be a single ASCII character" } };
         const res = scancodes.resolveChar(ch[0]) orelse return .{ .fail = .{ .code = "bad_request", .message = "no single set-1 scancode for that char" } };
-        return .{ .ok = .{ .input_key = .{
-            .scancode = res.scancode,
-            .make = true,
-            .ext = false,
-            .press = true,
-            .shift = res.shift,
-        } } };
+        return .{
+            .ok = .{
+                .input_key = .{
+                    .scancode = res.scancode,
+                    .make = true,
+                    .ext = false,
+                    .press = true,
+                    .shift = res.shift,
+                    // A `char` keystroke is a TAP: by DEFAULT it holds the key down for the
+                    // human-realistic dwell (`DEFAULT_CLICK_MS` ≈ 100 ms of emulated time) so a
+                    // guest that level-samples raw key STATE observes it — symmetric with a mouse
+                    // CLICK, and the footgun-free default (the buffered BIOS path sees one char
+                    // either way; 100 ms is well under the 500 ms typematic delay, so no repeat).
+                    // `hold_ms` OVERRIDES the dwell; `hold_ms:0` makes+breaks at the same cycle
+                    // (the instant escape hatch). The dwell ADVANCES the machine (it returns the
+                    // run/stop result) — for a sustained hold use the raw `{scancode, make}` edges.
+                    .hold_ms = r.hold_ms orelse DEFAULT_CLICK_MS,
+                },
+            },
+        };
     }
     return .{ .fail = .{ .code = "bad_request", .message = "provide scancode or char" } };
 }
 
+/// The PER-MYRIAD normalized-coordinate unit for `input_mouse` `nx`/`ny`: 0 = the
+/// left/top edge, `MOUSE_MYRIAD` = the right/bottom edge. Converted to the driver's
+/// internal Q16 (`0x1_0000` == the full edge) here so the driver speaks ONE absolute
+/// unit (Q16) for both the scripted-normalized and the live-browser paths, mapped
+/// through the live range by the SAME `q16ToVirtual`. INTEGER ONLY.
+pub const MOUSE_MYRIAD: u32 = 10000;
+
+/// The default click DWELL (ms of EMULATED time) when a button is pressed without an
+/// explicit `hold_ms` and without `release:false`. ~100 ms is the human-realistic value
+/// (one 70 Hz frame ≈ 14 ms, one 18.2 Hz timer tick ≈ 55 ms), so it comfortably covers
+/// any per-frame/per-tick level-sampler and is harmless to edge-latched guests. The
+/// default IS a click because that is the footgun-free common case; `release:false`
+/// opts into a raw press-and-hold for drags. Converted to cycles deterministically from
+/// the machine's own clock by `Controller.dwellCycles`. INTEGER ONLY.
+pub const DEFAULT_CLICK_MS: u32 = 100;
+
 /// `input_mouse` SCRIPTED path: per-axis mutual exclusion + the `set_*` flag mapping
-/// (the EXTRACTED `handleInputMouse` scripted tail). The LIVE coalesced browser path
-/// (nx_q16/ny_q16/mdx/mdy) is HTTP-only and stays in `server.zig` — MCP is scripted.
+/// (the EXTRACTED `handleInputMouse` scripted tail). Two absolute modes per axis:
+///   - RAW `x`/`y` — the driver's LIVE virtual coords (may be reprogrammed via fn 7/8).
+///   - NORMALIZED `nx`/`ny` — PER-MYRIAD 0..10000 (10000 = the edge), range-independent;
+///     converted to Q16 here and mapped through the driver's live range by the driver.
+/// Per axis, AT MOST ONE of {raw, normalized, relative} may be set. The LIVE coalesced
+/// browser path (nx_q16/ny_q16/mdx/mdy) is HTTP-only and stays in `server.zig`.
 pub fn mapMouseScripted(r: wire.MouseReq) MapResult(q.Command) {
-    if (r.x != null and r.dx != null) return .{ .fail = .{ .code = "bad_request", .message = "give either x or dx, not both" } };
-    if (r.y != null and r.dy != null) return .{ .fail = .{ .code = "bad_request", .message = "give either y or dy, not both" } };
-    if (r.x == null and r.y == null and r.dx == null and r.dy == null and r.buttons == null)
-        return .{ .fail = .{ .code = "bad_request", .message = "provide at least one of x/y/dx/dy/buttons" } };
+    // Per-axis exclusivity: raw absolute (x), normalized absolute (nx), and relative
+    // (dx) all address the SAME X coordinate — at most one may be given (resp. Y).
+    const xset = @as(u8, @intFromBool(r.x != null)) + @intFromBool(r.nx != null) + @intFromBool(r.dx != null);
+    const yset = @as(u8, @intFromBool(r.y != null)) + @intFromBool(r.ny != null) + @intFromBool(r.dy != null);
+    if (xset > 1) return .{ .fail = .{ .code = "bad_request", .message = "give at most one of x/nx/dx" } };
+    if (yset > 1) return .{ .fail = .{ .code = "bad_request", .message = "give at most one of y/ny/dy" } };
+    if (r.nx) |nx| if (nx > MOUSE_MYRIAD) return .{ .fail = .{ .code = "bad_request", .message = "nx must be 0..10000 (per-myriad)" } };
+    if (r.ny) |ny| if (ny > MOUSE_MYRIAD) return .{ .fail = .{ .code = "bad_request", .message = "ny must be 0..10000 (per-myriad)" } };
+    if (xset == 0 and yset == 0 and r.buttons == null)
+        return .{ .fail = .{ .code = "bad_request", .message = "provide at least one of x/y/nx/ny/dx/dy/buttons" } };
+    // CLICK vs HOLD. A non-zero `buttons` mask is, BY DEFAULT, a momentary CLICK:
+    // press → dwell (`hold_ms` ms of emulated time, default DEFAULT_CLICK_MS) → release,
+    // so a level-sampling guest observes it. `release:false` opts out → the mask is set
+    // RAW and HELD (pure cycle-neutral inject), the press-and-hold a drag needs.
+    //   - `hold_ms` (a click dwell) + `release:false` (a hold) are contradictory.
+    //   - `release:false` only means something with a buttons mask to hold.
+    //   - a dwell needs a non-zero mask to bracket (an empty mask has no down→…→up edge).
+    if (r.hold_ms != null and !r.release)
+        return .{ .fail = .{ .code = "bad_request", .message = "hold_ms (a click dwell) conflicts with release:false (hold); drop one" } };
+    if (!r.release and r.buttons == null)
+        return .{ .fail = .{ .code = "bad_request", .message = "release:false is only meaningful with a buttons mask to hold" } };
+    if (r.hold_ms != null and (r.buttons orelse 0) == 0)
+        return .{ .fail = .{ .code = "bad_request", .message = "hold_ms needs a non-zero buttons mask to click-and-hold" } };
+    // The effective dwell: a non-zero buttons press auto-CLICKS (default dwell) unless
+    // `release:false` HOLDS it; an explicit `hold_ms` overrides the default dwell. A
+    // zero/absent mask, or `release:false`, ⇒ `null` (pure cycle-neutral inject: set the
+    // state, no auto-release — also how `{buttons:0}` releases a held drag).
+    const eff_hold: ?u32 =
+        if ((r.buttons orelse 0) != 0 and r.release) (r.hold_ms orelse DEFAULT_CLICK_MS) else null;
     return .{ .ok = .{ .input_mouse = .{
         .x = r.x orelse 0,
         .y = r.y orelse 0,
+        .nx_q16 = if (r.nx) |nx| myriadToQ16(nx) else 0,
+        .ny_q16 = if (r.ny) |ny| myriadToQ16(ny) else 0,
         .dx = r.dx orelse 0,
         .dy = r.dy orelse 0,
         .buttons = r.buttons orelse 0,
         .set_x = r.x != null,
         .set_y = r.y != null,
+        .set_nx = r.nx != null,
+        .set_ny = r.ny != null,
         .set_dx = r.dx != null,
         .set_dy = r.dy != null,
         .set_buttons = r.buttons != null,
+        .hold_ms = eff_hold,
     } } };
+}
+
+/// Per-myriad (0..10000) → Q16 (0..0x1_0000). Exact integer math: `10000 * 0x1_0000`
+/// fits a u64, and `MOUSE_MYRIAD → 0x1_0000` (the full edge, which `q16ToVirtual`
+/// saturates onto `max`). NO float (determinism grep gate).
+fn myriadToQ16(myriad: u32) u32 {
+    return @intCast(@as(u64, myriad) * 0x1_0000 / MOUSE_MYRIAD);
 }
 
 /// `set_clock`: mult-xor-mhz validation + the integer mhz→mult conversion (the
@@ -725,6 +804,7 @@ pub fn buildCommand(
         return cmd(.{ .ivt_get = .{ .vector = r.vector } }, false);
     }
     if (is(name, "read_console")) return cmd(.console_get, false);
+    if (is(name, "read_mouse")) return cmd(.mouse_get, false);
     if (is(name, "read_io_port")) {
         const r = parse(PortReq, arena, args) orelse return invalid("read_io_port expects {port:integer 0..65535}");
         return cmd(.{ .io_shadow = .{ .port = r.port } }, false);

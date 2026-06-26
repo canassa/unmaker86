@@ -969,4 +969,15 @@ pub const Machine = struct {
     pub fn clockMult(self: *const Machine) u64 {
         return self.clock.mult;
     }
+
+    /// The active emulated CPU clock in Hz (`PIT_TICK_RATE * mult`) at the LIVE
+    /// `mult`. A pure function of the machine's OWN configured clock — NOT host wall
+    /// time. Used to convert a human-realistic input DWELL (ms of emulated time) into
+    /// a deterministic, CPU-speed-scaled cycle budget for a held click/tap
+    /// (`Controller.dwellCycles`): `cycles = cpuClockHz * ms / 1000`. Because it reads
+    /// the live `mult`, the same dwell yields proportionally more cycles at a faster
+    /// configured clock — the hold is a function of the cycle counter, never the host.
+    pub fn cpuClockHz(self: *const Machine) u64 {
+        return timing.cpuClockHz(self.clock.mult);
+    }
 };

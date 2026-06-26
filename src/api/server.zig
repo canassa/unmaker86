@@ -2465,6 +2465,7 @@ pub const Conn = struct {
             .stack => |s| try self.writeStack(w, s),
             .status => |st| try self.writeValue(w, st),
             .console => |cr| try self.writeConsole(w, cr),
+            .mouse => |ms| try self.writeValue(w, ms),
             .screen => |sr| try self.writeScreen(w, sr, opts.want_attrs),
             .regions => |rg| try self.writeRegions(w, rg),
             .disasm => |dr| try self.writeDisasm(w, dr),

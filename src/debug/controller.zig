@@ -97,6 +97,15 @@ pub const StopReason = union(enum) {
     /// is paused, not stopped) and reporting-only — it changes which REASON is
     /// surfaced, never which cycles ran or any guest state.
     target_reached: struct { at_cycle: u64 },
+    /// A held CLICK/TAP (`input_mouse`/`input_key` with a dwell) ran its FULL dwell and
+    /// released normally — the expected, successful outcome. A DEDICATED reason (not
+    /// `cycle_budget_exhausted`, which is the "you hit the cycle cap you asked `run` for"
+    /// signal) so a caller can tell "my click completed its hold" from "my run was capped"
+    /// and is NOT misled into thinking the click was truncated. If a USER breakpoint or a
+    /// terminal fires DURING the dwell, that reason is surfaced INSTEAD (the release is
+    /// still applied), so a breakpoint coinciding with a click is never masked. Carries
+    /// the cycle the dwell completed at. Non-terminal, reporting-only.
+    dwell_complete: struct { at_cycle: u64 },
     /// Deterministic permanent HLT (no pending events, not wakeable).
     halted_forever: struct { at_cycle: u64 },
     /// The DOS program terminated (INT 21h AH=4C / INT 20h). `ret_code` is the
@@ -179,14 +188,54 @@ pub const Region = struct {
 pub const MouseInject = struct {
     x: i16 = 0,
     y: i16 = 0,
+    /// NORMALIZED absolute position in Q16 (`0x1_0000` == the right/bottom edge): the
+    /// range-independent addressing mode. The wire-layer `nx`/`ny` (per-myriad) is
+    /// converted to this Q16 at the mapper; the DRIVER maps it through its LIVE range.
+    /// Mutually exclusive per axis with the raw `x`/`y` (enforced at the wire mapper).
+    nx_q16: u32 = 0,
+    ny_q16: u32 = 0,
     dx: i16 = 0,
     dy: i16 = 0,
     buttons: u16 = 0,
     set_x: bool = false,
     set_y: bool = false,
+    set_nx: bool = false,
+    set_ny: bool = false,
     set_dx: bool = false,
     set_dy: bool = false,
     set_buttons: bool = false,
+    /// The held-CLICK dwell in MILLISECONDS of EMULATED time (wire `hold_ms`). `null`
+    /// ⇒ pure cycle-neutral inject (set the mask, NO auto-release). A value ⇒ the
+    /// worker presses `buttons`, advances the machine `dwellCycles(hold_ms)` cycles,
+    /// then releases — so a level-sampling guest observes the click. Carried here so
+    /// the queue command (`Command.input_mouse` is a `MouseInject`) needs no new field.
+    hold_ms: ?u32 = null,
+};
+
+/// A read-only, side-effect-free snapshot of the INT 33h mouse-driver state for the
+/// `read_mouse` peek (mirrors the `DevicesSnapshot` idiom: a pointer-free POD that
+/// JSON-Stringifies directly). PURE peek — the worker reads the driver struct WITHOUT
+/// invoking a live INT 33h, so the AX=5/6 press/release counters are NOT cleared (a
+/// live AX=5/6 zeroes them). Fields:
+///   - `x`/`y`: the granularity-masked POS_X/POS_Y the guest observes via AX=3.
+///   - `buttons`: bit0 left, bit1 right, bit2 middle.
+///   - `min_x/max_x/min_y/max_y`: the LIVE coordinate range (per video mode by default,
+///     but a guest may reprogram it via INT 33h fn 7/8). This is the range the scripted
+///     `input_mouse` raw `x`/`y` are clamped to and the `nx`/`ny` normalize against.
+///   - `visible`: cursor shown (the driver show-count is zero).
+///   - `press_count`/`release_count`: the AX=5/6 per-button edge counters
+///     ([left, right, middle]); reported WITHOUT the read-and-zero a live AX=5/6 does.
+pub const MouseSnapshot = struct {
+    x: u16,
+    y: u16,
+    buttons: u16,
+    min_x: i16,
+    max_x: i16,
+    min_y: i16,
+    max_y: i16,
+    visible: bool,
+    press_count: [3]u16,
+    release_count: [3]u16,
 };
 
 /// Per-instruction rendered-text cap for a `/api/disasm` window. The longest
@@ -901,15 +950,108 @@ pub const Controller = struct {
         mouse.injectAndFire(&self.m.cpu, &self.m.svc.bridge, .{
             .x = req.x,
             .y = req.y,
+            .nx_q16 = req.nx_q16,
+            .ny_q16 = req.ny_q16,
             .dx = req.dx,
             .dy = req.dy,
             .buttons = req.buttons,
             .set_x = req.set_x,
             .set_y = req.set_y,
+            .set_nx = req.set_nx,
+            .set_ny = req.set_ny,
             .set_dx = req.set_dx,
             .set_dy = req.set_dy,
             .set_buttons = req.set_buttons,
         });
+    }
+
+    /// Convert a human-realistic input DWELL (ms of EMULATED time) into a deterministic
+    /// CPU-cycle budget from the machine's OWN configured clock:
+    /// `cycles = cpuClockHz(mult) * ms / 1000`. This is the faithful analog of "the VM
+    /// runs in real time while the button/key is held" (the SPICE/QEMU model: a click is
+    /// two events + real time passing between them) — except zdos has NO host clock, so it
+    /// advances that emulated time EXPLICITLY and deterministically. Because it reads the
+    /// LIVE `mult`, the same `ms` yields proportionally more cycles at a faster configured
+    /// clock (the hold is a function of the cycle counter, never the host wall clock). The
+    /// `u64` math is exact and cannot overflow for any sane dwell (`hold_ms` is a `u32`;
+    /// `cpuClockHz` ≤ ~66 MHz, so the product stays far under `u64`). INTEGER ONLY.
+    pub fn dwellCycles(self: *const Controller, ms: u64) u64 {
+        return self.m.cpuClockHz() * ms / 1000;
+    }
+
+    /// A held mouse CLICK (`input_mouse` with `hold_ms`): the faithful "press → the VM
+    /// runs while held → release" sequence that makes a click OBSERVABLE to a guest that
+    /// level-samples the button once per frame/tick. Applies `req` (position + the
+    /// pressed `buttons`) through the SINGLE edge-detecting injector, advances the machine
+    /// `dwellCycles(hold_ms)` cycles via the existing `run` machinery (so the INT 33h
+    /// AX=000C callback + the AX=5/6 edge counters fire at the right cycle points), then
+    /// RELEASES by reverting the mask to its pre-press value — again through the single
+    /// injector, so press and release each count exactly once (no divergence, no
+    /// double-count). Returns the run's `StopReason` (carrying the resulting cycle), so a
+    /// click reports its deterministic cycle delta exactly like `run`. A breakpoint/
+    /// terminal hit mid-dwell stops the run early; the release is still applied so the
+    /// click is never left half-held (the stop reason is surfaced to the caller).
+    pub fn clickMouse(self: *Controller, req: MouseInject, hold_ms: u32) StopReason {
+        const prev = self.m.dos.mouse.buttons;
+        self.injectMouse(req); // move (if any) + PRESS the buttons mask (down edges)
+        const stop = self.runDwell(self.dwellCycles(hold_ms)); // hold for the dwell
+        // RELEASE: revert to the pre-press mask (up edges for exactly the bits we pressed),
+        // position untouched. Routed through the same single edge-writer as the press.
+        self.injectMouse(.{ .buttons = prev, .set_buttons = true });
+        return stop;
+    }
+
+    /// Run a click/tap DWELL and report a completed hold as `dwell_complete` rather than
+    /// the generic `cycle_budget_exhausted` (which is the "you hit the `run` cap" signal
+    /// and reads as a truncation to a caller). A USER breakpoint or terminal that fires
+    /// during the dwell is passed through UNCHANGED, so a breakpoint coinciding with a
+    /// click is never masked as a normal completion. The reason translation is purely
+    /// cosmetic — it changes neither cycles run nor any guest state.
+    fn runDwell(self: *Controller, dwell_cycles: u64) StopReason {
+        const stop = self.runUntilEvent(dwell_cycles);
+        return switch (stop) {
+            .cycle_budget_exhausted => |c| .{ .dwell_complete = .{ .at_cycle = c.at_cycle } },
+            else => stop,
+        };
+    }
+
+    /// A held key TAP (`input_key` `char` form with `hold_ms`): inject the make (+ a
+    /// left-Shift make bracket for a shifted char), advance the machine
+    /// `dwellCycles(hold_ms)` cycles, then inject the break (+ Shift break) — so the key
+    /// is physically DOWN across the dwell and a guest that level-samples raw key state
+    /// observes the hold. Returns the run `StopReason`, or `null` if the 8042 output FIFO
+    /// is full at make time (the worker surfaces `input_buffer_full`; never a silent
+    /// drop). The break is injected on the SAME FIFO after the run; a full FIFO there is
+    /// the same transient resource limit and is surfaced identically.
+    pub fn tapKey(self: *Controller, scancode: u8, ext: bool, shift: bool, hold_ms: u32) ?StopReason {
+        const SC_LSHIFT: u8 = 0x2A; // left-Shift make scancode (set-1); same bracket as the worker's instant press
+        if (shift and !self.injectScancode(SC_LSHIFT, true, false)) return null;
+        if (!self.injectScancode(scancode, true, ext)) return null;
+        const stop = self.runDwell(self.dwellCycles(hold_ms));
+        if (!self.injectScancode(scancode, false, ext)) return null;
+        if (shift and !self.injectScancode(SC_LSHIFT, false, false)) return null;
+        return stop;
+    }
+
+    /// Cycle-neutral PURE peek of the INT 33h mouse-driver state (`read_mouse`). Reads
+    /// the driver struct directly — it does NOT invoke a live INT 33h, so it has no
+    /// side effects (in particular it does NOT clear the AX=5/6 press/release counters
+    /// the way a live AX=5/6 query does). Plumbed like `devicesSnapshot`/`cpuSnapshot`:
+    /// a pointer-free POD the worker returns and the serializer JSON-Stringifies.
+    pub fn mouseSnapshot(self: *Controller) MouseSnapshot {
+        const mo = &self.m.dos.mouse;
+        return .{
+            .x = mo.posX(),
+            .y = mo.posY(),
+            .buttons = mo.buttons,
+            .min_x = mo.min_x,
+            .max_x = mo.max_x,
+            .min_y = mo.min_y,
+            .max_y = mo.max_y,
+            .visible = mo.hidden == 0,
+            .press_count = mo.press_count,
+            .release_count = mo.release_count,
+        };
     }
 
     /// LIVE-MOUSE seamless inject (plans/mouse-input.md, LOCKED §1). The coalesced

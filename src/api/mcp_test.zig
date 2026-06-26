@@ -876,6 +876,136 @@ test "dispatch: input_key (char) and input_mouse (scripted)" {
     try std.testing.expectEqual(false, try toolIsError(call(&ts, 161, "input_mouse", "{\"x\":10,\"y\":20,\"buttons\":1}", &obuf).body));
 }
 
+test "mapMouseScripted: per-myriad nx/ny → Q16, per-axis exclusivity + range" {
+    // Midpoint per-myriad maps to the Q16 midpoint; 10000 maps to the full edge (which
+    // the driver's `q16ToVirtual` saturates onto `max`).
+    const mid = mcp_tools.mapMouseScripted(.{ .nx = 5000, .ny = 10000 });
+    try std.testing.expect(mid == .ok);
+    try std.testing.expectEqual(@as(u32, 0x8000), mid.ok.input_mouse.nx_q16); // 5000 → 32768
+    try std.testing.expectEqual(@as(u32, 0x1_0000), mid.ok.input_mouse.ny_q16); // 10000 → 65536
+    try std.testing.expect(mid.ok.input_mouse.set_nx and mid.ok.input_mouse.set_ny);
+    try std.testing.expect(!mid.ok.input_mouse.set_x and !mid.ok.input_mouse.set_y);
+
+    // Per-axis exclusivity: nx with raw x, or nx with relative dx → rejected.
+    try std.testing.expect(mcp_tools.mapMouseScripted(.{ .nx = 1, .x = 1 }) == .fail);
+    try std.testing.expect(mcp_tools.mapMouseScripted(.{ .nx = 1, .dx = 1 }) == .fail);
+    // Out-of-range per-myriad → rejected.
+    try std.testing.expect(mcp_tools.mapMouseScripted(.{ .nx = 10001 }) == .fail);
+    // A bare buttons mask is still valid (the raw path is unchanged).
+    try std.testing.expect(mcp_tools.mapMouseScripted(.{ .buttons = 1 }) == .ok);
+}
+
+test "mapMouseScripted: a button press defaults to a CLICK; release:false holds" {
+    // DEFAULT: a non-zero buttons mask with no hold_ms is a CLICK at the default dwell
+    // (the footgun-free common case — a bare {buttons:1} just works, no run-tuning).
+    const dflt = mcp_tools.mapMouseScripted(.{ .x = 5, .y = 5, .buttons = 1 });
+    try std.testing.expect(dflt == .ok);
+    try std.testing.expectEqual(@as(?u32, mcp_tools.DEFAULT_CLICK_MS), dflt.ok.input_mouse.hold_ms);
+    try std.testing.expect(dflt.ok.input_mouse.set_buttons);
+
+    // hold_ms OVERRIDES the default dwell.
+    const click = mcp_tools.mapMouseScripted(.{ .x = 5, .y = 5, .buttons = 1, .hold_ms = 250 });
+    try std.testing.expect(click == .ok);
+    try std.testing.expectEqual(@as(?u32, 250), click.ok.input_mouse.hold_ms);
+
+    // hold_ms:0 = an instantaneous click (still allowed with a button pressed).
+    const instant = mcp_tools.mapMouseScripted(.{ .buttons = 1, .hold_ms = 0 });
+    try std.testing.expect(instant == .ok);
+    try std.testing.expectEqual(@as(?u32, 0), instant.ok.input_mouse.hold_ms);
+
+    // release:false → press-and-HOLD: pure inject, NO dwell (hold_ms null), button set.
+    const hold = mcp_tools.mapMouseScripted(.{ .x = 5, .y = 5, .buttons = 1, .release = false });
+    try std.testing.expect(hold == .ok);
+    try std.testing.expectEqual(@as(?u32, null), hold.ok.input_mouse.hold_ms);
+    try std.testing.expect(hold.ok.input_mouse.set_buttons);
+
+    // buttons:0 (release all) is a pure inject too — no click to perform on an empty mask.
+    const releaseAll = mcp_tools.mapMouseScripted(.{ .buttons = 0 });
+    try std.testing.expect(releaseAll == .ok);
+    try std.testing.expectEqual(@as(?u32, null), releaseAll.ok.input_mouse.hold_ms);
+
+    // Motion-only stays a pure cycle-neutral inject (no buttons → no click).
+    const moveOnly = mcp_tools.mapMouseScripted(.{ .dx = 10, .dy = -4 });
+    try std.testing.expect(moveOnly == .ok);
+    try std.testing.expectEqual(@as(?u32, null), moveOnly.ok.input_mouse.hold_ms);
+
+    // Contradictions / nonsense are rejected:
+    //  - a click dwell (hold_ms) AND a hold (release:false) at once;
+    try std.testing.expect(mcp_tools.mapMouseScripted(.{ .buttons = 1, .hold_ms = 100, .release = false }) == .fail);
+    //  - release:false with no buttons mask to hold;
+    try std.testing.expect(mcp_tools.mapMouseScripted(.{ .x = 5, .release = false }) == .fail);
+    //  - hold_ms with no button (or a zero mask) to bracket.
+    try std.testing.expect(mcp_tools.mapMouseScripted(.{ .x = 5, .hold_ms = 100 }) == .fail);
+    try std.testing.expect(mcp_tools.mapMouseScripted(.{ .buttons = 0, .hold_ms = 100 }) == .fail);
+}
+
+test "mapKey: a char keystroke defaults to a ~100ms TAP; scancode is a raw edge" {
+    // DEFAULT: a char keystroke is a TAP at the default dwell (symmetric with a mouse
+    // click — the footgun-free default so a keystate-polling guest sees it).
+    const dflt = mcp_tools.mapKey(.{ .char = "a" });
+    try std.testing.expect(dflt == .ok);
+    try std.testing.expect(dflt.ok.input_key.press);
+    try std.testing.expectEqual(@as(?u32, mcp_tools.DEFAULT_CLICK_MS), dflt.ok.input_key.hold_ms);
+
+    // hold_ms OVERRIDES the dwell; hold_ms:0 = the instant make+break escape hatch.
+    try std.testing.expectEqual(@as(?u32, 250), mcp_tools.mapKey(.{ .char = "a", .hold_ms = 250 }).ok.input_key.hold_ms);
+    try std.testing.expectEqual(@as(?u32, 0), mcp_tools.mapKey(.{ .char = "a", .hold_ms = 0 }).ok.input_key.hold_ms);
+
+    // A raw scancode form is a single make/break EDGE — cycle-neutral, no dwell. hold_ms
+    // is rejected on it (sustained holds are two explicit edges).
+    const edge = mcp_tools.mapKey(.{ .scancode = 0x1E, .make = true });
+    try std.testing.expect(edge == .ok);
+    try std.testing.expect(!edge.ok.input_key.press);
+    try std.testing.expectEqual(@as(?u32, null), edge.ok.input_key.hold_ms);
+    try std.testing.expect(mcp_tools.mapKey(.{ .scancode = 0x1E, .hold_ms = 100 }) == .fail);
+}
+
+test "dispatch: input_mouse normalized nx/ny + read_mouse introspection (side-effect-free)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+
+    // Normalized addressing is accepted (motion only — no button, so it does not click
+    // and leaves the press counters at zero for the held-press read-back below)...
+    try std.testing.expectEqual(false, try toolIsError(call(&ts, 180, "input_mouse", "{\"nx\":5000,\"ny\":5000}", &obuf).body));
+    // ...but mixing nx with raw x on the same axis is a -32602 validation error...
+    try std.testing.expectEqual(@as(i64, -32602), try rpcErrorCode(call(&ts, 181, "input_mouse", "{\"nx\":1,\"x\":1}", &obuf).body, std.testing.allocator));
+    // ...and an out-of-range per-myriad nx too.
+    try std.testing.expectEqual(@as(i64, -32602), try rpcErrorCode(call(&ts, 182, "input_mouse", "{\"nx\":10001}", &obuf).body, std.testing.allocator));
+
+    // Place the cursor at a known in-range spot + press-and-HOLD left (release:false, so
+    // the button stays down to read back; a default press would click and release).
+    try std.testing.expectEqual(false, try toolIsError(call(&ts, 183, "input_mouse", "{\"x\":100,\"y\":50,\"buttons\":1,\"release\":false}", &obuf).body));
+    var dst: [1024]u8 = undefined;
+    const mtxt = try expectOkText(call(&ts, 184, "read_mouse", "{}", &obuf).body, &dst);
+    try std.testing.expect(std.mem.indexOf(u8, mtxt, "\"x\":100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mtxt, "\"y\":50") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mtxt, "\"buttons\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mtxt, "\"max_x\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mtxt, "\"press_count\":[1,0,0]") != null);
+
+    // PURE peek: a second read is byte-identical (read_mouse does NOT zero the AX=5/6
+    // press counter the way a live INT 33h AX=5 would).
+    var dst2: [1024]u8 = undefined;
+    const mtxt2 = try expectOkText(call(&ts, 185, "read_mouse", "{}", &obuf).body, &dst2);
+    try std.testing.expectEqualStrings(mtxt, mtxt2);
+
+    // First release the held button so the next click starts from a known all-up state:
+    // {buttons:0} is a pure inject (release all) → left release edge, button now UP.
+    try std.testing.expectEqual(false, try toolIsError(call(&ts, 186, "input_mouse", "{\"buttons\":0}", &obuf).body));
+
+    // DEFAULT CLICK (no hold_ms, no release:false): a bare {buttons:1} presses AND
+    // releases (advancing the dwell's cycles) — the footgun-free default. From the all-up
+    // baseline (press 1 / release 1), the click adds one press AND one release edge, and
+    // leaves the button back UP: press 1→2, release 1→2, buttons 0.
+    try std.testing.expectEqual(false, try toolIsError(call(&ts, 187, "input_mouse", "{\"buttons\":1}", &obuf).body));
+    var dst3: [1024]u8 = undefined;
+    const mtxt3 = try expectOkText(call(&ts, 188, "read_mouse", "{}", &obuf).body, &dst3);
+    try std.testing.expect(std.mem.indexOf(u8, mtxt3, "\"buttons\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mtxt3, "\"press_count\":[2,0,0]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mtxt3, "\"release_count\":[2,0,0]") != null);
+}
+
 test "dispatch: set_clock applies then get_clock reflects the mult" {
     var ts = try TestServer.init(std.testing.allocator);
     try ts.start();

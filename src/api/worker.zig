@@ -147,9 +147,16 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
         // ---- input ---------------------------------------------------------
         .input_key => |c| inputKey(ctrl, c),
         .input_mouse => |c| blk: {
-            // Mutate INT 33h driver state at the one-command-in-flight boundary
-            // (no host clock, no sample-rate gate). Always succeeds — driver-state
-            // injection has no FIFO to overflow (unlike the 8042 key path).
+            // A held CLICK (`hold_ms` present): press → advance the dwell's cycles →
+            // release, so a level-sampling guest observes it. DOES advance the machine;
+            // returns the run stop reason (the deterministic cycle delta), unlike the
+            // pure inject below. The wire mapper already guaranteed a non-zero button
+            // mask, so there is a real down→…→up edge to hold.
+            if (c.hold_ms) |ms| break :blk .{ .stop = ctrl.clickMouse(c, ms) };
+            // Pure inject: mutate INT 33h driver state at the one-command-in-flight
+            // boundary (no host clock, no sample-rate gate, cycle-neutral, NO auto-
+            // release). Always succeeds — driver-state injection has no FIFO to overflow
+            // (unlike the 8042 key path).
             ctrl.injectMouse(c);
             break :blk .ok;
         },
@@ -157,6 +164,7 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
 
         // ---- session -------------------------------------------------------
         .console_get => consoleResp(ctrl),
+        .mouse_get => .{ .mouse = ctrl.mouseSnapshot() },
         .screen_get => screenResp(ctrl),
         .framebuffer_get => framebufferResp(ctrl, render),
         .status => statusResp(ctrl),
@@ -190,8 +198,15 @@ const SC_LSHIFT: u8 = 0x2A;
 /// make+break (and a Shift bracket when `shift`) as one deterministic command.
 fn inputKey(ctrl: *Controller, c: anytype) Response {
     if (!c.press) {
-        // A single precise edge.
+        // A single precise edge (no hold — the mapper rejects `hold_ms` on a raw edge).
         if (ctrl.injectScancode(c.scancode, c.make, c.ext)) return .ok;
+        return .{ .err = .input_buffer_full };
+    }
+    // A held TAP (`hold_ms` present): make (+ Shift bracket) → advance the dwell's
+    // cycles → break, so a guest that level-samples raw key state observes the hold.
+    // Returns the run stop reason (the cycle delta); a full FIFO surfaces as before.
+    if (c.hold_ms) |ms| {
+        if (ctrl.tapKey(c.scancode, c.ext, c.shift, ms)) |stop| return .{ .stop = stop };
         return .{ .err = .input_buffer_full };
     }
     // A full keystroke: shift-make? ; key-make ; key-break ; shift-break?

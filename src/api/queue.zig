@@ -103,7 +103,12 @@ pub const Command = union(enum) {
     ///     make THEN the break as one deterministic command; `shift` brackets it
     ///     with a left-Shift make/break (the resolved "scancode(s)" of a shifted
     ///     char). All edges go through the controller in one worker step.
-    input_key: struct { scancode: u8, make: bool, ext: bool, press: bool, shift: bool },
+    ///   - held tap: `press=true` with `hold_ms != null` injects the make (+ Shift
+    ///     bracket), ADVANCES the machine `dwellCycles(hold_ms)` cycles, then injects
+    ///     the break — so a guest that level-samples raw key state observes the hold.
+    ///     `hold_ms` is only meaningful for `press=true` (rejected for a raw edge at
+    ///     the wire mapper); `null` ⇒ the back-to-back make+break above.
+    input_key: struct { scancode: u8, make: bool, ext: bool, press: bool, shift: bool, hold_ms: ?u32 = null },
     /// Inject a mouse event into the INT 33h driver state (Model A,
     /// input-injection.md §5.2). Pointer-free POD: the wire→resolved mapping
     /// (mutual-exclusion check + defaults) is done at the HANDLER; the queue
@@ -123,6 +128,11 @@ pub const Command = union(enum) {
     /// has printed so far. Side-effect-free (no clear-on-read); the worker copies the
     /// device buffer into the response POD.
     console_get: void,
+    /// Side-effect-free peek of the INT 33h mouse-driver state (`read_mouse`): cursor
+    /// position (AX=3 masked POS_X/POS_Y), button mask, the LIVE range (fn 7/8), and the
+    /// AX=5/6 press/release counters. Pure read — does NOT invoke a live INT 33h, so it
+    /// does NOT clear the AX=5/6 counters. Cycle-neutral, like the other peeks.
+    mouse_get: void,
     /// Read the active VGA text page (B8000/B0000 cells) — the side-effect-free
     /// screen grid for `GET /api/screen`. A `void` command: the `?attrs=1` flag is
     /// parsed server-side and drives JSON serialization only (Finding 5), so the
@@ -346,6 +356,8 @@ pub const Response = union(enum) {
     stack: StackResult,
     status: StatusResult,
     console: ConsoleResult,
+    /// The INT 33h mouse-driver peek (`read_mouse`). Pointer-free POD.
+    mouse: debug.MouseSnapshot,
     screen: ScreenResult,
     /// The framebuffer-capture descriptor; pixels live in the server render buffers.
     framebuffer: FramebufferResult,

@@ -307,6 +307,81 @@ test "Phase 3: set_clock applies the mult (clamped) and clock_get reflects it" {
     try std.testing.expectEqual(timing.MAX_MULT, m.clock.mult);
 }
 
+test "read_mouse (mouse_get) peeks INT 33h driver state, side-effect-free" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    var c = Controller.init(m);
+
+    // Drive the driver to a known state through the deterministic inject seam: a
+    // non-default LIVE range (fn 7/8 semantics), a placed cursor, and one left-button
+    // press edge (press_count[0]==1). gran stays 0xffff (no reset), so the masked AX=3
+    // position equals the raw position.
+    m.dos.mouse.min_x = 0;
+    m.dos.mouse.max_x = 1276;
+    m.dos.mouse.min_y = 0;
+    m.dos.mouse.max_y = 796;
+    m.dos.mouse.hidden = 0; // visible
+    m.dos.mouse.injectAbsolute(640, 400, 0, true, true, false); // position
+    m.dos.mouse.injectAbsolute(0, 0, 0b001, false, false, true); // press left at (640,400)
+
+    const r = drain(&c, .mouse_get);
+    try std.testing.expect(r == .mouse);
+    const ms = r.mouse;
+    try std.testing.expectEqual(@as(u16, 640), ms.x);
+    try std.testing.expectEqual(@as(u16, 400), ms.y);
+    try std.testing.expectEqual(@as(u16, 0b001), ms.buttons);
+    try std.testing.expectEqual(@as(i16, 0), ms.min_x);
+    try std.testing.expectEqual(@as(i16, 1276), ms.max_x);
+    try std.testing.expectEqual(@as(i16, 0), ms.min_y);
+    try std.testing.expectEqual(@as(i16, 796), ms.max_y);
+    try std.testing.expect(ms.visible);
+    try std.testing.expectEqual(@as(u16, 1), ms.press_count[0]); // one left press
+    try std.testing.expectEqual(@as(u16, 0), ms.press_count[1]); // right untouched
+
+    // PURE peek: a SECOND read returns the IDENTICAL snapshot — unlike a live INT 33h
+    // AX=5, the peek does NOT read-and-zero the press counter.
+    const r2 = drain(&c, .mouse_get);
+    try std.testing.expect(r2 == .mouse);
+    try std.testing.expectEqual(ms, r2.mouse);
+    try std.testing.expectEqual(@as(u16, 1), r2.mouse.press_count[0]); // still 1
+}
+
+test "input_mouse hold_ms: a held click advances cycles + auto-releases; plain inject is cycle-neutral" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    var c = Controller.init(m);
+
+    // PLAIN inject (no hold_ms): cycle-neutral, returns .ok, and the button STAYS down
+    // (the press-and-hold path — nothing auto-releases). No regression.
+    const c0 = m.cpu.st.cycles;
+    const plain = drain(&c, .{ .input_mouse = .{ .buttons = 0b001, .set_buttons = true } });
+    try std.testing.expect(plain == .ok);
+    try std.testing.expectEqual(c0, m.cpu.st.cycles); // zero cycles charged
+    try std.testing.expectEqual(@as(u16, 0b001), m.dos.mouse.buttons); // still held
+
+    // HELD click (hold_ms): presses (relative to the now-held left, this presses RIGHT),
+    // ADVANCES the machine for the dwell, then releases back to the pre-press mask
+    // (left, 0b001). Returns the run stop reason (a .stop, not .ok) and charges cycles.
+    const c1 = m.cpu.st.cycles;
+    const click = drain(&c, .{ .input_mouse = .{ .buttons = 0b011, .set_buttons = true, .hold_ms = 100 } });
+    try std.testing.expect(click == .stop);
+    // The click NEVER surfaces the raw `cycle_budget_exhausted` (the "run hit its cap"
+    // signal that reads as a truncated click): a full dwell reports `dwell_complete`,
+    // and a terminal/breakpoint during the dwell passes through. (This bare NOP machine
+    // HLTs as the sled runs out, so here it is `halted_forever` — a valid passthrough;
+    // the normal `dwell_complete` completion is asserted in the dos integration test
+    // where the guest spins for the whole dwell.)
+    try std.testing.expect(click.stop != .cycle_budget_exhausted);
+    try std.testing.expect(m.cpu.st.cycles > c1); // the dwell charged real cycles
+    // Reverted to the pre-press mask: right released, the originally-held left remains.
+    try std.testing.expectEqual(@as(u16, 0b001), m.dos.mouse.buttons);
+    // The press + release each counted exactly once for the RIGHT button (index 1).
+    try std.testing.expectEqual(@as(u16, 1), m.dos.mouse.press_count[1]);
+    try std.testing.expectEqual(@as(u16, 1), m.dos.mouse.release_count[1]);
+}
+
 /// A counting allocator wrapper (M1 lineage) — tallies alloc calls so we can assert
 /// the dispatch path is alloc-free.
 const CountingAllocator = struct {

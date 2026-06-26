@@ -15,6 +15,10 @@
 //!   - AX=0003 get position+buttons (POS_X/POS_Y granularity mask, mouse.cpp:1642).
 //!   - AX=0004 set position (signed clamp to range + the "==POS rounding" quirk,
 //!     mouse.cpp:1659).
+//!   - AX=0005/0006 get button PRESS/RELEASE data (per-button count + last
+//!     press/release position, returned-and-zeroed; the common poll-loop click
+//!     detector — mouse.cpp:1673/1702, edges recorded by `setButtons`). This is
+//!     how Betrayal at Krondor's mouse-only menu sees a click.
 //!   - AX=0007/0008 define horizontal/vertical range (min<->max swap + reclamp the
 //!     live position, mouse.cpp:1732/1801).
 //!   - AX=000B read motion counters (accumulate-and-zero-on-read; see note).
@@ -166,11 +170,35 @@ pub fn Int33(comptime Cpu: type) type {
         mickey_x: i16 = 0,
         mickey_y: i16 = 0,
 
+        /// Per-button press/release bookkeeping (dosbox-x `times_pressed`,
+        /// `times_released`, `last_pressed_x/y`, `last_released_x/y`,
+        /// mouse.cpp:201-206; dosbox-staging MouseDriverState
+        /// `times_pressed/last_pressed_*`, mouseif_dos_driver_state.cpp:436-553).
+        /// Index 0=left, 1=right, 2=middle (the BTN_* / button-number order). The
+        /// counters accumulate on each button EDGE (0->1 press, 1->0 release) and
+        /// are RETURNED-AND-ZEROED by INT 33h AX=0005 / AX=0006 for the queried
+        /// button (mouse.cpp:1680/1695/1709/1725). The `last_*_x/y` hold the
+        /// granularity-masked POS_X/POS_Y at the time of that button's last edge
+        /// (mouse.cpp:1291/1292/1354/1355 records `(uint16_t)POS_X/POS_Y`). All
+        /// integer, guest-observable, reset-on-read — deterministic (a pure
+        /// function of the injected button transitions + the cursor position at
+        /// each edge). Cleared by `reset` (Mouse_Reset, mouse.cpp:1587-1592) and
+        /// captured in the Snapshot (POD).
+        press_count: [MOUSE_BUTTONS]u16 = .{ 0, 0, 0 },
+        release_count: [MOUSE_BUTTONS]u16 = .{ 0, 0, 0 },
+        last_press_x: [MOUSE_BUTTONS]u16 = .{ 0, 0, 0 },
+        last_press_y: [MOUSE_BUTTONS]u16 = .{ 0, 0, 0 },
+        last_release_x: [MOUSE_BUTTONS]u16 = .{ 0, 0, 0 },
+        last_release_y: [MOUSE_BUTTONS]u16 = .{ 0, 0, 0 },
+
         /// Granularity-masked position the guest observes (mouse.cpp POS_X/POS_Y).
-        fn posX(self: *const Self) u16 {
+        /// `pub` so the read-only API peek (`Controller.mouseSnapshot` / `read_mouse`)
+        /// reports the SAME value AX=3 returns — the masking stays the single source of
+        /// truth here, not duplicated at the API layer.
+        pub fn posX(self: *const Self) u16 {
             return @as(u16, @bitCast(self.x)) & self.gran_x;
         }
-        fn posY(self: *const Self) u16 {
+        pub fn posY(self: *const Self) u16 {
             return @as(u16, @bitCast(self.y)) & self.gran_y;
         }
 
@@ -255,6 +283,14 @@ pub fn Int33(comptime Cpu: type) type {
             self.precise_mickey_y = 0;
             self.precise_pixel_x = 0;
             self.precise_pixel_y = 0;
+            // Mouse_Reset clears the per-button press/release counters + positions
+            // (mouse.cpp:1587-1592).
+            self.press_count = .{ 0, 0, 0 };
+            self.release_count = .{ 0, 0, 0 };
+            self.last_press_x = .{ 0, 0, 0 };
+            self.last_press_y = .{ 0, 0, 0 };
+            self.last_release_x = .{ 0, 0, 0 };
+            self.last_release_y = .{ 0, 0, 0 };
         }
 
         pub fn service(self: *Self, dos: *Dos, cpu: *Cpu, br: *Bridge) void {
@@ -284,6 +320,36 @@ pub fn Int33(comptime Cpu: type) type {
                     // Shared with `injectAbsolute` so the two paths can't diverge.
                     self.setClampedX(cx);
                     self.setClampedY(dx);
+                },
+                0x0005 => { // RETURN BUTTON PRESS DATA (mouse.cpp:1673)
+                    // BX = button number; out-of-range clamps to the highest valid
+                    // button (dosbox-x mouse.cpp:1691 `if (but>=MOUSE_BUTTONS) but =
+                    // MOUSE_BUTTONS-1`). AX = current button status, BX = number of
+                    // presses of that button since the last AX=5 (then ZEROED),
+                    // CX/DX = POS_X/POS_Y of that button's last press
+                    // (mouse.cpp:1690-1695). NOTE: zdos models no scroll wheel, so the
+                    // CuteMouse BX==0xFFFF wheel magic (mouse.cpp:1684) is not special-
+                    // cased — it falls through the clamp like any out-of-range index.
+                    var but = cpu.st.getReg16(EBX);
+                    if (but >= MOUSE_BUTTONS) but = MOUSE_BUTTONS - 1;
+                    cpu.st.setReg16(EAX, self.buttons);
+                    cpu.st.setReg16(EBX, self.press_count[but]);
+                    cpu.st.setReg16(ECX, self.last_press_x[but]);
+                    cpu.st.setReg16(EDX, self.last_press_y[but]);
+                    self.press_count[but] = 0;
+                },
+                0x0006 => { // RETURN BUTTON RELEASE DATA (mouse.cpp:1702)
+                    // As AX=5 but for RELEASES (mouse.cpp:1720-1725): AX = current
+                    // status, BX = release count since last AX=6 (then ZEROED), CX/DX
+                    // = POS_X/POS_Y of that button's last release. Same out-of-range
+                    // clamp and same no-wheel note as AX=5.
+                    var but = cpu.st.getReg16(EBX);
+                    if (but >= MOUSE_BUTTONS) but = MOUSE_BUTTONS - 1;
+                    cpu.st.setReg16(EAX, self.buttons);
+                    cpu.st.setReg16(EBX, self.release_count[but]);
+                    cpu.st.setReg16(ECX, self.last_release_x[but]);
+                    cpu.st.setReg16(EDX, self.last_release_y[but]);
+                    self.release_count[but] = 0;
                 },
                 0x0007 => { // DEFINE HORIZONTAL RANGE (mouse.cpp:1732)
                     const cx: i16 = @bitCast(cpu.st.getReg16(ECX));
@@ -389,6 +455,43 @@ pub fn Int33(comptime Cpu: type) type {
             if (v >= self.max_y) self.y = self.max_y else if (self.min_y >= v) self.y = self.min_y else if (v != @as(i16, @bitCast(self.posY()))) self.y = v;
         }
 
+        /// THE SINGLE WRITER of `self.buttons` for real button events. Detects the
+        /// per-button EDGE between the old mask and `new_btn` and drives the AX=5/6
+        /// press/release bookkeeping from the SAME transition the AX=0Ch callback
+        /// condition is built from (`conditionMask`), so the scripted, callback, and
+        /// live paths can never diverge or double-count: every inject path routes its
+        /// button update through here exactly once. Mirrors dosbox's `update_buttons`
+        /// (mouseif_dos_driver.cpp:1420-1443) / dosbox-x `Mouse_ButtonPressed` +
+        /// `Mouse_ButtonReleased` (mouse.cpp:1288-1356): on a 0->1 transition of
+        /// button b, record POS_X/POS_Y into `last_press_*[b]` and increment
+        /// `press_count[b]`; on 1->0, record into `last_release_*[b]` and increment
+        /// `release_count[b]`. The recorded position is the granularity-masked
+        /// POS_X/POS_Y (`posX()`/`posY()` — `(uint16_t)POS_X` in dosbox), captured
+        /// AFTER any same-inject position update (callers apply position before
+        /// buttons), exactly as dosbox records the live position at the edge. The
+        /// counters wrap like dosbox's `uint16_t + 1` (`+%=`); they realistically
+        /// never approach 65535 between reads.
+        fn setButtons(self: *Self, new_btn: u16) void {
+            const old = self.buttons;
+            const pressed = new_btn & ~old; // 0->1 transitions
+            const released = old & ~new_btn; // 1->0 transitions
+            var b: u16 = 0;
+            while (b < MOUSE_BUTTONS) : (b += 1) {
+                const bit = @as(u16, 1) << @intCast(b);
+                if (pressed & bit != 0) {
+                    self.last_press_x[b] = self.posX();
+                    self.last_press_y[b] = self.posY();
+                    self.press_count[b] +%= 1;
+                }
+                if (released & bit != 0) {
+                    self.last_release_x[b] = self.posX();
+                    self.last_release_y[b] = self.posY();
+                    self.release_count[b] +%= 1;
+                }
+            }
+            self.buttons = new_btn;
+        }
+
         /// Inject an ABSOLUTE scripted mouse event (deterministic external-input
         /// seam, input Phase 2). Each of position-x / position-y / buttons is set
         /// only when its `set_*` flag is true, so a caller can update a subset.
@@ -406,7 +509,7 @@ pub fn Int33(comptime Cpu: type) type {
         ) void {
             if (set_x) self.setClampedX(x);
             if (set_y) self.setClampedY(y);
-            if (set_buttons) self.buttons = buttons;
+            if (set_buttons) self.setButtons(buttons);
         }
 
         /// Round a SCALE-fixed-point value to the nearest whole unit, half AWAY
@@ -451,7 +554,7 @@ pub fn Int33(comptime Cpu: type) type {
         ) void {
             if (set_dx) self.applyRelAxis(dx, RATIO_X, self.senv_x_val, &self.precise_pixel_x, &self.precise_mickey_x, &self.mickey_x, true, false);
             if (set_dy) self.applyRelAxis(dy, RATIO_Y, self.senv_y_val, &self.precise_pixel_y, &self.precise_mickey_y, &self.mickey_y, false, false);
-            if (set_buttons) self.buttons = buttons;
+            if (set_buttons) self.setButtons(buttons);
         }
 
         /// Advance ONLY the AX=0Bh mickey counters from a relative delta — NOT the
@@ -687,13 +790,25 @@ pub fn Int33(comptime Cpu: type) type {
             const old_x = self.x;
             const old_y = self.y;
 
+            // Resolve the ABSOLUTE position per axis from EITHER the raw driver-range
+            // coord (`x`/`y`) OR the range-independent NORMALIZED Q16 (`nx_q16`/`ny_q16`),
+            // mapped through the driver's LIVE range with the SAME `q16ToVirtual` the
+            // seamless/browser path uses (`injectSeamless`) — no duplicated mapping math,
+            // no game-specific range, the faithful fn 7/8 range is the single authority.
+            // The raw and normalized modes are mutually exclusive per axis (enforced at
+            // the wire mapper), so at most one of set_x/set_nx (resp. set_y/set_ny) holds.
+            const set_abs_x = req.set_x or req.set_nx;
+            const set_abs_y = req.set_y or req.set_ny;
+            const abs_x: i16 = if (req.set_nx) q16ToVirtual(req.nx_q16, self.min_x, self.max_x) else req.x;
+            const abs_y: i16 = if (req.set_ny) q16ToVirtual(req.ny_q16, self.min_y, self.max_y) else req.y;
+
             // Apply absolute first (verbatim range-clamped) then relative (the
             // fixed-point mickey path) — identical ordering to Controller.injectMouse
             // so the firing and non-firing paths can't diverge. Buttons ride with
             // whichever path the caller selected; both write `self.buttons`.
-            if (req.set_x or req.set_y) {
+            if (set_abs_x or set_abs_y) {
                 const btn_here = req.set_buttons and !(req.set_dx or req.set_dy);
-                self.injectAbsolute(req.x, req.y, req.buttons, req.set_x, req.set_y, btn_here);
+                self.injectAbsolute(abs_x, abs_y, req.buttons, set_abs_x, set_abs_y, btn_here);
             }
             if (req.set_dx or req.set_dy or req.set_buttons) {
                 self.injectRelative(req.dx, req.dy, req.buttons, req.set_dx, req.set_dy, req.set_buttons);
@@ -772,8 +887,11 @@ pub fn Int33(comptime Cpu: type) type {
                 self.accumulateMickeys(dx16, dy16);
             }
 
-            // BUTTONS: latest mask (applied once, independent of motion).
-            if (req.set_buttons) self.buttons = req.buttons;
+            // BUTTONS: latest mask (applied once, independent of motion). Routes
+            // through the single edge-detecting writer so the live/seamless path
+            // feeds the AX=5/6 press/release counters identically to the scripted
+            // and callback paths (no divergence, no double-count).
+            if (req.set_buttons) self.setButtons(req.buttons);
 
             const moved = (self.x != old_x) or (self.y != old_y) or
                 (self.mickey_x != old_mx) or (self.mickey_y != old_my);
@@ -800,11 +918,19 @@ pub fn Int33(comptime Cpu: type) type {
         pub const InjectReq = struct {
             x: i16 = 0,
             y: i16 = 0,
+            /// NORMALIZED absolute position in Q16 (`0x1_0000` == the right/bottom edge),
+            /// the range-independent addressing mode. Mapped through the driver's LIVE
+            /// `min/max` via `q16ToVirtual` when `set_nx`/`set_ny` — mutually exclusive
+            /// per axis with the raw `x`/`y` (the wire mapper enforces it).
+            nx_q16: u32 = 0,
+            ny_q16: u32 = 0,
             dx: i16 = 0,
             dy: i16 = 0,
             buttons: u16 = 0,
             set_x: bool = false,
             set_y: bool = false,
+            set_nx: bool = false,
+            set_ny: bool = false,
             set_dx: bool = false,
             set_dy: bool = false,
             set_buttons: bool = false,
@@ -851,6 +977,13 @@ pub fn Int33(comptime Cpu: type) type {
             precise_pixel_y: i64,
             mickey_x: i16,
             mickey_y: i16,
+            // Per-button AX=5/6 press/release bookkeeping (POD).
+            press_count: [MOUSE_BUTTONS]u16,
+            release_count: [MOUSE_BUTTONS]u16,
+            last_press_x: [MOUSE_BUTTONS]u16,
+            last_press_y: [MOUSE_BUTTONS]u16,
+            last_release_x: [MOUSE_BUTTONS]u16,
+            last_release_y: [MOUSE_BUTTONS]u16,
         };
 
         pub fn snapshot(self: *const Self) Snapshot {
@@ -878,6 +1011,12 @@ pub fn Int33(comptime Cpu: type) type {
                 .precise_pixel_y = self.precise_pixel_y,
                 .mickey_x = self.mickey_x,
                 .mickey_y = self.mickey_y,
+                .press_count = self.press_count,
+                .release_count = self.release_count,
+                .last_press_x = self.last_press_x,
+                .last_press_y = self.last_press_y,
+                .last_release_x = self.last_release_x,
+                .last_release_y = self.last_release_y,
             };
         }
 
@@ -905,6 +1044,12 @@ pub fn Int33(comptime Cpu: type) type {
             self.precise_pixel_y = snap.precise_pixel_y;
             self.mickey_x = snap.mickey_x;
             self.mickey_y = snap.mickey_y;
+            self.press_count = snap.press_count;
+            self.release_count = snap.release_count;
+            self.last_press_x = snap.last_press_x;
+            self.last_press_y = snap.last_press_y;
+            self.last_release_x = snap.last_release_x;
+            self.last_release_y = snap.last_release_y;
         }
     };
 }

@@ -14,8 +14,10 @@ const machine_mod = @import("machine");
 const cpu_mod = @import("cpu");
 const dos_mod = @import("dos");
 const timing = @import("timing");
+const debug = @import("debug");
 
 const Machine = machine_mod.Machine;
+const Controller = debug.Controller;
 const Reg32 = cpu_mod.state.Reg32;
 
 const Ctx = struct {
@@ -546,6 +548,309 @@ fn guestInt33(m: *Machine, ax: u16) struct { cx: u16, dx: u16, bx: u16 } {
         .dx = m.cpu.st.getReg16(@intFromEnum(Reg32.edx)),
         .bx = m.cpu.st.getReg16(@intFromEnum(Reg32.ebx)),
     };
+}
+
+// Run `MOV AX,imm ; MOV BX,imm ; INT 33h ; HLT` and return AX/BX/CX/DX. Used by
+// the AX=0005/0006 button-press/release queries, which take the button number in
+// BX and report the current status in AX plus the count/position in BX/CX/DX.
+fn guestInt33BX(m: *Machine, ax: u16, bx: u16) struct { ax: u16, bx: u16, cx: u16, dx: u16 } {
+    asmInt67(m, &.{
+        0xB8, @truncate(ax), @truncate(ax >> 8), // MOV AX, imm16
+        0xBB, @truncate(bx), @truncate(bx >> 8), // MOV BX, imm16
+        0xCD, 0x33, // INT 33h
+        0xF4, // HLT
+    });
+    return .{
+        .ax = m.cpu.st.getReg16(@intFromEnum(Reg32.eax)),
+        .bx = m.cpu.st.getReg16(@intFromEnum(Reg32.ebx)),
+        .cx = m.cpu.st.getReg16(@intFromEnum(Reg32.ecx)),
+        .dx = m.cpu.st.getReg16(@intFromEnum(Reg32.edx)),
+    };
+}
+
+test "INT 33h AX=0005: guest sees an injected button press (count + position, reset-on-read)" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    // Position the cursor, then press the LEFT button at that spot (one 0->1 edge).
+    // Defaults: range x=0..639 y=0..479, gran 0xffff, so the position round-trips.
+    m.dos.mouse.injectAbsolute(222, 134, 0, true, true, false); // move, no buttons
+    m.dos.mouse.injectAbsolute(0, 0, 0b001, false, false, true); // press left
+
+    // AX=0005, BX=0 (left): AX=current status (left down), BX=press count (1),
+    // CX/DX = the position of the last press (mouse.cpp:1690-1695).
+    const r = guestInt33BX(m, 0x0005, 0);
+    try std.testing.expectEqual(@as(u16, 0b001), r.ax); // left button currently down
+    try std.testing.expectEqual(@as(u16, 1), r.bx); // one press since last query
+    try std.testing.expectEqual(@as(u16, 222), r.cx); // X at the press
+    try std.testing.expectEqual(@as(u16, 134), r.dx); // Y at the press
+
+    // Reset-on-read: a SECOND AX=0005 returns count 0 (mouse.cpp:1695 zeroes it),
+    // but AX still reflects the (still-held) button and CX/DX keep the last-press
+    // position (only the COUNTER is reset, not the position — dosbox keeps it).
+    const r2 = guestInt33BX(m, 0x0005, 0);
+    try std.testing.expectEqual(@as(u16, 0b001), r2.ax);
+    try std.testing.expectEqual(@as(u16, 0), r2.bx);
+    try std.testing.expectEqual(@as(u16, 222), r2.cx);
+    try std.testing.expectEqual(@as(u16, 134), r2.dx);
+
+    // The RIGHT button (BX=1) never pressed: count 0, position 0.
+    const rr = guestInt33BX(m, 0x0005, 1);
+    try std.testing.expectEqual(@as(u16, 0), rr.bx);
+    try std.testing.expectEqual(@as(u16, 0), rr.cx);
+    try std.testing.expectEqual(@as(u16, 0), rr.dx);
+}
+
+test "INT 33h AX=0006: guest sees an injected button release (count + position, reset-on-read)" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    // Press the left button at one spot, then release it at ANOTHER — AX=0006 must
+    // report the RELEASE position (not the press position) for the last release.
+    m.dos.mouse.injectAbsolute(100, 50, 0b001, true, true, true); // move + press
+    m.dos.mouse.injectAbsolute(300, 175, 0, true, true, true); // move + release left
+
+    // AX=0006, BX=0 (left): AX=current status (no buttons), BX=release count (1),
+    // CX/DX = position of the last release (mouse.cpp:1720-1725).
+    const r = guestInt33BX(m, 0x0006, 0);
+    try std.testing.expectEqual(@as(u16, 0), r.ax); // nothing held now
+    try std.testing.expectEqual(@as(u16, 1), r.bx); // one release since last query
+    try std.testing.expectEqual(@as(u16, 300), r.cx); // X at the release
+    try std.testing.expectEqual(@as(u16, 175), r.dx); // Y at the release
+
+    // Reset-on-read: a second AX=0006 returns count 0, position retained.
+    const r2 = guestInt33BX(m, 0x0006, 0);
+    try std.testing.expectEqual(@as(u16, 0), r2.bx);
+    try std.testing.expectEqual(@as(u16, 300), r2.cx);
+    try std.testing.expectEqual(@as(u16, 175), r2.dx);
+
+    // AX=0005 press count is independent of AX=0006: exactly one press happened.
+    const rp = guestInt33BX(m, 0x0005, 0);
+    try std.testing.expectEqual(@as(u16, 1), rp.bx);
+    try std.testing.expectEqual(@as(u16, 100), rp.cx); // press was at the FIRST spot
+    try std.testing.expectEqual(@as(u16, 50), rp.dx);
+
+    // Out-of-range button number clamps to the highest valid button (dosbox-x
+    // mouse.cpp:1721 `if (but>=MOUSE_BUTTONS) but = MOUSE_BUTTONS-1`): BX=99 reads
+    // the middle button (index 2), which never released -> count 0.
+    const oob = guestInt33BX(m, 0x0006, 99);
+    try std.testing.expectEqual(@as(u16, 0), oob.bx);
+}
+
+// ---------------------------------------------------------------------------
+// Held CLICK dwell (the level-sampling fix). A guest that LEVEL-SAMPLES the mouse
+// button — reads "is it down RIGHT NOW" via INT 33h AX=3 once per loop iteration,
+// mirroring Betrayal at Krondor's retrace-spinning menu — only observes a click if
+// the button-down state PERSISTS across at least one of its sample iterations. A
+// cycle-neutral press+release (dwell 0) is never seen; a press → ~100 ms-emulated
+// dwell → release IS. `Controller.clickMouse` advances that EMULATED time explicitly
+// (zdos has no host clock), so the click lands deterministically.
+// ---------------------------------------------------------------------------
+
+// Arm the LEVEL-SAMPLING guest at CODE_SEG:0 and start it (CS:IP, stack). It polls the
+// LEFT button via INT 33h AX=3 in a tight loop and, the instant it samples the button
+// DOWN, falls into a `JMP $` self-spin at SAMPLER_DONE_OFF:
+//   loop: MOV AX,0003 ; INT 33h ; TEST BL,1 ; JZ loop   done: JMP $
+// IF is cleared so no hardware IRQ ever perturbs the snippet (INT 33h is a software
+// interrupt — unaffected): the run is purely the guest's own poll loop. The guest's
+// EIP reaches SAMPLER_DONE_OFF (and stays there) IFF it observed the button down; while
+// it never sees the button it cycles through offsets 0..9 forever.
+const SAMPLER_DONE_OFF: u32 = 10; // the `JMP $` self-spin entered on detection
+fn armButtonSampler(m: *Machine) void {
+    const code = [_]u8{
+        0xB8, 0x03, 0x00, // off 0: MOV AX,0003h
+        0xCD, 0x33, // off 3: INT 33h          (BX <- buttons)
+        0xF6, 0xC3, 0x01, // off 5: TEST BL,1
+        0x74, 0xF6, // off 8: JZ -10 -> back to off 0
+        0xEB, 0xFE, // off 10: JMP $ (spin here once detected)
+    };
+    const base = @as(u32, CODE_SEG) << 4;
+    for (code, 0..) |c, i| m.bus.writePhys8(base + @as(u32, @intCast(i)), c);
+    m.cpu.loadSegment(.cs, CODE_SEG);
+    m.cpu.st.eip = 0;
+    m.cpu.loadSegment(.ss, CODE_SEG);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.esp), 0xFFF0);
+    m.cpu.st.eflags.iff = false; // no hardware IRQ perturbs the snippet
+    m.cpu.st.halted = false;
+}
+
+test "held click: a ~100 ms dwell makes a level-sampled click land; dwell 0 does not" {
+    const alloc = std.testing.allocator;
+
+    // --- WITH a dwell: the sampler observes the click ---
+    {
+        var ctx = try boot(alloc);
+        defer ctx.deinit();
+        const m = ctx.m;
+        armButtonSampler(m);
+        var ctrl = Controller.init(m);
+
+        // Press left, hold ~100 ms of EMULATED time, release. During the hold the
+        // button is down, so the polling guest samples it and reaches the spin.
+        const stop = ctrl.clickMouse(.{ .buttons = 0b001, .set_buttons = true }, 100);
+
+        // The guest spins for the rest of the dwell, so the hold runs to completion: the
+        // reason is `dwell_complete` (NOT the raw `cycle_budget_exhausted`), the dedicated
+        // "the click held its full dwell" signal a caller sees instead of a truncation.
+        try std.testing.expect(stop == .dwell_complete);
+        try std.testing.expectEqual(SAMPLER_DONE_OFF, m.cpu.st.eip); // observed
+        // The release edge landed too: the button is back up after the click.
+        try std.testing.expectEqual(@as(u16, 0), m.dos.mouse.buttons);
+    }
+
+    // --- dwell 0: the same press+release is INSTANTANEOUS, never sampled ---
+    {
+        var ctx = try boot(alloc);
+        defer ctx.deinit();
+        const m = ctx.m;
+        armButtonSampler(m);
+        var ctrl = Controller.init(m);
+
+        // Press+release at (effectively) the same cycle: runUntilEvent(0) steps a
+        // single instruction — not a whole poll+test+branch iteration — then we
+        // release. The guest cannot complete a detection in that window.
+        _ = ctrl.clickMouse(.{ .buttons = 0b001, .set_buttons = true }, 0);
+        try std.testing.expect(m.cpu.st.eip != SAMPLER_DONE_OFF); // NOT observed
+        try std.testing.expectEqual(@as(u16, 0), m.dos.mouse.buttons); // released
+
+        // Drive a long run AFTERWARD (button now up): the guest keeps polling an up
+        // button forever and STILL never reaches the spin — proving the instantaneous
+        // click was genuinely missed, not merely late. `untilDone` never trips (no HLT),
+        // so the run exhausts its whole budget.
+        _ = m.runUntil(untilDone, 5_000_000);
+        try std.testing.expect(m.cpu.st.eip != SAMPLER_DONE_OFF);
+    }
+}
+
+test "held click: deterministic — two fresh machines reach identical cycle + state" {
+    const alloc = std.testing.allocator;
+    var ca = try boot(alloc);
+    defer ca.deinit();
+    var cb = try boot(alloc);
+    defer cb.deinit();
+    armButtonSampler(ca.m);
+    armButtonSampler(cb.m);
+    var ctrl_a = Controller.init(ca.m);
+    var ctrl_b = Controller.init(cb.m);
+
+    _ = ctrl_a.clickMouse(.{ .buttons = 0b001, .set_buttons = true }, 100);
+    _ = ctrl_b.clickMouse(.{ .buttons = 0b001, .set_buttons = true }, 100);
+
+    // Same binary + same input (the click) => byte-identical cycle AND CPU state.
+    try std.testing.expectEqual(ca.m.cpu.st.cycles, cb.m.cpu.st.cycles);
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&ca.m.cpu.st),
+        std.mem.asBytes(&cb.m.cpu.st),
+    );
+    try std.testing.expectEqual(ca.m.dos.mouse.press_count[0], cb.m.dos.mouse.press_count[0]);
+}
+
+test "held click: the dwell->cycles budget scales with the configured CPU clock (reads the machine clock, not a constant)" {
+    const alloc = std.testing.allocator;
+
+    // Two identical machines, one at twice the CPU:PIT mult. The SAME hold_ms must
+    // charge proportionally more cycles at the faster clock — proving dwellCycles
+    // reads the live mult (cpuClockHz) rather than a hardcoded count. Use a snippet
+    // that NEVER halts (JMP $) so the dwell budget is exhausted in full, making the
+    // reported cycle delta exactly the dwell budget.
+    const spin = [_]u8{ 0xEB, 0xFE }; // JMP $ (tight self-loop, no INT, no HLT)
+
+    var slow = try boot(alloc);
+    defer slow.deinit();
+    var fast = try boot(alloc);
+    defer fast.deinit();
+    inline for (.{ slow, fast }) |c| {
+        const base = @as(u32, CODE_SEG) << 4;
+        for (spin, 0..) |b, i| c.m.bus.writePhys8(base + @as(u32, @intCast(i)), b);
+        c.m.cpu.loadSegment(.cs, CODE_SEG);
+        c.m.cpu.st.eip = 0;
+        c.m.cpu.loadSegment(.ss, CODE_SEG);
+        c.m.cpu.st.setReg16(@intFromEnum(Reg32.esp), 0xFFF0);
+        c.m.cpu.st.eflags.iff = false; // no IRQ; the spin just burns the dwell budget
+        c.m.cpu.st.halted = false;
+    }
+    _ = slow.m.setClockMult(timing.DEFAULT_MULT); // mult 12 (the pinned default)
+    _ = fast.m.setClockMult(timing.DEFAULT_MULT * 2); // mult 24 -> 2x the CPU clock
+
+    var ctrl_slow = Controller.init(slow.m);
+    var ctrl_fast = Controller.init(fast.m);
+
+    const c0_slow = slow.m.cpu.st.cycles;
+    const c0_fast = fast.m.cpu.st.cycles;
+    _ = ctrl_slow.clickMouse(.{ .buttons = 0b001, .set_buttons = true }, 100);
+    _ = ctrl_fast.clickMouse(.{ .buttons = 0b001, .set_buttons = true }, 100);
+    const d_slow = slow.m.cpu.st.cycles - c0_slow;
+    const d_fast = fast.m.cpu.st.cycles - c0_fast;
+
+    // The dwell budget is cpuClockHz(mult) * 100 / 1000; at mult 24 that is exactly
+    // double mult 12. The free-running spin overruns the deadline by a tiny, bounded
+    // amount each run (a single 2-byte instruction), so assert the EXACT budget plus a
+    // proven scaling: fast is ~2x slow, and both equal the dwellCycles formula.
+    try std.testing.expectEqual(ctrl_slow.dwellCycles(100), timing.cpuClockHz(timing.DEFAULT_MULT) * 100 / 1000);
+    try std.testing.expectEqual(ctrl_fast.dwellCycles(100), 2 * ctrl_slow.dwellCycles(100));
+    // The realized delta is the budget rounded up to the next whole instruction; the
+    // fast machine ran strictly more cycles, and at least ~2x the slow budget.
+    try std.testing.expect(d_fast > d_slow);
+    try std.testing.expect(d_fast >= 2 * ctrl_slow.dwellCycles(100));
+    try std.testing.expect(d_slow >= ctrl_slow.dwellCycles(100));
+}
+
+// Run `MOV AX,imm ; MOV CX,imm ; MOV DX,imm ; INT 33h ; HLT` — drives the AX=0007/
+// 0008 DEFINE-RANGE calls (CX=min, DX=max) from a real guest, so the live range the
+// normalized-inject test maps against was set the way a real game sets it.
+fn guestInt33CXDX(m: *Machine, ax: u16, cx: u16, dx: u16) void {
+    asmInt67(m, &.{
+        0xB8, @truncate(ax), @truncate(ax >> 8), // MOV AX, imm16
+        0xB9, @truncate(cx), @truncate(cx >> 8), // MOV CX, imm16
+        0xBA, @truncate(dx), @truncate(dx >> 8), // MOV DX, imm16
+        0xCD, 0x33, // INT 33h
+        0xF4, // HLT
+    });
+}
+
+test "INT 33h normalized inject maps through the LIVE fn 7/8 range (range-AWARE)" {
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    // The guest REPROGRAMS the coordinate range the way Betrayal at Krondor does:
+    // fn 7 horizontal [0,1276], fn 8 vertical [0,796] (a quarter-pixel range). The
+    // driver honors it (gran 0xffff default, no reset → no granularity mask).
+    guestInt33CXDX(m, 0x0007, 0, 1276);
+    guestInt33CXDX(m, 0x0008, 0, 796);
+    try std.testing.expectEqual(@as(i16, 1276), m.dos.mouse.max_x);
+    try std.testing.expectEqual(@as(i16, 796), m.dos.mouse.max_y);
+
+    // A NORMALIZED inject (Q16, the unit `nx`/`ny` convert to) maps through that LIVE
+    // range via the SAME `q16ToVirtual` the seamless path uses: 0 → min, 0x8000 →
+    // midpoint, 0x1_0000 → the max edge. This is the scripted-path parity the fix adds.
+    const br = &m.svc.bridge;
+    m.dos.mouse.injectAndFire(&m.cpu, br, .{ .nx_q16 = 0, .ny_q16 = 0, .set_nx = true, .set_ny = true });
+    try std.testing.expectEqual(@as(i16, 0), m.dos.mouse.x);
+    try std.testing.expectEqual(@as(i16, 0), m.dos.mouse.y);
+
+    m.dos.mouse.injectAndFire(&m.cpu, br, .{ .nx_q16 = 0x8000, .ny_q16 = 0x8000, .set_nx = true, .set_ny = true });
+    try std.testing.expectEqual(@as(i16, 638), m.dos.mouse.x); // midpoint of [0,1276]
+    try std.testing.expectEqual(@as(i16, 398), m.dos.mouse.y); // midpoint of [0,796]
+
+    m.dos.mouse.injectAndFire(&m.cpu, br, .{ .nx_q16 = 0x1_0000, .ny_q16 = 0x1_0000, .set_nx = true, .set_ny = true });
+    try std.testing.expectEqual(@as(i16, 1276), m.dos.mouse.x); // the right edge
+    try std.testing.expectEqual(@as(i16, 796), m.dos.mouse.y); // the bottom edge
+
+    // RANGE-AWARE: reprogram to the DEFAULT-style range [0,639]×[0,479] and inject the
+    // SAME midpoint Q16 — it now lands at a DIFFERENT driver coordinate (320, not 638),
+    // proving the mapping reads the driver's live range, with zero game-specific assumptions.
+    guestInt33CXDX(m, 0x0007, 0, 639);
+    guestInt33CXDX(m, 0x0008, 0, 479);
+    m.dos.mouse.injectAndFire(&m.cpu, br, .{ .nx_q16 = 0x8000, .ny_q16 = 0x8000, .set_nx = true, .set_ny = true });
+    try std.testing.expectEqual(@as(i16, 320), m.dos.mouse.x); // midpoint of [0,639] ≠ 638
+    try std.testing.expectEqual(@as(i16, 240), m.dos.mouse.y); // midpoint of [0,479]
 }
 
 test "input Phase 2: guest reads an injected position back via INT 33h AX=0003 (black-box)" {

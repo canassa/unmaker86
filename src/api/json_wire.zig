@@ -93,6 +93,17 @@ pub const KeyReq = struct {
     make: bool = true,
     ext: bool = false,
     char: ?[]const u8 = null,
+
+    // Optional dwell, in MILLISECONDS of EMULATED time, that turns the `char` keystroke
+    // into a held TAP: inject the make (+ any Shift bracket), ADVANCE the machine by the
+    // dwell's worth of cycles (the machine's OWN configured clock — `Controller.dwellCycles`),
+    // then inject the break. ABSENT ⇒ today's behavior (make+break injected back-to-back,
+    // cycle-neutral; the BIOS keystroke buffer makes that enough for nearly every guest).
+    // PRESENT ⇒ the key is physically DOWN across the dwell, so a guest that LEVEL-SAMPLES
+    // raw key state (tracks make/break in its own INT 09h handler) observes the hold;
+    // `hold_ms:0` is make+break at the same cycle. ONLY valid for the `char` form (a full
+    // keystroke); a raw single-edge `scancode` has no hold. INTEGER ONLY (determinism grep).
+    hold_ms: ?u32 = null,
 };
 
 /// `POST /api/input/mouse` — inject a mouse event into the INT 33h driver
@@ -121,6 +132,19 @@ pub const MouseReq = struct {
     buttons: ?u16 = null,
     fire_callback: bool = true,
 
+    // --- the SCRIPTED NORMALIZED absolute path (range-independent addressing) ---
+    // `nx`/`ny` address the screen in PER-MYRIAD units: 0 = the left/top edge, 10000
+    // = the right/bottom edge, 5000 = the center — INDEPENDENT of the driver's live
+    // coordinate range (which a guest may reprogram via INT 33h fn 7/8, e.g. Betrayal
+    // at Krondor → 0..1276 × 0..796). The server converts per-myriad → Q16 at the wire
+    // mapper (`mapMouseScripted`) and the DRIVER maps that Q16 through its LIVE
+    // `min_x/max_x`/`min_y/max_y` via the SAME `q16ToVirtual` the seamless browser path
+    // uses — so a caller can reach the whole screen without knowing the live range.
+    // INTEGER ONLY (the `src/api` determinism grep bans float types). Per axis, `nx` is
+    // MUTUALLY EXCLUSIVE with the raw `x` and the relative `dx` (and `ny` with `y`/`dy`).
+    nx: ?u32 = null,
+    ny: ?u32 = null,
+
     // --- the LIVE coalesced browser path (plans/mouse-input.md, LOCKED §2/§3) ---
     // Q16 normalized absolute over the CONTAINED image rect (0..65536 == [0,1]). The
     // SERVER scales these by the driver's LIVE per-mode `max_x/max_y` at fold time, so
@@ -135,6 +159,31 @@ pub const MouseReq = struct {
     // over a burst before a fold; the driver saturates to i16 for the mickey math).
     mdx: ?i32 = null,
     mdy: ?i32 = null,
+
+    // --- click vs. hold (the level-sampling fix) ---
+    // A button press is, BY DEFAULT, a momentary CLICK: the server presses `buttons`,
+    // ADVANCES the machine by a human-realistic dwell of EMULATED time (DEFAULT_CLICK_MS
+    // ≈ 100 ms — derived from the machine's OWN configured clock, see
+    // `Controller.dwellCycles`), then releases back to the pre-press mask. Both edges go
+    // through the single edge-detecting button writer, so the AX=5/6 counters + the
+    // AX=000C callback fire exactly as a real held click would. This makes the click
+    // OBSERVABLE to a guest that LEVEL-SAMPLES the button once per video frame / timer
+    // tick (e.g. Betrayal at Krondor's retrace-spinning menu): a pure instantaneous
+    // press+release is never seen by such a guest because injection is cycle-neutral.
+    // The default is the click because it is the FOOTGUN-FREE common case — a bare
+    // `{buttons:1}` "just works". `hold_ms` OVERRIDES the dwell (ms of EMULATED time);
+    // `hold_ms:0` presses+releases at the SAME cycle (instant; edge-latched AX=5/6
+    // catches it, a level-sampler does not). One 70 Hz frame ≈ 14 ms, one 18.2 Hz tick
+    // ≈ 55 ms, so the ~100 ms default comfortably covers any per-frame/per-tick sampler.
+    // INTEGER ONLY (the `src/api` determinism grep bans floats).
+    hold_ms: ?u32 = null,
+    // `release:false` opts OUT of the auto-release: the `buttons` mask is set RAW and
+    // HELD (the pure, cycle-neutral inject — no dwell, no release). This is the
+    // press-and-hold a DRAG needs: press (`{buttons:1, release:false}`) → move (`{dx,
+    // buttons:1, release:false}`, with a `run` between) → release (`{buttons:0}`).
+    // Mutually exclusive with `hold_ms` (a dwell implies a release). Default `true`, so
+    // a plain press is a click; only an explicit `release:false` holds.
+    release: bool = true,
 };
 
 /// `PATCH /api/cpu/reg` — a single valid `std.json` tagged union (§B.4/G2). One

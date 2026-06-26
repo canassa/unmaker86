@@ -429,7 +429,12 @@ pub fn build(b: *std.Build) void {
         .{ .name = "machine", .mod = machine_mod },
         .{ .name = "debug", .mod = debug_mod },
     });
-    const dos_integration = MachineTest.add(b, target, optimize, "src/dos/integration_test.zig", &dosbios_imports);
+    // The integration test drives the debug `Controller` (the held-click dwell path,
+    // `clickMouse`) against a real guest stub, so it needs `debug` on top of the
+    // dosbios set (like `dos_nested_exec` and `bios_input_det`).
+    const dos_integration = MachineTest.add(b, target, optimize, "src/dos/integration_test.zig", &(dosbios_imports ++ [_]Imp{
+        .{ .name = "debug", .mod = debug_mod },
+    }));
     const dos_determinism = MachineTest.add(b, target, optimize, "src/dos/determinism_test.zig", &dosbios_imports);
     // The real-CRT regression: load + run the committed Borland C++ 3.1 HELLO.EXE
     // through the full machine and assert its CON output + exit code (needs the
