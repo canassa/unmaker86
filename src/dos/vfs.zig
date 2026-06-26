@@ -164,16 +164,24 @@ pub const HostDirDrive = struct {
             // (no directory iteration, so it also works on a non-iterable mount).
             var host_name: []const u8 = direct;
             if (!self.childStatExists(out[0..prefix_len], direct)) {
-                if (is_leaf) {
-                    // A leaf with no direct match: keep the uppercased direct name
-                    // (a create / open names it; the host open will report absence).
-                    // No directory iteration here — the mount need not be iterable.
+                // No direct (uppercased-8.3) host file. Walk the parent for a
+                // case-insensitive / 8.3-munged ("~N") match — the analog of
+                // DOSBox's GetLongName, applied UNIFORMLY to leaf AND directory
+                // components: drive_cache.cpp GetExpandNameAndNormaliseCase resolves
+                // the leaf through the SAME GetLongName as each directory component
+                // (no leaf shortcut). `findChild` opens the dir with `.iterate` and
+                // `catch return null`, so a non-iterable mount degrades to null here
+                // automatically (the leaf then falls back to `direct`, as before).
+                if (self.findChild(out[0..prefix_len], comp)) |m| {
+                    host_name = m.slice(&name_buf);
+                } else if (is_leaf) {
+                    // Leaf with no host match: keep the uppercased `direct` name so a
+                    // create / open names a genuinely-absent file (DOSBox: GetLongName
+                    // returns -1 → the buffer keeps the DOS-supplied uppercased name).
                     host_name = direct;
                 } else {
-                    // An intermediate (directory) component must resolve. Walk the
-                    // parent for a case-insensitive / 8.3-munged match.
-                    const m = self.findChild(out[0..prefix_len], comp) orelse return null;
-                    host_name = m.slice(&name_buf);
+                    // A missing intermediate directory component is a hard failure.
+                    return null;
                 }
             }
 
@@ -226,11 +234,18 @@ pub const HostDirDrive = struct {
     /// the actual host name. Deterministic: enumerates in sorted order and takes
     /// the first match.
     fn findChild(self: *HostDirDrive, dir_rel: []const u8, comp: []const u8) ?ChildName {
-        var d: Io.Dir = if (dir_rel.len == 0)
-            self.dir
-        else
-            self.dir.openDir(self.io, dir_rel, .{ .iterate = true }) catch return null;
-        defer if (dir_rel.len != 0) d.close(self.io);
+        // Always obtain a FRESH iterable handle — even for the root ("."). The
+        // mount handle `self.dir` may be non-iterable (e.g. opened O_PATH on
+        // Linux); iterating it directly would trip a non-recoverable BADF panic
+        // rather than a catchable error, so we never iterate it. Re-opening with
+        // `.iterate = true` and `catch return null` is the graceful fallback for a
+        // non-iterable mount: the leaf then keeps its uppercased `direct` name.
+        var d: Io.Dir = self.dir.openDir(
+            self.io,
+            if (dir_rel.len == 0) "." else dir_rel,
+            .{ .iterate = true },
+        ) catch return null;
+        defer d.close(self.io);
 
         // The DOS component we want, as an 8.3 form (for munge matching).
         const want = name83.parse(comp);

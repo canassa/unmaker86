@@ -29,6 +29,73 @@ test "HostDirDrive create/write/read/seek round-trip (direct VFS)" {
     try std.testing.expectEqual(@as(u64, 6), try drive.size(rf));
 }
 
+// Leaf resolution must be case-insensitive / 8.3-munged just like directory
+// components — mirroring DOSBox's GetExpandNameAndNormaliseCase, which resolves
+// the leaf through the SAME GetLongName as each directory component (no leaf
+// shortcut; on a miss the buffer keeps the DOS-supplied uppercased name).
+
+test "leaf open: lowercase host file resolves via uppercased DOS name" {
+    var td = std.testing.tmpDir(.{ .iterate = true });
+    defer td.cleanup();
+    // Create the host file with a lowercase name DIRECTLY (not via the VFS, which
+    // would uppercase it) so the leaf lookup must fold case to find it.
+    {
+        const f = try td.dir.createFile(std.testing.io, "krondor.exe", .{});
+        f.close(std.testing.io);
+    }
+    var drive = dos.Vfs.HostDirDrive.init(td.dir, std.testing.io);
+
+    // DOS looks up the uppercased 8.3 name; it must resolve to the lowercase host.
+    const hf = try drive.open("KRONDOR.EXE", .read_only);
+    drive.close(hf);
+    const st = try drive.stat("KRONDOR.EXE");
+    try std.testing.expect(!st.is_dir);
+}
+
+test "leaf open: long-named host file resolves via its ~N short name" {
+    var td = std.testing.tmpDir(.{ .iterate = true });
+    defer td.cleanup();
+    // A >8.3 host name; its deterministic short form is LONGFI~1.TXT.
+    {
+        const f = try td.dir.createFile(std.testing.io, "longfilename.txt", .{});
+        f.close(std.testing.io);
+    }
+    var drive = dos.Vfs.HostDirDrive.init(td.dir, std.testing.io);
+
+    const hf = try drive.open("LONGFI~1.TXT", .read_only);
+    drive.close(hf);
+    const st = try drive.stat("LONGFI~1.TXT");
+    try std.testing.expect(!st.is_dir);
+}
+
+test "leaf open: uppercase host file still resolves (no regression)" {
+    var td = std.testing.tmpDir(.{ .iterate = true });
+    defer td.cleanup();
+    {
+        const f = try td.dir.createFile(std.testing.io, "RETAIL.EXE", .{});
+        f.close(std.testing.io);
+    }
+    var drive = dos.Vfs.HostDirDrive.init(td.dir, std.testing.io);
+
+    const hf = try drive.open("RETAIL.EXE", .read_only);
+    drive.close(hf);
+}
+
+test "leaf create: absent name uses the uppercased literal (create-new path)" {
+    var td = std.testing.tmpDir(.{ .iterate = true });
+    defer td.cleanup();
+    var drive = dos.Vfs.HostDirDrive.init(td.dir, std.testing.io);
+
+    // A genuinely-absent leaf: findChild returns null, so the resolved host name
+    // is the uppercased 8.3 literal (DOSBox: GetLongName -1 keeps that name).
+    const hf = try drive.create("newfile.dat");
+    drive.close(hf);
+    // The host file must exist under the UPPERCASED name, not the lowercase input.
+    const up = try td.dir.statFile(std.testing.io, "NEWFILE.DAT", .{});
+    try std.testing.expect(up.kind == .file);
+    try std.testing.expectError(error.FileNotFound, td.dir.statFile(std.testing.io, "newfile.dat", .{}));
+}
+
 test "char-device CON write records output; NUL discards" {
     var t = dos.DeviceTable{};
     _ = t.con.write("abc");
