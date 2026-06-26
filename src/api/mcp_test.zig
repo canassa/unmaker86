@@ -162,7 +162,10 @@ const Nav = struct {
     }
 };
 
-var obuf: [16 * 1024]u8 = undefined;
+// Sized to hold a full `tools/list` reply: the catalog grew (the machine-lifecycle tools +
+// the per-machine `machine` arg injected into every per-machine schema), so the response
+// now exceeds 16 KiB. The server's own `resp_buf` is 32 KiB; this mirrors that headroom.
+var obuf: [64 * 1024]u8 = undefined;
 
 // ===========================================================================
 // Lifecycle
@@ -1197,4 +1200,190 @@ test "concurrent /api/load + initialize: every minted session boots ONE WHOLE re
     // The invariant: NO minted session ever saw a torn recipe, and we actually sampled some.
     try std.testing.expect(!torn);
     try std.testing.expect(minted > 0);
+}
+
+// ===========================================================================
+// Agent-driven machine PROVISIONING (multi-machine plan §3/§8/§11.2) — provision_machine /
+// deprovision / list_machines + the `machine`-arg routing on the per-machine tools. Each
+// provisions a REAL machine (the committed example dirs) through the registry; assertions
+// are on per-machine state at explicit points (never inter-machine timing).
+// ===========================================================================
+
+/// Re-parse a tool reply's inner result (`result.content[0].text`) as a JSON object, in the
+/// SAME `nav` arena (so the returned Value stays valid while `nav` lives).
+fn toolObject(nav: *Nav) std.json.Value {
+    const text = toolText(nav);
+    return std.json.parseFromSliceLeaky(std.json.Value, nav.arena.allocator(), text, .{}) catch unreachable;
+}
+
+/// Provision a machine and return its handle (duped on `alloc` — the caller frees it).
+fn provisionHandle(ts: *TestServer, alloc: std.mem.Allocator, mount_dir: []const u8, file: []const u8, cpu_frag: []const u8) ![]u8 {
+    var bbuf: [1024]u8 = undefined;
+    const body = std.fmt.bufPrint(&bbuf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"provision_machine\",\"arguments\":{{\"mount_dir\":\"{s}\",\"file\":\"{s}\"{s}}}}}}}", .{ mount_dir, file, cpu_frag }) catch unreachable;
+    const r = mcpPost(ts, body, null, &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    var nav = try Nav.parse(alloc, r.body);
+    defer nav.deinit();
+    const obj = toolObject(&nav);
+    return alloc.dupe(u8, obj.object.get("machine").?.string);
+}
+
+/// `status.cycles` for a machine handle (or the default machine when `machine` is null),
+/// driven through the per-machine `status` tool via the `machine`-arg route.
+fn cyclesVia(ts: *TestServer, machine: ?[]const u8) u64 {
+    var bbuf: [512]u8 = undefined;
+    const body = if (machine) |h|
+        std.fmt.bufPrint(&bbuf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"status\",\"arguments\":{{\"machine\":\"{s}\"}}}}}}", .{h}) catch unreachable
+    else
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"status\"}}";
+    const r = mcpPost(ts, body, null, &obuf);
+    var nav = Nav.parse(std.testing.allocator, r.body) catch unreachable;
+    defer nav.deinit();
+    return @intCast(toolObject(&nav).object.get("cycles").?.integer);
+}
+
+test "provision_machine: two distinct dirs are isolated; {machine} routes only the addressed one" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+
+    const a = try provisionHandle(&ts, std.testing.allocator, build_options.examples_dir, "HELLO.COM", "");
+    defer std.testing.allocator.free(a);
+    const b = try provisionHandle(&ts, std.testing.allocator, build_options.dos_examples_dir, "HELLO.EXE", "");
+    defer std.testing.allocator.free(b);
+    try std.testing.expect(!std.mem.eql(u8, a, b)); // distinct handles
+
+    // Baseline: both freshly-booted machines and the default NOP machine are at cycle 0.
+    try std.testing.expectEqual(@as(u64, 0), cyclesVia(&ts, b));
+    try std.testing.expectEqual(@as(u64, 0), cyclesVia(&ts, null));
+
+    // Step ONLY machine A (route by its handle).
+    var sbuf: [512]u8 = undefined;
+    const step = std.fmt.bufPrint(&sbuf, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"step\",\"arguments\":{{\"machine\":\"{s}\"}}}}}}", .{a}) catch unreachable;
+    _ = mcpPost(&ts, step, null, &obuf);
+
+    // A advanced; B and the default machine are bit-for-bit untouched (separate machines).
+    try std.testing.expect(cyclesVia(&ts, a) > 0);
+    try std.testing.expectEqual(@as(u64, 0), cyclesVia(&ts, b));
+    try std.testing.expectEqual(@as(u64, 0), cyclesVia(&ts, null));
+}
+
+test "provision_machine: cpu {mult:24} is reflected by get_clock on that machine" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+
+    const h = try provisionHandle(&ts, std.testing.allocator, build_options.examples_dir, "HELLO.COM", ",\"cpu\":{\"mult\":24}");
+    defer std.testing.allocator.free(h);
+
+    var bbuf: [512]u8 = undefined;
+    const body = std.fmt.bufPrint(&bbuf, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"get_clock\",\"arguments\":{{\"machine\":\"{s}\"}}}}}}", .{h}) catch unreachable;
+    const r = mcpPost(&ts, body, null, &obuf);
+    var nav = try Nav.parse(std.testing.allocator, r.body);
+    defer nav.deinit();
+    try std.testing.expectEqual(@as(i64, 24), toolObject(&nav).object.get("mult").?.integer);
+}
+
+test "provision_machine: a missing file is -32602 file_not_found (NOT internal)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+
+    // A REAL (openable) mount dir but a file that is not in it → the loader's own NotFound,
+    // mapped to -32602 file_not_found (NOT a -32603 internal fault).
+    var bbuf: [1024]u8 = undefined;
+    const body = std.fmt.bufPrint(&bbuf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"provision_machine\",\"arguments\":{{\"mount_dir\":\"{s}\",\"file\":\"NOPE.COM\"}}}}}}", .{build_options.examples_dir}) catch unreachable;
+    const r = mcpPost(&ts, body, null, &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "-32602") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "file_not_found") != null);
+    // It must NOT have leaked a registry slot, and no machine was created.
+    try std.testing.expectEqual(@as(usize, 0), ts.srv.registry.liveCount());
+}
+
+test "provision_machine: at MAX_SESSIONS the next provision is machine_limit_reached" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+
+    var handles: [registry_max]?[]u8 = .{null} ** registry_max;
+    defer for (handles) |h| if (h) |hh| std.testing.allocator.free(hh);
+    var i: usize = 0;
+    while (i < registry_max) : (i += 1)
+        handles[i] = try provisionHandle(&ts, std.testing.allocator, build_options.examples_dir, "HELLO.COM", "");
+    try std.testing.expectEqual(registry_max, ts.srv.registry.liveCount());
+
+    // One past the cap → a distinct machine_limit_reached tool error (NOT -32603 internal).
+    var obuf2: [1024]u8 = undefined;
+    const over_body = std.fmt.bufPrint(&obuf2, "{{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{{\"name\":\"provision_machine\",\"arguments\":{{\"mount_dir\":\"{s}\",\"file\":\"HELLO.COM\"}}}}}}", .{build_options.examples_dir}) catch unreachable;
+    const over = mcpPost(&ts, over_body, null, &obuf);
+    try std.testing.expect(std.mem.indexOf(u8, over.body, "machine_limit_reached") != null);
+    try std.testing.expect(std.mem.indexOf(u8, over.body, "-32603") == null);
+}
+
+const registry_max = @import("session_registry.zig").SessionRegistry.MAX_SESSIONS;
+
+test "deprovision: provision -> list shows it -> deprovision -> list shows 0; slot reusable" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+
+    const h = try provisionHandle(&ts, std.testing.allocator, build_options.examples_dir, "HELLO.COM", "");
+    defer std.testing.allocator.free(h);
+
+    // list_machines shows exactly the one we provisioned.
+    {
+        const r = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"list_machines\"}}", null, &obuf);
+        var nav = try Nav.parse(std.testing.allocator, r.body);
+        defer nav.deinit();
+        const obj = toolObject(&nav).object;
+        try std.testing.expectEqual(@as(i64, 1), obj.get("live_machines").?.integer);
+        const machines = obj.get("machines").?.array;
+        try std.testing.expectEqual(@as(usize, 1), machines.items.len);
+        try std.testing.expectEqualStrings(h, machines.items[0].object.get("machine").?.string);
+        try std.testing.expectEqualStrings("HELLO.COM", machines.items[0].object.get("file").?.string);
+    }
+
+    // deprovision the handle (parse the result — the inner body is JSON-escaped into the
+    // text content block, so a raw substring search for `"deleted":true` would not match).
+    var dbuf: [512]u8 = undefined;
+    const del = std.fmt.bufPrint(&dbuf, "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"deprovision\",\"arguments\":{{\"machine\":\"{s}\"}}}}}}", .{h}) catch unreachable;
+    const dr = mcpPost(&ts, del, null, &obuf);
+    {
+        var nav = try Nav.parse(std.testing.allocator, dr.body);
+        defer nav.deinit();
+        const obj = toolObject(&nav).object;
+        try std.testing.expect(obj.get("deleted").?.bool);
+        try std.testing.expectEqual(@as(i64, 0), obj.get("live_machines").?.integer);
+    }
+    try std.testing.expectEqual(@as(usize, 0), ts.srv.registry.liveCount());
+
+    // list now shows zero; the slot is reusable (a fresh provision succeeds).
+    {
+        const r = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"list_machines\"}}", null, &obuf);
+        var nav = try Nav.parse(std.testing.allocator, r.body);
+        defer nav.deinit();
+        try std.testing.expectEqual(@as(i64, 0), toolObject(&nav).object.get("live_machines").?.integer);
+    }
+    const again = try provisionHandle(&ts, std.testing.allocator, build_options.examples_dir, "HELLO.COM", "");
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqual(@as(usize, 1), ts.srv.registry.liveCount());
+}
+
+test "deprovision: an unknown handle is an unknown_machine tool error, not a crash" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"deprovision\",\"arguments\":{\"machine\":\"zdos-sess-999\"}}}", null, &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "unknown_machine") != null);
+}
+
+test "per-machine routing: an unknown {machine} is an unknown_machine tool error" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = mcpPost(&ts, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{\"machine\":\"zdos-sess-999\"}}}", null, &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "unknown_machine") != null);
 }

@@ -44,10 +44,15 @@ const Session = session_mod.Session;
 const SessionId = session_mod.SessionId;
 const LoadRecipe = session_mod.LoadRecipe;
 
-/// Errors a `create` can surface to `initialize` (mapped to the MCP/JSON-RPC error model
-/// by the caller). `SessionLimitReached` is the resource cap (§9); `BootFailed` is a
-/// machine that could not load its program; `OutOfMemory` is a provisioning alloc failure.
-pub const CreateError = error{ SessionLimitReached, BootFailed } || std.Thread.SpawnError || std.mem.Allocator.Error;
+/// Errors a `create` can surface (mapped to the MCP/JSON-RPC error model by the caller —
+/// the per-failure granularity the LLM branches on, plan §8). `SessionLimitReached` is the
+/// resource cap (§9 → `machine_limit_reached`); `ProgramNotFound` is a missing program file
+/// in the mount (→ a client `-32602`, distinct from a genuine fault — it propagates the DOS
+/// loader's OWN `error.NotFound`, which resolves the host name through the case-insensitive
+/// vfs exactly as a real boot would, so it never diverges from what a launch would find);
+/// `BootFailed` is a program that was found but could not load/run (bad image / no guest
+/// memory / I/O — a `-32603` internal); `OutOfMemory`/`SpawnError` are provisioning faults.
+pub const CreateError = error{ SessionLimitReached, ProgramNotFound, BootFailed } || std.Thread.SpawnError || std.mem.Allocator.Error;
 
 /// The result of a successful `create`: the new `*Session` PLUS its minted id BY VALUE
 /// (multi-machine concurrency fix — the lifetime/UAF BLOCKER). `create` publishes the
@@ -128,7 +133,13 @@ pub const SessionRegistry = struct {
     /// work (machine alloc + boot + worker spawn) happens OUTSIDE the registry mutex so it
     /// never blocks concurrent `resolve`/`destroy` on OTHER sessions; only the cap reserve
     /// and the final map insert take the lock.
-    pub fn create(self: *SessionRegistry, recipe: LoadRecipe, mount_dir: Io.Dir) CreateError!CreateResult {
+    /// `cpu_mult` is applied to the fresh machine on THIS (create) thread — uncontended,
+    /// after `boot` and BEFORE the worker spawn, so it is a deterministic input at a fixed
+    /// post-boot cycle (the live-clock approach (B), no host clock/RNG/float). `owns_mount`
+    /// records whether the new session OWNS its `mount_dir` fd (a `provision_machine` opens
+    /// a fresh dir → `true`; an `initialize` clone of the default shares `main.zig`'s dir →
+    /// `false`); `teardown` closes the fd iff owned (the §5 fd-leak fix).
+    pub fn create(self: *SessionRegistry, recipe: LoadRecipe, mount_dir: Io.Dir, cpu_mult: u64, owns_mount: bool) CreateError!CreateResult {
         // Reserve a slot + a seq under the lock (the cap is enforced here, atomically).
         self.mutex.lockUncancelable(self.io);
         if (self.count >= MAX_SESSIONS) {
@@ -153,14 +164,26 @@ pub const SessionRegistry = struct {
         try m.init(self.gpa, &.{});
         errdefer m.deinit();
         m.wire();
-        m.boot(recipe.drive, mount_dir, self.io, recipe.file[0..recipe.file_len], recipe.cmdtail[0..recipe.cmdtail_len]) catch
-            return error.BootFailed;
+        // Map the loader's OWN failure cause so the caller can report the precise code
+        // (plan §8): `error.NotFound` (the program file is not in the mount) is a CLIENT
+        // input error (`-32602`), distinct from a genuine load fault. The DOS loader
+        // resolves the host name through the case-insensitive vfs, so propagating its
+        // `NotFound` is strictly more faithful than a host-side case-sensitive pre-stat
+        // (which would falsely miss a `BAK.EXE` stored as `bak.exe`).
+        m.boot(recipe.drive, mount_dir, self.io, recipe.file[0..recipe.file_len], recipe.cmdtail[0..recipe.cmdtail_len]) catch |err| switch (err) {
+            error.NotFound => return error.ProgramNotFound,
+            else => return error.BootFailed,
+        };
 
         // The Controller over the heap-pinned machine — heap-allocated so its address is
         // stable for the worker (the worker dereferences `session.ctrl`).
         const ctrl = try self.gpa.create(Controller);
         errdefer self.gpa.destroy(ctrl);
         ctrl.* = Controller.init(m);
+        // Apply the requested CPU:PIT multiplier now (uncontended — no worker yet), exactly
+        // as a `set_clock` would on the worker, but at this fixed post-boot cycle. Integer-
+        // only, clamped to `[1, MAX_MULT]`; the applied value rides the machine snapshot.
+        _ = ctrl.setCpuMult(cpu_mult);
 
         // The Session block (its own heap address; the worker captures `&session.queue`).
         const session = try self.gpa.create(Session);
@@ -176,6 +199,7 @@ pub const SessionRegistry = struct {
         const minted_id = session.id;
         session.owned_machine = m;
         session.owned_ctrl = ctrl;
+        session.owns_mount = owns_mount;
         session.destroyable = true;
         // Wire the hub now that the session is at its final address.
         session.wireStream(self.io);
@@ -269,6 +293,10 @@ pub const SessionRegistry = struct {
         _ = session.queue.submit(&sc);
         if (session.worker_thread) |t| t.join();
         session.worker_thread = null;
+        // Snapshot the mount ownership BEFORE freeing the session block (the close happens
+        // last, once nothing can touch the dir).
+        const owns_mount = session.owns_mount;
+        const mount_dir = session.mount_dir;
         if (session.owned_machine) |m| {
             m.deinit();
             self.gpa.destroy(m);
@@ -276,6 +304,11 @@ pub const SessionRegistry = struct {
         if (session.owned_ctrl) |c| self.gpa.destroy(c);
         session.deinit(self.gpa);
         self.gpa.destroy(session);
+        // Close the OWNED mount fd LAST — the worker is joined and the machine is freed, so
+        // nothing can touch the dir now (the §5 fd-leak fix). A provisioned session owns its
+        // fresh `Io.Dir`; the DEFAULT session does NOT (`main.zig` owns + closes that one),
+        // so closing it here would double-close it.
+        if (owns_mount) mount_dir.close(self.io);
     }
 
     /// Live minted-session count (for the cap-aware caller / tests). Takes the lock.
@@ -283,5 +316,30 @@ pub const SessionRegistry = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.count;
+    }
+
+    /// Snapshot the live minted sessions into `out` and PIN each (refcount++), returning the
+    /// count written (capped at `out.len`). The read-only `list_machines` tool needs a stable
+    /// set of `*Session` to read each machine's small metadata from — but it must not hold the
+    /// registry mutex while doing so (that work submits to per-session workers / takes per-
+    /// session locks). Pinning under the mutex here lets the caller release the mutex, read the
+    /// metadata OFF the global lock, and tear-down-safely: a concurrent `destroy` removes the
+    /// id + drains the refcount, so a pinned session cannot be freed mid-read. The caller MUST
+    /// pair EACH returned session with `release` (exactly like a `resolve`). Skips a session
+    /// already `pending_destroy` (mid-teardown — treat as gone), mirroring `resolve`.
+    pub fn snapshotLive(self: *SessionRegistry, out: []*Session) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var n: usize = 0;
+        var it = self.map.valueIterator();
+        while (it.next()) |vp| {
+            if (n >= out.len) break;
+            const s = vp.*;
+            if (s.pending_destroy) continue;
+            s.refs += 1;
+            out[n] = s;
+            n += 1;
+        }
+        return n;
     }
 };

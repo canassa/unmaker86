@@ -18,6 +18,7 @@ const build_options = @import("build_options");
 const registry_mod = @import("session_registry.zig");
 const session_mod = @import("session.zig");
 const q = @import("queue.zig");
+const timing = @import("timing");
 
 const SessionRegistry = registry_mod.SessionRegistry;
 const Session = session_mod.Session;
@@ -52,7 +53,11 @@ const Fixture = struct {
     fn create(self: *Fixture) !*Session {
         // `create` now returns `{session,id}` (the lifetime fix); these single-threaded
         // tests have no concurrent DELETE, so dereferencing `.session` is safe here.
-        const res = try self.reg.create(self.recipe(), self.dir);
+        // `cpu_mult = DEFAULT_MULT` (the boot default, so these stay byte-identical to the
+        // pre-cpu-knob behavior) and `owns_mount = false` — every session here shares the
+        // ONE fixture `dir`, which the fixture closes at `deinit`; an owning teardown would
+        // double-close it (the fd-close path is exercised by the dedicated test below).
+        const res = try self.reg.create(self.recipe(), self.dir, timing.DEFAULT_MULT, false);
         return res.session;
     }
 
@@ -187,4 +192,56 @@ test "registry: the MAX_SESSIONS cap rejects with SessionLimitReached; a destroy
     const again = try fx.create();
     try std.testing.expectEqualStrings("zdos-sess-8", again.id.slice()); // seq kept climbing
     try std.testing.expectEqual(SessionRegistry.MAX_SESSIONS, fx.reg.liveCount());
+}
+
+/// Count this process's open fds (Linux `/proc/self/fd`). Symmetric across calls (it opens
+/// + closes its own dir), so a DELTA between two calls reflects only fds opened in between —
+/// the one observable proof that a mount fd was closed (`std.testing.allocator` catches
+/// memory leaks but NOT fd leaks, multi-machine plan §5/§11).
+fn openFdCount(io: Io) usize {
+    var d = Io.Dir.cwd().openDir(io, "/proc/self/fd", .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    var it = d.iterate();
+    var n: usize = 0;
+    while (it.next(io) catch null) |_| n += 1;
+    return n;
+}
+
+test "registry: a provisioned (owned) mount fd is CLOSED on deprovision — no fd leak" {
+    var fx = try Fixture.init(std.testing.allocator);
+    defer fx.deinit();
+
+    // Each cycle opens a FRESH owned dir (mirroring `provision_machine`), creates a session
+    // that TAKES ownership (`owns_mount=true`), then destroys it. If `teardown` leaked the
+    // owned dir fd, 4 cycles would grow the fd count by 4; the close keeps it flat.
+    const baseline = openFdCount(fx.io);
+    var cycle: usize = 0;
+    while (cycle < 4) : (cycle += 1) {
+        const dir = try Io.Dir.cwd().openDir(fx.io, build_options.examples_dir, .{ .iterate = true });
+        const res = try fx.reg.create(fx.recipe(), dir, timing.DEFAULT_MULT, true);
+        try std.testing.expect(fx.reg.destroy(res.id.slice()));
+    }
+    try std.testing.expect(openFdCount(fx.io) <= baseline);
+}
+
+test "registry: a failed (boot) create does NOT leak the reserved slot" {
+    var fx = try Fixture.init(std.testing.allocator);
+    defer fx.deinit();
+
+    // Fill to one below the cap with good creates.
+    var i: usize = 0;
+    while (i < SessionRegistry.MAX_SESSIONS - 1) : (i += 1) _ = try fx.create();
+
+    // A create whose program is not in the mount BOOT-fails → it must roll back the reserved
+    // slot (the errdefer at session_registry.zig:144), not consume one. `owns_mount=false`
+    // here so the failure path does not touch the shared fixture dir.
+    const bad = LoadRecipe.init(2, "NOPE.COM", "");
+    try std.testing.expectError(error.ProgramNotFound, fx.reg.create(bad, fx.dir, timing.DEFAULT_MULT, false));
+    try std.testing.expectEqual(SessionRegistry.MAX_SESSIONS - 1, fx.reg.liveCount());
+
+    // The released slot is reusable: one more good create reaches the cap, and only THEN is
+    // the cap genuinely hit — proving the failed create did not silently eat a slot.
+    _ = try fx.create();
+    try std.testing.expectEqual(SessionRegistry.MAX_SESSIONS, fx.reg.liveCount());
+    try std.testing.expectError(error.SessionLimitReached, fx.create());
 }

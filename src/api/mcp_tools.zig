@@ -32,16 +32,38 @@ const Seg = cpu_mod.Seg;
 
 /// One catalog entry. `input_schema` is a hand-authored JSON Schema object literal
 /// (already valid JSON), spliced verbatim into the `tools/list` reply (§8 option a).
+///
+/// `per_machine` (multi-machine plan §2/§3): a PER-MACHINE tool (the existing 32 —
+/// step/read_cpu/…/screenshot) is ROUTED by an optional `machine` handle the model threads
+/// into its arguments; for those the `tools/list` emitter INJECTS the `machine` property
+/// into the advertised schema (so a strict `additionalProperties:false` client does not
+/// reject it). The MACHINE-AGNOSTIC lifecycle tools (`provision_machine`/`deprovision`/
+/// `list_machines`) carry `per_machine = false`: they are not routed by a `machine` arg
+/// (provision creates one; deprovision/list take the handle in their OWN schema), so no
+/// `machine` property is injected. The `machine` value is IGNORED by `buildCommand`'s
+/// per-tool parse (`ignore_unknown_fields`), so the injection never breaks dispatch.
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
     input_schema: []const u8,
+    per_machine: bool = true,
 };
 
-// A reusable "no arguments" schema (an empty, closed object).
+// A reusable "no arguments" schema (an empty, closed object). A per-machine no-arg tool
+// using this still advertises `machine` — the `tools/list` emitter injects it (see
+// `writeSchemaWithMachine`); a machine-AGNOSTIC no-arg tool (`list_machines`) keeps it bare.
 const SCHEMA_EMPTY =
     \\{"type":"object","properties":{},"additionalProperties":false}
 ;
+
+// The optional `machine`-handle property injected into every PER-MACHINE tool's advertised
+// inputSchema (multi-machine plan §3). Hand-authored ASCII (the §8/§10 determinism posture);
+// integer-free, clock-free. The `<n>` placeholder documents the `zdos-sess-<seq>` shape.
+const MACHINE_PROP =
+    \\"machine":{"type":"string","description":"the zdos-sess-<n> handle from provision_machine; omit for the default machine"}
+;
+// Every catalog schema begins with this exact prefix — the anchor the injector splits on.
+const SCHEMA_HEAD = "{\"type\":\"object\",";
 
 /// The full Phase-2 tool catalog (mcp-plan.md §4). Each row maps 1:1 to a `q.Command`
 /// (built in `buildCommand`) — except `load`, whose recipe overlay/persist is
@@ -262,6 +284,38 @@ pub const tools = [_]Tool{
         .description = "Read the run status: runnable, terminated, ret_code, cycles, last_stop.",
         .input_schema = SCHEMA_EMPTY,
     },
+    // --- machine lifecycle (machine-AGNOSTIC; server-special, like `load`) ---
+    .{
+        // Server-special (handled in `server.zig:handleMcpToolCall`, not via `buildCommand`):
+        // it opens a fresh host mount dir + provisions a new machine in the registry and
+        // returns the handle IN THE RESULT (no header). `cpu` reuses the shared `mapCpuSpeed`
+        // (mult xor mhz); `drive` defaults to 2; `cmdtail` is the DOS command tail.
+        .name = "provision_machine",
+        .description = "Provision a NEW emulated machine: mount host dir `mount_dir` as the DOS drive, load `file` (.COM/.EXE) within it, and return its zdos-sess-<n> handle in the result. Pass that handle as the `machine` arg to the per-machine tools to drive it; deprovision to free it.",
+        .input_schema =
+        \\{"type":"object","properties":{"mount_dir":{"type":"string","minLength":1,"description":"host dir mounted as the DOS drive (opened cwd-relative)"},"file":{"type":"string","minLength":1,"description":"program (.COM/.EXE) within mount_dir"},"cmdtail":{"type":"string","maxLength":127,"description":"DOS command tail"},"drive":{"type":"integer","minimum":0,"maximum":25,"default":2,"description":"DOS drive index (0=A..25=Z)"},"cpu":{"type":"object","description":"CPU speed; give exactly one of mult/mhz","oneOf":[{"properties":{"mult":{"type":"integer","minimum":1,"description":"CPU:PIT multiplier (clamped to [1,55])"}},"required":["mult"]},{"properties":{"mhz":{"type":"integer","minimum":1,"description":"target MHz, converted to the nearest mult"}},"required":["mhz"]}]}},"required":["mount_dir","file"],"additionalProperties":false}
+        ,
+        .per_machine = false,
+    },
+    .{
+        // Server-special: tear down the addressed machine (stop+join its worker, free its
+        // ~21 MiB + close its owned mount fd). The handle is its OWN arg, not the routing arg.
+        .name = "deprovision",
+        .description = "Deprovision (destroy) the machine with the given handle: stop its worker and free its memory + mount fd. An unknown/already-gone handle is a tool error.",
+        .input_schema =
+        \\{"type":"object","properties":{"machine":{"type":"string","minLength":1,"description":"the zdos-sess-<n> handle to destroy"}},"required":["machine"],"additionalProperties":false}
+        ,
+        .per_machine = false,
+    },
+    .{
+        // Server-special, read-only: enumerate the live machines + small metadata so a model
+        // that lost a handle can recover/reclaim. Exposes handles/metadata ONLY — never
+        // another machine's guest memory/registers.
+        .name = "list_machines",
+        .description = "List the live provisioned machines (handle, file, drive, cpu mult, cycles) plus live/max counts. Read-only and side-effect-free.",
+        .input_schema = SCHEMA_EMPTY,
+        .per_machine = false,
+    },
 };
 
 /// Look up a tool by name (`null` if not in the catalog → `-32602` at the caller).
@@ -284,11 +338,68 @@ pub fn writeToolsList(w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll(",\"description\":");
         try std.json.Stringify.encodeJsonString(t.description, .{}, w);
         try w.writeAll(",\"inputSchema\":");
-        try w.writeAll(t.input_schema);
+        if (t.per_machine) try writeSchemaWithMachine(w, t.input_schema) else try w.writeAll(t.input_schema);
         try w.writeAll("}");
     }
     try w.writeAll("]}");
 }
+
+/// Emit a per-machine tool's inputSchema with the optional `machine` property injected at
+/// the TOP level (multi-machine plan §3 — so a strict client neither rejects nor is misled
+/// about the routing arg). Every catalog schema begins with `SCHEMA_HEAD` (`{"type":
+/// "object",`); the rest either opens with a top-level `"properties":{…}` (most tools) or
+/// with `"oneOf":[…]` (`set_register`, which has no top-level properties). Two cases, no
+/// duplicate-key hazard:
+///   - top-level properties present → splice `MACHINE_PROP,` right after `"properties":{`
+///     (the comma is omitted when the original object is EMPTY, e.g. `SCHEMA_EMPTY`);
+///   - no top-level properties (oneOf-first) → wrap a fresh `"properties":{MACHINE_PROP},`
+///     in front of the rest (the oneOf arms allow the extra key — none is closed).
+/// PURE string work over the hand-authored ASCII schema; no allocation, no host time.
+fn writeSchemaWithMachine(w: *std.Io.Writer, schema: []const u8) std.Io.Writer.Error!void {
+    // Defensive: a schema that does not match the expected prefix is emitted verbatim
+    // (never corrupted). Every catalog schema DOES match, so this is belt-and-suspenders.
+    if (!std.mem.startsWith(u8, schema, SCHEMA_HEAD)) return w.writeAll(schema);
+    try w.writeAll(SCHEMA_HEAD);
+    const rest = schema[SCHEMA_HEAD.len..];
+    const props_key = "\"properties\":{";
+    if (std.mem.startsWith(u8, rest, props_key)) {
+        try w.writeAll(props_key);
+        try w.writeAll(MACHINE_PROP);
+        const after = rest[props_key.len..];
+        // A non-empty original properties object (next char is not the closing `}`) needs a
+        // separator before its first key; an empty `{}` does not.
+        if (after.len != 0 and after[0] != '}') try w.writeAll(",");
+        try w.writeAll(after);
+    } else {
+        try w.writeAll(props_key);
+        try w.writeAll(MACHINE_PROP);
+        try w.writeAll("},");
+        try w.writeAll(rest);
+    }
+}
+
+// ===========================================================================
+// Machine-lifecycle tool argument structs (multi-machine plan §3). PUBLIC so
+// `server.zig:handleMcpToolCall` (the server-special handler) parses them via
+// `parseFromValueLeaky` and validates `cpu` through the SHARED `mapCpuSpeed` — the
+// SAME mult-xor-mhz acceptor the `set_clock` tool / HTTP `cpu/clock` route use (no drift).
+// ===========================================================================
+
+/// The `cpu` sub-object: exactly one of mult/mhz (validated by `mapCpuSpeed`).
+pub const CpuArg = struct { mult: ?u64 = null, mhz: ?u64 = null };
+
+/// `provision_machine` arguments. `cmdtail`/`drive`/`cpu` are optional (drive default 2,
+/// cpu default = the boot multiplier, resolved by the handler). Strings are arena slices.
+pub const ProvisionArgs = struct {
+    mount_dir: []const u8,
+    file: []const u8,
+    cmdtail: ?[]const u8 = null,
+    drive: u8 = 2,
+    cpu: ?CpuArg = null,
+};
+
+/// `deprovision` arguments — the handle to destroy (its OWN arg, not the routing arg).
+pub const DeprovisionArgs = struct { machine: []const u8 };
 
 // ===========================================================================
 // Serialization options the inner tool body needs (mcp-plan.md §3.2). Threaded from
@@ -941,6 +1052,64 @@ test "buildCommand rejects an unknown tool" {
     var ctx: q.RequestCtx = .{ .cmd = .status };
     const r = buildCommand(std.testing.allocator, "frobnicate", .null, &ctx);
     try std.testing.expect(r == .invalid_params);
+}
+
+test "schema↔acceptor: provision_machine cpu oneOf tracks mapCpuSpeed (mult xor mhz)" {
+    const alloc = std.testing.allocator;
+    // The `cpu` oneOf MUST declare exactly the two acceptor arms (mult, mhz) the shared
+    // `mapCpuSpeed` honors — so the advertised schema can never drift from the validator.
+    var p = try std.json.parseFromSlice(std.json.Value, alloc, find("provision_machine").?.input_schema, .{});
+    defer p.deinit();
+    const cpu = p.value.object.get("properties").?.object.get("cpu").?.object;
+    const oneof = cpu.get("oneOf").?.array;
+    try std.testing.expectEqual(@as(usize, 2), oneof.items.len);
+    // Each declared arm names exactly its required key, and that key is an acceptor input.
+    var saw_mult = false;
+    var saw_mhz = false;
+    for (oneof.items) |arm| {
+        const req = arm.object.get("required").?.array;
+        try std.testing.expectEqual(@as(usize, 1), req.items.len);
+        const key = req.items[0].string;
+        if (std.mem.eql(u8, key, "mult")) saw_mult = true;
+        if (std.mem.eql(u8, key, "mhz")) saw_mhz = true;
+    }
+    try std.testing.expect(saw_mult and saw_mhz);
+    // The acceptor enforces the mult-XOR-mhz the oneOf declares: each arm alone is ok, both
+    // is a fail (the schema's `oneOf` exclusivity), neither is a fail.
+    try std.testing.expect(mapCpuSpeed(12, null) == .ok);
+    try std.testing.expect(mapCpuSpeed(null, 25) == .ok);
+    try std.testing.expect(mapCpuSpeed(12, 25) == .fail);
+    try std.testing.expect(mapCpuSpeed(null, null) == .fail);
+}
+
+test "tools/list injects the machine arg into per-machine schemas only, staying valid JSON" {
+    const alloc = std.testing.allocator;
+    var buf: [64 * 1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeToolsList(&w);
+    var p = try std.json.parseFromSlice(std.json.Value, alloc, w.buffered(), .{});
+    defer p.deinit();
+    const list = p.value.object.get("tools").?.array;
+    try std.testing.expectEqual(tools.len, list.items.len);
+    for (list.items) |item| {
+        const name = item.object.get("name").?.string;
+        // Every emitted inputSchema is still a valid JSON object (injection never corrupts).
+        const schema = item.object.get("inputSchema").?.object;
+        const t = find(name).?;
+        const props = schema.get("properties");
+        const has_machine = props != null and props.?.object.get("machine") != null;
+        if (t.per_machine) {
+            // A per-machine tool advertises the routing handle...
+            try std.testing.expect(has_machine);
+            try std.testing.expectEqualStrings("string", props.?.object.get("machine").?.object.get("type").?.string);
+        } else {
+            // ...a machine-agnostic tool does NOT get an injected `machine` (deprovision's own
+            // schema declares its `machine` arg explicitly, which is fine; list/provision must
+            // not have an injected one).
+            if (std.mem.eql(u8, name, "list_machines") or std.mem.eql(u8, name, "provision_machine"))
+                try std.testing.expect(!has_machine);
+        }
+    }
 }
 
 fn jsonValue(arena: std.mem.Allocator, s: []const u8) !std.json.Value {

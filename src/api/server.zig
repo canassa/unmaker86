@@ -1691,6 +1691,155 @@ pub const Conn = struct {
         self.respondJson(req, .ok, "{\"ok\":true,\"deleted\":true}");
     }
 
+    /// `provision_machine` (multi-machine plan §3, machine-AGNOSTIC server-special): open a
+    /// fresh host mount dir, build a `LoadRecipe`, and `registry.create` a NEW machine + worker
+    /// at the requested CPU speed. The minted handle is returned IN THE RESULT (no header), so
+    /// the model threads it as the `machine` arg into the per-machine tools. Per-failure error
+    /// granularity (plan §8 — the LLM branches on it): a CLIENT input error (malformed args /
+    /// bad drive / bad cpu / mount-dir-not-found / file-not-found in the mount) is `-32602`
+    /// invalid_params; the resource cap is a distinct `machine_limit_reached` tool error (NOT
+    /// internal); a genuine fault (a found-but-unrunnable image / OOM / worker-spawn) is
+    /// `-32603` internal. Determinism: the recipe + cpu mult are fixed inputs; the mount dir is
+    /// a CALLER-managed external input (distinct per machine ⇒ isolated + reproducible, plan §10).
+    fn handleMcpProvision(self: *Conn, req: *http.Server.Request, id: ?mcp.Id, args: std.json.Value) void {
+        if (args != .object) return self.respondRpcError(req, id, .invalid_params, "provision_machine requires arguments {mount_dir,file,...}");
+        const pa = std.json.parseFromValueLeaky(mcp_tools.ProvisionArgs, self.arena.allocator(), args, wire.parse_options) catch
+            return self.respondRpcError(req, id, .invalid_params, "provision_machine expects {mount_dir:string, file:string, cmdtail?:string, drive?:int, cpu?:{mult|mhz}}");
+
+        // Input validation (mirrors the schema bounds) → -32602 (fix the call).
+        if (pa.mount_dir.len == 0) return self.respondRpcError(req, id, .invalid_params, "mount_dir must be non-empty");
+        if (pa.file.len == 0 or pa.file.len > 12) return self.respondRpcError(req, id, .invalid_params, "file must be a 1..12 character DOS name");
+        if (pa.drive > 25) return self.respondRpcError(req, id, .invalid_params, "drive must be 0..25");
+        const cmdtail = tail: {
+            const t = pa.cmdtail orelse "";
+            if (t.len > 127) return self.respondRpcError(req, id, .invalid_params, "cmdtail too long (max 127)");
+            break :tail t;
+        };
+        // `cpu` reuses the SHARED `mapCpuSpeed` (mult-xor-mhz); omitted → the boot multiplier.
+        const cpu_mult: u64 = if (pa.cpu) |c| switch (mcp_tools.mapCpuSpeed(c.mult, c.mhz)) {
+            .ok => |m| m,
+            .fail => |e| return self.respondRpcError(req, id, .invalid_params, e.message),
+        } else timing.DEFAULT_MULT;
+        const applied_mult: u64 = @min(cpu_mult, timing.MAX_MULT); // what the machine will actually use (the clamp)
+
+        // Open the mount dir cwd-relative (security/confinement WAIVED — local-only tool,
+        // main.zig:104; no serve-root). A bad path / non-directory is a CLIENT error.
+        var dir = std.Io.Dir.cwd().openDir(self.server.io, pa.mount_dir, .{ .iterate = true }) catch
+            return self.respondRpcError(req, id, .invalid_params, "mount_dir not found or not a directory");
+
+        const recipe = session_mod.LoadRecipe.init(pa.drive, pa.file, cmdtail);
+        const created = self.server.registry.create(recipe, dir, cpu_mult, true) catch |err| {
+            // create FAILED → ownership of `dir` did NOT transfer; close it (the §5 fd hygiene)
+            // and map the cause to its precise code.
+            dir.close(self.server.io);
+            return switch (err) {
+                error.ProgramNotFound => self.respondRpcError(req, id, .invalid_params, "file_not_found: the program file is not in the mount dir"),
+                error.SessionLimitReached => self.respondMcpToolError(req, id, "machine_limit_reached", "at the machine cap; deprovision an existing one or call list_machines"),
+                error.BootFailed => self.respondRpcError(req, id, .internal, "the program was found but could not be loaded/run"),
+                error.OutOfMemory => self.respondRpcError(req, id, .internal, "out of memory provisioning the machine"),
+                else => self.respondRpcError(req, id, .internal, "failed to provision the machine (worker spawn)"),
+            };
+        };
+        // SUCCESS: `dir` ownership has transferred to the session (`owns_mount=true`); we must
+        // NOT close it here. We use ONLY the id value (never deref `created.session` — a
+        // concurrent deprovision could free it the instant it is published, the UAF contract).
+        const handle = created.id;
+        const live = self.server.registry.liveCount();
+
+        var bw = std.Io.Writer.fixed(self.mcp_body_buf[0..]);
+        const built = blk: {
+            bw.writeAll("{\"machine\":") catch break :blk false;
+            std.json.Stringify.encodeJsonString(handle.slice(), .{}, &bw) catch break :blk false;
+            bw.print(",\"drive\":{d},\"mult\":{d},\"live_machines\":{d},\"max_machines\":{d}}}", .{ pa.drive, applied_mult, live, SessionRegistry.MAX_SESSIONS }) catch break :blk false;
+            break :blk true;
+        };
+        if (!built) return self.respondRpcError(req, id, .internal, "failed to serialize provision result");
+        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
+        mcp.writeTextResult(&w, id, bw.buffered(), false) catch return self.respondRpcError(req, id, .internal, "response too large");
+        self.respondJson(req, .ok, w.buffered());
+    }
+
+    /// `deprovision` (multi-machine plan §3): destroy the addressed machine via the registry
+    /// (stop+join its worker, free its ~21 MiB + close its owned mount fd). The handle is its
+    /// OWN explicit arg, not the routing arg. An unknown / already-gone handle is a tool error
+    /// (an `isError` result with `unknown_machine`), never a crash.
+    fn handleMcpDeprovision(self: *Conn, req: *http.Server.Request, id: ?mcp.Id, args: std.json.Value) void {
+        if (args != .object) return self.respondRpcError(req, id, .invalid_params, "deprovision requires {machine}");
+        const da = std.json.parseFromValueLeaky(mcp_tools.DeprovisionArgs, self.arena.allocator(), args, wire.parse_options) catch
+            return self.respondRpcError(req, id, .invalid_params, "deprovision expects {machine:string}");
+        if (!self.server.registry.destroy(da.machine))
+            return self.respondMcpToolError(req, id, "unknown_machine", "no live machine with that handle");
+        const live = self.server.registry.liveCount();
+
+        var bw = std.Io.Writer.fixed(self.mcp_body_buf[0..]);
+        const built = blk: {
+            bw.writeAll("{\"machine\":") catch break :blk false;
+            std.json.Stringify.encodeJsonString(da.machine, .{}, &bw) catch break :blk false;
+            bw.print(",\"deleted\":true,\"live_machines\":{d}}}", .{live}) catch break :blk false;
+            break :blk true;
+        };
+        if (!built) return self.respondRpcError(req, id, .internal, "failed to serialize deprovision result");
+        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
+        mcp.writeTextResult(&w, id, bw.buffered(), false) catch return self.respondRpcError(req, id, .internal, "response too large");
+        self.respondJson(req, .ok, w.buffered());
+    }
+
+    /// `list_machines` (multi-machine plan §3/§9, read-only): enumerate the live machines +
+    /// their small metadata so a model that LOST a handle can recover/reclaim. Side-effect-
+    /// free; exposes handles/metadata ONLY — never another machine's guest memory/registers.
+    /// Each live session is PINNED (refcount) by `snapshotLive` so a concurrent deprovision
+    /// can't free it mid-read; the per-machine `cycles`/`mult` are read via the SAME gated
+    /// queue the `status`/`get_clock` tools use (cycle-neutral; off-worker reads are banned),
+    /// and the `file`/`drive` recipe fields under the session lock (the off-queue read CONTRACT).
+    fn handleMcpListMachines(self: *Conn, req: *http.Server.Request, id: ?mcp.Id) void {
+        var sessions: [SessionRegistry.MAX_SESSIONS]*Session = undefined;
+        const n = self.server.registry.snapshotLive(sessions[0..]);
+        // Release EVERY pin on every exit path (the resolve/release discipline).
+        defer for (sessions[0..n]) |s| self.server.registry.release(s);
+
+        var bw = std.Io.Writer.fixed(self.mcp_body_buf[0..]);
+        const built = blk: {
+            bw.writeAll("{\"machines\":[") catch break :blk false;
+            for (sessions[0..n], 0..) |s, i| {
+                if (i != 0) bw.writeAll(",") catch break :blk false;
+                // recipe (file/drive) under the session lock — an off-queue per-session read
+                // (session.zig CONTRACT #4: a load writer overlays `recipe` under this lock).
+                var file_buf: [13]u8 = undefined;
+                var flen: usize = 0;
+                var drive: u8 = 0;
+                {
+                    s.lock.lockUncancelable(self.server.io);
+                    defer s.lock.unlock(self.server.io);
+                    flen = s.recipe.file_len;
+                    @memcpy(file_buf[0..flen], s.recipe.file[0..flen]);
+                    drive = s.recipe.drive;
+                }
+                // cycles + applied mult via the gated queue (cycle-neutral peeks).
+                var sctx: q.RequestCtx = .{ .cmd = .status };
+                const cycles: u64 = switch (s.queue.submit(&sctx)) {
+                    .status => |st| st.cycles,
+                    else => 0,
+                };
+                var cctx: q.RequestCtx = .{ .cmd = .clock_get };
+                const mult: u64 = switch (s.queue.submit(&cctx)) {
+                    .clock => |mv| mv,
+                    else => 0,
+                };
+                bw.writeAll("{\"machine\":") catch break :blk false;
+                std.json.Stringify.encodeJsonString(s.id.slice(), .{}, &bw) catch break :blk false;
+                bw.writeAll(",\"file\":") catch break :blk false;
+                std.json.Stringify.encodeJsonString(file_buf[0..flen], .{}, &bw) catch break :blk false;
+                bw.print(",\"drive\":{d},\"mult\":{d},\"cycles\":{d}}}", .{ drive, mult, cycles }) catch break :blk false;
+            }
+            bw.print("],\"live_machines\":{d},\"max_machines\":{d}}}", .{ n, SessionRegistry.MAX_SESSIONS }) catch break :blk false;
+            break :blk true;
+        };
+        if (!built) return self.respondRpcError(req, id, .internal, "response too large");
+        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
+        mcp.writeTextResult(&w, id, bw.buffered(), false) catch return self.respondRpcError(req, id, .internal, "response too large");
+        self.respondJson(req, .ok, w.buffered());
+    }
+
     /// `tools/call`: validate `name`+`arguments` → build the worker command → submit →
     /// serialize the result content via the SHARED writeX builders.
     fn handleMcpToolCall(self: *Conn, req: *http.Server.Request, id: ?mcp.Id, params: std.json.Value, session: *Session) void {
@@ -1702,20 +1851,47 @@ pub const Conn = struct {
         if (mcp_tools.find(name) == null) return self.respondRpcError(req, id, .invalid_params, "unknown tool");
         const args: std.json.Value = pobj.get("arguments") orelse .null;
 
+        // The MACHINE-AGNOSTIC lifecycle tools (multi-machine plan §3) are server-special
+        // like `load`: they create / destroy / enumerate machines through the registry, so
+        // they do NOT route a `machine` arg and ignore the header-resolved `session` entirely.
+        if (std.mem.eql(u8, name, "provision_machine")) return self.handleMcpProvision(req, id, args);
+        if (std.mem.eql(u8, name, "deprovision")) return self.handleMcpDeprovision(req, id, args);
+        if (std.mem.eql(u8, name, "list_machines")) return self.handleMcpListMachines(req, id);
+
+        // PER-MACHINE routing (multi-machine plan §2/§3): a `machine` handle in the arguments
+        // selects the target machine the model controls; absent → the EXISTING resolution
+        // (the header-resolved `session`, default for a blank header — unchanged back-compat).
+        // A present-but-unknown/destroyed handle is a tool error (the model self-corrects via
+        // list_machines/provision_machine). The override is PINNED for the whole call (its own
+        // refcount + `defer release`), exactly as the header path pins `session` in `handleMcp`.
+        var target = session;
+        var pinned: ?*Session = null;
+        if (args == .object) {
+            if (args.object.get("machine")) |mv| {
+                if (mv != .string) return self.respondRpcError(req, id, .invalid_params, "machine must be a string handle");
+                const s = self.server.registry.resolve(mv.string) orelse
+                    return self.respondMcpToolError(req, id, "unknown_machine", "no live machine with that handle; call list_machines or provision_machine");
+                pinned = s;
+                target = s;
+            }
+        }
+        defer if (pinned) |s| self.server.registry.release(s);
+
         // `screenshot` is server-special like `load`: it needs the session render buffers
         // AND emits a bespoke (image, streamed) response shape rather than the text
         // content block the rest of the tools share (mcp-plan.md §7). It takes no
-        // arguments, so it branches out before the buildCommand mapping below.
-        if (std.mem.eql(u8, name, "screenshot")) return self.handleMcpScreenshot(req, id, session);
+        // arguments (besides the routing `machine`), so it branches before the mapping below.
+        if (std.mem.eql(u8, name, "screenshot")) return self.handleMcpScreenshot(req, id, target);
 
         // Map (name, args) → q.Command (+ debugger flag + RespondOpts). A validation
         // failure is -32602 (fix the CALL). `load` is server-special: its recipe overlay
         // + persist need `Server` state, so it is built here (mcp-plan.md §4.4) instead
-        // of in the pure `buildCommand`.
+        // of in the pure `buildCommand`. A `machine` field in `arguments` is IGNORED by
+        // `buildCommand`'s per-tool parse (`ignore_unknown_fields`), so routing never breaks it.
         var ctx: q.RequestCtx = .{ .cmd = undefined };
         var opts: mcp_tools.RespondOpts = .{};
 
-        // Submit through the SAME queue as the HTTP path, taking `session.lock` for exactly
+        // Submit through the SAME queue as the HTTP path, taking `target.lock` for exactly
         // the off-queue spans (session.zig CONTRACT): `load` is the RECIPE span (#3 — recipe
         // overlay+persist+submit atomic, identical to `handleLoad`); a run/step is the
         // DEBUGGER span (#2 — begin→submit→end atomic, identical to `submitDebuggerAndRespond`,
@@ -1723,10 +1899,10 @@ pub const Conn = struct {
         // (the `submit_gate` already serializes it). Order `lock` → `run_control.arb` →
         // `submit_gate`, never inverted.
         const resp: q.Response = if (std.mem.eql(u8, name, "load")) load: {
-            session.lock.lockUncancelable(self.server.io);
-            defer session.lock.unlock(self.server.io);
-            ctx.cmd = self.buildMcpLoad(req, id, session, args) orelse return; // error reply done inside; defer unlocks
-            break :load session.queue.submit(&ctx);
+            target.lock.lockUncancelable(self.server.io);
+            defer target.lock.unlock(self.server.io);
+            ctx.cmd = self.buildMcpLoad(req, id, target, args) orelse return; // error reply done inside; defer unlocks
+            break :load target.queue.submit(&ctx);
         } else built: {
             const b = switch (mcp_tools.buildCommand(self.arena.allocator(), name, args, &ctx)) {
                 .invalid_params => |msg| return self.respondRpcError(req, id, .invalid_params, msg),
@@ -1735,20 +1911,20 @@ pub const Conn = struct {
             ctx.cmd = b.cmd;
             opts = b.opts;
             if (b.needs_debugger) {
-                session.lock.lockUncancelable(self.server.io);
-                defer session.lock.unlock(self.server.io);
-                const restore = session.run_control.beginDebugger();
-                defer session.run_control.endDebugger(restore);
-                break :built session.queue.submit(&ctx);
+                target.lock.lockUncancelable(self.server.io);
+                defer target.lock.unlock(self.server.io);
+                const restore = target.run_control.beginDebugger();
+                defer target.run_control.endDebugger(restore);
+                break :built target.queue.submit(&ctx);
             }
-            break :built session.queue.submit(&ctx);
+            break :built target.queue.submit(&ctx);
         };
 
         // `set_clock` post-step (mcp-plan.md §4.4): retune the pacer slice from the
         // APPLIED (worker-clamped) mult so the timer wall rate stays correct — exactly
         // like the HTTP `handleCpuSpeedSet`. Wall-only; no cycle golden moves.
         if (std.mem.eql(u8, name, "set_clock")) switch (resp) {
-            .clock => |applied| retunePacerSlice(session, applied),
+            .clock => |applied| retunePacerSlice(target, applied),
             else => {},
         };
 
@@ -1995,8 +2171,22 @@ pub const Conn = struct {
             defer default.lock.unlock(self.server.io);
             break :blk .{ default.recipe, default.mount_dir };
         };
-        const created = self.server.registry.create(recipe, mount_dir) catch |err| switch (err) {
+        // Clone the default's APPLIED CPU multiplier so the minted session boots at the same
+        // speed the default currently runs at (a faithful clone). Read it via the gated
+        // `clock_get` (cycle-neutral, off-worker reads are banned) on the default's worker.
+        // For a fresh default this is `timing.DEFAULT_MULT` (12) — byte-identical to before
+        // this change, when the minted machine simply inherited the boot-default mult.
+        var cctx: q.RequestCtx = .{ .cmd = .clock_get };
+        const default_mult: u64 = switch (default.queue.submit(&cctx)) {
+            .clock => |mv| mv,
+            else => timing.DEFAULT_MULT,
+        };
+        // The minted session SHARES the default's `mount_dir` (owned + closed by `main.zig`),
+        // so it does NOT own the fd → `owns_mount = false` (closing it on teardown would
+        // double-close `main.zig`'s dir). Only `provision_machine` opens a fresh, owned dir.
+        const created = self.server.registry.create(recipe, mount_dir, default_mult, false) catch |err| switch (err) {
             error.SessionLimitReached => return self.respondRpcError(req, id, .internal, "session limit reached; DELETE an existing session first"),
+            error.ProgramNotFound => return self.respondRpcError(req, id, .internal, "the program for the new session was not found in the mount"),
             error.BootFailed => return self.respondRpcError(req, id, .internal, "failed to boot the program for the new session"),
             error.OutOfMemory => return self.respondRpcError(req, id, .internal, "out of memory provisioning the new session"),
             // A worker-thread spawn failure (resource exhaustion) is likewise a provisioning failure.

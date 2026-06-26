@@ -242,6 +242,16 @@ pub const Session = struct {
     recipe: LoadRecipe,
     mount_dir: Io.Dir,
 
+    /// Does THIS session OWN its `mount_dir` fd (multi-machine plan §5, the v2 BLOCKER
+    /// fix)? The single DEFAULT session shares `main.zig`'s one `Io.Dir` (opened +
+    /// `defer dir.close`-d there), so it is `false` — `main.zig` closes that dir, and the
+    /// registry must NOT (a double-close). A registry-PROVISIONED session (`provision_
+    /// machine`) opens a FRESH `Io.Dir` per machine and hands ownership here, so it is
+    /// `true` and `SessionRegistry.teardown` closes that fd on deprovision — without this,
+    /// every provision/deprovision cycle would leak a directory fd (an agent churning
+    /// machines would exhaust host fds). Set by `SessionRegistry.create`'s caller.
+    owns_mount: bool = false,
+
     /// The PER-SESSION concurrency lock (see the module-level CONTRACT above). Guards the
     /// OFF-QUEUE critical sections only — the capture (render/png_out), debugger (owner
     /// save/restore), and recipe (overlay/persist) spans, plus the host pacer's live-frame
