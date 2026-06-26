@@ -160,6 +160,13 @@ pub fn main(init: std.process.Init) !void {
         const banner = std.fmt.bufPrint(&sbuf, "\n[zdos] listening 127.0.0.1:{d}\n", .{server.boundPort()}) catch "\n[zdos] listening\n";
         try stderr.writeStreamingAll(io, banner);
 
+        // Informational: the MCP (Model Context Protocol) JSON-RPC 2.0 endpoint rides the
+        // SAME `--serve` port (mcp-plan.md §3.4). Purely a banner — no behavior change, no
+        // wall clock (the bound port is the only datum).
+        var mbuf: [96]u8 = undefined;
+        const mcp_banner = std.fmt.bufPrint(&mbuf, "[zdos] mcp endpoint: POST http://127.0.0.1:{d}/mcp\n", .{server.boundPort()}) catch "[zdos] mcp endpoint: POST /mcp\n";
+        try stderr.writeStreamingAll(io, mcp_banner);
+
         // The host-side run-pacer (stream §5): a separate thread that, while armed via
         // `POST /api/run/start`, submits `run_slice` through the submit-gated queue and
         // sleeps the rest of each wall-clock tick. The HOST CLOCK lives in

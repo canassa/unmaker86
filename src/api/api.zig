@@ -23,6 +23,15 @@ const run_control = @import("run_control.zig");
 const live_mouse = @import("live_mouse.zig");
 const stream = @import("stream.zig");
 const shared_frame = @import("shared_frame.zig");
+const mcp = @import("mcp.zig");
+const mcp_tools = @import("mcp_tools.zig");
+const session_mod = @import("session.zig");
+const session_registry = @import("session_registry.zig");
+
+// ---- the per-session bundle + the N-session registry (multi-machine plan §4, Phase 3) ----
+pub const Session = session_mod.Session;
+pub const SessionId = session_mod.SessionId;
+pub const SessionRegistry = session_registry.SessionRegistry;
 
 // ---- the command queue + handoff (Phase 2) ----
 pub const Command = queue.Command;
@@ -74,6 +83,10 @@ test {
     _ = live_mouse;
     _ = stream;
     _ = shared_frame;
+    _ = mcp;
+    _ = mcp_tools;
+    _ = session_mod;
+    _ = session_registry;
     _ = @import("json_wire_test.zig");
     _ = @import("queue_test.zig");
     _ = @import("worker_test.zig");
@@ -82,4 +95,7 @@ test {
     _ = @import("png_test.zig");
     _ = @import("run_control_test.zig");
     _ = @import("stream_test.zig");
+    _ = @import("mcp_test.zig");
+    _ = @import("session_registry_test.zig");
+    _ = @import("concurrency_stress_test.zig");
 }

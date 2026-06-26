@@ -70,6 +70,13 @@ pub const StreamHub = struct {
     /// reads the freshly-peeked index/palette out of these and copies into `frame`.
     render: *RenderBuffers,
     frame: *SharedFrame,
+    /// The owning session's concurrency lock (session.zig CONTRACT, span #4). `produceFrame`
+    /// reads `render` OFF the queue on the host pacer thread; the connection-thread capture
+    /// paths (`handleMcpScreenshot`/`/api/framebuffer`) read the same `render`. Holding this
+    /// across `produceFrame`'s submit→copy serializes the two so neither tears the frame nor
+    /// races the worker re-rendering into `render`. Pointer into the Session (stable for the
+    /// session's life). Order: `lock` → `submit_gate` (taken inside `queue.submit`).
+    lock: *Io.Mutex,
 
     /// Registry mutex: guards the `conns` slots' `active`/`thread`/`socket` + the count
     /// so concurrent upgrades and the joining shutdown serialize. CLOCKLESS.
@@ -82,8 +89,8 @@ pub const StreamHub = struct {
     /// same nominal type, so we take it as an opaque-by-import alias.
     pub const RenderBuffers = @import("worker.zig").RenderBuffers;
 
-    pub fn init(io: Io, queue: *q.CommandQueue, control: *run_control.RunControl, render: *RenderBuffers, frame: *SharedFrame) StreamHub {
-        return .{ .io = io, .queue = queue, .control = control, .render = render, .frame = frame };
+    pub fn init(io: Io, queue: *q.CommandQueue, control: *run_control.RunControl, render: *RenderBuffers, frame: *SharedFrame, lock: *Io.Mutex) StreamHub {
+        return .{ .io = io, .queue = queue, .control = control, .render = render, .frame = frame, .lock = lock };
     }
 
     /// True iff at least one stream client is connected — the producer only samples then
@@ -118,6 +125,14 @@ pub const StreamHub = struct {
         // A terminated machine: stop sampling it (the "stopped" control frame was already
         // published by `markStopped`). The pacer also disarms, so this is belt-and-braces.
         if (self.frame.isStopped()) return;
+        // Hold the session lock across submit→read(render)→publish (session.zig CONTRACT,
+        // span #4): the connection-thread capture paths read the SAME `render`, so without
+        // this a concurrent screenshot/framebuffer would tear the frame the worker is re-
+        // rendering. Order `lock` → `submit_gate` (inside `submit`) matches every covered
+        // span — no inversion, and the pacer's run_control use is unaffected (this touches
+        // no `run_control`). A bounded peek + a ~308 KiB copy, never a long debugger run.
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
         var ctx: q.RequestCtx = .{ .cmd = .framebuffer_get };
         const resp = self.queue.submit(&ctx);
         const fr = switch (resp) {

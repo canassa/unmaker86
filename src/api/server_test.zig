@@ -61,8 +61,8 @@ const TestServer = struct {
         const srv = try alloc.create(Server);
         srv.* = try Server.init(alloc, io, undefined, 0, server_mod.LoadRecipe.init(2, "PROG.COM", ""), std.Io.Dir.cwd());
         // The Controller lives inline in the returned struct; `start()` binds
-        // `srv.ctrl` to its FINAL address (after the caller stores the struct), so
-        // the worker thread sees the stable Controller.
+        // `srv.session.ctrl` to its FINAL address (after the caller stores the struct),
+        // so the worker thread sees the stable Controller.
         return .{
             .alloc = alloc,
             .threaded = threaded,
@@ -74,11 +74,11 @@ const TestServer = struct {
     }
 
     fn start(self: *TestServer) !void {
-        self.srv.ctrl = &self.ctrl;
+        self.srv.session.ctrl = &self.ctrl;
         const w = struct {
             fn run(s: *Server) void {
                 const worker = @import("worker.zig");
-                const ww: worker.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl, .render = s.render };
+                const ww: worker.Worker = .{ .queue = &s.session.queue, .ctrl = s.session.ctrl, .render = s.session.render };
                 ww.run();
             }
         };
@@ -88,7 +88,7 @@ const TestServer = struct {
     fn deinit(self: *TestServer) void {
         // Shut the worker down via the sentinel, join, then free.
         var ctx: q.RequestCtx = .{ .cmd = .shutdown_worker };
-        _ = self.srv.queue.submit(&ctx);
+        _ = self.srv.session.queue.submit(&ctx);
         self.worker.join();
         self.srv.deinit();
         destroy(self.alloc, self.m);

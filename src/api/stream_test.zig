@@ -308,7 +308,10 @@ test "producer: sampling N frames is cycle-neutral (charges no cycle)" {
     }
 
     var rc = run_control.RunControl.init(io);
-    var hub = stream.StreamHub.init(io, &queue, &rc, render, frame);
+    // A standalone session lock for the hub's off-queue `render` read (session.zig
+    // CONTRACT span #4); in this unit test only the producer touches `render`.
+    var session_lock: std.Io.Mutex = .init;
+    var hub = stream.StreamHub.init(io, &queue, &rc, render, frame, &session_lock);
 
     // Advance the machine a bit so there is a defined cycle count.
     {

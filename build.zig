@@ -16,6 +16,10 @@ pub fn build(b: *std.Build) void {
     // Absolute path to the committed Borland-C++-3.1 example programs, so the DOS
     // loader regression can mount + run the real `HELLO.EXE` fixture offline.
     opts.addOption([]const u8, "dos_examples_dir", b.pathFromRoot("examples/dos-src"));
+    // Absolute path to the committed top-level example programs (HELLO.COM/.EXE), so the
+    // multi-machine session-registry tests can boot a real program into a minted session
+    // OFFLINE without depending on the test process's cwd (multi-machine plan §10 Phase 3).
+    opts.addOption([]const u8, "examples_dir", b.pathFromRoot("examples"));
 
     // The shared contract leaf module (B10): the single source of truth for the
     // comptime Bus/hook contracts. BOTH `cpu` and `bus` import it; neither
@@ -521,7 +525,19 @@ pub fn build(b: *std.Build) void {
         .{ .name = "timing", .mod = timing_mod },
         .{ .name = "bios", .mod = bios_mod }, // server.zig resolves {"char"} via scancodes
     };
-    const api_tests = MachineTest.add(b, target, optimize, "src/api/api.zig", &api_imports);
+    // Built explicitly (not via `MachineTest.add`) so the api test root can carry
+    // `build_options` — the session-registry tests read `examples_dir` to boot a real
+    // program into a minted session (multi-machine plan §10 Phase 3).
+    const api_tests_t = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/api/api.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    for (api_imports) |imp| api_tests_t.root_module.addImport(imp.name, imp.mod);
+    api_tests_t.root_module.addOptions("build_options", opts);
+    const api_tests = b.addRunArtifact(api_tests_t);
     const api_test_step = b.step("test-api", "Run the HTTP/JSON API-server tests");
     api_test_step.dependOn(&api_tests.step);
 

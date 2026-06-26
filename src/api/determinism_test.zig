@@ -43,6 +43,28 @@ const api_sources = [_][]const u8{
     // affordance to any api source (the frame capture is the cycle-neutral peek).
     @embedFile("shared_frame.zig"),
     @embedFile("stream.zig"),
+    // The MCP (Model Context Protocol) JSON-RPC 2.0 front-end (M3, mcp-plan.md §3.6).
+    // PURE by design: JSON string work + `queue.submit` (clockless) + the shared `writeX`
+    // builders. No host time, no RNG, no float in any emitted byte; the session id is a
+    // fixed literal constant (NOT `getrandom`). Embedding them proves the second
+    // front-end added no host-clock / RNG / float affordance to any api source.
+    @embedFile("mcp.zig"),
+    @embedFile("mcp_tools.zig"),
+    // The per-session state bundle (multi-machine plan §3.2/§4.1, Phase 1). PURE by
+    // design: it only GROUPS the per-machine fields the Server used to hold directly
+    // (queue + worker handle + clockless run_control/live_mouse + render/shared-frame/
+    // stream-hub + load recipe + mount dir) — no host clock, no RNG, no float in any
+    // emitted byte; the machine's only time source stays `cpu.st.cycles`, reached via
+    // the gated queue on the worker. Embedding it keeps the no-host-dependence gate
+    // covering the extracted code exactly as it covered it on `Server`.
+    @embedFile("session.zig"),
+    // The N-session registry (multi-machine plan §4, Phase 3). DETERMINISM-CLEAN by
+    // design: session ids are minted from a monotonic counter (`zdos-sess-<seq>` — NO
+    // clock, NO RNG), GC is explicit-DELETE / LRU-by-request-count (NEVER a timed sweep),
+    // and it coordinates with the SAME clockless no-timeout `Io.Mutex`/`Io.Condition`
+    // variants the queue uses. Embedding it proves the multi-session routing added no
+    // host-clock / RNG / float affordance to any api source.
+    @embedFile("session_registry.zig"),
 };
 
 test "src/api grep: no host time / RNG / env / floats / clock affordances" {
@@ -115,7 +137,10 @@ test "off-worker grep (R2): server.zig touches no machine/controller state off t
     // state), and everything else goes through submit(). (The needle is the source
     // form — the body literal is escaped in server.zig.)
     try std.testing.expect(std.mem.indexOf(u8, server_src, "zdos-m2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, server_src, "self.queue.submit") != null);
+    // Reaches the queue through the default session now (Phase 1 `Session` extraction):
+    // `self.queue.submit` became `self.session.queue.submit`. Same assertion intent —
+    // every machine access still goes through the gated `submit()`.
+    try std.testing.expect(std.mem.indexOf(u8, server_src, "self.session.queue.submit") != null);
 }
 
 test "reflection: Command/Response carry no pointer or host-time fields" {
