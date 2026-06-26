@@ -97,6 +97,7 @@ const std = @import("std");
 const debug = @import("debug");
 const machine_mod = @import("machine");
 const q = @import("queue.zig");
+const wire = @import("json_wire.zig");
 const worker_mod = @import("worker.zig");
 const run_control = @import("run_control.zig");
 const live_mouse_mod = @import("live_mouse.zig");
@@ -156,6 +157,28 @@ pub const LoadRecipe = struct {
         @memcpy(r.cmdtail[0..ct_len], cmdtail[0..ct_len]);
         r.cmdtail_len = @intCast(ct_len);
         return r;
+    }
+
+    /// Apply the PRESENT (non-null) fields of a wire `LoadReq` onto this recipe IN PLACE
+    /// — the single overlay both load front-ends share (HTTP `handleLoad` + MCP
+    /// `buildMcpLoad`), so the two transports can never drift in how a partial request
+    /// updates the persisted recipe (anti-drift; the equivalence tests pin it). An absent
+    /// field keeps the prior value, so `{}` re-loads the persisted program after a reset.
+    /// The file/cmdtail copies are length-capped to the fixed buffers with the SAME
+    /// `@min`/`@memcpy`/`_len` discipline as `init` (a too-long name truncates, never
+    /// overruns). PURE: no allocation, no host time.
+    pub fn overlay(self: *LoadRecipe, r: wire.LoadReq) void {
+        if (r.drive) |d| self.drive = d;
+        if (r.file) |f| {
+            const n = @min(f.len, self.file.len);
+            @memcpy(self.file[0..n], f[0..n]);
+            self.file_len = @intCast(n);
+        }
+        if (r.cmdtail) |ct| {
+            const n = @min(ct.len, self.cmdtail.len);
+            @memcpy(self.cmdtail[0..n], ct[0..n]);
+            self.cmdtail_len = @intCast(n);
+        }
     }
 
     pub fn toCmd(self: LoadRecipe) q.LoadCmd {

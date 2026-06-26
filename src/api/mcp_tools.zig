@@ -473,11 +473,12 @@ pub fn buildSearch(needle: []const u8, start: u32, len: u32, max: u32) MapResult
     } };
 }
 
-/// The `read_devices {device}` selector allowlist. The name→field DISPATCH authority is
-/// `server.zig:writeNamedDevice` (a typed snapshot dispatcher shared by the HTTP
-/// `/api/device/<name>` route and the MCP selector); this mirror exists only so the
-/// pure `buildCommand` — which cannot reach a live snapshot — can reject an unknown
-/// group as `-32602` before dispatch. Keep the two lists in sync.
+/// The `read_devices {device}` selector allowlist — the SINGLE source of truth for the
+/// valid device-group names. The pure `buildCommand` (which cannot reach a live snapshot)
+/// uses it here to reject an unknown group as `-32602` before dispatch; the typed name→
+/// field dispatcher `server.zig:writeNamedDevice` `inline for`s over this SAME list (each
+/// name is also its `DevicesSnapshot` field name, reached by `@field`), so the two can
+/// never drift. Each name MUST remain a `DevicesSnapshot` field name (the `@field` access).
 pub const device_groups = [_][]const u8{ "a20", "pic", "pit", "vga", "kbc", "speaker", "opl", "ems" };
 
 fn isDeviceGroup(name: []const u8) bool {

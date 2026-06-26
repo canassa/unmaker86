@@ -655,6 +655,25 @@ pub const Conn = struct {
         return buf;
     }
 
+    /// Copy the value of request header `name` (case-insensitive) into `buf`, returning the
+    /// number of bytes copied — 0 if the header is absent — truncating to `buf.len`. MUST be
+    /// called BEFORE the body read: `iterateHeaders` asserts `received_head`, which the body
+    /// reader invalidates, so this is the only window to read a header (mcp-plan.md §3.3/§11
+    /// R7). The ONE walk both session-routing captures share — the `/mcp` `Mcp-Session-Id`
+    /// and the `/api/*` `X-Zdos-Session` — so the two can never drift in how a header value
+    /// is captured (the routes are mutually exclusive: at most one capture runs per request).
+    fn captureHeader(request: *http.Server.Request, name: []const u8, buf: []u8) usize {
+        var it = request.iterateHeaders();
+        while (it.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) {
+                const n = @min(h.value.len, buf.len);
+                @memcpy(buf[0..n], h.value[0..n]);
+                return n;
+            }
+        }
+        return 0;
+    }
+
     /// The shared request body: capture route + content-type, read the body, dispatch.
     fn serveRequest(self: *Conn, request: *http.Server.Request) void {
         // CAPTURE route + content-type BEFORE taking the body reader (it invalidates
@@ -680,15 +699,7 @@ pub const Conn = struct {
         // `/mcp` route consults it; skip the header walk for every other path.
         self.mcp_session_len = 0;
         if (std.mem.startsWith(u8, target, "/mcp")) {
-            var it = request.iterateHeaders();
-            while (it.next()) |h| {
-                if (std.ascii.eqlIgnoreCase(h.name, mcp.SESSION_HEADER)) {
-                    const n = @min(h.value.len, self.mcp_session_buf.len);
-                    @memcpy(self.mcp_session_buf[0..n], h.value[0..n]);
-                    self.mcp_session_len = n;
-                    break;
-                }
-            }
+            self.mcp_session_len = captureHeader(request, mcp.SESSION_HEADER, self.mcp_session_buf[0..]);
         }
 
         // Capture the OPTIONAL `X-Zdos-Session` header for `/api/*` (Phase 4 §6 option B),
@@ -698,15 +709,7 @@ pub const Conn = struct {
         // exclusive, so at most one runs, and neither walk is taken for static/other paths.
         self.api_session_len = 0;
         if (std.mem.startsWith(u8, target, "/api/")) {
-            var it = request.iterateHeaders();
-            while (it.next()) |h| {
-                if (std.ascii.eqlIgnoreCase(h.name, API_SESSION_HEADER)) {
-                    const n = @min(h.value.len, self.api_session_buf.len);
-                    @memcpy(self.api_session_buf[0..n], h.value[0..n]);
-                    self.api_session_len = n;
-                    break;
-                }
-            }
+            self.api_session_len = captureHeader(request, API_SESSION_HEADER, self.api_session_buf[0..]);
         }
 
         // Reject an oversized body BEFORE reading it (413).
@@ -1137,6 +1140,17 @@ pub const Conn = struct {
     /// Rejects `mult==0`/`mhz==0` (400). The worker CLAMPS to `[1, MAX_MULT]` and
     /// returns the APPLIED value; we then retune the pacer slice from the SAME applied
     /// value and reply with `{mult, cpu_hz, mhz, slice_cycles}`.
+    /// Retune the host pacer's run-slice from a worker-APPLIED (clamped) CPU mult so the
+    /// timer wall rate tracks the CPU speed as it changes (§3). The slice is
+    /// `PIT_TICK_RATE * mult / 100` cycles; the pacer reads this atomic at the top of each
+    /// slice, so it is WALL-ONLY — paced ≡ unpaced, NO cycle golden moves. The ONE copy
+    /// both speed-set front-ends call (HTTP `handleCpuSpeedSet` + the MCP `set_clock`
+    /// post-step), so the two transports can never drift in the retune (anti-drift). The
+    /// prior slice the worker returns is unused.
+    fn retunePacerSlice(session: *Session, applied: u64) void {
+        _ = session.run_control.setSlice(timing.PIT_TICK_RATE * applied / 100);
+    }
+
     fn handleCpuSpeedSet(self: *Conn, req: *http.Server.Request, body: []const u8, is_json: bool) void {
         if (!self.requireJson(req, is_json, body)) return;
         const r = self.parseBody(wire.CpuSpeedReq, body) orelse return self.badJson(req);
@@ -1157,11 +1171,9 @@ pub const Conn = struct {
         };
 
         // Retune the pacer slice from the APPLIED mult so the timer wall rate stays
-        // correct as the CPU speeds up (§3). Wall-only: the pacer reads this atomic at
-        // the top of each slice (paced ≡ unpaced — no cycle golden moves). fps==0 keeps
-        // the current frame cadence; we only change the slice.
-        const slice: u64 = timing.PIT_TICK_RATE * applied / 100;
-        _ = self.session.run_control.setSlice(slice);
+        // correct as the CPU speeds up (§3) — the SHARED `retunePacerSlice` the MCP
+        // `set_clock` post-step also calls (anti-drift). Wall-only; no cycle golden moves.
+        retunePacerSlice(self.session, applied);
 
         self.respondCpuSpeed(req, applied);
     }
@@ -1283,21 +1295,12 @@ pub const Conn = struct {
         // the machine state actually loaded. Order `lock` → `submit_gate` (in submit).
         self.session.lock.lockUncancelable(self.server.io);
         defer self.session.lock.unlock(self.server.io);
-        // Start from the server-held recipe; override with any provided fields.
+        // Start from the server-held recipe; override with any provided fields via the
+        // SHARED `LoadRecipe.overlay` (the SAME copy `buildMcpLoad` applies — anti-drift).
         var recipe = self.session.recipe;
         if (body.len > 0) {
             const r = self.parseBody(wire.LoadReq, body) orelse return self.badJson(req);
-            if (r.drive) |d| recipe.drive = d;
-            if (r.file) |f| {
-                const n = @min(f.len, recipe.file.len);
-                @memcpy(recipe.file[0..n], f[0..n]);
-                recipe.file_len = @intCast(n);
-            }
-            if (r.cmdtail) |ct| {
-                const n = @min(ct.len, recipe.cmdtail.len);
-                @memcpy(recipe.cmdtail[0..n], ct[0..n]);
-                recipe.cmdtail_len = @intCast(n);
-            }
+            recipe.overlay(r);
         }
         // Persist the updated recipe so a later `POST /api/load {}` re-loads it.
         self.session.recipe = recipe;
@@ -1742,7 +1745,7 @@ pub const Conn = struct {
         // APPLIED (worker-clamped) mult so the timer wall rate stays correct — exactly
         // like the HTTP `handleCpuSpeedSet`. Wall-only; no cycle golden moves.
         if (std.mem.eql(u8, name, "set_clock")) switch (resp) {
-            .clock => |applied| _ = session.run_control.setSlice(timing.PIT_TICK_RATE * applied / 100),
+            .clock => |applied| retunePacerSlice(session, applied),
             else => {},
         };
 
@@ -1757,9 +1760,8 @@ pub const Conn = struct {
                 .err => |code| {
                     is_error = true;
                     const info = errInfo(code);
-                    bw.print("{{\"error\":{{\"code\":\"{s}\",\"message\":", .{info.code}) catch break :blk false;
-                    std.json.Stringify.encodeJsonString(info.msg, wire.stringify_options, &bw) catch break :blk false;
-                    bw.writeAll("}}") catch break :blk false;
+                    // The SHARED `{"error":{...}}` content body (anti-drift with respondMcpToolError).
+                    mcp.writeErrorContent(&bw, info.code, info.msg) catch break :blk false;
                 },
                 else => self.writeResponseBody(&bw, resp, opts) catch break :blk false,
             }
@@ -1768,18 +1770,11 @@ pub const Conn = struct {
         if (!body_ok) return self.respondRpcError(req, id, .internal, "failed to serialize tool result");
         const inner = bw.buffered();
 
-        // Frame the JSON-RPC envelope in `resp_buf`, escaping the inner body (itself JSON
-        // text) into the MCP text content block.
+        // Frame the JSON-RPC envelope in `resp_buf` via the SHARED `mcp.writeTextResult`,
+        // escaping the inner body (itself JSON text) into the MCP text content block — the
+        // SAME framer respondMcpToolError uses (anti-drift).
         var w = std.Io.Writer.fixed(self.resp_buf[0..]);
-        const env_ok = blk: {
-            mcp.writeResultPrefix(&w, id) catch break :blk false;
-            w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":") catch break :blk false;
-            std.json.Stringify.encodeJsonString(inner, wire.stringify_options, &w) catch break :blk false;
-            w.print("}}],\"isError\":{s}}}", .{if (is_error) "true" else "false"}) catch break :blk false;
-            mcp.writeResultSuffix(&w) catch break :blk false;
-            break :blk true;
-        };
-        if (!env_ok) return self.respondRpcError(req, id, .internal, "response too large");
+        mcp.writeTextResult(&w, id, inner, is_error) catch return self.respondRpcError(req, id, .internal, "response too large");
         self.respondJson(req, .ok, w.buffered());
     }
 
@@ -1913,25 +1908,12 @@ pub const Conn = struct {
     /// `resp_buf` via the normal `respondJson` path. Byte-identical in shape to the
     /// `.err` arm of `handleMcpToolCall`.
     fn respondMcpToolError(self: *Conn, req: *http.Server.Request, id: ?mcp.Id, code: []const u8, msg: []const u8) void {
-        // Build the inner `{"error":...}` object first, then escape it as the content text.
+        // Build the inner `{"error":...}` object first, then frame it as the text content —
+        // both via the SHARED `mcp` builders the `handleMcpToolCall` arms use (anti-drift).
         var bw = std.Io.Writer.fixed(self.mcp_body_buf[0..]);
-        const inner_ok = blk: {
-            bw.print("{{\"error\":{{\"code\":\"{s}\",\"message\":", .{code}) catch break :blk false;
-            std.json.Stringify.encodeJsonString(msg, wire.stringify_options, &bw) catch break :blk false;
-            bw.writeAll("}}") catch break :blk false;
-            break :blk true;
-        };
-        if (!inner_ok) return self.respondRpcError(req, id, .internal, "failed to serialize tool error");
+        mcp.writeErrorContent(&bw, code, msg) catch return self.respondRpcError(req, id, .internal, "failed to serialize tool error");
         var w = std.Io.Writer.fixed(self.resp_buf[0..]);
-        const ok = blk: {
-            mcp.writeResultPrefix(&w, id) catch break :blk false;
-            w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":") catch break :blk false;
-            std.json.Stringify.encodeJsonString(bw.buffered(), wire.stringify_options, &w) catch break :blk false;
-            w.writeAll("}],\"isError\":true}") catch break :blk false;
-            mcp.writeResultSuffix(&w) catch break :blk false;
-            break :blk true;
-        };
-        if (!ok) return self.respondRpcError(req, id, .internal, "response too large");
+        mcp.writeTextResult(&w, id, bw.buffered(), true) catch return self.respondRpcError(req, id, .internal, "response too large");
         self.respondJson(req, .ok, w.buffered());
     }
 
@@ -1949,17 +1931,8 @@ pub const Conn = struct {
                 self.respondRpcError(req, id, .invalid_params, "load expects {drive?,file?,cmdtail?}");
                 return null;
             };
-            if (r.drive) |d| recipe.drive = d;
-            if (r.file) |f| {
-                const n = @min(f.len, recipe.file.len);
-                @memcpy(recipe.file[0..n], f[0..n]);
-                recipe.file_len = @intCast(n);
-            }
-            if (r.cmdtail) |ct| {
-                const n = @min(ct.len, recipe.cmdtail.len);
-                @memcpy(recipe.cmdtail[0..n], ct[0..n]);
-                recipe.cmdtail_len = @intCast(n);
-            }
+            // The SAME overlay the HTTP `handleLoad` applies (anti-drift).
+            recipe.overlay(r);
         }
         session.recipe = recipe;
         return .{ .load = recipe.toCmd() };
@@ -2279,28 +2252,22 @@ pub const Conn = struct {
     /// Write one device group by name into `w`; returns false (writing nothing) when the
     /// name is unknown. The ONE name→field dispatch authority, shared by the HTTP
     /// `/api/device/<name>` route (404 on false) and the MCP `read_devices {device}`
-    /// selector via `writeResponseBody`.
+    /// selector via `writeResponseBody`. Dispatch is driven off the SINGLE canonical group
+    /// list `mcp_tools.device_groups` — the SAME list the pure `buildCommand` pre-rejects
+    /// an unknown group with (-32602) — so the two can never drift (was a hand-kept "keep
+    /// in sync" pair). Each group name is also its `DevicesSnapshot` field name, so the
+    /// comptime `@field(snap, g)` selects the typed sub-snapshot; `inline for` over the
+    /// comptime list keeps `g` (and so the field access) comptime-known. An unknown name
+    /// returns false here (the HTTP route 404s); the MCP path never reaches here for one,
+    /// since `buildCommand` already rejected it as -32602.
     fn writeNamedDevice(self: *Conn, w: *std.Io.Writer, snap: debug.DevicesSnapshot, name: []const u8) std.Io.Writer.Error!bool {
-        if (std.mem.eql(u8, name, "a20")) {
-            try self.writeValue(w, snap.a20);
-        } else if (std.mem.eql(u8, name, "pic")) {
-            try self.writeValue(w, snap.pic);
-        } else if (std.mem.eql(u8, name, "pit")) {
-            try self.writeValue(w, snap.pit);
-        } else if (std.mem.eql(u8, name, "vga")) {
-            try self.writeValue(w, snap.vga);
-        } else if (std.mem.eql(u8, name, "kbc")) {
-            try self.writeValue(w, snap.kbc);
-        } else if (std.mem.eql(u8, name, "speaker")) {
-            try self.writeValue(w, snap.speaker);
-        } else if (std.mem.eql(u8, name, "opl")) {
-            try self.writeValue(w, snap.opl);
-        } else if (std.mem.eql(u8, name, "ems")) {
-            try self.writeValue(w, snap.ems);
-        } else {
-            return false;
+        inline for (mcp_tools.device_groups) |g| {
+            if (std.mem.eql(u8, name, g)) {
+                try self.writeValue(w, @field(snap, g));
+                return true;
+            }
         }
-        return true;
+        return false;
     }
 
     /// `{"port":N,"value":"0xNN"|null,"shadow":true,"note":"..."}` — the I/O-port
@@ -2317,25 +2284,14 @@ pub const Conn = struct {
         try w.writeAll("\"note\":\"non-mutating view; a live IN may differ for stateful ports (DAC index advance, FIFO pop, AC flip-flop)\"}");
     }
 
-    fn respondIoShadow(self: *Conn, req: *http.Server.Request, io: debug.IoShadow) void {
-        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
-        self.writeIoShadow(&w, io) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
-        self.respondJson(req, .ok, w.buffered());
-    }
-
     /// Pure body-builder (mcp-plan.md §3.2): write `v` as the project-standard JSON into
-    /// `w`. The HTTP `respondValue` wrapper and `handleMcp` (the MCP front-end) BOTH call
-    /// this, so the bytes are byte-identical across the two transports (the anti-drift
-    /// requirement, pinned by the equivalence tests). No host time, no allocation.
+    /// `w`. Reached through the shared `writeResponseBody` from BOTH the HTTP serializer and
+    /// the MCP `handleMcpToolCall` front-end, so the bytes are byte-identical across the two
+    /// transports (the anti-drift requirement, pinned by the equivalence tests). No host
+    /// time, no allocation.
     fn writeValue(self: *Conn, w: *std.Io.Writer, v: anytype) std.Io.Writer.Error!void {
         _ = self;
         try std.json.Stringify.value(v, wire.stringify_options, w);
-    }
-
-    fn respondValue(self: *Conn, req: *http.Server.Request, status: http.Status, v: anytype) void {
-        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
-        self.writeValue(&w, v) catch return self.respondError(req, .service_unavailable, "internal", "response too large to serialize");
-        self.respondJson(req, status, w.buffered());
     }
 
     fn writeBpList(self: *Conn, w: *std.Io.Writer, l: q.BpListResult) std.Io.Writer.Error!void {
@@ -2346,12 +2302,6 @@ pub const Conn = struct {
         try w.writeAll("}");
     }
 
-    fn respondBpList(self: *Conn, req: *http.Server.Request, l: q.BpListResult) void {
-        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
-        self.writeBpList(&w, l) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
-        self.respondJson(req, .ok, w.buffered());
-    }
-
     fn writeRegions(self: *Conn, w: *std.Io.Writer, rg: q.RegionsResult) std.Io.Writer.Error!void {
         _ = self;
         try w.writeAll("{\"regions\":");
@@ -2359,27 +2309,16 @@ pub const Conn = struct {
         try w.writeAll("}");
     }
 
-    fn respondRegions(self: *Conn, req: *http.Server.Request, rg: q.RegionsResult) void {
-        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
-        self.writeRegions(&w, rg) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
-        self.respondJson(req, .ok, w.buffered());
-    }
-
     /// Pure body-builder (mcp-plan.md §3.2) for a memory peek: `{"phys":N,"len":N,
-    /// "data":"<hex>"}`. Shared by the HTTP `respondMem` wrapper and `handleMcp` so the
-    /// `read_memory` tool body == the `GET /api/mem` body byte-for-byte (anti-drift).
+    /// "data":"<hex>"}`. Reached via the shared `writeResponseBody` from both the HTTP
+    /// serializer and the MCP front-end, so the `read_memory` tool body == the
+    /// `GET /api/mem` body byte-for-byte (anti-drift).
     fn writeMem(self: *Conn, w: *std.Io.Writer, mr: q.MemResult) std.Io.Writer.Error!void {
         _ = self;
         var hex_buf: [q.MAX_MEM_CHUNK * 2]u8 = undefined;
         // `mr.len` is worker-bounded to MAX_MEM_CHUNK, so the encode never overflows.
         const hex = wire.hexEncode(&hex_buf, mr.bytes[0..mr.len]) catch unreachable;
         try w.print("{{\"phys\":{d},\"len\":{d},\"data\":\"{s}\"}}", .{ mr.phys, mr.len, hex });
-    }
-
-    fn respondMem(self: *Conn, req: *http.Server.Request, mr: q.MemResult) void {
-        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
-        self.writeMem(&w, mr) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
-        self.respondJson(req, .ok, w.buffered());
     }
 
     fn writeConsole(self: *Conn, w: *std.Io.Writer, cr: q.ConsoleResult) std.Io.Writer.Error!void {
@@ -2390,12 +2329,6 @@ pub const Conn = struct {
         var hex_buf: [q.MAX_CONSOLE * 2]u8 = undefined;
         const hex = wire.hexEncode(&hex_buf, cr.bytes[0..cr.len]) catch unreachable;
         try w.print("{{\"len\":{d},\"data\":\"{s}\"}}", .{ cr.len, hex });
-    }
-
-    fn respondConsole(self: *Conn, req: *http.Server.Request, cr: q.ConsoleResult) void {
-        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
-        self.writeConsole(&w, cr) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
-        self.respondJson(req, .ok, w.buffered());
     }
 
     /// Serialize a text-screen grid (§4.1). `text` = `rows` rows joined by '\n',
@@ -2479,23 +2412,11 @@ pub const Conn = struct {
         try w.writeAll("]}");
     }
 
-    fn respondDisasm(self: *Conn, req: *http.Server.Request, dr: debug.DisasmResult) void {
-        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
-        self.writeDisasm(&w, dr) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
-        self.respondJson(req, .ok, w.buffered());
-    }
-
     fn writeStack(self: *Conn, w: *std.Io.Writer, s: q.StackResult) std.Io.Writer.Error!void {
         _ = self;
         try w.print("{{\"count\":{d},\"words\":", .{s.count});
         try std.json.Stringify.value(s.words[0..s.count], wire.stringify_options, w);
         try w.writeAll("}");
-    }
-
-    fn respondStack(self: *Conn, req: *http.Server.Request, s: q.StackResult) void {
-        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
-        self.writeStack(&w, s) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
-        self.respondJson(req, .ok, w.buffered());
     }
 
     // -----------------------------------------------------------------------

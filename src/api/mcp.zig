@@ -102,6 +102,35 @@ pub fn writeResultSuffix(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("}");
 }
 
+/// Frame a tool-call reply whose payload is a SINGLE text content block:
+/// `{"jsonrpc":"2.0","id":<id>,"result":{"content":[{"type":"text","text":<inner>}],
+///  "isError":<is_error>}}`. `inner_body` is itself JSON text (a serialized tool result,
+/// OR an `{"error":{...}}` object from `writeErrorContent`) and is JSON-escaped into the
+/// `text` field. The ONE framer all THREE tool-result sites share — the
+/// `handleMcpToolCall` success arm, its emulator-`.err` arm, and `respondMcpToolError` —
+/// so the envelope can never drift between them (the anti-drift requirement the MCP↔HTTP
+/// equivalence tests pin). `is_error` is emitted as the JSON literal `true`/`false`.
+/// PURE: only std, no host time, no allocation on the write path.
+pub fn writeTextResult(w: *std.Io.Writer, id: ?Id, inner_body: []const u8, is_error: bool) std.Io.Writer.Error!void {
+    try writeResultPrefix(w, id);
+    try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
+    try std.json.Stringify.encodeJsonString(inner_body, .{}, w);
+    try w.print("}}],\"isError\":{s}}}", .{if (is_error) "true" else "false"});
+    try writeResultSuffix(w);
+}
+
+/// Build the INNER emulator-domain error content body shared by the two `isError` tool-
+/// result sites: `{"error":{"code":"<code>","message":<msg>}}`. `code` is a STABLE string
+/// code (e.g. `not_implemented` — NOT a JSON-RPC numeric code, which is `writeErrorEnvelope`)
+/// drawn from the controlled `errInfo`/screenshot set, so it is emitted verbatim inside the
+/// quotes (matching both prior hand-built copies byte-for-byte); `msg` is JSON-escaped. The
+/// caller frames this object into a text content block via `writeTextResult(..,true)`. PURE.
+pub fn writeErrorContent(w: *std.Io.Writer, code: []const u8, msg: []const u8) std.Io.Writer.Error!void {
+    try w.print("{{\"error\":{{\"code\":\"{s}\",\"message\":", .{code});
+    try std.json.Stringify.encodeJsonString(msg, .{}, w);
+    try w.writeAll("}}");
+}
+
 /// A complete JSON-RPC error envelope:
 /// `{"jsonrpc":"2.0","id":<id>,"error":{"code":<n>,"message":<msg>}}`. Used ONLY for
 /// protocol-level failures (parse/invalid-request/method-not-found/invalid-params/
