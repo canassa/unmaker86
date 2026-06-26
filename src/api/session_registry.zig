@@ -68,7 +68,7 @@ pub const CreateError = error{ SessionLimitReached, ProgramNotFound, BootFailed 
 /// that needs the id (e.g. `initialize` echoing the `Mcp-Session-Id` header) must read it
 /// from THIS value copy and MUST NOT dereference `session` after the call (the pointer is
 /// only safe to deref while the caller holds a refcount, which `create` does not take).
-pub const CreateResult = struct { session: *Session, id: SessionId };
+pub const CreateResult = struct { session: *Session, id: SessionId, mult: u64 };
 
 pub const SessionRegistry = struct {
     gpa: std.mem.Allocator,
@@ -146,7 +146,11 @@ pub const SessionRegistry = struct {
     /// and the final map insert take the lock.
     /// `cpu_mult` is applied to the fresh machine on THIS (create) thread — uncontended,
     /// after `boot` and BEFORE the worker spawn, so it is a deterministic input at a fixed
-    /// post-boot cycle (the live-clock approach (B), no host clock/RNG/float). `owns_mount`
+    /// post-boot cycle (the live-clock approach (B), no host clock/RNG/float). A `cpu_mult`
+    /// of `0` means "no override": `setCpuMult` is SKIPPED so the machine keeps its exact
+    /// boot-default clock (byte-identical to the inline `--serve` default). The applied mult
+    /// (clamped, or the machine default when skipped) rides back in `CreateResult.mult` so
+    /// the caller echoes it without re-deriving the clamp. `owns_mount`
     /// records whether the new session OWNS its `mount_dir` fd (a `provision_machine` opens
     /// a fresh dir → `true`; an `initialize` clone of the default shares `main.zig`'s dir →
     /// `false`); `teardown` closes the fd iff owned (the §5 fd-leak fix).
@@ -194,7 +198,12 @@ pub const SessionRegistry = struct {
         // Apply the requested CPU:PIT multiplier now (uncontended — no worker yet), exactly
         // as a `set_clock` would on the worker, but at this fixed post-boot cycle. Integer-
         // only, clamped to `[1, MAX_MULT]`; the applied value rides the machine snapshot.
-        _ = ctrl.setCpuMult(cpu_mult);
+        // `cpu_mult == 0` is the "no override" sentinel: SKIP `setCpuMult` entirely so the
+        // machine keeps its EXACT boot-default clock state (no extra `syncDeviceTime`),
+        // making a no-cpu provision provably byte-identical to the inline `--serve` default
+        // (which never calls `setCpuMult`). The echoed `applied_mult` is the clamped value
+        // when overridden, else the machine's actual default (a cycle-neutral read).
+        const applied_mult: u64 = if (cpu_mult != 0) ctrl.setCpuMult(cpu_mult) else ctrl.clockMult();
 
         // The Session block (its own heap address; the worker captures `&session.queue`).
         const session = try self.gpa.create(Session);
@@ -238,7 +247,7 @@ pub const SessionRegistry = struct {
         self.mutex.unlock(self.io);
         // Return the id by VALUE; the caller must NOT dereference `session` (a concurrent
         // DELETE may already have freed it now that it is published un-refcounted).
-        return .{ .session = session, .id = minted_id };
+        return .{ .session = session, .id = minted_id, .mult = applied_mult };
     }
 
     /// Route an `Mcp-Session-Id` to its session, bumping the in-flight refcount + the LRU

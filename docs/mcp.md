@@ -194,7 +194,10 @@ out of range), not the call.
 ```
 
 Tool error codes: `breakpoint_table_full`, `no_such_breakpoint`, `address_out_of_range`,
-`out_of_range`, `bad_request`, `not_implemented`, `load_failed`, `input_buffer_full`.
+`out_of_range`, `bad_request`, `not_implemented`, `load_failed`, `input_buffer_full`,
+`machine_limit_reached` (at the machine cap — deprovision one or `list_machines`),
+`unknown_machine` (deprovision/route of an unknown/already-gone handle), `no_machine`
+(a per-machine call with no `machine` and no default — `provision_machine` first).
 
 ## Machines
 

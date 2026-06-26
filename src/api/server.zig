@@ -1805,12 +1805,14 @@ pub const Conn = struct {
             if (t.len > 127) return self.respondRpcError(req, id, .invalid_params, "cmdtail too long (max 127)");
             break :tail t;
         };
-        // `cpu` reuses the SHARED `mapCpuSpeed` (mult-xor-mhz); omitted → the boot multiplier.
+        // `cpu` reuses the SHARED `mapCpuSpeed` (mult-xor-mhz); omitted → `0`, the registry's
+        // "no override" sentinel: `create` then SKIPS `setCpuMult` so the new machine keeps its
+        // EXACT boot-default clock state (provably byte-identical to the inline `--serve`
+        // default, which never calls `setCpuMult`) — the determinism fix, not a behavior change.
         const cpu_mult: u64 = if (pa.cpu) |c| switch (mcp_tools.mapCpuSpeed(c.mult, c.mhz)) {
             .ok => |m| m,
             .fail => |e| return self.respondRpcError(req, id, .invalid_params, e.message),
-        } else timing.DEFAULT_MULT;
-        const applied_mult: u64 = @min(cpu_mult, timing.MAX_MULT); // what the machine will actually use (the clamp)
+        } else 0;
 
         // Open the mount dir cwd-relative (security/confinement WAIVED — local-only tool,
         // main.zig:104; no serve-root). A bad path / non-directory is a CLIENT error.
@@ -1834,6 +1836,10 @@ pub const Conn = struct {
         // NOT close it here. We use ONLY the id value (never deref `created.session` — a
         // concurrent deprovision could free it the instant it is published, the UAF contract).
         const handle = created.id;
+        // The APPLIED mult (the clamped override, or the machine's default when `cpu` was
+        // omitted) comes back BY VALUE in `created.mult` — accurate without re-deriving the
+        // clamp here, and safe to read (it is not a `created.session` deref, per the UAF contract).
+        const applied_mult = created.mult;
         const live = self.server.registry.liveCount();
 
         var bw = std.Io.Writer.fixed(self.mcp_body_buf[0..]);
