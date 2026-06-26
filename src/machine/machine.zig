@@ -554,11 +554,16 @@ pub const Machine = struct {
     /// re-runs `bios.init`/`dos.init` (the latter wipes the mounted drives via
     /// `dos.init`'s `drives = @splat(null)`) but does NOT re-run `post()` — so after a
     /// reset the machine has no callbacks planted, no DOS arena/IVT, and no mount.
-    /// Calling `boot` re-establishes all of it. PRECONDITION: the machine is at the
-    /// post-`wire`/post-`reset` state (RAM zeroed, bridge allocator fresh) — `post`'s
-    /// `registerCallbacks` allocates ids from a fresh bridge, which `reset`/`wire`
-    /// guarantee. Mirrors what `main.zig` did inline before this method existed.
+    /// Calling `boot` re-establishes all of it. `boot` is IDEMPOTENT: it resets first,
+    /// so `post`'s `registerCallbacks` always allocates ids from a fresh bridge. This
+    /// makes `load` (a worker-side `boot`) safe WITHOUT a preceding `reset` — without
+    /// the reset, re-running `post` re-registered 23 callbacks onto an already-populated
+    /// bridge, overflowing the 128-slot table after ~5 loads (a process-killing panic),
+    /// and resumed over stale RAM/devices (a determinism violation). The reset is an
+    /// idempotent no-op for the fresh-launch callers (`main.zig`/`session_registry`),
+    /// which already `wire` (→reset) immediately before `boot`, so no golden moves.
     pub fn boot(self: *Machine, drive: u8, dir: std.Io.Dir, io: std.Io, host_name: []const u8, cmdtail: []const u8) !void {
+        self.reset(); // establish boot's own precondition (fresh bridge, zeroed RAM/devices)
         self.post();
         self.dos.mountDrive(drive, dir, io);
         self.dos.current_drive = drive;

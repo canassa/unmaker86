@@ -84,3 +84,37 @@ test "Borland C++ 3.1 HELLO.EXE is deterministic across two runs" {
     try std.testing.expectEqual(r1.ret_code, r2.ret_code);
     try std.testing.expectEqual(r1.cycles, r2.cycles);
 }
+
+// Regression: `boot` (the worker-side `load`) must be IDEMPOTENT — re-bootable
+// WITHOUT a preceding `reset`. Before `boot` reset first, each re-boot re-ran
+// `post`'s `registerCallbacks`, accumulating 23 callbacks per boot onto an
+// already-populated bridge; the 128-slot table overflowed after ~5 boots and
+// `allocCallback`'s `assert(count < CB_MAX)` panicked the whole process (taking
+// every session down in the multi-machine server). The fix makes `boot` reset
+// first, so the callback count is pinned across any number of boots.
+test "boot is idempotent: repeated boot without reset does not grow the callback table" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, build_options.dos_examples_dir, .{ .iterate = true });
+    defer dir.close(io);
+
+    const m = try alloc.create(Machine);
+    defer {
+        m.deinit();
+        alloc.destroy(m);
+    }
+    try m.init(alloc, &.{});
+    m.wire();
+
+    // First boot establishes the baseline callback count.
+    try m.boot(2, dir, io, "HELLO.EXE", "");
+    const baseline = m.svc.bridge.count;
+
+    // Boot many more times with NO intervening reset. Pre-fix this panicked around
+    // the 5th boot; with the fix the count stays pinned at the baseline every time.
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        try m.boot(2, dir, io, "HELLO.EXE", "");
+        try std.testing.expectEqual(baseline, m.svc.bridge.count);
+    }
+}
