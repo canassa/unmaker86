@@ -41,6 +41,13 @@ test "StopReason golden: a memory watchpoint hit carries the access detail" {
     , try ser(r));
 }
 
+test "StopReason golden: target_reached carries at_cycle (distinct from breakpoint)" {
+    const r: StopReason = .{ .target_reached = .{ .at_cycle = 12 } };
+    try std.testing.expectEqualStrings(
+        \\{"target_reached":{"at_cycle":12}}
+    , try ser(r));
+}
+
 test "StopReason golden: u64 at_cycle > 2^53 emits as a JSON string (R6)" {
     const big: u64 = (1 << 53) + 1; // 9007199254740993 — outside f64 exact range
     const r: StopReason = .{ .step_complete = .{ .at_cycle = big } };

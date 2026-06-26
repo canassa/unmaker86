@@ -410,6 +410,55 @@ test "tools/call add_breakpoint returns an id" {
     try std.testing.expectEqual(@as(i64, 0), inner.root.object.get("id").?.integer);
 }
 
+test "tools/call set_register WITH a machine arg accepts a valid union arm (regression)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+
+    const h = try provisionHandle(&ts, std.testing.allocator, build_options.examples_dir, "HELLO.COM", "");
+    defer std.testing.allocator.free(h);
+
+    // Set bx = 4660 (0x1234) on the provisioned machine. The `machine` routing arg is
+    // present ALONGSIDE the union arm — the case that broke union parsing → -32602 for
+    // every arm (a `union(enum)` must be a single-key object; the stray `machine` made it
+    // multi-key). Must SUCCEED now (the routing strips `machine` before the per-tool parse).
+    var sbuf: [512]u8 = undefined;
+    const set = std.fmt.bufPrint(&sbuf, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"set_register\",\"arguments\":{{\"machine\":\"{s}\",\"reg16\":{{\"name\":\"bx\",\"value\":4660}}}}}}}}", .{h}) catch unreachable;
+    const r = mcpPost(&ts, set, null, &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "-32602") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"isError\":false") != null);
+
+    // Read it back via read_cpu routed to the SAME machine: low 16 bits of ebx == 4660.
+    var rbuf: [512]u8 = undefined;
+    const read = std.fmt.bufPrint(&rbuf, "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"read_cpu\",\"arguments\":{{\"machine\":\"{s}\"}}}}}}", .{h}) catch unreachable;
+    const rc = mcpPost(&ts, read, null, &obuf);
+    try std.testing.expectEqual(@as(u16, 200), rc.status);
+    var nav = try Nav.parse(std.testing.allocator, rc.body);
+    defer nav.deinit();
+    const text = nav.root.object.get("result").?.object.get("content").?.array.items[0].object.get("text").?.string;
+    var inner = try Nav.parse(std.testing.allocator, text);
+    defer inner.deinit();
+    const ebx: u64 = @intCast(inner.root.object.get("ebx").?.integer);
+    try std.testing.expectEqual(@as(u64, 4660), ebx & 0xffff);
+}
+
+test "tools/call set_register WITH a machine arg still rejects a malformed (zero-arm) union" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+
+    const h = try provisionHandle(&ts, std.testing.allocator, build_options.examples_dir, "HELLO.COM", "");
+    defer std.testing.allocator.free(h);
+
+    // After stripping `machine`, the union has ZERO arms left → genuine -32602 (the strip
+    // must not paper over real validation failures).
+    var sbuf: [512]u8 = undefined;
+    const set = std.fmt.bufPrint(&sbuf, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"set_register\",\"arguments\":{{\"machine\":\"{s}\"}}}}}}", .{h}) catch unreachable;
+    const r = mcpPost(&ts, set, null, &obuf);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "-32602") != null);
+}
+
 // ===========================================================================
 // Screenshot — the deferred framebuffer feature (mcp-plan.md §7): an MCP IMAGE
 // content block carrying a base64 PNG, streamed with an exact Content-Length. The

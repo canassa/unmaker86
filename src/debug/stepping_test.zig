@@ -80,6 +80,46 @@ test "#5 step == run equivalence: runToCycle(N) vs stepInstruction until >= N" {
     try std.testing.expectEqualSlices(u8, run_ram, ms.bus.ram);
 }
 
+test "runToCycle reports target_reached (a dedicated reason, not a leaked breakpoint)" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    loadArithProg(m);
+    var ctrl = Controller.init(m);
+    const N: u64 = 12;
+    const r = try ctrl.runToCycle(N);
+    switch (r) {
+        .target_reached => |t| try std.testing.expect(t.at_cycle >= N),
+        else => return error.WrongStopReason, // must NOT be a `.breakpoint`
+    }
+    // The internal one-shot was discarded — nothing leaked into the user id-space.
+    try std.testing.expectEqual(@as(u32, 0), ctrl.set.active_count);
+    // The next user breakpoint claims slot 0 (the one-shot's slot was freed, not held).
+    const uid = try ctrl.addBreakpoint(.{ .cycle = .{ .at_cycle = 0 } }, false);
+    try std.testing.expectEqual(@as(u32, 0), uid);
+}
+
+test "runToCycle whose target coincides with a USER breakpoint reports the user breakpoint" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    loadArithProg(m);
+    var ctrl = Controller.init(m);
+
+    // A persistent USER cycle breakpoint at the same target. It claims slot 0, so it
+    // is LOWER-id than the internal one-shot runToCycle adds — the ascending-id
+    // tie-break makes the user breakpoint win, and only the internal one-shot would
+    // have been translated, so this still reports as `.breakpoint`.
+    const target: u64 = 12;
+    const uid = try ctrl.addBreakpoint(.{ .cycle = .{ .at_cycle = target } }, false);
+    try std.testing.expectEqual(@as(u32, 0), uid);
+    const r = try ctrl.runToCycle(target);
+    switch (r) {
+        .breakpoint => |hit| try std.testing.expectEqual(uid, hit.id),
+        else => return error.WrongStopReason, // a USER bp at the same cycle still wins
+    }
+}
+
 test "runToCycle in the past returns immediately with cycle_budget_exhausted" {
     const alloc = std.testing.allocator;
     const m = try makeMachine(alloc);
@@ -96,6 +136,46 @@ test "runToCycle in the past returns immediately with cycle_budget_exhausted" {
     try std.testing.expectEqual(cyc, m.cpu.st.cycles); // no step taken
 }
 
+test "runToAddress reports target_reached (a dedicated reason, not a leaked breakpoint)" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    loadArithProg(m);
+    var ctrl = Controller.init(m);
+    // CS base is 0, so the linear target is just the offset of the INC AX at 0x0506.
+    const target: u32 = PROG + 6;
+    const r = try ctrl.runToAddress(target);
+    switch (r) {
+        .target_reached => {},
+        else => return error.WrongStopReason, // must NOT be a leaked `.breakpoint`
+    }
+    // The internal one-shot was discarded — nothing leaked into the user id-space.
+    try std.testing.expectEqual(@as(u32, 0), ctrl.set.active_count);
+    // The next user breakpoint claims slot 0 (the one-shot's slot was freed, not held).
+    const uid = try ctrl.addBreakpoint(.{ .cycle = .{ .at_cycle = 0 } }, false);
+    try std.testing.expectEqual(@as(u32, 0), uid);
+}
+
+test "runToAddress whose target coincides with a USER breakpoint reports the user breakpoint" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    loadArithProg(m);
+    var ctrl = Controller.init(m);
+
+    // A persistent USER execution breakpoint at the same target. It claims slot 0, so it
+    // is LOWER-id than the internal one-shot runToAddress adds — the ascending-id tie-break
+    // makes the user breakpoint win, so this still reports as `.breakpoint`.
+    const target: u32 = PROG + 6;
+    const uid = try ctrl.addBreakpoint(.{ .execution_address = .{ .linear = target } }, false);
+    try std.testing.expectEqual(@as(u32, 0), uid);
+    const r = try ctrl.runToAddress(target);
+    switch (r) {
+        .breakpoint => |hit| try std.testing.expectEqual(uid, hit.id),
+        else => return error.WrongStopReason, // a USER bp at the same address still wins
+    }
+}
+
 test "stepInstruction on an already-terminal machine does not step" {
     const alloc = std.testing.allocator;
     const m = try makeMachine(alloc);
@@ -109,6 +189,87 @@ test "stepInstruction on an already-terminal machine does not step" {
     const r = ctrl.stepInstruction();
     try std.testing.expectEqual(@as(std.meta.Tag(debug.StopReason), .halted_forever), std.meta.activeTag(r));
     try std.testing.expectEqual(cyc, m.cpu.st.cycles); // ledger untouched (no hole)
+}
+
+// ---- Bug 3: single-step must fire breakpoints/watchpoints (step == step_n(1)) --
+
+// A program whose SECOND instruction stores a byte to a known data address WSTORE.
+//   0500: B0 AB        MOV AL, 0xAB
+//   0502: 88 06 34 12  MOV [0x1234], AL    (write to WSTORE)
+//   0506: F4           HLT
+const STOREPROG: u32 = 0x0500;
+const STORE_INSN: u32 = 0x0502;
+const AFTER_STORE: u32 = 0x0506;
+const WSTORE: u32 = 0x1234;
+fn loadStoreProg(m: *Machine) void {
+    const b = &m.bus;
+    const code = [_]u8{
+        0xB0, 0xAB, // MOV AL, 0xAB
+        0x88, 0x06, 0x34, 0x12, // MOV [0x1234], AL
+        0xF4, // HLT
+    };
+    for (code, 0..) |byte, i| b.writePhys8(STOREPROG + @as(u32, @intCast(i)), byte);
+    m.cpu.loadSegment(.cs, 0);
+    m.cpu.loadSegment(.ds, 0);
+    m.cpu.loadSegment(.ss, 0);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.esp), 0x7000);
+    m.cpu.st.eip = STOREPROG;
+}
+
+test "Bug3(a) stepInstruction fires a memory watchpoint on the step's write" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    loadStoreProg(m);
+    var ctrl = Controller.init(m);
+    _ = try ctrl.addBreakpoint(.{ .memory = .{ .linear = WSTORE, .len = 1, .access = .write } }, false);
+
+    // First single step: MOV AL,0xAB — no write, so step_complete (control: a quiet step).
+    switch (ctrl.stepInstruction()) {
+        .step_complete => {},
+        else => return error.WrongStopReason,
+    }
+    try std.testing.expectEqual(@as(u32, STORE_INSN), m.cpu.st.eip);
+
+    // Second single step: the store. A single `step` MUST scan the watch (step == step_n(1)),
+    // so it reports the breakpoint carrying the memory watch detail — NOT a silent step_complete.
+    const r = ctrl.stepInstruction();
+    switch (r) {
+        .breakpoint => |hit| {
+            const w = hit.watch orelse return error.WrongStopReason;
+            try std.testing.expectEqual(@as(u32, WSTORE), w.addr);
+            try std.testing.expectEqual(@as(u8, 0xAB), m.bus.peekPhys8(WSTORE)); // the store landed
+        },
+        else => return error.WrongStopReason, // currently step_complete (the bug)
+    }
+}
+
+test "Bug3(b) stepInstruction reports an execution breakpoint the step lands on" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    loadStoreProg(m);
+    var ctrl = Controller.init(m);
+    // Breakpoint at the address the FIRST step lands on (after MOV AL,0xAB → 0x0502).
+    const uid = try ctrl.addBreakpoint(.{ .execution_address = .{ .linear = STORE_INSN } }, false);
+    const r = ctrl.stepInstruction();
+    switch (r) {
+        .breakpoint => |hit| try std.testing.expectEqual(uid, hit.id),
+        else => return error.WrongStopReason, // currently step_complete (the bug)
+    }
+}
+
+test "Bug3 control: a step with no breakpoint/watch still returns step_complete" {
+    const alloc = std.testing.allocator;
+    const m = try makeMachine(alloc);
+    defer destroy(alloc, m);
+    loadStoreProg(m);
+    var ctrl = Controller.init(m);
+    // No breakpoints armed: the common case must stay step_complete.
+    switch (ctrl.stepInstruction()) {
+        .step_complete => |s| try std.testing.expect(s.at_cycle > 0),
+        else => return error.WrongStopReason,
+    }
 }
 
 // ---- #15 stepOver -------------------------------------------------------------

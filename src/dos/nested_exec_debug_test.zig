@@ -330,7 +330,9 @@ test "cycle breakpoint / run-to-cycle stops AT N inside the child (no overshoot)
     const target = write_cycle - 10; // a cycle strictly inside the child
     const r = try ctrl.runToCycle(target);
     switch (r) {
-        .breakpoint => |hit| {
+        // runToCycle surfaces its own dedicated reason (the internal one-shot's id
+        // never leaks as a `.breakpoint`).
+        .target_reached => |hit| {
             try std.testing.expect(hit.at_cycle >= target);
             try std.testing.expect(hit.at_cycle < write_cycle); // did NOT overshoot
             try std.testing.expect(ctx.inChild());

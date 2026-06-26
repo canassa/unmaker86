@@ -38,6 +38,7 @@ pub const StopTag = enum(u8) {
     breakpoint,
     step_complete,
     cycle_budget_exhausted,
+    target_reached,
     halted_forever,
     program_terminated,
     shutdown,

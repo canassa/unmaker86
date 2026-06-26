@@ -86,6 +86,17 @@ pub const StopReason = union(enum) {
     step_complete: struct { at_cycle: u64 },
     /// The cycle cap was reached with no terminal/breakpoint.
     cycle_budget_exhausted: struct { at_cycle: u64 },
+    /// `runToCycle` reached its requested TARGET cycle: the machine ran up to the
+    /// first boundary where `cpu.cycles >= at_cycle` (the internal one-shot `.cycle`
+    /// breakpoint `runToCycle` armed fired). A DEDICATED reason — distinct from
+    /// `breakpoint` — so a consumer can tell "reached my target cycle" from "hit a
+    /// USER breakpoint", and the internal one-shot's id never leaks into the user
+    /// id-space. A USER breakpoint that matches at the SAME boundary with a LOWER id
+    /// still wins the ascending-id tie-break and reports as `breakpoint`; only the
+    /// internal one-shot's own hit is translated to this. Non-terminal (the machine
+    /// is paused, not stopped) and reporting-only — it changes which REASON is
+    /// surfaced, never which cycles ran or any guest state.
+    target_reached: struct { at_cycle: u64 },
     /// Deterministic permanent HLT (no pending events, not wakeable).
     halted_forever: struct { at_cycle: u64 },
     /// The DOS program terminated (INT 21h AH=4C / INT 20h). `ret_code` is the
@@ -576,10 +587,19 @@ pub const Controller = struct {
     pub fn stepInstruction(self: *Controller) StopReason {
         self.last_stop = null;
         if (self.terminalReason()) |r| return self.record(r);
+        // `step` == `step_n(1)`: capture the pre-step sequence counters, retire one
+        // instruction, then SCAN breakpoints/watchpoints so a single step over a watched
+        // write — or onto an execution breakpoint — fires it (the universal debugger
+        // convention) instead of silently dropping the event. Stepping OFF an exec bp does
+        // not re-trigger it (zdos reports exec bps on the PC AFTER the step), so there is no
+        // re-trigger loop. Mirrors `stepN`'s single-iteration logic exactly.
+        const seq_before = bp.seqBefore(self.m);
         _ = self.m.step();
         // A step may itself reach a terminal (e.g. the instruction was HLT with no
-        // events, or it triple-faulted) — surface that, else step_complete.
+        // events, or it triple-faulted) — surface that, else a fired breakpoint, else
+        // step_complete.
         if (self.terminalReason()) |r| return self.record(r);
+        if (self.scanBreakpoints(seq_before)) |r| return self.record(r);
         return self.record(.{ .step_complete = .{ .at_cycle = self.m.cpu.st.cycles } });
     }
 
@@ -609,7 +629,18 @@ pub const Controller = struct {
         }
         const id = try self.set.add(.{ .cycle = .{ .at_cycle = c } }, true);
         defer self.discardOneShot(id);
-        return self.runUntilEvent(std.math.maxInt(u64));
+        const r = self.runUntilEvent(std.math.maxInt(u64));
+        // Translate OUR internal one-shot's hit into the dedicated `target_reached`
+        // reason. The id is unique to this slot for the call's duration (added above,
+        // defer-removed), so the equality test is exact: a USER breakpoint matching at
+        // the SAME boundary has a DIFFERENT id (a lower id wins the ascending-id
+        // tie-break in `scanBreakpoints` and is reported here unchanged as
+        // `breakpoint`). Pure reporting — the ledger is exactly where `runUntilEvent`
+        // left it; no cycle runs and no guest state changes.
+        if (r == .breakpoint and r.breakpoint.id == id) {
+            return self.record(.{ .target_reached = .{ .at_cycle = r.breakpoint.at_cycle } });
+        }
+        return r;
     }
 
     /// Set a one-shot `execution_address` breakpoint at `linear`, then
@@ -617,7 +648,17 @@ pub const Controller = struct {
     pub fn runToAddress(self: *Controller, linear: u32) Error!StopReason {
         const id = try self.set.add(.{ .execution_address = .{ .linear = linear } }, true);
         defer self.discardOneShot(id);
-        return self.runUntilEvent(std.math.maxInt(u64));
+        const r = self.runUntilEvent(std.math.maxInt(u64));
+        // Translate OUR internal one-shot's hit into the dedicated `target_reached` reason
+        // (exactly like `runToCycle`). The id is unique to this slot for the call's duration
+        // (added above, defer-removed), so the equality test is exact: a USER breakpoint at
+        // the SAME address has a DIFFERENT id — a lower id wins the ascending-id tie-break in
+        // `scanBreakpoints` and is reported here unchanged as `breakpoint`. Pure reporting —
+        // the ledger is exactly where `runUntilEvent` left it; no cycle runs, no state changes.
+        if (r == .breakpoint and r.breakpoint.id == id) {
+            return self.record(.{ .target_reached = .{ .at_cycle = r.breakpoint.at_cycle } });
+        }
+        return r;
     }
 
     /// Remove a transient one-shot used by run-to/step-over (idempotent: it may

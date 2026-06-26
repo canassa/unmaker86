@@ -138,12 +138,12 @@ first. See *Machines* below.
 ### Inspection
 | tool | arguments | does |
 |---|---|---|
-| `read_screen` | `{attrs?}` | active VGA text page (char grid + cursor/mode); `attrs=true` also returns the per-cell attribute bytes as hex. |
+| `read_screen` | `{attrs?}` | active VGA text page (char grid + cursor/mode); `attrs=true` also returns the per-cell attribute bytes as hex. Note: DOS INT 21h console output (AH=02/06/09) does **not** appear here — read it via `read_console` (see Notes). |
 | `screenshot` | `{}` | capture the current video frame as a PNG, returned as an **image** content block (`mimeType: image/png`, `data` = base64 PNG). Re-renders the live VGA mode deterministically (same machine state ⇒ byte-identical PNG). A video mode with no faithful rasterizer returns an `isError` `not_implemented` result rather than a fabricated frame. |
 | `read_devices` | `{palette?, device?}` | grouped chipset/A20/device snapshot. `palette=true` widens the VGA DAC palette; `device` selects one group (`a20`/`pic`/`pit`/`vga`/`kbc`/`speaker`/`opl`/`ems`). |
 | `read_stack` | `{count}` | read `count` 16-bit words from SS:SP. |
 | `read_ivt` | `{vector}` | read one real-mode interrupt vector (0..255): its segment:offset. |
-| `read_console` | `{}` | the guest's accumulated CON output as hex (side-effect-free — no clear-on-read). |
+| `read_console` | `{}` | the guest's accumulated CON output as hex (side-effect-free — no clear-on-read). DOS INT 21h console writes (AH=02/06/09) surface **here**, not on the `read_screen`/`screenshot` text page (see Notes). |
 | `read_io_port` | `{port}` | the non-mutating shadow of one I/O port (never a live, stateful IN). |
 
 ### Input injection (scripted / deterministic)
@@ -279,5 +279,12 @@ curl -s http://127.0.0.1:8099/mcp -H 'content-type: application/json' -d \
   block (a base64 PNG, streamed with an exact `Content-Length` so it never buffers). The
   **raw** framebuffer (index/rgba binary, 64 KiB–1.2 MiB) is not exposed over MCP — it does
   not fit a JSON-RPC result; use the HTTP `/api/framebuffer` route for raw pixels.
+- **DOS console output vs. the screen:** DOS INT 21h character output (AH=02 print char,
+  AH=06 direct console I/O, AH=09 print `$`-string) is recorded deterministically to the CON
+  device's output buffer and surfaced by `read_console` — it is **not** written to the VGA
+  text page, so `read_screen`/`screenshot` will not show it. (zdos records CON output rather
+  than rendering it through the BIOS teletype to the text page; the full teletype path is not
+  yet implemented.) Programs that draw directly to the text page (BIOS INT 10h / direct
+  B800h writes) do appear on `read_screen`/`screenshot` as expected.
 - Every tool maps to the same worker `q.Command` the HTTP API uses; the JSON bodies are
   pinned byte-identical to the matching HTTP route by the equivalence tests.

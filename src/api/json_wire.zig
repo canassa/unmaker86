@@ -59,7 +59,8 @@ pub const CpuSpeedReq = struct { mult: ?u64 = null, mhz: ?u64 = null };
 
 /// `POST /api/breakpoints` — `kind` is the discriminated `BreakpointKind`
 /// (`{"execution_address":{"linear":N}}`, etc.); parsed by std.json's default
-/// tagged-union decoding. `io` parses but the handler rejects it (501).
+/// tagged-union decoding. All five kinds (execution_address, cycle, interrupt,
+/// memory, io) are live — the worker arms the bus memory/port watch for memory/io.
 pub const AddBpReq = struct { kind: BreakpointKind, one_shot: bool = false };
 pub const EnableBpReq = struct { enabled: bool };
 

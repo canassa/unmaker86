@@ -1945,7 +1945,7 @@ pub const Conn = struct {
         if (name_v != .string) return self.respondRpcError(req, id, .invalid_params, "name must be a string");
         const name = name_v.string;
         if (mcp_tools.find(name) == null) return self.respondRpcError(req, id, .invalid_params, "unknown tool");
-        const args: std.json.Value = pobj.get("arguments") orelse .null;
+        var args: std.json.Value = pobj.get("arguments") orelse .null;
 
         // The MACHINE-AGNOSTIC lifecycle tools (multi-machine plan §3) are server-special
         // like `load`: they create / destroy / enumerate machines through the registry, so
@@ -1977,6 +1977,15 @@ pub const Conn = struct {
         }
         defer if (pinned) |s| self.server.registry.release(s);
 
+        // STRIP the routing `machine` key from `arguments` before ANY per-tool parse: the
+        // per-machine tools never receive it, so the per-tool struct/union parse sees only
+        // its OWN fields. This is the GENERAL fix (not "ignore_unknown_fields covers it"):
+        // `set_register`'s `wire.RegSetReq` is a `union(enum)`, which std.json requires to be
+        // a SINGLE-key object — `{"machine":...,"reg16":{...}}` is multi-key and fails to
+        // parse → -32602 for every arm. `ignore_unknown_fields` skips extras for STRUCTS only,
+        // so stripping here is the correct uniform fix for all per-tool wires.
+        if (args == .object) _ = args.object.swapRemove("machine");
+
         // `screenshot` is server-special like `load`: it needs the session render buffers
         // AND emits a bespoke (image, streamed) response shape rather than the text
         // content block the rest of the tools share (mcp-plan.md §7). It takes no
@@ -1986,8 +1995,8 @@ pub const Conn = struct {
         // Map (name, args) → q.Command (+ debugger flag + RespondOpts). A validation
         // failure is -32602 (fix the CALL). `load` is server-special: its recipe overlay
         // + persist need `Server` state, so it is built here (mcp-plan.md §4.4) instead
-        // of in the pure `buildCommand`. A `machine` field in `arguments` is IGNORED by
-        // `buildCommand`'s per-tool parse (`ignore_unknown_fields`), so routing never breaks it.
+        // of in the pure `buildCommand`. The routing `machine` key was already STRIPPED from
+        // `args` above, so the per-tool parse below sees only its own fields.
         var ctx: q.RequestCtx = .{ .cmd = undefined };
         var opts: mcp_tools.RespondOpts = .{};
 

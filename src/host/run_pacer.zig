@@ -207,6 +207,7 @@ fn recordAndClassify(control: *RunControl, resp: api.Response) Classification {
                 .breakpoint => |b| .{ .breakpoint, b.at_cycle, true },
                 .step_complete => |s| .{ .step_complete, s.at_cycle, false },
                 .cycle_budget_exhausted => |c| .{ .cycle_budget_exhausted, c.at_cycle, false },
+                .target_reached => |t| .{ .target_reached, t.at_cycle, false },
                 .halted_forever => |h| .{ .halted_forever, h.at_cycle, true },
                 .program_terminated => |p| .{ .program_terminated, p.at_cycle, true },
                 .shutdown => |s| .{ .shutdown, s.at_cycle, true },

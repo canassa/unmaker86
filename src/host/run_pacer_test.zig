@@ -263,13 +263,15 @@ test "run-to-cycle with the pacer armed disarms it and lands exactly at N" {
     const ram1 = try alloc.dupe(u8, m.bus.ram);
     defer alloc.free(ram1);
 
-    // It must have stopped at EXACTLY the target cycle. `runToCycle` arms a one-shot
-    // CYCLE breakpoint at N, so reaching N fires as `.breakpoint{at_cycle=N}` (a
-    // run-to-PAST cycle would instead be `cycle_budget_exhausted` at the current
-    // cycle — a different, also-deterministic case). Here N is in the future → bp.
+    // It must have stopped at EXACTLY the target cycle. `runToCycle` arms an internal
+    // one-shot CYCLE breakpoint at N and translates its hit into the dedicated
+    // `target_reached{at_cycle=N}` reason (the internal id never leaks as a
+    // `.breakpoint`). A run-to-PAST cycle would instead be `cycle_budget_exhausted`
+    // at the current cycle — a different, also-deterministic case. Here N is in the
+    // future → target_reached.
     switch (resp) {
         .stop => |s| switch (s) {
-            .breakpoint => |c| try std.testing.expectEqual(target, c.at_cycle),
+            .target_reached => |c| try std.testing.expectEqual(target, c.at_cycle),
             .cycle_budget_exhausted => |c| try std.testing.expectEqual(target, c.at_cycle),
             else => return error.WrongStop,
         },
