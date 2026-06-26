@@ -615,7 +615,7 @@ pub fn buildCommand(
     }
     if (is(name, "read_devices")) return buildDevicesTool(arena, args);
     if (is(name, "read_stack")) {
-        const r = parse(wire.StackReq, arena, args) orelse return invalid("read_stack expects {count:integer 0..65535}");
+        const r = parse(wire.StackReq, arena, args) orelse return invalid("read_stack expects {count:integer 0..256}");
         return cmd(.{ .stack_get = .{ .count = r.count } }, false);
     }
     if (is(name, "read_ivt")) {
@@ -864,6 +864,42 @@ test "schema enums match the runtime acceptors (set_register names + device grou
     try std.testing.expectEqual(device_groups.len, declared.len);
     inline for (declared) |g| try std.testing.expect(isDeviceGroup(g));
     try std.testing.expect(!isDeviceGroup("nope"));
+}
+
+test "schema numeric caps + union/struct shapes track their runtime sources" {
+    const alloc = std.testing.allocator;
+
+    // A capped field's declared `maximum` MUST equal the runtime constant, so a change to
+    // a MAX_* cap can't silently leave the schema (and the LLM) stale — this is exactly the
+    // read_stack 65535->256 drift the enrichment fixed.
+    const caps = .{
+        .{ "read_memory", "len", @as(i64, q.MAX_MEM_CHUNK) },
+        .{ "read_memory_seg", "len", @as(i64, q.MAX_MEM_CHUNK) },
+        .{ "read_stack", "count", @as(i64, q.MAX_STACK_WORDS) },
+        .{ "disassemble", "count", @as(i64, debug.MAX_DISASM_INSNS) },
+    };
+    inline for (caps) |c| {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, find(c[0]).?.input_schema, .{});
+        defer p.deinit();
+        const max = p.value.object.get("properties").?.object.get(c[1]).?.object.get("maximum").?.integer;
+        try std.testing.expectEqual(c[2], max);
+    }
+
+    // `add_breakpoint.kind`'s oneOf MUST carry one arm per BreakpointKind union variant.
+    {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, find("add_breakpoint").?.input_schema, .{});
+        defer p.deinit();
+        const oneof = p.value.object.get("properties").?.object.get("kind").?.object.get("oneOf").?.array;
+        try std.testing.expectEqual(@typeInfo(debug.BreakpointKind).@"union".fields.len, oneof.items.len);
+    }
+
+    // `set_register`'s flags arm MUST name every FlagsPayload bool (so a new flag forces a
+    // schema update). The names are quoted property keys; an off-by-name flag fails here.
+    {
+        const sr = find("set_register").?.input_schema;
+        inline for (@typeInfo(wire.FlagsPayload).@"struct".fields) |f|
+            try std.testing.expect(std.mem.indexOf(u8, sr, "\"" ++ f.name ++ "\"") != null);
+    }
 }
 
 test "mapDisasm: precedence + count bound" {

@@ -75,8 +75,10 @@ const RESPONSE_BUF = 32 * 1024; // serialized JSON body
 /// (`RENDER_INDEX_CAP`), the RGBA buffer (`RENDER_RGBA_CAP`), or the encoded PNG slab
 /// (`PNG_OUT_CAP`); the screenshot path copies the PNG and base64-streams it from this
 /// owned copy AFTER unlock. Sized to the max of the three so ONE buffer serves every
-/// path. Lazily heap-allocated per connection on first capture and reused, so only
-/// capture-active connections pay and the static `Conn` footprint is unchanged.
+/// path. Lazily heap-allocated on the connection's first capture (and freed in
+/// `Conn.deinit`), so only capture-active connections pay and the static `Conn`
+/// footprint is unchanged. Keep-alive is off (one request per connection), so in
+/// practice this is one alloc+free per capturing connection, not cross-request reuse.
 const CAPTURE_BUF_CAP: usize = @max(
     worker_mod.PNG_OUT_CAP,
     @max(debug.RENDER_RGBA_CAP, debug.RENDER_INDEX_CAP),
@@ -619,14 +621,15 @@ pub const Conn = struct {
     api_session_buf: [128]u8 = undefined,
     api_session_len: usize = 0,
 
-    /// LAZILY heap-allocated, reused per-connection CAPTURE scratch (Finding 2). The
+    /// LAZILY heap-allocated, owned per-connection CAPTURE scratch (Finding 2). The
     /// capture paths (`handleMcpScreenshot`, `submitAndRespondFramebuffer`) snapshot +
     /// encode the frame under `session.lock`, COPY the finished wire bytes here, UNLOCK,
     /// then write — so the unbounded socket write never holds the lock that the pacer's
     /// inline `produceFrame` shares (holding it across the write freezes the guest, since
     /// the pacer cannot submit its next slice). `null` until the first capture on this
-    /// connection; allocated once to `CAPTURE_BUF_CAP` and reused; freed in `deinit`.
-    /// Only capture-active connections pay; the static `Conn` footprint is unchanged.
+    /// connection; allocated once to `CAPTURE_BUF_CAP`, freed in `deinit`. Keep-alive is
+    /// off (one request per connection), so this is one alloc+free per capturing
+    /// connection. Only capture-active connections pay; the static `Conn` footprint is unchanged.
     capture_buf: ?[]u8 = null,
 
     /// Build a fresh per-connection context. The big scratch arrays stay `undefined`
@@ -1984,10 +1987,14 @@ pub const Conn = struct {
         // registry mutex under `session.lock` (it would invert `session.lock` →
         // registry-mutex against the resolve/release ordering). So we never hold the
         // session lock across `create`.
-        default.lock.lockUncancelable(self.server.io);
-        const recipe = default.recipe;
-        const mount_dir = default.mount_dir;
-        default.lock.unlock(self.server.io);
+        // Copy under the lock in a block so the `defer` unlock fires at the block end —
+        // i.e. BEFORE `create` (preserving the lock order), and robust against a future
+        // edit inserting a fallible/early-returning step between lock and unlock.
+        const recipe, const mount_dir = blk: {
+            default.lock.lockUncancelable(self.server.io);
+            defer default.lock.unlock(self.server.io);
+            break :blk .{ default.recipe, default.mount_dir };
+        };
         const created = self.server.registry.create(recipe, mount_dir) catch |err| switch (err) {
             error.SessionLimitReached => return self.respondRpcError(req, id, .internal, "session limit reached; DELETE an existing session first"),
             error.BootFailed => return self.respondRpcError(req, id, .internal, "failed to boot the program for the new session"),
