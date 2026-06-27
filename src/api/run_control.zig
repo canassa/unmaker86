@@ -42,6 +42,12 @@ pub const StopTag = enum(u8) {
     halted_forever,
     program_terminated,
     shutdown,
+    /// A branch-trace trap fired (docs/branch-trace-plan.md §4) — the paced run disarms
+    /// (like a breakpoint), but it is NOT a program end (no "stopped" stream frame).
+    branch_trap,
+    /// The no-progress watchdog tripped (a frozen ledger) — the paced run disarms so it
+    /// does not busy-spin against the stuck machine. Not a program end.
+    no_progress,
 };
 
 pub const RunControl = struct {

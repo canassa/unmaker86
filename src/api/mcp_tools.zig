@@ -136,6 +136,43 @@ pub const tools = [_]Tool{
         .description = "Remove all breakpoints; returns the count removed.",
         .input_schema = SCHEMA_EMPTY,
     },
+    // --- branch trace + trap (docs/branch-trace-plan.md) ---
+    .{
+        .name = "branch_trace_arm",
+        .description = "Arm/disarm the control-flow branch trace (a ring of computed transfers: ret/iret, indirect call/jmp, far transfers, near-direct call, interrupts). Optional `kinds` filter; omit for all.",
+        .input_schema =
+        \\{"type":"object","properties":{"enabled":{"type":"boolean","description":"arm (true) or disarm (false) recording"},"kinds":{"type":"array","items":{"type":"string"},"description":"optional kind filter; omit for ALL. names: call_near_direct, ret_near, ret_far, iret, call_near_ind, jmp_near_ind, call_far, call_far_ind, jmp_far, jmp_far_ind, interrupt"}},"required":["enabled"],"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "branch_trace_clear",
+        .description = "Clear the branch-trace ring CONTENTS (the armed/kind_mask/trap config persists).",
+        .input_schema = SCHEMA_EMPTY,
+    },
+    .{
+        .name = "branch_trace_dump",
+        .description = "Page the branch-trace ring: up to `limit` rows from `offset`, newest-first by default. Each row: kind, from/to (cs:ip + linear), sp, at_cycle, index. The 4096 ring pages in 4 requests.",
+        .input_schema =
+        \\{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":1024,"description":"max rows (<=1024)"},"offset":{"type":"integer","minimum":0,"description":"chronological offset from the oldest valid entry"},"newest_first":{"type":"boolean","default":true,"description":"newest-first (default) or oldest-first"}},"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "branch_trace_status",
+        .description = "Read the branch-trace status: armed, ring len/capacity, total recorded, kind_mask, and whether the trap is armed.",
+        .input_schema = SCHEMA_EMPTY,
+    },
+    .{
+        .name = "branch_trap_arm",
+        .description = "Arm the stop-on-matching-transfer TRAP. OR of: a target-OUTSIDE-[to_lo,to_hi] linear range; an SP-OUTSIDE-[sp_lo,sp_hi] range; a `kinds` class match. The run halts AT the first matching transfer (a branch_trap stop).",
+        .input_schema =
+        \\{"type":"object","properties":{"to_range":{"type":"boolean","description":"enable the target-out-of-range clause"},"to_lo":{"type":"integer","minimum":0,"description":"code-range low linear (inclusive)"},"to_hi":{"type":"integer","minimum":0,"description":"code-range high linear (inclusive)"},"sp_range":{"type":"boolean","description":"enable the SP-out-of-bounds clause"},"sp_lo":{"type":"integer","minimum":0,"maximum":65535,"description":"stack low SP (inclusive)"},"sp_hi":{"type":"integer","minimum":0,"maximum":65535,"description":"stack high SP (inclusive)"},"kinds":{"type":"array","items":{"type":"string"},"description":"trap on any of these transfer kinds"}},"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "branch_trap_clear",
+        .description = "Disarm the branch-trace trap (reset the predicate) and drop any latched hit.",
+        .input_schema = SCHEMA_EMPTY,
+    },
     // --- cpu / registers ---
     .{
         .name = "read_cpu",
@@ -715,6 +752,31 @@ pub fn parseSnapHandle(s: []const u8) ?u64 {
     return std.fmt.parseInt(u64, digits, 10) catch null;
 }
 const ScreenReq = struct { attrs: bool = false };
+
+// Branch-trace MCP argument structs (docs/branch-trace-plan.md §6). `kinds` is an
+// optional array of BranchKind tag names → a `kind_mask`/`kind_trap_mask`.
+const BranchTraceArmReq = struct { enabled: bool = true, kinds: ?[]const []const u8 = null };
+const BranchTraceDumpReq = struct { limit: u32 = q.MAX_TRACE_DUMP, offset: u32 = 0, newest_first: bool = true };
+const BranchTrapArmReq = struct {
+    to_range: bool = false,
+    to_lo: u32 = 0,
+    to_hi: u32 = 0xFFFFF,
+    sp_range: bool = false,
+    sp_lo: u16 = 0,
+    sp_hi: u16 = 0xFFFF,
+    kinds: ?[]const []const u8 = null,
+};
+
+/// OR `1 << @intFromEnum(kind)` for each named kind. Returns null on an unknown name
+/// (the caller maps that to a -32602 invalid-params). Integer-only; no clock/RNG.
+fn kindMaskFromNames(names: []const []const u8) ?u16 {
+    var mask: u16 = 0;
+    for (names) |n| {
+        const k = std.meta.stringToEnum(cpu_mod.branch_trace.BranchKind, n) orelse return null;
+        mask |= @as(u16, 1) << @as(u4, @intCast(@intFromEnum(k)));
+    }
+    return mask;
+}
 const DevicesReq = struct { palette: bool = false, device: ?[]const u8 = null };
 const DisasmReq = struct { linear: ?u32 = null, seg: ?u16 = null, off: ?u32 = null, count: ?u32 = null };
 const SearchReq = struct {
@@ -790,6 +852,46 @@ pub fn buildCommand(
     }
     if (is(name, "list_breakpoints")) return cmd(.list_bp, false);
     if (is(name, "clear_breakpoints")) return cmd(.clear_bp, false);
+
+    // --- branch trace + trap (docs/branch-trace-plan.md §6) ---
+    if (is(name, "branch_trace_arm")) {
+        const r = parse(BranchTraceArmReq, arena, args) orelse return invalid("branch_trace_arm expects {enabled:bool, kinds?:[string]}");
+        var mask: u16 = 0xFFFF;
+        if (r.kinds) |ks| mask = kindMaskFromNames(ks) orelse return invalid("unknown branch kind name");
+        return cmd(.{ .branch_trace_arm = .{ .on = r.enabled, .kind_mask = mask } }, false);
+    }
+    if (is(name, "branch_trace_clear")) return cmd(.branch_trace_clear, false);
+    if (is(name, "branch_trace_status")) return cmd(.branch_trace_status, false);
+    if (is(name, "branch_trace_dump")) {
+        var limit: u32 = q.MAX_TRACE_DUMP;
+        var offset: u32 = 0;
+        var newest: bool = true;
+        if (args == .object) {
+            const r = parse(BranchTraceDumpReq, arena, args) orelse return invalid("branch_trace_dump expects {limit?:int, offset?:int, newest_first?:bool}");
+            limit = r.limit;
+            offset = r.offset;
+            newest = r.newest_first;
+        }
+        if (limit == 0 or limit > q.MAX_TRACE_DUMP) return invalid("limit must be 1..1024");
+        return cmd(.{ .branch_trace_dump = .{ .limit = limit, .offset = offset, .newest_first = newest } }, false);
+    }
+    if (is(name, "branch_trap_arm")) {
+        const r = parse(BranchTrapArmReq, arena, args) orelse return invalid("branch_trap_arm expects {to_range?,to_lo?,to_hi?,sp_range?,sp_lo?,sp_hi?,kinds?}");
+        var ta: q.TrapArgs = .{
+            .to_range = r.to_range,
+            .to_lo = r.to_lo,
+            .to_hi = r.to_hi,
+            .sp_range = r.sp_range,
+            .sp_lo = r.sp_lo,
+            .sp_hi = r.sp_hi,
+        };
+        if (r.kinds) |ks| {
+            ta.kind_match = true;
+            ta.kind_trap_mask = kindMaskFromNames(ks) orelse return invalid("unknown branch kind name");
+        }
+        return cmd(.{ .branch_trap_arm = ta }, false);
+    }
+    if (is(name, "branch_trap_clear")) return cmd(.branch_trap_clear, false);
 
     // --- cpu / registers ---
     if (is(name, "read_cpu")) return cmd(.cpu_get, false);

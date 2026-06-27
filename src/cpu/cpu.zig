@@ -21,6 +21,10 @@ pub const cycles = @import("cycles.zig");
 /// operand-shape table). Pure/side-effect-free; drives the debugger's `/api/disasm`
 /// peek path. See src/cpu/disasm.zig.
 pub const disasm = @import("disasm.zig");
+/// The control-flow branch-trace observer POD (docs/branch-trace-plan.md). A CPU-owned
+/// observer TYPE (no upward import) the Machine instantiates and the CPU reaches via an
+/// optional back-pointer — mirroring the `cb` callback-sink seam.
+pub const branch_trace = @import("branch_trace.zig");
 
 pub const State = state.State;
 pub const StepResult = state.StepResult;
@@ -92,11 +96,21 @@ pub fn CpuWith(comptime Bus: type, comptime opts: Options) type {
         /// The guest->host callback-trap sink (D2). null until the machine wires
         /// the `Services` aggregate; a `0xFE 0x38` opcode with no sink #UDs.
         cb: ?*opts.CallbackSink = null,
+        /// The control-flow branch-trace ring (docs/branch-trace-plan.md §3). null in
+        /// bare-CPU tests; wired ONCE by `Machine.wire` to the Machine-owned slab. A
+        /// PURE observer: a null vs non-null pointer changes nothing executed (the
+        /// `recordBranch`/`recordBranchEx` methods are a single optional-deref no-op when
+        /// unwired). NOT part of `State`, so it survives snapshot/restore untouched.
+        branch_trace: ?*branch_trace.BranchTrace = null,
 
         // ---- Per-instruction decode scratch (reset each step; no alloc) ----
         dec: decode.Decoded = .{},
         /// EIP at the start of the current instruction (fault rollback, Phase 6).
         instr_start_eip: u32 = 0,
+        /// CS selector at the start of the current instruction — the branch-trace `from`
+        /// for far transfers (CS changes mid-instruction). Mirrors `instr_start_eip`; set
+        /// in `interrupts.step`. Per-step scratch, NOT in `State`.
+        instr_start_cs: u16 = 0,
 
         pub fn init(bus: *Bus, pic: *opts.Pic, sched: *opts.Scheduler) Self {
             var self: Self = .{ .bus = bus, .pic = pic, .sched = sched };
@@ -106,6 +120,45 @@ pub fn CpuWith(comptime Bus: type, comptime opts: Options) type {
 
         pub fn reset(self: *Self) void {
             self.st.reset();
+        }
+
+        // -------------------------------------------------------------------
+        // Branch-trace observer hooks (docs/branch-trace-plan.md §1/§3). PURE: a
+        // single optional-deref no-op when unwired; reads ONLY integers already in
+        // `State` + the per-instruction `instr_start_*` scratch; charges no cycle,
+        // takes no guest-state branch, allocates nothing.
+        // -------------------------------------------------------------------
+
+        /// Record a computed transfer at its tail (the exec_ctrl arm): `from` is the
+        /// instruction's own CS:IP (`instr_start_*`), `to` is the freshly-committed
+        /// CS:IP, `sp` the post-transfer SP, `at_cycle` the ledger.
+        pub inline fn recordBranch(self: *Self, kind: branch_trace.BranchKind) void {
+            const t = self.branch_trace orelse return;
+            t.push(.{
+                .kind = @intFromEnum(kind),
+                .from_cs = self.instr_start_cs,
+                .from_ip = @truncate(self.instr_start_eip),
+                .to_cs = self.st.selector[@intFromEnum(Seg.cs)],
+                .to_ip = @truncate(self.st.eip),
+                .sp = self.st.getReg16(@intFromEnum(Reg32.esp)),
+                .at_cycle = self.st.cycles,
+            });
+        }
+
+        /// Record a transfer with EXPLICIT from/to/sp (the interrupt-delivery arm): a
+        /// hardware IRQ is delivered at a boundary, not from the just-retired
+        /// instruction's start, so the `instr_start_*` shortcut does not apply.
+        pub inline fn recordBranchEx(self: *Self, kind: branch_trace.BranchKind, from_cs: u16, from_ip: u16, to_cs: u16, to_ip: u16, sp: u16) void {
+            const t = self.branch_trace orelse return;
+            t.push(.{
+                .kind = @intFromEnum(kind),
+                .from_cs = from_cs,
+                .from_ip = from_ip,
+                .to_cs = to_cs,
+                .to_ip = to_ip,
+                .sp = sp,
+                .at_cycle = self.st.cycles,
+            });
         }
 
         // -------------------------------------------------------------------

@@ -63,6 +63,9 @@ pub fn step(cpu: anytype) StepResult {
     }
 
     cpu.instr_start_eip = cpu.st.eip;
+    // Branch-trace `from` for far transfers (CS changes mid-instruction). Per-step
+    // scratch, mirrors instr_start_eip; a PURE observer field (no cycle, no State).
+    cpu.instr_start_cs = cpu.st.selector[@intFromEnum(Seg.cs)];
     const shadow_was_set = cpu.st.inhibit_irq_one_instruction;
     // TF as seen at the START of this instruction. The single-step #DB is a TRAP
     // recognized only when TF was ALREADY set entering the instruction — an
@@ -198,6 +201,13 @@ pub fn deliverInterrupt(cpu: anytype, vector: u8) !void {
 
 /// The real-mode IVT delivery sequence (the only delivery path in scope).
 pub fn deliverViaIvt(cpu: anytype, vector: u8) !void {
+    // Branch-trace `from` = the return frame this delivery PUSHES (the boundary CS:IP
+    // the handler IRETs back to), snapshotted BEFORE the pushes/far load below. For a
+    // software INT n it is the byte after the opcode; for a hardware IRQ it is the
+    // instruction that would have run next — precisely the pushed return address.
+    const from_cs = cpu.st.selector[@intFromEnum(Seg.cs)];
+    const from_ip: u16 = @truncate(cpu.st.eip);
+
     // IDTR.limit enforcement (Theme D): vector*4 + 3 must be within the limit.
     const entry: u32 = @as(u32, vector) * 4;
     if (entry + 3 > cpu.st.idtr_limit) {
@@ -221,6 +231,11 @@ pub fn deliverViaIvt(cpu: anytype, vector: u8) !void {
     // Load CS:IP from the IVT entry (real-mode far load).
     cpu.loadSegment(.cs, new_cs);
     cpu.st.eip = new_ip;
+
+    // Branch-trace: record the interrupt delivery (the single faithful IVT chokepoint).
+    // Recorded AFTER the successful far load, so a limit-exceeded delivery (returned
+    // above) is correctly NOT recorded. SP is post-3-pushes. A pure observer (no cycle).
+    cpu.recordBranchEx(.interrupt, from_cs, from_ip, new_cs, @truncate(new_ip), cpu.st.getReg16(@intFromEnum(state.Reg32.esp)));
 
     // Record the delivery breadcrumb (M1 Phase 4 — interrupt-vector breakpoints).
     // Every IVT delivery funnels through here (software INT via exec_ctrl, hardware

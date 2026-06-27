@@ -72,6 +72,7 @@ test "M6: no host time / RNG / thread / env reads anywhere in src/cpu (grep-enfo
         @embedFile("exec_bit.zig"),     @embedFile("exec_bcd.zig"),   @embedFile("exec_ctrl.zig"),
         @embedFile("exec_string.zig"),  @embedFile("exec_io.zig"),    @embedFile("exec_system.zig"),
         @embedFile("segmentation.zig"), @embedFile("interrupts.zig"), @embedFile("cycles.zig"),
+        @embedFile("branch_trace.zig"),
     };
     const forbidden = [_][]const u8{
         "std.time", // host wall clock

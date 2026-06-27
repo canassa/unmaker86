@@ -29,6 +29,9 @@ const controller = @import("controller.zig");
 pub const Controller = controller.Controller;
 pub const StopReason = controller.StopReason;
 pub const StepOverResult = controller.StepOverResult;
+/// Branch-trace status POD (docs/branch-trace-plan.md §6); the trace entry/predicate
+/// types live in the `cpu` module (`cpu.branch_trace`), reached by the API layer.
+pub const TraceStatus = controller.TraceStatus;
 pub const CpuSnapshot = controller.CpuSnapshot;
 pub const Reg16 = controller.Reg16;
 pub const Reg8 = controller.Reg8;
@@ -62,4 +65,5 @@ test {
     _ = @import("interrupt_test.zig");
     _ = @import("watchpoint_test.zig");
     _ = @import("determinism_test.zig");
+    _ = @import("branch_trap_test.zig");
 }

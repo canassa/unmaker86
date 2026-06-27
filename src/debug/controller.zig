@@ -114,6 +114,19 @@ pub const StopReason = union(enum) {
     program_terminated: struct { ret_code: u16, at_cycle: u64 },
     /// Triple fault / shutdown latched.
     shutdown: struct { at_cycle: u64 },
+    /// A branch-trace TRAP fired: a recorded transfer matched the armed predicate
+    /// (docs/branch-trace-plan.md §4.1). The machine is paused AT the transfer (CS:IP =
+    /// the target); `entry` is the matching transfer (the culprit). Reporting-only — it
+    /// changes WHERE the run pauses, never which cycles ran or any guest state, exactly
+    /// like `target_reached`. Precedence: BELOW a user breakpoint at a same-step tie
+    /// (terminal > user breakpoint > branch_trap).
+    branch_trap: struct { entry: cpu_mod.branch_trace.BranchEntry, at_cycle: u64 },
+    /// The no-progress watchdog tripped: the cycle ledger did not advance for
+    /// `NO_PROGRESS_LIMIT` consecutive steps — a host emulation path spinning with no
+    /// guest progress (a FROZEN ledger). The unconditional backstop so a worker never
+    /// spins forever; complementary to `branch_trap` (which catches a LIVE-ledger
+    /// derail that DOES charge cycles). Reporting-only — non-terminal, not a program end.
+    no_progress: struct { at_cycle: u64 },
 };
 
 pub const StepOverResult = struct {
@@ -121,6 +134,17 @@ pub const StepOverResult = struct {
     /// true if we could not step *over* and fell back to step-into (reported,
     /// never silent — ground rule).
     stepped_into: bool,
+};
+
+/// A side-effect-free snapshot of the branch-trace config + fill (docs/branch-trace-
+/// plan.md §6). Pointer-free POD; the worker maps it 1:1 to the wire `q.TraceStatus`.
+pub const TraceStatus = struct {
+    armed: bool,
+    len: u32,
+    capacity: u32,
+    total: u64,
+    kind_mask: u16,
+    trap_armed: bool,
 };
 
 /// A side-effect-free CPU register/flag/cycle snapshot. Field order for the GP
@@ -444,6 +468,7 @@ pub const Controller = struct {
     pub fn runUntilEvent(self: *Controller, cycle_cap: u64) StopReason {
         self.last_stop = null; // clear so a stale value can't leak
         const deadline = self.m.cpu.st.cycles +| cycle_cap;
+        var stuck_steps: u64 = 0;
         while (true) {
             // Resume rule: step at least once before evaluating breakpoints. We
             // also check terminals AFTER stepping (you cannot step a terminal
@@ -452,15 +477,52 @@ pub const Controller = struct {
             if (self.terminalReason()) |r| return self.record(r);
 
             const seq_before = bp.seqBefore(self.m);
+            const cycles_before = self.m.cpu.st.cycles;
             _ = self.m.step();
+
+            // No-progress watchdog (FROZEN-ledger backstop): a step that charges zero
+            // cycles is a host emulation path spinning with no guest progress. After
+            // NO_PROGRESS_LIMIT consecutive such steps, stop so a worker never spins
+            // forever. Complementary to the branch-trap (which catches a LIVE-ledger
+            // derail that DOES charge cycles, so this watchdog never sees it).
+            if (self.m.cpu.st.cycles == cycles_before) {
+                stuck_steps += 1;
+                if (stuck_steps >= NO_PROGRESS_LIMIT) {
+                    return self.record(.{ .no_progress = .{ .at_cycle = self.m.cpu.st.cycles } });
+                }
+            } else {
+                stuck_steps = 0;
+            }
 
             if (self.terminalReason()) |r| return self.record(r);
             if (self.scanBreakpoints(seq_before)) |r| return self.record(r);
+            // Branch-trap check — BELOW user breakpoints at a same-step tie (terminal >
+            // user breakpoint > branch_trap). The match was computed during the step
+            // (the only place the resolved target/SP exist); we take the STOP here, at
+            // the boundary, leaving the machine paused AT the transfer target.
+            if (self.consumeBranchTrap()) |r| return self.record(r);
 
             if (self.m.cpu.st.cycles >= deadline) {
                 return self.record(.{ .cycle_budget_exhausted = .{ .at_cycle = self.m.cpu.st.cycles } });
             }
         }
+    }
+
+    /// The consecutive zero-cycle-step limit before the no-progress watchdog trips. A
+    /// FROZEN ledger (no guest progress) is pathological; this bound is generous so a
+    /// legitimate long HLT-idle fast-forward (which DOES advance the ledger) never trips.
+    pub const NO_PROGRESS_LIMIT: u64 = 1_000_000;
+
+    /// Consume a latched branch-trap, if any, into a `branch_trap` stop. Clears the
+    /// latch so a subsequent `run` does not immediately re-fire on the stale hit. The
+    /// machine is already paused AT the transfer target (CS:IP = `to`) — the transfer is
+    /// the last thing the instruction did, so when `step` returned CS:IP was committed.
+    fn consumeBranchTrap(self: *Controller) ?StopReason {
+        if (self.m.branch_trace.trap_hit) |e| {
+            self.m.branch_trace.trap_hit = null;
+            return .{ .branch_trap = .{ .entry = e, .at_cycle = self.m.cpu.st.cycles } };
+        }
+        return null;
     }
 
     /// The fixed terminal-precedence check at a boundary (returns null if the
@@ -623,6 +685,60 @@ pub const Controller = struct {
         self.set.forEach(ctx, f);
     }
 
+    // -----------------------------------------------------------------------
+    // Branch-trace control (docs/branch-trace-plan.md §6). These read/mutate ONLY
+    // `self.m.branch_trace` (observer state) — never CPU/guest state, never a cycle.
+    // The arm/clear methods take `*Controller` (mutate observer config); the
+    // dump/status are `*const Controller` (side-effect-free, like `forEachBreakpoint`).
+    // -----------------------------------------------------------------------
+
+    /// Arm/disarm RECORDING + set the kind filter; returns the post-mutation status.
+    pub fn armBranchTrace(self: *Controller, on: bool, mask: u16) TraceStatus {
+        self.m.branch_trace.armed = on;
+        self.m.branch_trace.kind_mask = mask;
+        return self.branchTraceStatus();
+    }
+    /// Clear the ring CONTENTS (config persists); returns the post-clear status.
+    pub fn clearBranchTrace(self: *Controller) TraceStatus {
+        self.m.branch_trace.clear();
+        return self.branchTraceStatus();
+    }
+    /// Set the trap PREDICATE + arm it; clears any stale latch. Returns the status.
+    pub fn armBranchTrap(self: *Controller, pred: cpu_mod.branch_trace.TrapPredicate) TraceStatus {
+        self.m.branch_trace.trap = pred;
+        self.m.branch_trace.trap_hit = null;
+        return self.branchTraceStatus();
+    }
+    /// Disarm the trap (reset the predicate) + drop any latch. Returns the status.
+    pub fn clearBranchTrap(self: *Controller) TraceStatus {
+        self.m.branch_trace.trap = .{};
+        self.m.branch_trace.trap_hit = null;
+        return self.branchTraceStatus();
+    }
+    /// Side-effect-free trace status (armed/len/total/kind_mask + trap-arm state).
+    pub fn branchTraceStatus(self: *const Controller) TraceStatus {
+        const t = &self.m.branch_trace;
+        return .{
+            .armed = t.armed,
+            .len = t.len,
+            .capacity = cpu_mod.branch_trace.TRACE_CAPACITY,
+            .total = t.total,
+            .kind_mask = t.kind_mask,
+            .trap_armed = t.trap.armed,
+        };
+    }
+    /// Copy up to `out.len` ring entries chronologically (newest- or oldest-first)
+    /// starting at `offset` from the oldest valid entry. Pure copy; returns the filled
+    /// prefix of raw `BranchEntry` POD (the worker maps each to the wire row).
+    pub fn dumpBranchTrace(self: *const Controller, out: []cpu_mod.branch_trace.BranchEntry, offset: u32, newest_first: bool) []cpu_mod.branch_trace.BranchEntry {
+        return self.m.branch_trace.copyOut(out, offset, newest_first);
+    }
+    /// The absolute (monotonic-`total`-space) index of the chronological entry at
+    /// `chrono_from_oldest` — so a dump row reports a stable, wrap-aware position.
+    pub fn branchTraceAbsIndex(self: *const Controller, chrono_from_oldest: u32) u64 {
+        return self.m.branch_trace.absIndexAt(chrono_from_oldest);
+    }
+
     /// Re-sync the bus memory/IO watch tables with the live breakpoint set after a
     /// `Machine.restore` reverted those tables to the snapshot instant (snapshot-
     /// restore-plan §1.2 #2 / Decision D2). The coupling: the bus watch tables ride
@@ -708,6 +824,9 @@ pub const Controller = struct {
         // step_complete.
         if (self.terminalReason()) |r| return self.record(r);
         if (self.scanBreakpoints(seq_before)) |r| return self.record(r);
+        // A single step across a matching transfer also stops on the trap (the universal
+        // debugger convention, mirroring the scanBreakpoints check above).
+        if (self.consumeBranchTrap()) |r| return self.record(r);
         return self.record(.{ .step_complete = .{ .at_cycle = self.m.cpu.st.cycles } });
     }
 
@@ -723,6 +842,7 @@ pub const Controller = struct {
             _ = self.m.step();
             if (self.terminalReason()) |r| return self.record(r);
             if (self.scanBreakpoints(seq_before)) |r| return self.record(r);
+            if (self.consumeBranchTrap()) |r| return self.record(r);
         }
         return self.record(.{ .step_complete = .{ .at_cycle = self.m.cpu.st.cycles } });
     }

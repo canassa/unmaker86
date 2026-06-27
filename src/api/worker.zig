@@ -195,8 +195,68 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
         .list_snapshots => listSnapshotsResp(snapshots),
         .delete_snapshot => |c| deleteSnapshotResp(snapshots, c.seq),
 
+        // ---- branch trace + trap (docs/branch-trace-plan.md §6) ------------
+        .branch_trace_arm => |c| .{ .trace_status = wireTraceStatus(ctrl.armBranchTrace(c.on, c.kind_mask)) },
+        .branch_trace_clear => .{ .trace_status = wireTraceStatus(ctrl.clearBranchTrace()) },
+        .branch_trace_status => .{ .trace_status = wireTraceStatus(ctrl.branchTraceStatus()) },
+        .branch_trace_dump => |c| branchTraceDump(ctrl, c),
+        .branch_trap_arm => |a| .{ .trace_status = wireTraceStatus(ctrl.armBranchTrap(.{
+            .armed = true,
+            .to_range = a.to_range,
+            .to_lo = a.to_lo,
+            .to_hi = a.to_hi,
+            .sp_range = a.sp_range,
+            .sp_lo = a.sp_lo,
+            .sp_hi = a.sp_hi,
+            .kind_match = a.kind_match,
+            .kind_trap_mask = a.kind_trap_mask,
+        })) },
+        .branch_trap_clear => .{ .trace_status = wireTraceStatus(ctrl.clearBranchTrap()) },
+
         .shutdown_worker => .ok,
     };
+}
+
+/// Map the debug-layer `TraceStatus` to the wire `q.TraceStatus` (identical fields).
+fn wireTraceStatus(s: debug.TraceStatus) q.TraceStatus {
+    return .{
+        .armed = s.armed,
+        .len = s.len,
+        .capacity = s.capacity,
+        .total = s.total,
+        .kind_mask = s.kind_mask,
+        .trap_armed = s.trap_armed,
+    };
+}
+
+/// Fill a `q.TraceDumpResult` from the ring (mirrors `listBreakpoints`: a stack result
+/// filled element-by-element, no alloc). Maps each raw `BranchEntry` to the wire row,
+/// computing `from_lin`/`to_lin` (`(seg<<4)+ip`) and the absolute `index`.
+fn branchTraceDump(ctrl: *Controller, c: anytype) Response {
+    const limit: u32 = @min(c.limit, @as(u32, q.MAX_TRACE_DUMP));
+    var scratch: [q.MAX_TRACE_DUMP]cpu_mod.branch_trace.BranchEntry = undefined;
+    const entries = ctrl.dumpBranchTrace(scratch[0..limit], c.offset, c.newest_first);
+    const status = ctrl.branchTraceStatus();
+    var res: q.TraceDumpResult = .{ .capacity = status.capacity, .total = status.total };
+    for (entries, 0..) |e, i| {
+        // chronological position (from the oldest valid entry) of this row.
+        const ii: u32 = @intCast(i);
+        const chrono: u32 = if (c.newest_first) (status.len - 1 - c.offset - ii) else (c.offset + ii);
+        res.items[i] = .{
+            .kind = @enumFromInt(e.kind),
+            .from_cs = e.from_cs,
+            .from_ip = e.from_ip,
+            .to_cs = e.to_cs,
+            .to_ip = e.to_ip,
+            .from_lin = (@as(u32, e.from_cs) << 4) +% e.from_ip,
+            .to_lin = (@as(u32, e.to_cs) << 4) +% e.to_ip,
+            .sp = e.sp,
+            .at_cycle = e.at_cycle,
+            .index = status.total - status.len + chrono,
+        };
+        res.count += 1;
+    }
+    return .{ .trace_dump = res };
 }
 
 /// Left-Shift make scancode (set-1) — used to bracket a shifted-char keystroke.
@@ -520,9 +580,12 @@ fn restoreResp(ctrl: *Controller, snapshots: ?*SnapshotStore, seq: u64) Response
     ctrl.rearmWatches();
     // A rewind invalidates any prior stop; mirror reset/load's clear so status is coherent.
     ctrl.last_stop = null;
-    // TODO(branch-trace): clear the branch trace here when it lands (snapshot-restore-plan
-    // §4(b)) — a rewind would otherwise interleave two timelines whose at_cycle stamps
-    // overlap. The branch-trace feature does not exist yet; this is the wiring seam.
+    // Auto-clear the branch trace (docs/branch-trace-plan.md §3/§7): a restore starts a
+    // NEW timeline, so prior `at_cycle` coordinates are invalid — a later dump would
+    // otherwise interleave two timelines with overlapping `at_cycle`. The clear also
+    // drops a stale `trap_hit`. The trace CONFIG (armed/kind_mask/trap) persists, like
+    // the breakpoint set; only the timeline CONTENTS are cleared.
+    _ = ctrl.clearBranchTrace();
     return .{ .snapshot_restored = .{ .seq = seq } };
 }
 

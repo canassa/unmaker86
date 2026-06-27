@@ -215,6 +215,13 @@ fn recordAndClassify(control: *RunControl, resp: api.Response) Classification {
                 .halted_forever => |h| .{ .halted_forever, h.at_cycle, true },
                 .program_terminated => |p| .{ .program_terminated, p.at_cycle, true },
                 .shutdown => |s| .{ .shutdown, s.at_cycle, true },
+                // A branch-trap is like a breakpoint: disarm the paced run (terminal in
+                // the pacer's sense) so it doesn't immediately run past the trap; NOT a
+                // program end (no "stopped" stream frame).
+                .branch_trap => |t| .{ .branch_trap, t.at_cycle, true },
+                // The no-progress watchdog: disarm so the pacer doesn't busy-spin against
+                // a frozen-ledger machine. NOT a program end.
+                .no_progress => |t| .{ .no_progress, t.at_cycle, true },
             };
             control.recordStop(tag, cycle);
             // Program-end terminals only (NOT breakpoint, step, budget, or shutdown):

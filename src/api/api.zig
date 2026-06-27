@@ -92,6 +92,7 @@ test {
     _ = snapshot_store_mod;
     _ = @import("json_wire_test.zig");
     _ = @import("snapshot_store_test.zig");
+    _ = @import("branch_trace_worker_test.zig");
     _ = @import("queue_test.zig");
     _ = @import("worker_test.zig");
     _ = @import("server_test.zig");

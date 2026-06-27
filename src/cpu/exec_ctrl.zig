@@ -76,6 +76,7 @@ pub fn callRelv(cpu: anytype) !void {
     // Push return address (current EIP after operand fetch).
     try pushIp(cpu, cpu.st.eip);
     cpu.st.eip = (cpu.st.eip +% rel) & ipMask(cpu);
+    cpu.recordBranch(.call_near_direct);
 }
 
 fn pushIp(cpu: anytype, ip: u32) !void {
@@ -117,6 +118,7 @@ pub fn retNear(cpu: anytype, imm16: ?u16) !void {
         cpu.st.setReg16(ESP, cpu.st.getReg16(ESP) +% n);
     }
     cpu.st.eip = ip;
+    cpu.recordBranch(.ret_near);
 }
 
 // ---- SETcc r/m8 ----
@@ -168,10 +170,12 @@ pub fn grp5(cpu: anytype) !void {
             const target: u32 = @as(u32, @truncate(try exec.readRMv(cpu))) & ipMask(cpu);
             try pushIp(cpu, cpu.st.eip);
             cpu.st.eip = target;
+            cpu.recordBranch(.call_near_ind);
         },
         3 => try farCallIndirect(cpu), // CALL far
         4 => { // JMP near indirect
             cpu.st.eip = @as(u32, @truncate(try exec.readRMv(cpu))) & ipMask(cpu);
+            cpu.recordBranch(.jmp_near_ind);
         },
         5 => try farJmpIndirect(cpu), // JMP far
         6 => { // PUSH r/m
@@ -230,6 +234,7 @@ pub fn farJmpDirect(cpu: anytype) !void {
     const new_cs = try dispatch.fetch16(cpu);
     cpu.loadSegment(.cs, new_cs);
     cpu.st.eip = new_ip & ipMask(cpu);
+    cpu.recordBranch(.jmp_far);
 }
 pub fn farCallDirect(cpu: anytype) !void {
     const new_ip = try dispatch.immByOpSize(cpu);
@@ -238,6 +243,7 @@ pub fn farCallDirect(cpu: anytype) !void {
     try pushIp(cpu, cpu.st.eip);
     cpu.loadSegment(.cs, new_cs);
     cpu.st.eip = new_ip & ipMask(cpu);
+    cpu.recordBranch(.call_far);
 }
 fn farJmpIndirect(cpu: anytype) !void {
     if (cpu.dec.kind != .mem) return exec.ud(cpu);
@@ -248,6 +254,7 @@ fn farJmpIndirect(cpu: anytype) !void {
     const new_cs = try cpu.segRead16(seg, cs_off);
     cpu.loadSegment(.cs, new_cs);
     cpu.st.eip = new_ip & ipMask(cpu);
+    cpu.recordBranch(.jmp_far_ind);
 }
 fn farCallIndirect(cpu: anytype) !void {
     if (cpu.dec.kind != .mem) return exec.ud(cpu);
@@ -260,6 +267,7 @@ fn farCallIndirect(cpu: anytype) !void {
     try pushIp(cpu, cpu.st.eip);
     cpu.loadSegment(.cs, new_cs);
     cpu.st.eip = new_ip & ipMask(cpu);
+    cpu.recordBranch(.call_far_ind);
 }
 pub fn retFar(cpu: anytype, imm16: ?u16) !void {
     const ip = try popIp(cpu);
@@ -267,6 +275,7 @@ pub fn retFar(cpu: anytype, imm16: ?u16) !void {
     cpu.loadSegment(.cs, cs);
     cpu.st.eip = ip & ipMask(cpu);
     if (imm16) |n| cpu.st.setReg16(ESP, cpu.st.getReg16(ESP) +% n);
+    cpu.recordBranch(.ret_far);
 }
 
 // ---- INT/INT3/INTO/IRET ----
@@ -296,6 +305,7 @@ pub fn iret(cpu: anytype) !void {
     cpu.st.eflags = @import("flags.zig").Flags.fromU32((cur & ~mask) | (new_flags & mask));
     // Clear NMI-in-service on IRET.
     cpu.st.nmi_in_service = false;
+    cpu.recordBranch(.iret);
 }
 
 // ---- Flag ops ----

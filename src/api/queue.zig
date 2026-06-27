@@ -194,8 +194,77 @@ pub const Command = union(enum) {
     list_snapshots: void,
     /// Free a snapshot slot by its `seq` (explicit reclamation; no time/LRU eviction).
     delete_snapshot: struct { seq: u64 },
+    // ---- branch trace + trap (docs/branch-trace-plan.md §6) ----
+    /// Arm/disarm RECORDING + set the kind filter (`kind_mask`; default = all kinds).
+    branch_trace_arm: struct { on: bool, kind_mask: u16 = 0xFFFF },
+    /// Clear the ring CONTENTS (config persists).
+    branch_trace_clear: void,
+    /// Page the ring: up to `limit` (≤ MAX_TRACE_DUMP) entries from `offset`,
+    /// newest-first by default. The full 4096 ring pages out in 4 requests.
+    branch_trace_dump: struct { limit: u32, offset: u32 = 0, newest_first: bool = true },
+    /// Read the trace config + fill (armed/len/total/kind_mask + trap-arm state).
+    branch_trace_status: void,
+    /// Set the stop-on-matching-transfer trap predicate + arm it.
+    branch_trap_arm: TrapArgs,
+    /// Disarm the trap (reset the predicate) + drop any latch.
+    branch_trap_clear: void,
     /// The worker-shutdown sentinel: the worker loop exits when it dequeues this.
     shutdown_worker: void,
+};
+
+/// Per-response branch-trace dump cap (docs/branch-trace-plan.md §6) — bounds the
+/// inline array exactly like `MAX_STACK_WORDS` bounds `StackResult`. The 4096 ring
+/// pages out in 4 requests via `offset`/`limit`.
+pub const MAX_TRACE_DUMP = 1024;
+
+/// One branch-trace dump row. Pointer-free POD: `kind` is the `BranchKind` ENUM (std.json
+/// renders it as its tag-name string — NO `[]const u8` pointer, so the reflection gate
+/// stays clean). `from_lin`/`to_lin` are the convenience `(seg<<4)+ip` linears (the same
+/// space exec-breakpoints/`disassemble` use); `index` is the absolute (monotonic-`total`)
+/// position so a reader can tell whether the ring wrapped.
+pub const WireBranchEntry = struct {
+    kind: cpu_mod.branch_trace.BranchKind,
+    from_cs: u16,
+    from_ip: u16,
+    to_cs: u16,
+    to_ip: u16,
+    from_lin: u32,
+    to_lin: u32,
+    sp: u16,
+    at_cycle: u64,
+    index: u64,
+};
+
+/// The `branch_trace_dump` result — a fixed array of rows + the live counters. The
+/// worker fills `items[0..count]` from the ring (no heap on the hot path).
+pub const TraceDumpResult = struct {
+    count: u16 = 0,
+    capacity: u32 = 0,
+    total: u64 = 0,
+    items: [MAX_TRACE_DUMP]WireBranchEntry = undefined,
+};
+
+/// The `branch_trace_status` / arm/clear ack POD (mirrors `debug.TraceStatus` 1:1).
+pub const TraceStatus = struct {
+    armed: bool,
+    len: u32,
+    capacity: u32,
+    total: u64,
+    kind_mask: u16,
+    trap_armed: bool,
+};
+
+/// Pointer-free POD mirroring `cpu.branch_trace.TrapPredicate` (minus the master
+/// `armed`, which the worker sets true on arm). The OR-composed clauses (§4.1).
+pub const TrapArgs = struct {
+    to_range: bool = false,
+    to_lo: u32 = 0,
+    to_hi: u32 = 0xFFFFF,
+    sp_range: bool = false,
+    sp_lo: u16 = 0,
+    sp_hi: u16 = 0xFFFF,
+    kind_match: bool = false,
+    kind_trap_mask: u16 = 0,
 };
 
 /// A fully-resolved register-set command (the string name was validated + mapped to
@@ -423,6 +492,10 @@ pub const Response = union(enum) {
     /// A completed `delete_snapshot`: the freed handle + the remaining live count.
     /// Serialized as `{"handle":"snap-<n>","deleted":true,"count":N}`.
     snapshot_deleted: struct { seq: u64, count: u32 },
+    /// Branch-trace status / arm / clear ack (docs/branch-trace-plan.md §6).
+    trace_status: TraceStatus,
+    /// A branch-trace dump page. Pointer-free POD filled by the worker from the ring.
+    trace_dump: TraceDumpResult,
     /// A typed error. The handler maps `code` → HTTP status.
     err: ErrCode,
 };

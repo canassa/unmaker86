@@ -26,7 +26,9 @@ comptime {
     _ = @import("segmentation.zig");
     _ = @import("interrupts.zig");
     _ = @import("cycles.zig");
+    _ = @import("branch_trace.zig");
     _ = @import("decode_test.zig");
+    _ = @import("branch_trace_test.zig");
     _ = @import("disasm_test.zig");
     _ = @import("exec_test.zig");
     _ = @import("interrupts_test.zig");

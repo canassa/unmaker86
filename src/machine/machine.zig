@@ -215,6 +215,13 @@ pub const Machine = struct {
     /// cpu.st.cycles`.
     dt_accounted_cpu: u64 = 0,
     cpu: Cpu = undefined,
+    /// The control-flow branch-trace ring (docs/branch-trace-plan.md §3). A Machine-
+    /// owned slab the CPU reaches via an optional back-pointer bound ONCE in `wire`
+    /// (mirroring the `cb` callback-sink seam). Deliberately OMITTED from
+    /// `Machine.Snapshot` — it is debugger/observer state, like the controller's
+    /// breakpoint set, NOT determinism-critical machine state. A power-on `reset` clears
+    /// its CONTENTS (config persists); `snapshot`/`restore` leaves it untouched.
+    branch_trace: cpu_mod.branch_trace.BranchTrace = .{},
     /// The host-serviced BIOS + DOS + the CallbackSink aggregate (D2/D12).
     bios: Bios = .{},
     dos: Dos = .{},
@@ -310,6 +317,11 @@ pub const Machine = struct {
     pub fn wire(self: *Machine) void {
         // (a) the CPU's *Bus/*Pic/*Machine.
         self.cpu = Cpu.init(&self.bus, &self.pic, self);
+        // (a1) the branch-trace back-pointer — bound ONCE here, after `Cpu.init` placed
+        //      the CPU at its final pinned address (mirrors the `cb` seam). Never
+        //      serialized; survives snapshot/restore + reset untouched (it lives on the
+        //      CpuWith wrapper, not in State).
+        self.cpu.branch_trace = &self.branch_trace;
         // (b) bus PortHandler.ctx = &self.pic (PIC ports 0x20/0x21/0xA0/0xA1).
         _ = self.bus.registerPort(0x20, self.pic.portHandler());
         _ = self.bus.registerPort(0x21, self.pic.portHandler());
@@ -683,6 +695,10 @@ pub const Machine = struct {
         // Phase 5) — like cpu.reset clears last_delivered. The armed watch table +
         // `.watched` page markers PERSIST (a debug session's breakpoints outlive a
         // machine reset, mirroring the controller's surviving breakpoint set).
+        // The branch trace follows the SAME split (docs/branch-trace-plan.md §3): a
+        // power-on is a new timeline, so CONTENTS clear (head/len/total/trap_hit) while
+        // CONFIG persists (armed/kind_mask/trap), exactly like RAM vs. the breakpoint set.
+        self.branch_trace.resetTimeline();
         self.pic.reset();
         self.pit.reset();
         self.speaker.reset(); // port_61_data=0; lowers ch2 gate (needs pit reset first)

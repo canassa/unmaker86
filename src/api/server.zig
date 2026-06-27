@@ -2515,6 +2515,8 @@ pub const Conn = struct {
             .snapshot_restored => |d| try w.print("{{\"handle\":\"snap-{d}\"}}", .{d.seq}),
             .snapshot_list => |l| try self.writeSnapshotList(w, l),
             .snapshot_deleted => |d| try w.print("{{\"handle\":\"snap-{d}\",\"deleted\":true,\"count\":{d}}}", .{ d.seq, d.count }),
+            .trace_status => |s| try self.writeValue(w, s),
+            .trace_dump => |d| try self.writeTraceDump(w, d),
             // Pre-handled by every caller (see the doc comment). Reaching here is a bug.
             .err, .framebuffer => unreachable,
         }
@@ -2605,6 +2607,15 @@ pub const Conn = struct {
         try w.writeAll("{\"regions\":");
         try std.json.Stringify.value(rg.items[0..rg.count], wire.stringify_options, w);
         try w.writeAll("}");
+    }
+
+    /// `{"trace":[...],"total":N,"capacity":C}` — the branch-trace dump page (mirrors
+    /// `writeBpList`/`writeRegions`). `kind` renders as its enum tag-name string.
+    fn writeTraceDump(self: *Conn, w: *std.Io.Writer, d: q.TraceDumpResult) std.Io.Writer.Error!void {
+        _ = self;
+        try w.writeAll("{\"trace\":");
+        try std.json.Stringify.value(d.items[0..d.count], wire.stringify_options, w);
+        try w.print(",\"total\":{d},\"capacity\":{d}}}", .{ d.total, d.capacity });
     }
 
     /// Pure body-builder (mcp-plan.md §3.2) for a memory peek: `{"phys":N,"len":N,
