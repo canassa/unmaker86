@@ -498,6 +498,10 @@ pub const Machine = struct {
         // Plant the EXEC "return into the child" RETF stub (nested-EXEC de-nest):
         // `loader.exec` redirects CS:IP here after pushing the child entry CS:IP.
         Bridge.emitExecRetf(&self.bios_image);
+        // Plant the host INT 74h mouse-callback trampoline (Option C) right after it.
+        // IVT[0x74] is pointed at it in `dos.dosInit`; the driver raises IRQ12 and the
+        // foreground trampoline delivers the AX=0Ch handler on the controller loop.
+        self.dos.emitInt74Trampoline(&self.bios_image);
         // Stage the VGA ROM fonts into the BIOS image (the F000 window is ROM;
         // writes are dropped, so the bytes must be planted in the image before
         // loadRom). AH=1130 / IVT[0x1F]/[0x43] then return real font pointers.
@@ -598,6 +602,28 @@ pub const Machine = struct {
         const pic: *Pic = @ptrCast(@alignCast(ctx));
         pic.raiseIrq(line);
     }
+    /// PIC lower seam — the INT 33h driver lowers a pending IRQ12 on driver reset
+    /// (Option C). Bound to &self.pic alongside the raise seam.
+    fn picLowerThunk(ctx: *anyopaque, line: u4) void {
+        const pic: *Pic = @ptrCast(@alignCast(ctx));
+        pic.lowerIrq(line);
+    }
+    /// PIC unmask seam — the INT 33h driver unmasks IRQ12 (the "mouse-driver TSR
+    /// unmasks its IRQ on install" step) at AX=0000 reset + AX=000C install.
+    fn picUnmaskThunk(ctx: *anyopaque, line: u4) void {
+        const pic: *Pic = @ptrCast(@alignCast(ctx));
+        pic.unmaskIrq(line);
+    }
+    /// Bind the INT 33h driver's PIC seam (Option C). Called after every `dos.init`
+    /// (which does `mouse = .{}`, nulling the seam) — in `wire` (via the trailing
+    /// `reset`) and in `reset`. The seam is re-bound here, NOT snapshotted; a
+    /// `restore` preserves it because it only overwrites the mouse's POD fields.
+    fn bindMouseSeam(self: *Machine) void {
+        self.dos.mouse.pic_ctx = &self.pic;
+        self.dos.mouse.pic_raise = picRaiseThunk;
+        self.dos.mouse.pic_lower = picLowerThunk;
+        self.dos.mouse.pic_unmask = picUnmaskThunk;
+    }
     /// PIT ch0 schedule seam — the DEVICE-TIME boundary (Phase 1). The PIT works
     /// in CPU cycles (`from` == cpu.st.cycles, its counter read-back domain) and a
     /// PIT-native tick count; the SCHEDULER keys on device-time. We convert the
@@ -675,6 +701,8 @@ pub const Machine = struct {
         self.dos.init(&self.cpu);
         self.svc.wire(&self.cpu, &self.bios, &self.dos);
         self.svc.bridge.setStepper(self, stepOnceThunk);
+        // Re-bind the INT 33h driver's PIC seam (dos.init nulled it via mouse = .{}).
+        self.bindMouseSeam();
     }
 
     // -----------------------------------------------------------------------

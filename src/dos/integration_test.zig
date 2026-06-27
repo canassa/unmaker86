@@ -460,7 +460,9 @@ test "snapshot/restore round-trips the mouse driver state (input Phase 0)" {
     @memcpy(m.bus.ram, ram_copy);
 
     // Byte-equal the whole restored mouse driver state to the snapshotted value.
-    // `Int33` is a POD struct (no pointers), so a value compare is a byte compare.
+    // `Int33` now also carries the machine-bound PIC seam pointers (Option C), but
+    // this is the SAME machine `m` before/after, so they are stable — a whole-value
+    // compare is still valid here (cross-machine compares use `.snapshot()`).
     try std.testing.expectEqual(expected, m.dos.mouse);
     // And the rest of the machine round-tripped (the post-snapshot RAM poke gone).
     try std.testing.expect(m.bus.readPhys8(0x10000) != 0xFF);
@@ -508,8 +510,10 @@ test "input Phase 2: absolute injection is byte-identical across two runs" {
     injectScriptAbsolute(a.m);
     injectScriptAbsolute(b.m);
 
-    // The whole mouse driver state (POD) must match byte-for-byte.
-    try std.testing.expectEqual(a.m.dos.mouse, b.m.dos.mouse);
+    // The whole mouse driver STATE must match byte-for-byte. Compare the POD
+    // snapshot (which excludes the machine-bound PIC seam pointers — those differ by
+    // machine address and are re-bound on restore, exactly like Keyboard.raise_fn).
+    try std.testing.expectEqual(a.m.dos.mouse.snapshot(), b.m.dos.mouse.snapshot());
     // Sanity: the script actually changed state from the default.
     try std.testing.expect(a.m.dos.mouse.x != 0 or a.m.dos.mouse.y != 0);
 }
@@ -1095,6 +1099,33 @@ fn slot16(m: *Machine, off: u16) u16 {
     return m.bus.readPhys16((@as(u32, HANDLER_SEG) << 4) + off);
 }
 
+// IRQ12 → slave 8259 line 4. Helpers to inspect the deferred-delivery PIC state.
+const IRQ12_SLAVE_BIT: u8 = 1 << 4;
+fn irq12Pending(m: *Machine) bool {
+    return (m.pic.slave.irr & IRQ12_SLAVE_BIT) != 0;
+}
+
+// Arm a tight foreground spin (JMP $) at CODE_SEG:0 with a valid stack and IF=1,
+// NOT halted — the IF=1 boundary at which a deferred (injected) IRQ12 is delivered
+// on the next `run` (Option C). installMouseHandler ends in HLT, leaving the CPU
+// halted; the restructured "inject → run → assert" tests re-arm this clean spin so
+// the INT 74h trampoline delivers the AX=0Ch handler foreground.
+fn armMouseSpin(m: *Machine) void {
+    m.cpu.loadSegment(.cs, CODE_SEG);
+    m.cpu.st.eip = 0;
+    m.cpu.loadSegment(.ss, CODE_SEG);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.esp), 0xFF00);
+    m.bus.writePhys8((@as(u32, CODE_SEG) << 4) + 0, 0xEB); // JMP $
+    m.bus.writePhys8((@as(u32, CODE_SEG) << 4) + 1, 0xFE);
+    m.cpu.st.eflags.iff = true;
+    m.cpu.st.halted = false;
+}
+
+// A generous bounded run that delivers a pending IRQ12 (and runs the AX=0Ch handler
+// foreground) while the spin foreground is active. The IRQ delivers at the first
+// IF=1 boundary, so this needs only a few cycles; the budget is comfortably large.
+const DELIVER_BUDGET: u64 = 4000;
+
 test "input Phase 3: injected mouse event fires the AX=0Ch handler with the right regs (no hole)" {
     const alloc = std.testing.allocator;
     var ctx = try boot(alloc);
@@ -1109,8 +1140,9 @@ test "input Phase 3: injected mouse event fires the AX=0Ch handler with the righ
     try std.testing.expectEqual(@as(u16, 0x7F), m.dos.mouse.handler_mask);
 
     // Inject an absolute move to (222,134) with the LEFT button pressed. This is a
-    // move + left-press, both in the mask, so the handler MUST fire.
-    const cyc_before = m.cpu.st.cycles;
+    // move + left-press, both in the mask. Under Option C the inject is DEFERRED: it
+    // raises IRQ12 (it does NOT run the handler synchronously), so nothing runs at
+    // inject time and the latch slots stay 0 until a `run` delivers INT 74h.
     m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
         .x = 222,
         .y = 134,
@@ -1119,19 +1151,37 @@ test "input Phase 3: injected mouse event fires the AX=0Ch handler with the righ
         .set_y = true,
         .set_buttons = true,
     });
+    // The deferral raised IRQ12 but ran nothing yet (the restructure point: the old
+    // synchronous-fire assertions move AFTER an explicit run).
+    try std.testing.expect(irq12Pending(m));
+    try std.testing.expectEqual(@as(u16, 0), slot16(m, SLOT_CX));
+
+    // RUN: the pending IRQ12 delivers INT 74h at the HEAD of the run (the first IF=1
+    // boundary), routes through the foreground trampoline, and runs the AX=0Ch
+    // handler FOREGROUND on the controller-owned step loop — breakpointable.
+    armMouseSpin(m);
+    const cyc_before = m.cpu.st.cycles;
+    _ = m.runCycles(DELIVER_BUDGET);
 
     // (a) The handler RAN: it latched the callback's CX/DX/BL into guest RAM. CX/DX
     // are the granularity-masked position (== AX=03 read), BL the button state.
+    // [PRESERVED intent: "the handler ran with the right regs"; only the trigger
+    //  moved from the synchronous far-call to the foreground INT 74h delivery.]
     try std.testing.expectEqual(@as(u16, 222), slot16(m, SLOT_CX));
     try std.testing.expectEqual(@as(u16, 134), slot16(m, SLOT_DX));
     try std.testing.expectEqual(@as(u16, 0b001), slot16(m, SLOT_BL) & 0xFF);
 
-    // (b) NO ledger hole: the cycle counter advanced by the handler's real
-    // instruction cost (the 6 guest instructions the far-call ran). Strictly > 0.
+    // (b) NO ledger hole: the cycle counter advanced (the INT gate + the `.irq`
+    // prep cost + the trampoline + the handler's real instruction cost). [PRESERVED.]
     try std.testing.expect(m.cpu.st.cycles > cyc_before);
 
-    // After the far-call the machine's CS:IP/SP are restored (runGuestFarCall
-    // contract): a subsequent guest INT 33h still works — read the position back.
+    // The trampoline's EOI_STUB cleanly EOI'd IRQ12 (slave + master cascade): no
+    // line is left in-service after delivery.
+    try std.testing.expectEqual(@as(u8, 0), m.pic.slave.isr & IRQ12_SLAVE_BIT);
+    try std.testing.expectEqual(@as(u8, 0), m.pic.master.isr & (1 << 2));
+
+    // The IRET unwound the INT 74h frame back to the foreground: a subsequent guest
+    // INT 33h still works — read the position back.
     const r = guestInt33(m, 0x0003);
     try std.testing.expectEqual(@as(u16, 222), r.cx);
     try std.testing.expectEqual(@as(u16, 134), r.dx);
@@ -1147,8 +1197,13 @@ test "input Phase 3: callback does NOT fire when the event is outside the instal
     // Register for RIGHT-button events ONLY (bits 3|4), NOT move or left.
     installMouseHandler(m, EV_RBTN_DOWN | EV_RBTN_UP);
 
-    const cyc_before = m.cpu.st.cycles;
-    // A pure move + left-press — none of those bits are in the installed mask.
+    // A pure move + left-press — none of those bits are in the installed mask. A
+    // masked-out edge is DROPPED: it raises NO IRQ12 and stages NO pending event.
+    // [PRESERVED intent: "the callback does NOT fire outside the mask". Under Option
+    //  C the faithful proof is the ABSENCE of an IRQ12 (a masked-out PS/2 ISR misses
+    //  the edge), checked BEFORE any run — the old "no cycles charged" check can no
+    //  longer be used because verifying "nothing ran" now requires a run, which the
+    //  spinning foreground itself charges. This is a strictly STRONGER assertion.]
     m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
         .x = 100,
         .y = 100,
@@ -1157,17 +1212,22 @@ test "input Phase 3: callback does NOT fire when the event is outside the instal
         .set_y = true,
         .set_buttons = true,
     });
-
-    // The handler must NOT have run: latch slots stay zero, no cycles charged.
-    try std.testing.expectEqual(@as(u16, 0), slot16(m, SLOT_CX));
+    try std.testing.expect(!irq12Pending(m)); // masked-out: no IRQ12 raised
+    try std.testing.expectEqual(@as(u16, 0), m.dos.mouse.pending_event_mask); // nothing deferred
+    try std.testing.expectEqual(@as(u16, 0), slot16(m, SLOT_CX)); // handler did not (and cannot) run
     try std.testing.expectEqual(@as(u16, 0), slot16(m, SLOT_DX));
-    try std.testing.expectEqual(cyc_before, m.cpu.st.cycles);
 
-    // Now a RIGHT-button press IS in the mask -> the handler fires.
+    // Now a RIGHT-button press IS in the mask -> IRQ12 is raised (deferred).
     m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
         .buttons = 0b011, // keep left, add right
         .set_buttons = true,
     });
+    try std.testing.expect(irq12Pending(m));
+
+    // RUN: the in-mask event now delivers INT 74h -> the handler fires foreground.
+    armMouseSpin(m);
+    const cyc_before = m.cpu.st.cycles;
+    _ = m.runCycles(DELIVER_BUDGET);
     try std.testing.expectEqual(@as(u16, 0b011), slot16(m, SLOT_BL) & 0xFF);
     try std.testing.expect(m.cpu.st.cycles > cyc_before);
 }
@@ -1187,6 +1247,9 @@ test "input Phase 3: firing the callback is byte-identical across two runs (dete
         const m = ctx.m;
         plantMouseHandler(m);
         installMouseHandler(m, 0x7F);
+        // Inject → run → inject → run: each inject defers (raises IRQ12), each run
+        // delivers its INT 74h handler foreground. Two real deliveries, exactly the
+        // two synchronous fires the old path did — just on the controller loop now.
         m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
             .x = 200,
             .y = 120,
@@ -1195,6 +1258,8 @@ test "input Phase 3: firing the callback is byte-identical across two runs (dete
             .set_y = true,
             .set_buttons = true,
         });
+        armMouseSpin(m);
+        _ = m.runCycles(DELIVER_BUDGET);
         m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
             .dx = 15,
             .dy = -7,
@@ -1203,10 +1268,15 @@ test "input Phase 3: firing the callback is byte-identical across two runs (dete
             .set_dy = true,
             .set_buttons = true,
         });
+        armMouseSpin(m);
+        _ = m.runCycles(DELIVER_BUDGET);
     }
 
     // Same script -> byte-identical driver state, latched guest RAM, AND cycles.
-    try std.testing.expectEqual(a.m.dos.mouse, b.m.dos.mouse);
+    // [PRESERVED: the double-mint EQUALITY is the determinism guard; Option C only
+    //  moves the absolute values, never breaks run-A == run-B.] Compare the POD
+    // snapshot (excludes the machine-bound PIC seam pointers, which differ by address).
+    try std.testing.expectEqual(a.m.dos.mouse.snapshot(), b.m.dos.mouse.snapshot());
     try std.testing.expectEqual(a.m.cpu.st.cycles, b.m.cpu.st.cycles);
     try std.testing.expectEqual(slot16(a.m, SLOT_CX), slot16(b.m, SLOT_CX));
     try std.testing.expectEqual(slot16(a.m, SLOT_DX), slot16(b.m, SLOT_DX));
@@ -1216,31 +1286,23 @@ test "input Phase 3: firing the callback is byte-identical across two runs (dete
 }
 
 // ===========================================================================
-// PHASE 1 REPRODUCTION (plans/mouse-callback-irq-strand.md) — the PIC timer-IRQ
-// strand. The INT 33h AX=0Ch mouse callback is fired OUT OF BAND as a bare
-// `runGuestFarCall` with the foreground IF (=1 for the BaK spin) and NO PIC/EOI
-// frame discipline. With IF=1 a hardware timer IRQ0 can be acknowledged
-// (master ISR bit0 -> 1) INSIDE the callback's `runGuestFarCall` step loop.
+// FORMER PHASE-1 IRQ-STRAND REGION (plans/mouse-callback-irq-strand.md), now the
+// PROOF that Option C makes the strand STRUCTURALLY IMPOSSIBLE.
 //
-// The hermetic claim: there is a PIT-IRQ0 due-cycle offset, landing inside the
-// callback window, at which `runGuestFarCall` returns with master ISR bit0 STUCK
-// set and never EOI'd — exactly the live BaK deadlock state (isr=1, irr=1,
-// getPendingInterrupt()==null, timer dead). We SWEEP every offset across the
-// window and assert the CORRECT (no-strand) behavior, so the test goes RED at
-// the stranding offset(s).
+// History: the AX=0Ch mouse callback used to be fired OUT OF BAND as a bare host
+// far-call with the foreground IF (=1 for the BaK spin) and NO PIC/EOI discipline.
+// With IF=1 a hardware timer IRQ0 could be acknowledged (master ISR bit0 -> 1)
+// INSIDE that callback's step loop and, at a stranding PIT offset, the loop
+// returned with master ISR bit0 STUCK and never EOI'd — the live BaK deadlock
+// (isr=1, irr=1, getPendingInterrupt()==null, timer dead). That whole out-of-band
+// path is GONE (Option C: the handler is reached via a REAL INT 74h frame, the
+// INT gate clears IF for its duration, and EOI_STUB EOIs slave+master in-band).
 //
-// Wiring (machine-level, the real paths only):
-//  - A guest INT 08h ISR planted in RAM: INC a known RAM counter, EOI to the
-//    master (OUT 0x20,0x20), IRET. IVT[8] -> it. (A faithful self-EOI timer ISR
-//    like BaK's own, whose exit is CORRECT.)
-//  - A multi-instruction AX=0Ch mouse handler (many NOPs so a timer IRQ has
-//    boundaries to land on mid-callback), then RETF. Installed via the REAL
-//    INT 33h AX=0Ch service. Event mask armed for all events.
-//  - The PIT ch0 IRQ0 scheduled (via the real scheduler seam the PIT uses) to
-//    come due at cycles_now + delta, swept across the whole callback window.
-//  - Foreground IF=1.
-//  - The callback fired the live way: `injectAndFire` -> fireEventCallback ->
-//    runGuestFarCall.
+// So the test below does the OPPOSITE of the old sweep: it asserts that a deferred
+// IRQ12 and a concurrent timer IRQ0 BOTH deliver foreground and EOI cleanly,
+// leaving no stuck in-service bit and the timer LIVE. The helpers (a self-EOI guest
+// INT 08h timer ISR, a wide-NOP AX=0Ch handler installed via the REAL INT 33h
+// service, and a one-shot PIT IRQ0 via the real scheduler seam) are reused as-is.
 // ===========================================================================
 
 // A second handler segment so this repro never collides with plantMouseHandler's
@@ -1339,131 +1401,227 @@ fn scheduleOneShotIrq0(m: *Machine, delta: u64) void {
     m.sched.schedule(m.device_time, timing.cpuToDevice(delta, m.clock.mult), PIT_SOURCE_ID, .pit_ch0, 0);
 }
 
-test "live mouse: AX=0Ch callback must not strand a hardware IRQ in-service (timer nested at the sentinel boundary, cycle sweep)" {
+test "mouse: AX=0Ch callback (INT 74h) and a concurrent timer IRQ0 both EOI cleanly under foreground delivery (no strand)" {
+    // RE-PURPOSED from the Phase-1 IRQ-strand REPRODUCTION. Under Option C the strand
+    // is STRUCTURALLY IMPOSSIBLE: the AX=0Ch handler is reached through a REAL INT 74h
+    // frame (the foreground trampoline), the INT gate clears IF for its duration (so a
+    // hardware IRQ0 can NOT be acknowledged mid-handler), and EOI_STUB discharges the
+    // slave+master EOI IN-BAND before IRET. So instead of sweeping for the strand, we
+    // assert the OPPOSITE: a deferred IRQ12 delivers, runs the handler, and EOIs
+    // cleanly — AND a concurrent periodic timer IRQ0 lands around it and ALSO EOIs
+    // cleanly, leaving the timer LIVE (no frozen in-service bit, no deadlock).
     const alloc = std.testing.allocator;
     var ctx = try boot(alloc);
     defer ctx.deinit();
     const m = ctx.m;
 
-    plantStrandHandler(m);
-    installStrandHandler(m, 0x7F); // arm for all events
-    plantTimerIsr(m);
+    plantStrandHandler(m); // NOP*32 + RETF (reached via INT 74h now)
+    installStrandHandler(m, 0x7F); // arm for all events; AX=000C unmasks IRQ12
+    plantTimerIsr(m); // self-EOI INT 08h timer ISR at IVT[8]
 
-    // post() already programmed the PIC (IRQ0 unmasked). Confirm the preconditions
-    // the BaK spin had: IRQ0 unmasked, nothing yet in service.
+    // Preconditions: IRQ0 unmasked (POST), IRQ12 unmasked (AX=000C), nothing yet in
+    // service, IVT[0x74] pointed at the host trampoline.
     try std.testing.expectEqual(@as(u8, 0), m.pic.master.imr & 0x01); // IRQ0 unmasked
-    try std.testing.expectEqual(@as(u8, 0), m.pic.master.isr & 0x01); // nothing in service
+    try std.testing.expectEqual(@as(u8, 0), m.pic.slave.imr & IRQ12_SLAVE_BIT); // IRQ12 unmasked
+    try std.testing.expectEqual(@as(u8, 0), m.pic.master.isr & 0x01);
+    try std.testing.expectEqual(@as(u8, 0), m.pic.slave.isr & IRQ12_SLAVE_BIT);
 
-    // post() armed the BIOS default ~18.2 Hz periodic IRQ0. Cancel it + make ch0
-    // inactive so the ONLY timer interrupt during the sweep is the one we place
-    // (otherwise the default period dominates the window measurement). Each sweep
-    // iteration re-arms its own one-shot via scheduleOneShotIrq0.
-    m.sched.cancel(PIT_SOURCE_ID, .pit_ch0);
-    m.pit.channels[0].mode = .inactive;
-
-    // A valid foreground (CS:SS:SP) with IF=1, NOT halted — installStrandHandler's
-    // HLT left the CPU halted; the far-call must execute, not idle.
+    // Foreground spin with IF=1 (the BaK spin context).
     setStrandForeground(m);
 
-    // Find the callback's cycle WIDTH so we can sweep the whole window. Fire once
-    // with NO timer scheduled to measure how many cycles the far-call costs (just
-    // the planted handler's instructions — the sentinel-step boundary is its end).
-    const probe_before = m.cpu.st.cycles;
+    // Schedule a timer IRQ0 to land a few cycles into the run (it will be recognized
+    // around/after the INT 74h delivery — never INSIDE it, since IF=0 there), and
+    // raise IRQ12 via a deferred mouse inject.
+    scheduleOneShotIrq0(m, 3);
     m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
-        .x = 100,
-        .y = 100,
+        .dx = 3,
+        .dy = -2,
+        .set_dx = true,
+        .set_dy = true,
+    });
+    try std.testing.expect(irq12Pending(m)); // deferred IRQ12 staged
+
+    // RUN: both INT 74h (IRQ12) and INT 08h (IRQ0) deliver foreground on the one
+    // step loop. Each owns a real IVT frame and EOIs in-band.
+    _ = m.runCycles(4000);
+
+    // CORRECT behavior (the opposite of the old strand assertion): neither line is
+    // left stuck in-service after delivery.
+    try std.testing.expectEqual(@as(u8, 0), m.pic.master.isr & 0x01); // IRQ0 EOI'd
+    try std.testing.expectEqual(@as(u8, 0), m.pic.slave.isr & IRQ12_SLAVE_BIT); // IRQ12 EOI'd
+    try std.testing.expectEqual(@as(u8, 0), m.pic.master.isr & (1 << 2)); // cascade IRQ2 EOI'd
+    // The timer ISR ran (the deferred IRQ12 did NOT strand it).
+    try std.testing.expect(tickCount(m) > 0);
+
+    // And the timer is still LIVE: a freshly scheduled IRQ0 delivers and bumps the
+    // counter (under the old strand it would be frozen, blocked by a stuck ISR bit).
+    const ticks_before = tickCount(m);
+    scheduleOneShotIrq0(m, 4);
+    _ = m.runCycles(4000);
+    try std.testing.expect(tickCount(m) > ticks_before);
+    // No line stuck, and nothing falsely pending-but-blocked.
+    try std.testing.expectEqual(@as(u8, 0), m.pic.master.isr & 0x01);
+}
+
+test "mouse: snapshot/restore round-trips a pending (in-flight) IRQ12 + pending_event_mask" {
+    // Option C determinism audit: a snapshot taken with an AX=0Ch event DEFERRED (an
+    // IRQ12 in flight, not yet serviced) must restore byte-identically — the deferred
+    // state lives in exactly two snapshotted places: the driver's `pending_event_mask`
+    // AND the PIC slave IRR (Pic.Snapshot). After restore the handler still delivers.
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    plantMouseHandler(m);
+    installMouseHandler(m, 0x7F);
+
+    // Inject WITHOUT running: raises IRQ12 + stages pending_event_mask (in flight).
+    m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
+        .x = 210,
+        .y = 118,
         .buttons = 0b001,
         .set_x = true,
         .set_y = true,
         .set_buttons = true,
     });
-    const window = m.cpu.st.cycles - probe_before;
-    try std.testing.expect(window > 0);
+    try std.testing.expect(irq12Pending(m));
+    try std.testing.expect(m.dos.mouse.pending_event_mask != 0);
 
-    // Sweep the IRQ0 due-cycle across [1 .. window + slack]. At EACH offset:
-    //   * arm a foreground spin with IF=1,
-    //   * schedule the one-shot IRQ0 at cycles_now + delta,
-    //   * fire the callback the live way,
-    //   * assert the CORRECT post-state: master ISR bit0 CLEAR, and the timer is
-    //     still LIVE (a subsequent scheduled IRQ0 delivers and bumps the counter).
-    var strand_offsets: [64]u64 = undefined;
-    var n_strands: usize = 0;
+    // Snapshot the in-flight state; the snapshot must capture BOTH places.
+    const snap = m.snapshot();
+    const ram_copy = try alloc.alloc(u8, m.bus.ram.len);
+    defer alloc.free(ram_copy);
+    @memcpy(ram_copy, m.bus.ram);
+    try std.testing.expectEqual(m.dos.mouse.pending_event_mask, snap.dos_mouse.pending_event_mask);
+    try std.testing.expect(snap.dos_mouse.pending_event_mask != 0);
 
-    var delta: u64 = 1;
-    const sweep_end = window + 8;
-    while (delta <= sweep_end) : (delta += 1) {
-        // Fresh PIC/CPU interrupt preconditions for this offset. Clear any
-        // residue from the previous iteration so each offset is independent.
-        m.pic.master.isr = 0;
-        m.pic.master.irr = 0;
-        m.pic.slave.isr = 0;
-        m.pic.slave.irr = 0;
-        m.bus.writePhys16((@as(u32, STRAND_ISR_SEG) << 4) + STRAND_TICK_SLOT, 0);
+    // Mutate the deferred state AWAY (drop the pending mask + lower the IRQ12), then
+    // restore and assert both came back. (The PIC seam is re-bound, not snapshotted —
+    // a restore preserves it because it overwrites only POD fields.)
+    m.dos.mouse.pending_event_mask = 0;
+    m.pic.lowerIrq(12);
+    try std.testing.expect(!irq12Pending(m));
+    m.restore(snap);
+    @memcpy(m.bus.ram, ram_copy);
+    try std.testing.expect(irq12Pending(m)); // slave IRR bit4 restored
+    try std.testing.expect(m.dos.mouse.pending_event_mask != 0); // pending mask restored
 
-        // Foreground: a tight JMP $ spin at a fixed seg:off, IF=1 (the BaK spin).
-        setStrandForeground(m);
+    // The restored in-flight IRQ12 is LIVE: a run delivers the handler foreground.
+    armMouseSpin(m);
+    _ = m.runCycles(DELIVER_BUDGET);
+    try std.testing.expectEqual(@as(u16, 210), slot16(m, SLOT_CX));
+    try std.testing.expectEqual(@as(u16, 118), slot16(m, SLOT_DX));
+    try std.testing.expectEqual(@as(u8, 0), m.pic.slave.isr & IRQ12_SLAVE_BIT); // EOI'd
+}
 
-        // Schedule the timer IRQ0 to land at cycles_now + delta (inside/around the
-        // callback window), then fire the callback OUT OF BAND like the live path.
-        scheduleOneShotIrq0(m, delta);
+test "mouse: AX=0000 driver reset unmasks IRQ12 and (re)points IVT[0x74] at the host trampoline" {
+    // Option C determinism-audit checklist: the driver reset must UNMASK IRQ12 (the
+    // "mouse-driver TSR unmasks its IRQ on install" step) AND re-establish zdos's
+    // ownership of INT 74h (IVT[0x74] -> the host trampoline), and clear any deferred
+    // event. Clobber both first, then drive a REAL guest INT 33h AX=0000 and assert.
+    const alloc = std.testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    // Clobber: mask IRQ12 in the slave PIC, point IVT[0x74] at junk, stage a pending
+    // event — exactly the stale state a reset must scrub.
+    m.pic.slave.imr |= IRQ12_SLAVE_BIT;
+    m.bus.writePhys16(0x74 * 4, 0xDEAD);
+    m.bus.writePhys16(0x74 * 4 + 2, 0xBEEF);
+    m.dos.mouse.pending_event_mask = 0x55;
+    m.pic.raiseIrq(12);
+    try std.testing.expect(irq12Pending(m));
+
+    // The REAL driver-reset path (MOV AX,0; INT 33h; HLT) — no host shortcut.
+    _ = guestInt33(m, 0x0000);
+
+    // IRQ12 unmasked, deferred state scrubbed, pending IRQ12 lowered.
+    try std.testing.expectEqual(@as(u8, 0), m.pic.slave.imr & IRQ12_SLAVE_BIT);
+    try std.testing.expectEqual(@as(u16, 0), m.dos.mouse.pending_event_mask);
+    try std.testing.expect(!irq12Pending(m));
+    // IVT[0x74] re-points at the host INT 74h trampoline (zdos owns INT 74h).
+    const t = machine_mod.Bridge.int74SegOff();
+    try std.testing.expectEqual(t.off, m.bus.readPhys16(0x74 * 4));
+    try std.testing.expectEqual(t.seg, m.bus.readPhys16(0x74 * 4 + 2));
+}
+
+// A dedicated stack segment for the SP-near-floor test, isolated from CODE_SEG
+// (0x2000), HANDLER_SEG (0x3000), and the strand segs (0x4000/0x5000).
+const FLOOR_SEG: u16 = 0x6000;
+
+// Arm a foreground spin (CS=CODE_SEG JMP $) but with SS=FLOOR_SEG and a SP only a
+// few bytes above the segment floor, IF=1 — so the ~34-byte INT 74h ISR frame
+// (FLAGS/CS/IP + PUSHA + DS/ES + two far frames) wraps within the stack segment.
+fn armFloorForeground(m: *Machine, sp: u16) void {
+    m.cpu.loadSegment(.cs, CODE_SEG);
+    m.cpu.st.eip = 0;
+    m.bus.writePhys8((@as(u32, CODE_SEG) << 4) + 0, 0xEB); // JMP $
+    m.bus.writePhys8((@as(u32, CODE_SEG) << 4) + 1, 0xFE);
+    m.cpu.loadSegment(.ss, FLOOR_SEG);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.esp), sp);
+    m.cpu.st.eflags.iff = true;
+    m.cpu.st.halted = false;
+}
+
+test "mouse: AX=0Ch INT 74h delivery with SP a few bytes above the segment floor is DETECTED as a #SS fault, not a silent wrap" {
+    // The deliberately-chosen no-stack-switch model (docs/callback-observability-plan
+    // §3) runs the handler on the FOREGROUND stack — ~34 bytes (FLAGS/CS/IP + PUSHA +
+    // DS/ES + two far frames). The known regression risk: a deep guest stack near a
+    // segment floor overflowing under that frame. zdos does NOT silently wrap it: the
+    // 386 real-mode stack-limit is enforced, and the trampoline's PUSHA PRE-FLIGHTS
+    // the whole push range (exec_data.zig `pusha`) — an overflow past the 0xFFFF
+    // segment limit raises #SS (vector 12) with NO partial commit, BEFORE any byte is
+    // written. So the overflow is DETECTED (a fault), not a silent wrap. This test
+    // pins exactly that, deterministically.
+    const alloc = std.testing.allocator;
+    var a = try boot(alloc);
+    defer a.deinit();
+    var b = try boot(alloc);
+    defer b.deinit();
+
+    const floor_base: u32 = @as(u32, FLOOR_SEG) << 4;
+
+    inline for (.{ a, b }) |ctx| {
+        const m = ctx.m;
+        plantMouseHandler(m);
+        installMouseHandler(m, 0x7F);
         m.dos.mouse.injectAndFire(&m.cpu, &m.svc.bridge, .{
-            .dx = 3,
-            .dy = -2,
-            .set_dx = true,
-            .set_dy = true,
+            .x = 150,
+            .y = 90,
+            .buttons = 0b001,
+            .set_x = true,
+            .set_y = true,
+            .set_buttons = true,
         });
-
-        // --- Observe the PIC state immediately after the out-of-band callback ---
-        const isr_after = m.pic.master.isr & 0x01;
-
-        // CORRECT behavior: bit0 must NOT be stuck in-service. Either the IRQ0 was
-        // not yet acked (still pending in IRR, to be delivered by the foreground),
-        // or it was acked AND its ISR ran its EOI to completion -> isr clear.
-        if (isr_after != 0) {
-            // Strand candidate. Confirm it is the LIVE deadlock state: prove the
-            // timer is DEAD — step the foreground (IF=1, IRQ0 unmasked, the spin)
-            // and a freshly scheduled IRQ0 can NOT deliver (the equal-rank
-            // re-pending IRQ0 is blocked by the in-service bit -> counter frozen).
-            const irr_after = m.pic.master.irr & 0x01;
-            const ticks_before = tickCount(m);
-            // Schedule another IRQ0 and let the foreground spin run well past it.
-            scheduleOneShotIrq0(m, 4);
-            _ = m.runCycles(2000);
-            const ticks_after = tickCount(m);
-            const irr_repended = m.pic.master.irr & 0x01; // the re-pending IRQ0
-            const pending = m.pic.getPendingInterrupt();
-
-            if (n_strands < strand_offsets.len) strand_offsets[n_strands] = delta;
-            n_strands += 1;
-            std.debug.print(
-                "STRAND at delta={d}: post-callback isr&1={d} irr&1={d} | after re-pend+spin: isr&1={d} irr&1={d} ticks {d}->{d} (frozen={}) getPendingInterrupt={any}\n",
-                .{ delta, isr_after, irr_after, m.pic.master.isr & 1, irr_repended, ticks_before, ticks_after, ticks_after == ticks_before, pending },
-            );
-        }
+        // SP = 8: the INT 74h gate (6 bytes) brings SP to 2, then the trampoline's
+        // PUSHA (16 bytes) would overflow past the segment floor → #SS.
+        armFloorForeground(m, 8);
+        _ = m.runCycles(DELIVER_BUDGET);
     }
 
-    if (n_strands > 0) {
-        std.debug.print("REGRESSION: IRQ strand at {d} offset(s) in [1..{d}]; first={d}\n", .{ n_strands, sweep_end, strand_offsets[0] });
-    }
+    // (a) DETECTED: the overflow raised #SS (vector 12). The INT 74h frame was
+    // delivered, but its PUSHA pre-flight faulted — the LAST delivered vector is the
+    // #SS, proving the overflow surfaced as a fault rather than corrupting silently.
+    try std.testing.expectEqual(@as(u8, 12), a.m.cpu.st.last_delivered.vector);
 
-    // THE ASSERTION (correct behavior): NO offset may leave the timer IRQ0 stuck
-    // in-service. RED here == the strand reproduced.
-    //
-    // OBSERVED (current code, RED): offsets delta=129..132 strand. At each, the
-    // diagnostics confirmed the exact mechanism — vector 0x08 (IRQ0) WAS delivered
-    // INSIDE the callback (cpu.st.last_delivered.vector==8, seq incremented: the
-    // ISR was ENTERED, ackIrq set master.isr bit0), but `runGuestFarCall`'s
-    // unconditional CS:IP/SP restore returned the CPU to the FOREGROUND spin
-    // (CS:IP back at CODE_SEG:0) BEFORE the ISR ran its `OUT 0x20,0x20` EOI. The
-    // in-service bit is stranded. After a fresh IRQ0 re-pends, the master sits at
-    // isr&1=1 AND irr&1=1 with getPendingInterrupt()==null (equal-rank IRQ0 blocked
-    // by the in-service bit — pic.zig pendingLine rank gate) and the tick counter
-    // is FROZEN — byte-for-byte the live BaK deadlock (plan §0/§1).
-    //
-    // The stranding offsets are the cycles at which the timer IRQ0 first becomes
-    // due ON THE STOP-SENTINEL step of runGuestFarCall: cpu.step() runs the
-    // sentinel via executeOne (which sets reentry_done=true), THEN serviceInterrupts
-    // acks+delivers IRQ0 at that same boundary; the loop sees reentry_done and
-    // exits, restoring CS:IP and abandoning the just-entered ISR (bridge.zig:705-714).
-    try std.testing.expectEqual(@as(usize, 0), n_strands);
+    // (b) The handler did NOT run (the overflow prevented delivery): latch stays 0.
+    try std.testing.expectEqual(@as(u16, 0), slot16(a.m, SLOT_CX));
+    try std.testing.expectEqual(@as(u16, 0), slot16(a.m, SLOT_BL) & 0xFF);
+
+    // (c) NOT a silent wrap: PUSHA's pre-flight committed NOTHING on the fault, so the
+    // top of the stack segment (where a wrapping PUSHA would have scribbled) is
+    // untouched — no out-of-segment AND no wrap-around write.
+    try std.testing.expectEqual(@as(u8, 0), a.m.bus.readPhys8(floor_base + 0xFFF0));
+    try std.testing.expectEqual(@as(u8, 0), a.m.bus.readPhys8(floor_base + 0xFFFE));
+
+    // (d) DETERMINISTIC: the near-floor fault path is byte-identical across runs.
+    try std.testing.expectEqual(a.m.cpu.st.cycles, b.m.cpu.st.cycles);
+    try std.testing.expectEqual(a.m.cpu.st.last_delivered.seq, b.m.cpu.st.last_delivered.seq);
+    try std.testing.expectEqual(a.m.dos.mouse.snapshot(), b.m.dos.mouse.snapshot());
+    var off: u32 = 0;
+    while (off < 0x10000) : (off += 1) {
+        try std.testing.expectEqual(a.m.bus.readPhys8(floor_base + off), b.m.bus.readPhys8(floor_base + off));
+    }
 }

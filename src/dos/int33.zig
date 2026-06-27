@@ -73,6 +73,16 @@ const BTN_LEFT: u16 = 1 << 0;
 const BTN_RIGHT: u16 = 1 << 1;
 const BTN_MIDDLE: u16 = 1 << 2;
 
+/// The PS/2 mouse IRQ line (IRQ12 → slave 8259 line 4 → INT 74h). The host-
+/// emulated INT 33h driver raises this directly (settled sub-decision A: zdos
+/// models the driver, not the 8042 aux channel).
+const MOUSE_IRQ: u4 = 12;
+
+/// The PIC raise/lower/unmask seam (mirrors `Keyboard.RaiseFn`) — a bound callback
+/// so the DOS module does NOT import the machine or the concrete `Pic`. The machine
+/// binds it to its `Pic` at `wire`/`reset` and re-binds on restore.
+pub const PicLineFn = *const fn (ctx: *anyopaque, line: u4) void;
+
 pub fn Int33(comptime Cpu: type) type {
     return struct {
         const Self = @This();
@@ -142,15 +152,29 @@ pub fn Int33(comptime Cpu: type) type {
         handler_off: u16 = 0,
         handler_mask: u16 = 0,
 
-        /// Re-entrancy guard for the event callback (input Phase 3). TRANSIENT,
-        /// stack-scoped: set on entry to `fireEventCallback` and cleared on exit,
-        /// so a guest handler that itself injects (or whose nested instructions
-        /// re-enter this path) cannot recursively fire the handler. It is ALWAYS
-        /// false at any command/snapshot boundary (the far-call runs to completion
-        /// synchronously on the worker before the next command), so it is NOT a
-        /// snapshot field — capturing an invariably-false flag would add nothing
-        /// and only widen the golden. See the snapshot SCOPE NOTE below.
-        firing: bool = false,
+        /// Deferred AX=0Ch event bits awaiting INT 74h service (Option C). When an
+        /// inject produces an event that intersects the installed `handler_mask`,
+        /// the driver OR-accumulates the intersected bits HERE and raises IRQ12
+        /// (instead of firing the handler synchronously out of band). The handler
+        /// then runs FOREGROUND when `serviceInterrupts` delivers INT 74h at the
+        /// next IF=1 boundary (so it is breakpointable), and `prepareInt74` consumes
+        /// this mask. Coalescing semantics (sub-decision B): a second event arriving
+        /// before service ORs into the same pending mask → ONE delivery reporting the
+        /// LIVE driver state. This IS snapshot state (an IRQ12 can be in flight at a
+        /// command/snapshot boundary), unlike the old transient `firing` flag which
+        /// it replaces — re-entrancy is now enforced by the slave PIC ISR-in-service
+        /// bit (set by `ackIrq`, snapshotted in `Pic.Snapshot`), not a host flag.
+        pending_event_mask: u16 = 0,
+
+        /// PIC seam (mirrors `Keyboard.raise_ctx`/`raise_fn`) — bound by the machine
+        /// at `wire`/`reset`, re-bound on restore, NEVER snapshotted. Lets the driver
+        /// raise/lower IRQ12 (slave line 4) and unmask it without importing the
+        /// machine or the concrete `Pic`. `null` outside a wired machine (a pure
+        /// unit test) — then the deferral is inert (no IRQ12, no delivery).
+        pic_ctx: ?*anyopaque = null,
+        pic_raise: ?PicLineFn = null,
+        pic_lower: ?PicLineFn = null,
+        pic_unmask: ?PicLineFn = null,
 
         /// Sub-mickey remainder (dosbox `precise_mickey_counter`,
         /// mouseif_dos_driver.cpp:1268), scaled by SCALE. Carries the
@@ -291,6 +315,45 @@ pub fn Int33(comptime Cpu: type) type {
             self.last_press_y = .{ 0, 0, 0 };
             self.last_release_x = .{ 0, 0, 0 };
             self.last_release_y = .{ 0, 0, 0 };
+
+            // Option C — clear the deferred-event state HOLE (CLAUDE rule 5: every
+            // field reset). A stale pending mask or a stuck slave IRQ12 surviving a
+            // driver reset would deliver a phantom callback on the next `run` and
+            // break determinism across reset boundaries. So: drop the pending mask,
+            // lower any pending IRQ12, re-point IVT[0x74] at the host trampoline
+            // (zdos owns INT 74h — re-establish it even if a guest clobbered the
+            // vector), and UNMASK IRQ12 in the slave PIC (the "mouse-driver TSR
+            // unmasks its IRQ on install" step; the slave IMR stays 0xFF from POST
+            // until this driver reset, exactly as a real machine with no mouse TSR).
+            self.pending_event_mask = 0;
+            self.lowerIrq12();
+            self.repointInt74Vector(cpu);
+            self.unmaskIrq12();
+        }
+
+        // -------------------------------------------------------------------
+        // PIC seam helpers (Option C). No-ops outside a wired machine.
+        // -------------------------------------------------------------------
+        fn raiseIrq12(self: *Self) void {
+            if (self.pic_raise) |f| f(self.pic_ctx.?, MOUSE_IRQ);
+        }
+        fn lowerIrq12(self: *Self) void {
+            if (self.pic_lower) |f| f(self.pic_ctx.?, MOUSE_IRQ);
+        }
+        fn unmaskIrq12(self: *Self) void {
+            if (self.pic_unmask) |f| f(self.pic_ctx.?, MOUSE_IRQ);
+        }
+
+        /// Point IVT[0x74] at the host INT 74h trampoline (the BIOS-ROM stub the
+        /// bridge planted). zdos OWNS INT 74h and routes it straight to the AX=0Ch
+        /// handler (sub-decision A's documented limitation — a guest installing its
+        /// own INT 74h ISR to read the PS/2 packet is unsupported). Re-established at
+        /// POST (`dosInit`) and on every driver reset.
+        fn repointInt74Vector(self: *Self, cpu: *Cpu) void {
+            _ = self;
+            const t = Bridge.int74SegOff();
+            cpu.bus.writePhys16(0x74 * 4, t.off);
+            cpu.bus.writePhys16(0x74 * 4 + 2, t.seg);
         }
 
         pub fn service(self: *Self, dos: *Dos, cpu: *Cpu, br: *Bridge) void {
@@ -398,6 +461,10 @@ pub fn Int33(comptime Cpu: type) type {
                     self.handler_mask = cpu.st.getReg16(ECX);
                     self.handler_seg = cpu.st.selector[@intFromEnum(Seg.es)];
                     self.handler_off = cpu.st.getReg16(EDX);
+                    // Option C belt-and-suspenders: unmask IRQ12 here too, so a guest
+                    // that installs a handler WITHOUT a fresh AX=0000 driver reset
+                    // still gets deliveries (closes the silent-no-fire hole).
+                    self.unmaskIrq12();
                 },
                 0x0011 => { // GET NUMBER OF BUTTONS / CuteMouse id (mouse.cpp:1935)
                     cpu.st.setReg16(EAX, 0x574D); // detection identifier
@@ -672,12 +739,43 @@ pub fn Int33(comptime Cpu: type) type {
             return mask;
         }
 
-        /// Far-call the installed AX=0Ch event handler with the Microsoft callback
-        /// register ABI, charging EVERY instruction it runs through the normal
-        /// ledger (no hole — see `runGuestFarCall`). Fires ONLY when a handler is
+        /// DEFER the installed AX=0Ch event handler to IRQ12/INT 74h (Option C). The
+        /// driver no longer far-calls the handler synchronously out of band; instead
+        /// it OR-accumulates the intersected event bits into `pending_event_mask` and
+        /// raises IRQ12, so the handler runs FOREGROUND when `serviceInterrupts`
+        /// delivers INT 74h at the next IF=1 boundary (through the trampoline) — every
+        /// handler instruction retires on the ONE controller-owned step loop, so it is
+        /// breakpointable and its watched accesses fire. Fires ONLY when a handler is
         /// installed AND the triggering `condition` intersects the installed
-        /// `handler_mask`. AX carries just the intersected bits (the events THIS
-        /// call is reporting, the bits the handler asked for).
+        /// `handler_mask`; otherwise the event is dropped (raises no IRQ12), faithful
+        /// to a masked-out PS/2 ISR.
+        ///
+        /// Delivery is now CONDITIONAL (requires guest IF=1 + IRQ12 unmasked), not
+        /// forced — see docs/callback-observability-plan.md §4. The register ABI the
+        /// handler receives is applied later, by `prepareInt74`, AFTER the trampoline's
+        /// PUSHA saved the foreground copies.
+        fn fireEventCallback(self: *Self, condition: u16) void {
+            if (self.handler_seg == 0 and self.handler_off == 0) return;
+            const fire_bits = condition & self.handler_mask;
+            if (fire_bits == 0) return; // masked-out edge: dropped, no IRQ12
+            // OR-accumulate (coalescing, sub-decision B): a second event before the
+            // first is serviced adds its bits to the same pending mask → ONE INT 74h
+            // reporting the LIVE state. The slave ISR-in-service bit (set by ackIrq)
+            // blocks re-delivery until the EOI in the trampoline, so there is no host
+            // re-entrancy flag to track.
+            self.pending_event_mask |= fire_bits;
+            self.raiseIrq12();
+        }
+
+        /// The INT 74h host trap (Option C) — invoked by the trampoline's embedded
+        /// `FE 38 prep_id`, AFTER PUSHA/PUSH DS/PUSH ES saved the foreground context
+        /// onto the guest stack. It stages the user handler far-call by setting the
+        /// Microsoft callback register ABI into the (now-saved) live regs and pushing
+        /// the far-return frames so the trampoline's `RETF` enters the handler and the
+        /// handler's `RETF` lands on EOI_STUB. Charged the `.irq` synthetic cost by
+        /// the dispatch sink (no ledger hole). Does NOT touch IF (the INT gate already
+        /// cleared it; EOI_STUB's IRET restores it) — re-entrancy is blocked by the
+        /// slave ISR-in-service bit for the whole handler duration.
         ///
         /// Register ABI (dosbox-x INT74_Handler, mouse.cpp:2266-2273):
         ///   AX = condition mask (events ∩ installed mask)
@@ -688,63 +786,26 @@ pub fn Int33(comptime Cpu: type) type {
         ///   DI = signed vertical mickey counter (mouse.mickey_y)
         /// DS is left UNTOUCHED: the real driver never sets DS for the user sub
         /// (dosbox-x pushes only sub_seg:sub_ofs, never DS), and BaK's Borland far
-        /// callback establishes its own DGROUP in its prologue — verified against
-        /// `mouse_event_callback` (KRONDOR-flat.c:20257), which reads in_CX/in_DX/
-        /// in_BL and writes DGROUP statics with no reliance on the caller's DS.
-        ///
-        /// Re-entrancy: guarded by `self.firing` (transient) so a handler that
-        /// re-enters the inject path can't recursively fire. Runs on the worker
-        /// (machine owner) at a command boundary, so the far-call completes before
-        /// the next command — `firing` is always false across snapshots.
-        fn fireEventCallback(self: *Self, cpu: *Cpu, br: *Bridge, condition: u16) void {
-            if (self.firing) return; // re-entrancy guard (Phase 3)
-            if (self.handler_seg == 0 and self.handler_off == 0) return;
-            const fire_bits = condition & self.handler_mask;
-            if (fire_bits == 0) return;
+        /// callback establishes its own DGROUP in its prologue.
+        pub fn prepareInt74(self: *Self, cpu: *Cpu) void {
+            const eoi = Bridge.int74EoiStubSegOff();
+            const have_handler = !(self.handler_seg == 0 and self.handler_off == 0);
+            const fire_bits = self.pending_event_mask & self.handler_mask;
+            // The IRQ is now being serviced (the ISR-in-service bit blocks re-entry
+            // until EOI); the pending mask is consumed regardless of delivery.
+            self.pending_event_mask = 0;
 
-            self.firing = true;
-            defer self.firing = false;
-
-            // PRESERVE THE INTERRUPTED GUEST CONTEXT (the ISR-frame model).
-            //
-            // On real hardware the AX=0Ch handler is reached from the mouse driver's
-            // INT 74h ISR: the hardware IRQ pushes FLAGS/CS/IP, and the driver's
-            // dispatch preserves the GP registers around the user handler. The user
-            // handler is therefore free to clobber AX/BX/CX/DX (mouse-handler ABI
-            // scratch), but the FOREGROUND code it interrupted resumes with its
-            // registers intact (dosbox-x INT74_Handler, mouse.cpp:2266 — the IRQ
-            // entry frame restores the caller's full context on IRET).
-            //
-            // zdos fires the callback as a bare far-call between debugger commands
-            // (the machine is parked mid-program), and `runGuestFarCall` only
-            // restores CS:IP/SP. Without preserving the rest, the callback's scratch
-            // writes to AX/BX/CX/DX/SI/DI and any DS/ES it establishes would corrupt
-            // the parked foreground context — e.g. Betrayal at Krondor's per-frame
-            // cursor loop resumes with garbage registers and blits to wrong VRAM
-            // offsets (observed as top-of-screen corruption on every injected event).
-            // Save the full architectural GP/DS/ES/FLAGS context here, set the
-            // callback-ABI inputs, run the handler, then restore — so an injected
-            // event is transparent to the interrupted program, exactly as a real IRQ
-            // is. The whole GP file (incl. ESP) is captured BEFORE we touch any
-            // register; `runGuestFarCall` independently restores ESP to this same
-            // pre-call value, so restoring the saved file is consistent (no skew).
-            const saved_regs = cpu.st.regs;
-            const saved_eflags = cpu.st.eflags;
-            const ds = @intFromEnum(Seg.ds);
-            const es = @intFromEnum(Seg.es);
-            const saved_ds_sel = cpu.st.selector[ds];
-            const saved_ds_base = cpu.st.seg_base[ds];
-            const saved_es_sel = cpu.st.selector[es];
-            const saved_es_base = cpu.st.seg_base[es];
-            defer {
-                cpu.st.regs = saved_regs;
-                cpu.st.eflags = saved_eflags;
-                cpu.st.selector[ds] = saved_ds_sel;
-                cpu.st.seg_base[ds] = saved_ds_base;
-                cpu.st.selector[es] = saved_es_sel;
-                cpu.st.seg_base[es] = saved_es_base;
+            if (!have_handler or fire_bits == 0) {
+                // No-op delivery: nothing to call, but the IVT frame + ackIrq's
+                // in-service bit are real, so the trampoline must still EOI. Push the
+                // EOI_STUB far-ptr so the trampoline's RETF lands straight on it (it
+                // unwinds the saved PUSHA/DS/ES and EOIs slave+master).
+                pushFar(cpu, eoi.seg, eoi.off);
+                return;
             }
 
+            // Set the callback ABI into the live regs (the foreground copies are
+            // safely on the guest stack from PUSHA).
             cpu.st.setReg16(EAX, fire_bits);
             cpu.st.setReg16(EBX, self.buttons & 0x00FF); // BL=buttons, BH=wheel=0
             cpu.st.setReg16(ECX, self.posX());
@@ -752,34 +813,36 @@ pub fn Int33(comptime Cpu: type) type {
             cpu.st.setReg16(ESI, @bitCast(self.mickey_x));
             cpu.st.setReg16(EDI, @bitCast(self.mickey_y));
 
-            // CLEAR IF for the duration of the callback (restored by the `defer`
-            // above with the rest of eflags). On real hardware the AX=0Ch sub is
-            // reached through the mouse driver's INT 74h/IRQ12 gate, which clears IF
-            // on entry. zdos fires it out of band as a bare `runGuestFarCall`, which
-            // — unlike an INT — does NOT clear IF, so it inherited the foreground's
-            // IF=1 and ran interruptible. That let a hardware IRQ (e.g. the guest's
-            // fast timer IRQ0) be ACKNOWLEDGED inside the far-call; if the ack lands
-            // on the step that RETFs onto the stop-sentinel, `runGuestFarCall`'s loop
-            // exits (reentry_done) and its unconditional CS:IP/SP restore abandons
-            // the just-entered ISR before its EOI — stranding the PIC in-service bit,
-            // which then blocks all further delivery of that line (the BaK timer
-            // deadlock; plans/mouse-callback-irq-strand.md). The host-driven far-call
-            // owns no interrupt frame and discharges no EOI, so it MUST NOT permit a
-            // maskable IRQ to be delivered inside it; clearing IF closes that window.
-            // A pending IRQ simply stays latched in the PIC IRR and is delivered
-            // normally once IF is restored on return.
-            cpu.st.eflags.iff = false;
+            // Push the far frames so real-mode RETF semantics route correctly: the
+            // trampoline's RETF pops handler_off,handler_seg (enter the user sub); the
+            // handler's terminating RETF pops eoi_off,eoi_seg (-> EOI_STUB). Push the
+            // EOI frame FIRST (deeper), then the handler frame (on top).
+            pushFar(cpu, eoi.seg, eoi.off);
+            pushFar(cpu, self.handler_seg, self.handler_off);
+        }
 
-            br.runGuestFarCall(self.handler_seg, self.handler_off);
+        /// Push a 16-bit real-mode far-pointer frame (CS then IP, IP on top so RETF
+        /// pops IP then CS) onto SS:SP — the standard real-mode far-CALL frame order,
+        /// used here to chain the INT 74h trampoline's `RETF` into the user handler and
+        /// the handler's `RETF` into EOI_STUB. SP wraps within the stack segment
+        /// (faithful 8086 behavior).
+        fn pushFar(cpu: *Cpu, seg: u16, off: u16) void {
+            var sp = cpu.st.getReg16(@intFromEnum(Reg32.esp));
+            sp -%= 2;
+            cpu.segWrite16(.ss, sp, seg) catch {};
+            sp -%= 2;
+            cpu.segWrite16(.ss, sp, off) catch {};
+            cpu.st.setReg16(@intFromEnum(Reg32.esp), sp);
         }
 
         /// Inject an absolute/relative mouse event AND fire the AX=0Ch event
         /// callback for the resulting transition (input Phase 3, the BaK path). The
         /// FULL inject is applied first (so CX/DX/BL passed to the handler reflect
-        /// the final state — BaK just latches them), then ONE far-call carries the
-        /// combined condition mask. Captures the pre-inject button state + position
-        /// BEFORE mutating so the press/release/move bits are derived from the real
-        /// transition. The far-call self-charges its cycles via `runGuestFarCall`.
+        /// the final state — BaK just latches them), then ONE `fireEventCallback`
+        /// RAISES IRQ12 for the combined condition mask (Option C: the AX=0Ch handler
+        /// is delivered FOREGROUND via INT 74h on the next IF=1 boundary, not far-called
+        /// here). Captures the pre-inject button state + position BEFORE mutating so the
+        /// press/release/move bits are derived from the real transition.
         pub fn injectAndFire(
             self: *Self,
             cpu: *Cpu,
@@ -816,7 +879,12 @@ pub fn Int33(comptime Cpu: type) type {
 
             const moved = (self.x != old_x) or (self.y != old_y);
             const condition = conditionMask(old_btn, self.buttons, moved);
-            self.fireEventCallback(cpu, br, condition);
+            // Option C: this RAISES IRQ12 (deferred); the handler runs on the next
+            // `run` when IF=1 + IRQ12 unmasked. cpu/br are unused on the inject path
+            // now (kept for the stable caller ABI).
+            _ = cpu;
+            _ = br;
+            self.fireEventCallback(condition);
         }
 
         /// Map a normalized Q16 value (0..0x1_0000 == [0,1]) into the virtual range
@@ -850,11 +918,11 @@ pub fn Int33(comptime Cpu: type) type {
         ///     mickey path). Applied only when `set_rel`.
         ///   - `buttons`: latest mask. Applied only when `set_buttons`.
         ///
-        /// Fires the AX=0Ch callback ONCE for the combined transition; `moved` is
+        /// Raises IRQ12 for the AX=0Ch callback ONCE for the combined transition
+        /// (Option C: delivered FOREGROUND via INT 74h on the next `run`); `moved` is
         /// derived from EITHER a position change OR a mickey-counter change (so a
         /// sub-granularity drag — which moves mickeys without crossing the granularity
-        /// mask on `self.x` — still latches EV_MOVED; LOCKED minor). The far-call
-        /// self-charges its cycles via `runGuestFarCall` (no ledger hole).
+        /// mask on `self.x` — still latches EV_MOVED; LOCKED minor).
         pub fn injectSeamless(
             self: *Self,
             cpu: *Cpu,
@@ -896,7 +964,10 @@ pub fn Int33(comptime Cpu: type) type {
             const moved = (self.x != old_x) or (self.y != old_y) or
                 (self.mickey_x != old_mx) or (self.mickey_y != old_my);
             const condition = conditionMask(old_btn, self.buttons, moved);
-            self.fireEventCallback(cpu, br, condition);
+            // Option C: RAISES IRQ12 (deferred). cpu/br unused on this path now.
+            _ = cpu;
+            _ = br;
+            self.fireEventCallback(condition);
         }
 
         /// The coalesced live-mouse sample (plain integers — mirrors
@@ -945,12 +1016,14 @@ pub fn Int33(comptime Cpu: type) type {
         //
         // SCOPE NOTE: this captures the fields that exist TODAY. The Phase-2
         // relative-motion (mickey) accumulators + counters ARE captured here (the
-        // field deferred from Phase 0 — now mutable host-side state). The Phase-3
-        // callback re-entrancy flag (`firing`) is DELIBERATELY NOT captured: it is
-        // transient, set/cleared within a single `fireEventCallback` that runs to
-        // completion synchronously on the worker before the next command, so it is
-        // ALWAYS false at any snapshot boundary. Capturing an invariably-false flag
-        // would only widen the golden without adding observable state.
+        // field deferred from Phase 0 — now mutable host-side state). Option C's
+        // `pending_event_mask` (the deferred AX=0Ch event bits awaiting INT 74h
+        // service) IS captured — an IRQ12 can be in flight at a snapshot boundary, so
+        // a mid-flight snapshot must round-trip both this mask AND the PIC slave
+        // IRR/ISR (covered by `Pic.Snapshot`) to restore byte-identically. The old
+        // transient `firing` re-entrancy flag is GONE (replaced by the slave PIC
+        // ISR-in-service bit). The PIC seam (`pic_*` fn pointers) is NOT captured —
+        // it is re-bound by the machine on restore, like `Keyboard.raise_fn`.
         // -------------------------------------------------------------------
         pub const Snapshot = struct {
             present: bool,
@@ -970,6 +1043,8 @@ pub fn Int33(comptime Cpu: type) type {
             handler_seg: u16,
             handler_off: u16,
             handler_mask: u16,
+            // Option C: deferred AX=0Ch event bits awaiting INT 74h service (POD).
+            pending_event_mask: u16,
             // Phase-2 relative-motion state (fixed-point, POD).
             precise_mickey_x: i64,
             precise_mickey_y: i64,
@@ -1005,6 +1080,7 @@ pub fn Int33(comptime Cpu: type) type {
                 .handler_seg = self.handler_seg,
                 .handler_off = self.handler_off,
                 .handler_mask = self.handler_mask,
+                .pending_event_mask = self.pending_event_mask,
                 .precise_mickey_x = self.precise_mickey_x,
                 .precise_mickey_y = self.precise_mickey_y,
                 .precise_pixel_x = self.precise_pixel_x,
@@ -1038,6 +1114,7 @@ pub fn Int33(comptime Cpu: type) type {
             self.handler_seg = snap.handler_seg;
             self.handler_off = snap.handler_off;
             self.handler_mask = snap.handler_mask;
+            self.pending_event_mask = snap.pending_event_mask;
             self.precise_mickey_x = snap.precise_mickey_x;
             self.precise_mickey_y = snap.precise_mickey_y;
             self.precise_pixel_x = snap.precise_pixel_x;

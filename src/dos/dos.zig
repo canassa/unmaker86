@@ -56,6 +56,11 @@ pub const DosInt = enum {
     int2f, // multiplex
     int67, // EMS
     int33, // mouse
+    // The INT 74h (IRQ12) mouse-callback PREP trap (Option C). NOT an IVT-vectored
+    // stub: the host INT 74h trampoline (planted in the BIOS image) embeds this id's
+    // `FE 38 id`, so its own slot tail is never executed (inert, like the INT 16h
+    // poll-loop has-key/dequeue slots). Routed to `Int33.prepareInt74`.
+    int74,
 };
 
 /// A structural "unsupported DOS service" signal (D11). The API server observes
@@ -196,9 +201,9 @@ pub fn Dos(comptime Cpu: type) type {
             inline for (std.meta.fields(DosInt)) |f| {
                 const dint: DosInt = @enumFromInt(f.value);
                 const kind: bridge_mod.Kind = switch (dint) {
-                    .int21 => .dispatch,
-                    .int67 => .dispatch,
-                    .int33 => .dispatch,
+                    // The INT 74h prep trap is an IRQ-service callback (charges the
+                    // `.irq` synthetic cost, like INT 08h/09h), not a DOS dispatch.
+                    .int74 => .irq,
                     else => .dispatch,
                 };
                 const id = br.allocCallback(.iret, kind);
@@ -229,7 +234,17 @@ pub fn Dos(comptime Cpu: type) type {
                 .int2f => Int21.handle2f(self, cpu, br),
                 .int67 => self.ems.service(self, cpu, br),
                 .int33 => self.mouse.service(self, cpu, br),
+                .int74 => self.mouse.prepareInt74(cpu),
             }
+        }
+
+        /// Emit the host INT 74h mouse-callback trampoline (Option C) into the BIOS
+        /// ROM `image`. Called by the machine in POST after `registerCallbacks` (which
+        /// assigned the prep id) and before `loadRom`, alongside `emitExecRetf` — so
+        /// the stub is real guest code at `Bridge.INT74_PHYS`. IVT[0x74] is pointed at
+        /// it in `dosInit`.
+        pub fn emitInt74Trampoline(self: *Self, image: []u8) void {
+            Bridge.emitInt74Trampoline(image, self.ids.get(.int74));
         }
 
         // -------------------------------------------------------------------
@@ -252,6 +267,13 @@ pub fn Dos(comptime Cpu: type) type {
             br.setRealVec(self.ids.get(.int2f), 0x2F);
             br.setRealVec(self.ids.get(.int67), 0x67);
             br.setRealVec(self.ids.get(.int33), 0x33);
+            // INT 74h points at the host TRAMPOLINE (in the BIOS image), NOT the
+            // bare int74 slot: the trampoline (PUSHA/.../RETF/EOI_STUB) embeds the
+            // prep id's `FE 38 id` and routes to `Int33.prepareInt74` (Option C). zdos
+            // owns INT 74h (sub-decision A). Re-established on every driver reset.
+            const t = Bridge.int74SegOff();
+            self.cpu.bus.writePhys16(0x74 * 4, t.off);
+            self.cpu.bus.writePhys16(0x74 * 4 + 2, t.seg);
 
             // The arena MCB chain: one big free block.
             self.arena_first_mcb = arena_start_seg;

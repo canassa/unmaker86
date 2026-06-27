@@ -226,9 +226,10 @@ fn inputKey(ctrl: *Controller, c: anytype) Response {
 /// race-free gate: `takeFold()` returns null UNDER THE MUTEX when the record is clean,
 /// so a no-input slice runs NO machine work (zero added cycles — the determinism
 /// keystone) and a dirty slice forwards ONE coalesced sample as PLAIN INTEGERS to
-/// `Controller.injectMouseSeamless` (the abs write + true-relative mickeys + the AX=0Ch
-/// callback, each self-charging cycles via `runGuestFarCall`). No-op when `live` is null
-/// (headless/test builds never wire a record).
+/// `Controller.injectMouseSeamless` (the abs write + true-relative mickeys + RAISING
+/// IRQ12 for the AX=0Ch callback, which is delivered FOREGROUND via INT 74h on a
+/// subsequent slice's run — Option C). No-op when `live` is null (headless/test builds
+/// never wire a record).
 fn foldLiveMouse(ctrl: *Controller, live: ?*LiveMouseState) Response {
     const lm = live orelse return .ok;
     const fold = lm.takeFold() orelse return .ok; // clean ⇒ zero guest cycles

@@ -938,13 +938,13 @@ pub const Controller = struct {
     /// here we apply absolute first (verbatim range-clamped) then relative (the
     /// fixed-point mickey path), so a caller that sets neither leaves position
     /// untouched. Buttons are applied once (a relative call carries the same mask).
-    /// (Phase 3) After updating driver position/buttons, FIRE the guest's INT 33h
-    /// AX=0Ch event callback (if one is installed and the event intersects its
-    /// mask). This is what real Betrayal at Krondor requires — it is callback-only
-    /// and never polls AX=03, so injected movement/clicks reach it ONLY here. The
-    /// far-call self-charges every instruction it runs (no ledger hole; see
-    /// `Bridge.runGuestFarCall`). It runs on the worker (the machine owner) at this
-    /// command boundary, so the call completes before the next command.
+    /// (Phase 3) After updating driver position/buttons, RAISE IRQ12 for the guest's
+    /// INT 33h AX=0Ch event callback (if one is installed and the event intersects its
+    /// mask). This is what real Betrayal at Krondor requires — it is callback-only and
+    /// never polls AX=03, so injected movement/clicks reach it ONLY here. Option C: the
+    /// handler is delivered FOREGROUND via INT 74h on the next `run` (IF=1 + IRQ12
+    /// unmasked), so it runs on the ONE controller-owned step loop — every instruction
+    /// charges through the normal ledger and the handler is breakpointable.
     pub fn injectMouse(self: *Controller, req: MouseInject) void {
         const mouse = &self.m.dos.mouse;
         mouse.injectAndFire(&self.m.cpu, &self.m.svc.bridge, .{
@@ -995,11 +995,35 @@ pub const Controller = struct {
         const prev = self.m.dos.mouse.buttons;
         self.injectMouse(req); // move (if any) + PRESS the buttons mask (down edges)
         const stop = self.runDwell(self.dwellCycles(hold_ms)); // hold for the dwell
-        // RELEASE: revert to the pre-press mask (up edges for exactly the bits we pressed),
-        // position untouched. Routed through the same single edge-writer as the press.
+        // If the dwell stopped early on a USER breakpoint/terminal, surface it now —
+        // do NOT run the release tick past it (a breakpoint mid-dwell pre-empts the
+        // click; the press handler already delivered during the dwell). The release
+        // is still applied so the click is never left half-held.
+        if (stop != .dwell_complete) {
+            self.injectMouse(.{ .buttons = prev, .set_buttons = true });
+            return stop;
+        }
+        // RELEASE: revert to the pre-press mask (up edges for exactly the bits we
+        // pressed), position untouched. Routed through the same single edge-writer
+        // as the press. Under Option C this RAISES IRQ12 (deferred) — so run a SHORT
+        // tick to deliver the release AX=0Ch callback before returning, keeping a
+        // click self-contained (BOTH the press and release handlers run before
+        // clickMouse returns, as the old synchronous path guaranteed). A breakpoint
+        // inside the release handler is a real stop and is surfaced here, not
+        // swallowed; otherwise the tick's `dwell_complete` is folded back into the
+        // dwell's completion (cosmetically unchanged from the caller's view).
         self.injectMouse(.{ .buttons = prev, .set_buttons = true });
-        return stop;
+        const rel = self.runDwell(self.dwellCycles(RELEASE_TICK_MS));
+        return switch (rel) {
+            .dwell_complete => stop, // both callbacks delivered; report the dwell's completion
+            else => rel, // a breakpoint/terminal inside the release handler — surface it
+        };
     }
+
+    /// The release-delivery tick budget (ms of emulated time) for `clickMouse`
+    /// (Option C). Small but ample for `serviceInterrupts` to deliver the deferred
+    /// IRQ12/INT 74h release callback at the next IF=1 boundary.
+    const RELEASE_TICK_MS: u32 = 1;
 
     /// Run a click/tap DWELL and report a completed hold as `dwell_complete` rather than
     /// the generic `cycle_budget_exhausted` (which is the "you hit the `run` cap" signal

@@ -159,6 +159,19 @@ pub const Pic = struct {
         }
     }
 
+    /// Clear the IMR mask bit for `line` on its controller (master 0-7, slave 8-15)
+    /// — the "a driver unmasks its IRQ on install" step. Used by the INT 33h driver
+    /// to unmask IRQ12 (slave bit4) at AX=0000 reset and AX=000C handler-install.
+    /// Touches only the one mask bit (the other bits keep their POST values), so it
+    /// is equivalent to the read-modify-write `IN/AND/OUT` a real driver issues.
+    pub fn unmaskIrq(self: *Pic, line: u4) void {
+        if (line < 8) {
+            self.master.imr &= ~(@as(u8, 1) << @intCast(line));
+        } else {
+            self.slave.imr &= ~(@as(u8, 1) << @intCast(line - 8));
+        }
+    }
+
     pub fn lowerIrq(self: *Pic, line: u4) void {
         if (line < 8) {
             self.master.irr &= ~(@as(u8, 1) << @intCast(line));

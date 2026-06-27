@@ -67,6 +67,13 @@ const OP_OUT_IMM_AL: u8 = 0xE6;
 const OP_INT_IMM: u8 = 0xCD;
 const OP_PUSH_AX: u8 = 0x50; // preserve the interrupted AX across the EOI sequence
 const OP_POP_AX: u8 = 0x58;
+// ISR-discipline register save/restore (the INT 74h mouse trampoline, Option C).
+const OP_PUSHA: u8 = 0x60; // PUSHA  — save AX,CX,DX,BX,SP,BP,SI,DI (16-bit)
+const OP_POPA: u8 = 0x61; // POPA   — restore them
+const OP_PUSH_DS: u8 = 0x1E;
+const OP_POP_DS: u8 = 0x1F;
+const OP_PUSH_ES: u8 = 0x06;
+const OP_POP_ES: u8 = 0x07;
 const EOI: u8 = 0x20; // OCW2 non-specific EOI
 const PIC1_CMD: u8 = 0x20;
 const PIC2_CMD: u8 = 0xA0;
@@ -411,6 +418,87 @@ pub fn Bridge(comptime Cpu: type) type {
             image[EXEC_RETF_PHYS - IMAGE_BASE] = OP_RETF;
         }
 
+        // -------------------------------------------------------------------
+        // The INT 74h (IRQ12) mouse-callback trampoline (Option C — the faithful
+        // PS/2-mouse-ISR shape that makes the INT 33h AX=0Ch handler FOREGROUND
+        // and so breakpointable). Planted in the BIOS ROM image immediately after
+        // the EXEC RETF stub; IVT[0x74] is pointed at INT74_ENTRY in POST. The
+        // driver raises IRQ12; `serviceInterrupts` delivers INT 74h at the next
+        // IF=1 boundary through the IVT, so the whole trampoline (incl. the user
+        // handler) runs on the ONE controller-owned step loop. See
+        // docs/callback-observability-plan.md §3.
+        //
+        //   INT74_ENTRY:                  ; IVT[0x74] -> here. CPU pushed FLAGS/CS/IP, IF=0.
+        //     PUSHA                       ; 60   save foreground GP regs (ISR discipline)
+        //     PUSH DS                     ; 1E
+        //     PUSH ES                     ; 06
+        //     <trap int74_prep_id>        ; FE 38 id   host Int33.prepareInt74(cpu)
+        //     RETF                        ; CB   enter the user handler (or fall to EOI_STUB)
+        //   EOI_STUB:                     ; the user handler's RETF returns here
+        //     POP ES                      ; 07
+        //     POP DS                      ; 1F
+        //     POPA                        ; 61   restore the foreground GP regs
+        //     PUSH AX                     ; 50   preserve AL across the EOI MOV
+        //     MOV AL,0x20                 ; B0 20
+        //     OUT 0xA0,AL                 ; E6 A0  slave EOI
+        //     OUT 0x20,AL                 ; E6 20  master cascade EOI
+        //     POP AX                      ; 58
+        //     IRET                        ; CF   unwind the INT 74h frame; restores IF
+        pub const INT74_PHYS: u32 = EXEC_RETF_PHYS + 1;
+        /// Byte length of the whole trampoline (entry + EOI stub).
+        pub const INT74_LEN: u16 = 19;
+        /// Offset of EOI_STUB within the trampoline: PUSHA(1)+PUSH DS(1)+PUSH ES(1)+
+        /// trap(3)+RETF(1) = 7.
+        pub const INT74_EOI_STUB_OFFSET: u16 = 7;
+
+        comptime {
+            // The multi-byte trampoline must fit inside the BIOS ROM window after
+            // the EXEC RETF stub (mirrors the EXEC_RETF_PHYS placement assert).
+            std.debug.assert(INT74_PHYS + INT74_LEN <= 0x100000);
+        }
+
+        /// The seg:off of INT74_ENTRY (the IVT[0x74] target).
+        pub fn int74SegOff() struct { seg: u16, off: u16 } {
+            return .{ .seg = CB_SEG, .off = @intCast(INT74_PHYS - (@as(u32, CB_SEG) << 4)) };
+        }
+        /// The seg:off of EOI_STUB (the far-return target the prep trap pushes — the
+        /// user handler's RETF lands here, OR the RETF lands here directly in the
+        /// no-event / no-handler no-op-delivery case).
+        pub fn int74EoiStubSegOff() struct { seg: u16, off: u16 } {
+            return .{ .seg = CB_SEG, .off = @intCast(INT74_PHYS + INT74_EOI_STUB_OFFSET - (@as(u32, CB_SEG) << 4)) };
+        }
+
+        /// Emit the INT 74h trampoline into `image` (the BIOS ROM image) at the
+        /// fixed `INT74_PHYS`. `prep_id` is the `allocCallback(.iret, .irq)` slot the
+        /// embedded `FE 38 id` invokes (its own slot tail is never executed — the
+        /// stub continues into RETF — exactly like the poll-loop has-key/dequeue
+        /// slots). Call alongside `emitExecRetf` in `post`, before `loadRom`.
+        pub fn emitInt74Trampoline(image: []u8, prep_id: u8) void {
+            const start = INT74_PHYS - IMAGE_BASE;
+            var w = Emit{ .image = image, .pos = start };
+            w.byte(OP_PUSHA);
+            w.byte(OP_PUSH_DS);
+            w.byte(OP_PUSH_ES);
+            w.byte(OP_TRAP0);
+            w.byte(OP_TRAP1);
+            w.byte(prep_id);
+            w.byte(OP_RETF);
+            // EOI_STUB (offset 7): unwind the saved context, then EOI slave+master.
+            w.byte(OP_POP_ES);
+            w.byte(OP_POP_DS);
+            w.byte(OP_POPA);
+            w.byte(OP_PUSH_AX);
+            w.byte(OP_MOV_AL_IMM);
+            w.byte(EOI);
+            w.byte(OP_OUT_IMM_AL);
+            w.byte(PIC2_CMD); // OUT 0xA0,AL — slave EOI
+            w.byte(OP_OUT_IMM_AL);
+            w.byte(PIC1_CMD); // OUT 0x20,AL — master cascade EOI
+            w.byte(OP_POP_AX);
+            w.byte(OP_IRET);
+            std.debug.assert(w.pos - start == INT74_LEN);
+        }
+
         /// Parameters for the INT 16h host/guest-asm HYBRID block (Phase 1d).
         pub const Int16Hybrid = struct {
             /// Callback id of the host `int16.handle` (the AH=01/02/05/11/12/... path).
@@ -638,95 +726,6 @@ pub fn Bridge(comptime Cpu: type) type {
             self.reentry_done = save_done;
         }
 
-        /// Execute a guest FAR CALL into `seg:off` from host code and return when
-        /// the matching `RETF` fires (Phase 1·0b — the sibling of `runGuestInt`,
-        /// used by the Phase-3 mouse-callback far-call). Like `runGuestInt`, it
-        /// drives the MACHINE step (injected stepper) per inner instruction, so
-        /// EVERY instruction the guest handler runs charges its REAL cycle cost
-        /// through the normal ledger — there is NO separate timing path and NO
-        /// ledger hole. A host re-entry that ran the handler OUTSIDE the step loop
-        /// (the Spice86 failure §4.2) is exactly what this avoids.
-        ///
-        /// Mechanism: push a 16-bit far-return frame (CS then IP, IP on top — the
-        /// real-mode far-CALL push order, see `exec_ctrl.farCallDirect`) pointing
-        /// at the re-entrancy STOP-sentinel slot (`0xFE 0x38 <stop_id>`), then set
-        /// CS:IP to the target. The guest runs; its `RETF` pops that frame and
-        /// lands on the stop sentinel's trap, which sets `reentry_done` -> exit.
-        /// No new trampoline is needed: the stop slot already lives in the ROM
-        /// image and the far-return frame is the "trampoline" for this path.
-        pub fn runGuestFarCall(self: *Self, seg: u16, off: u16) void {
-            std.debug.assert(self.step_one != null); // stepper must be wired
-            std.debug.assert(self.depth < MAX_DEPTH); // depth guard (D3)
-            self.depth += 1;
-            defer self.depth -= 1;
-
-            const cpu = self.cpu;
-            const Reg32 = @import("cpu").state.Reg32;
-            const Seg = @import("cpu").state.Seg;
-
-            // (1) Save CS:IP/SP + the re-entry seam scratch (same rationale as
-            // runGuestInt: a nested step clobbers the outer decode scratch).
-            const save_cs = cpu.st.selector[@intFromEnum(Seg.cs)];
-            const save_cs_base = cpu.st.seg_base[@intFromEnum(Seg.cs)];
-            const save_eip = cpu.st.eip;
-            const save_sp = cpu.st.getReg16(@intFromEnum(Reg32.esp));
-            const save_dec = cpu.dec;
-            const save_start_eip = cpu.instr_start_eip;
-            const save_done = self.reentry_done;
-            // The injected far-call must EXECUTE regardless of whether the parked
-            // foreground was halted (HLT) — this is a forced host->guest subroutine,
-            // not the foreground resuming. On real hardware the hardware IRQ that
-            // delivers such a callback (e.g. INT 74h/IRQ12 for the mouse sub) also
-            // WAKES the CPU from HLT; model that by clearing `halted` for the run and
-            // restoring it after. Without this, a halted foreground + a callback fired
-            // with IF=0 (see int33.fireEventCallback) would spin the step loop forever
-            // (the HLT gate in interrupts.step only un-halts via a *wakeable* IRQ,
-            // which needs IF=1) — it previously "worked" only by the accident of an
-            // ambient IF=1 + a pending timer IRQ un-halting it.
-            const save_halted = cpu.st.halted;
-            cpu.st.halted = false;
-
-            // (2) Push the far-return frame onto SS:SP pointing at the stop
-            // sentinel slot. Real-mode far CALL pushes CS first, then IP (so IP is
-            // on top and RETF pops IP then CS). 16-bit words: default real-mode
-            // operand size, matching what the guest `RETF` (op_size .b16) pops.
-            const stop = slotSegOff(self.stop_id);
-            var sp = cpu.st.getReg16(@intFromEnum(Reg32.esp));
-            sp -%= 2;
-            cpu.segWrite16(.ss, sp, stop.seg) catch {};
-            sp -%= 2;
-            cpu.segWrite16(.ss, sp, stop.off) catch {};
-            cpu.st.setReg16(@intFromEnum(Reg32.esp), sp);
-
-            // (3) Point CS:IP at the guest target and run until the RETF lands on
-            // the stop sentinel.
-            cpu.loadSegment(.cs, seg);
-            cpu.st.eip = off;
-            self.reentry_done = false;
-
-            var guard: u64 = 0;
-            const max_steps: u64 = 5_000_000; // bounded; flag loudly if exceeded
-            while (!self.reentry_done) {
-                self.step_one.?(self.step_ctx.?);
-                guard += 1;
-                if (guard >= max_steps) {
-                    std.debug.panic("runGuestFarCall(0x{X}:0x{X}) did not return within {d} steps", .{ seg, off, max_steps });
-                }
-            }
-
-            // (4) Restore CS:IP/SP + the seam scratch. The far-return frame was
-            // already consumed by the guest RETF, but we restore SP explicitly to
-            // the pre-call value so a partial/short run can never leave it skewed.
-            cpu.st.selector[@intFromEnum(Seg.cs)] = save_cs;
-            cpu.st.seg_base[@intFromEnum(Seg.cs)] = save_cs_base;
-            cpu.st.eip = save_eip;
-            cpu.st.setReg16(@intFromEnum(Reg32.esp), save_sp);
-            cpu.dec = save_dec;
-            cpu.instr_start_eip = save_start_eip;
-            self.reentry_done = save_done;
-            cpu.st.halted = save_halted; // resume the foreground's HLT, if any
-        }
-
         /// The stop-sentinel handler (D3): sets `reentry_done`. The CPU's Grp4 arm
         /// dispatches this through the Services sink like any callback, but the
         /// cost is `.stop_sentinel` (0, guard-exempt).
@@ -738,9 +737,13 @@ pub fn Bridge(comptime Cpu: type) type {
         // nested-EXEC de-nest (plans/nested-exec-debug.md). EXEC now returns INTO
         // the child via `emitExecRetf` and the child runs on the ONE controller-
         // owned step loop — so breakpoints/watchpoints/step/pause work inside a
-        // child. `runGuestInt`/`runGuestFarCall` remain: they model genuinely
-        // re-entrant, bounded host->guest->host calls (mouse callback, INT 16h
-        // poll), which EXEC was never an instance of.
+        // child. `runGuestInt` remains: it models the one genuinely re-entrant,
+        // bounded host->guest->host call that still needs the handler's RESULT —
+        // the INT 23h Ctrl-C handler (`src/dos/int21.zig`) — which EXEC was never
+        // an instance of. (The mouse AX=0Ch callback USED to ride a sibling
+        // `runGuestFarCall` here; Option C moved it to a real IRQ12/INT 74h
+        // foreground trampoline, so that primitive was removed — host-invoked
+        // guest code that does NOT need a return value now runs as foreground.)
     };
 }
 
@@ -847,4 +850,35 @@ test "emitInt16Hybrid: AH-branch preamble + embedded poll loop emit the exact by
     // Bytes outside the window are untouched.
     try std.testing.expectEqual(@as(u8, 0), image[4]);
     try std.testing.expectEqual(@as(u8, 0), image[5 + want.len]);
+}
+
+test "emitInt74Trampoline: PUSHA/PUSH DS/ES; trap; RETF; EOI_STUB emits the exact bytes" {
+    var image = std.mem.zeroes([TestBridge.IMAGE_LEN]u8);
+    const prep_id: u8 = 0x2A;
+    TestBridge.emitInt74Trampoline(&image, prep_id);
+
+    const off: usize = @intCast(TestBridge.INT74_PHYS - TestBridge.IMAGE_BASE);
+    const want = [_]u8{
+        0x60, // PUSHA
+        0x1E, // PUSH DS
+        0x06, // PUSH ES
+        0xFE, 0x38, prep_id, // trap -> Int33.prepareInt74
+        0xCB, // RETF -> the user handler (or straight to EOI_STUB)
+        0x07, // EOI_STUB: POP ES
+        0x1F, // POP DS
+        0x61, // POPA
+        0x50, // PUSH AX
+        0xB0, 0x20, // MOV AL,0x20
+        0xE6, 0xA0, // OUT 0xA0,AL  (slave EOI)
+        0xE6, 0x20, // OUT 0x20,AL  (master cascade EOI)
+        0x58, // POP AX
+        0xCF, // IRET
+    };
+    try std.testing.expectEqual(TestBridge.INT74_LEN, @as(u16, want.len));
+    try std.testing.expectEqualSlices(u8, &want, image[off .. off + want.len]);
+    // EOI_STUB sits exactly at the documented offset (the prep trap's RETF target).
+    try std.testing.expectEqual(@as(u8, 0x07), image[off + TestBridge.INT74_EOI_STUB_OFFSET]);
+    // Bytes outside the emitted window are untouched (no over-write).
+    try std.testing.expectEqual(@as(u8, 0), image[off - 1]);
+    try std.testing.expectEqual(@as(u8, 0), image[off + want.len]);
 }
