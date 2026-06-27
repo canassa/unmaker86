@@ -179,6 +179,21 @@ pub const Command = union(enum) {
     /// handler before submit, like `mem_write`); the command carries only the
     /// length + window. Pure peek path; cycle-neutral.
     mem_search: MemSearchCmd,
+    /// Capture the full live machine into a per-session snapshot slot (snapshot-
+    /// restore-plan §2.3). Pointer-free POD: the worker reaches the server-owned
+    /// `SnapshotStore` via its own `?*SnapshotStore` (like `render`/`live_mouse`),
+    /// NOT through the Command. A pure read (cycle-neutral); returns a deterministic
+    /// `snap-<n>` handle (the `seq`), the cycle, and the byte size.
+    snapshot: void,
+    /// Rewind the machine to a captured snapshot handle (its monotonic `seq`, parsed
+    /// from the `snap-<n>` text by the handler — the queue carries only the integer).
+    /// Deterministic state load at the serialized command boundary; resets the cycle
+    /// counter to the snapshot's and re-arms the bus watches (clear-then-rebuild).
+    restore: struct { seq: u64 },
+    /// Enumerate the live snapshot slots (handle/cycle/bytes + count/max).
+    list_snapshots: void,
+    /// Free a snapshot slot by its `seq` (explicit reclamation; no time/LRU eviction).
+    delete_snapshot: struct { seq: u64 },
     /// The worker-shutdown sentinel: the worker loop exits when it dequeues this.
     shutdown_worker: void,
 };
@@ -225,6 +240,34 @@ pub const ErrCode = enum {
     /// §5.1b). Surfaced as HTTP 503 (the `breakpoint_table_full` idiom); the client
     /// can `run` to let the INT 09h ISR drain the controller, then retry.
     input_buffer_full,
+    /// All `MAX_SNAPSHOTS` per-session snapshot slots are in use (snapshot-restore-plan
+    /// §3). No time/LRU eviction (that would inject host scheduling into which
+    /// checkpoint survives) — reclaim with `delete_snapshot`.
+    snapshot_limit_reached,
+    /// No snapshot slot with the requested `seq` (restore/delete of an unknown or
+    /// already-freed handle).
+    no_such_snapshot,
+};
+
+/// The per-session snapshot-slot cap (snapshot-restore-plan §3 / Decision D1; LOCKED).
+/// A one-line knob, mirroring `SessionRegistry.MAX_SESSIONS`. At the cap, `snapshot`
+/// returns `snapshot_limit_reached`. Lives here (a pure POD wire constant) so the queue
+/// stays free of any `machine`/`SnapshotStore` import; `snapshot_store.zig` reads it back.
+pub const MAX_SNAPSHOTS: u32 = 8;
+
+/// One snapshot slot's wire metadata (`list_snapshots` row). Pointer-free POD: the
+/// `seq` becomes the `snap-<n>` handle at serialization; `cycle`/`bytes` are echoed.
+pub const SnapshotInfo = struct {
+    seq: u64,
+    cycle: u64,
+    bytes: u64,
+};
+
+/// The `list_snapshots` result: a fixed array of slot rows + the live count + the cap.
+pub const SnapshotListResult = struct {
+    count: u32 = 0,
+    max: u32 = MAX_SNAPSHOTS,
+    items: [MAX_SNAPSHOTS]SnapshotInfo = undefined,
 };
 
 pub const MemResult = struct {
@@ -370,6 +413,16 @@ pub const Response = union(enum) {
     io_shadow: debug.IoShadow,
     /// A memory-search result (`/api/mem/search`). Pointer-free POD.
     search: SearchResult,
+    /// A completed `snapshot` capture: the minted handle `seq` + the cycle it was taken
+    /// at + the slab byte size. Serialized as `{"handle":"snap-<n>","cycle":N,"bytes":N}`.
+    snapshot_done: struct { seq: u64, cycle: u64, bytes: u64 },
+    /// A completed `restore`: the handle restored. Serialized as `{"handle":"snap-<n>"}`.
+    snapshot_restored: struct { seq: u64 },
+    /// A `list_snapshots` enumeration. Pointer-free POD.
+    snapshot_list: SnapshotListResult,
+    /// A completed `delete_snapshot`: the freed handle + the remaining live count.
+    /// Serialized as `{"handle":"snap-<n>","deleted":true,"count":N}`.
+    snapshot_deleted: struct { seq: u64, count: u32 },
     /// A typed error. The handler maps `code` → HTTP status.
     err: ErrCode,
 };

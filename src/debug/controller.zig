@@ -623,6 +623,65 @@ pub const Controller = struct {
         self.set.forEach(ctx, f);
     }
 
+    /// Re-sync the bus memory/IO watch tables with the live breakpoint set after a
+    /// `Machine.restore` reverted those tables to the snapshot instant (snapshot-
+    /// restore-plan §1.2 #2 / Decision D2). The coupling: the bus watch tables ride
+    /// INSIDE `Machine.Snapshot` (so `restore` reverts them), but the controller's
+    /// observer state (`set`, `watch_ids`, `port_watch_ids`) is NOT snapshotted — so a
+    /// memory/IO breakpoint added or removed between snapshot and restore desyncs the
+    /// two (a phantom or dangling watch).
+    ///
+    /// CLEAR-THEN-REBUILD (NOT a naive re-`setWatch`): (1) CLEAR every snapshot-reverted
+    /// bus watch and reset the controller's `watch_ids`/`port_watch_ids` to empty, then
+    /// (2) REBUILD by walking the live `.memory`/`.io` breakpoints and re-arming each
+    /// exactly as `addBreakpoint` does. A re-arm WITHOUT the clear would stack new
+    /// entries on the reverted ones and exhaust/duplicate the bounded watch table
+    /// (`setWatch` → `WatchTableFull`). Breakpoints PERSIST across a restore (LOCKED,
+    /// like `reset`); only their bus-side watches are rebuilt here.
+    ///
+    /// Clearing ALL bus watches is exact because bus memory/port watches are armed
+    /// ONLY by `addBreakpoint` (for the `.memory`/`.io` kinds), so the live breakpoint
+    /// set is the complete source from which to rebuild. The table cannot overflow on
+    /// rebuild (it holds exactly what it held before the snapshot ± the live churn,
+    /// bounded by `MAX_BREAKPOINTS <= max_watches`).
+    pub fn rearmWatches(self: *Controller) void {
+        // (1) CLEAR: drop every reverted bus watch + reset the observer id tables. The
+        // bus state is self-consistent right after `restore`, so iterating the used
+        // slots and clearing each restores the page-kind markers exactly.
+        var wid: u16 = 0;
+        while (wid < bus_mod.max_watches) : (wid += 1) {
+            if (self.m.bus.watch_used[wid]) self.m.bus.clearWatch(wid);
+            if (self.m.bus.port_watch_used[wid]) self.m.bus.clearPortWatch(wid);
+        }
+        self.watch_ids = @splat(null);
+        self.port_watch_ids = @splat(null);
+
+        // (2) REBUILD from the live breakpoint set — re-arm each `.memory`/`.io`
+        // breakpoint exactly as `addBreakpoint` does, re-recording its watch slot id.
+        var id: u32 = 0;
+        while (id < bp.MAX_BREAKPOINTS) : (id += 1) {
+            if (!self.set.used[id]) continue;
+            switch (self.set.items[id].kind) {
+                .memory => |k| {
+                    const w = self.m.bus.setWatch(.{
+                        .linear = k.linear,
+                        .len = k.len,
+                        .access = toWatchAccess(k.access),
+                    }) catch unreachable; // bounded by MAX_BREAKPOINTS <= max_watches
+                    self.watch_ids[id] = w;
+                },
+                .io => |k| {
+                    const w = self.m.bus.setPortWatch(.{
+                        .port = k.port,
+                        .access = toWatchAccess(k.access),
+                    }) catch unreachable;
+                    self.port_watch_ids[id] = w;
+                },
+                else => {},
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Stepping & run-to (Phase 3) — built on one-shot breakpoints + run_loop.step.
     // -----------------------------------------------------------------------

@@ -874,6 +874,17 @@ pub const Machine = struct {
         dos_ret_code: u16,
         dos_ret_type: u8,
         dos_terminated: bool,
+        /// Three more guest-MUTABLE, guest-OBSERVABLE DOS scalars the process subset
+        /// above omitted (snapshot-restore-plan §1.1.1). The guest can both set AND
+        /// read each back, so a restore that did not revert them would silently leak
+        /// the live `Dos` value: `strategy` (INT 21h AX=5801 set / AX=5800 get),
+        /// `last_error` (set on DOS errors / AH=59 get), `breakcheck` (AH=33 subfn
+        /// 1/2 set / subfn 0/2 get). All POD/snapshot-safe; same recipe as the
+        /// `dos_current_psp` work above. With these added, the "run-from-restored ==
+        /// run-from-original" determinism claim is exact.
+        dos_strategy: @TypeOf(@as(Dos, undefined).strategy),
+        dos_last_error: u16,
+        dos_breakcheck: bool,
         shutdown: bool,
         /// The active CPU:PIT clock config (Phase 2). The `mult` VALUE is
         /// guest-affecting state (it sets where device events land relative to
@@ -917,6 +928,9 @@ pub const Machine = struct {
             .dos_ret_code = self.dos.ret_code,
             .dos_ret_type = self.dos.ret_type,
             .dos_terminated = self.dos.terminated,
+            .dos_strategy = self.dos.strategy,
+            .dos_last_error = self.dos.last_error,
+            .dos_breakcheck = self.dos.breakcheck,
             .shutdown = self.shutdown,
             .clock = self.clock,
             .device_time = self.device_time,
@@ -946,6 +960,9 @@ pub const Machine = struct {
         self.dos.ret_code = snap.dos_ret_code;
         self.dos.ret_type = snap.dos_ret_type;
         self.dos.terminated = snap.dos_terminated;
+        self.dos.strategy = snap.dos_strategy;
+        self.dos.last_error = snap.dos_last_error;
+        self.dos.breakcheck = snap.dos_breakcheck;
         self.shutdown = snap.shutdown;
         // The clock VALUE rides the snapshot (guest-affecting state); the device
         // `*const u64` back-pointers into `&self.clock.mult` are stable across this

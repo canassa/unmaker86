@@ -19,8 +19,10 @@ const q = @import("queue.zig");
 const json_wire = @import("json_wire.zig");
 const png = @import("png.zig");
 const live_mouse = @import("live_mouse.zig");
+const snapshot_store = @import("snapshot_store.zig");
 
 const LiveMouseState = live_mouse.LiveMouseState;
+const SnapshotStore = snapshot_store.SnapshotStore;
 
 const Controller = debug.Controller;
 const Seg = cpu_mod.Seg;
@@ -92,7 +94,7 @@ fn inSlab(ctrl: *const Controller, start: u32, len: u32) bool {
 /// Dispatch exactly one command to one `Controller` method. Pure mapping; the only
 /// state it touches is via `ctrl` (the worker owns it) and `ctx.scratch` (the
 /// mem_write bytes, copied in by the handler before submit).
-pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render: ?*RenderBuffers, live: ?*LiveMouseState) Response {
+pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render: ?*RenderBuffers, live: ?*LiveMouseState, snapshots: ?*SnapshotStore) Response {
     return switch (ctx.cmd) {
         // ---- run / step ----------------------------------------------------
         .run => |c| .{ .stop = ctrl.runUntilEvent(c.cycle_cap) },
@@ -184,6 +186,14 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
         .devices_get => .{ .devices = ctrl.devicesSnapshot() },
         .io_shadow => |c| .{ .io_shadow = .{ .port = c.port, .value = ctrl.ioShadow(c.port) } },
         .mem_search => |c| memSearch(ctrl, ctx, c),
+
+        // ---- snapshot / restore (snapshot-restore-plan §2.3) ---------------
+        // Run ON THE WORKER (the machine owner); reach the per-session store via the
+        // worker's `?*SnapshotStore` (like `render`/`live_mouse`), never via the queue.
+        .snapshot => snapshotResp(ctrl, snapshots),
+        .restore => |c| restoreResp(ctrl, snapshots, c.seq),
+        .list_snapshots => listSnapshotsResp(snapshots),
+        .delete_snapshot => |c| deleteSnapshotResp(snapshots, c.seq),
 
         .shutdown_worker => .ok,
     };
@@ -480,6 +490,54 @@ fn loadResp(ctrl: *Controller, c: q.LoadCmd, mount: MountSource) Response {
 }
 
 // ===========================================================================
+// Snapshot / restore (snapshot-restore-plan §2.3). All four run on the worker (the
+// sole machine owner) and reach the per-session `SnapshotStore` via the worker's
+// `?*SnapshotStore` back-pointer. When the store is absent (an in-process test harness
+// that never wired one) they fail loud with `load_failed` rather than faking a capture.
+// ===========================================================================
+
+/// Capture the full live machine into a snapshot slot (PURE READ — charges no cycles,
+/// like the other peeks). A full store is `snapshot_limit_reached`; an alloc failure is
+/// surfaced as a clean error, never a panic.
+fn snapshotResp(ctrl: *Controller, snapshots: ?*SnapshotStore) Response {
+    const store = snapshots orelse return .{ .err = .load_failed };
+    const info = store.capture(ctrl.m) catch |e| return .{ .err = switch (e) {
+        error.LimitReached => .snapshot_limit_reached,
+        error.OutOfMemory => .load_failed,
+    } };
+    return .{ .snapshot_done = .{ .seq = info.seq, .cycle = info.cycle, .bytes = info.bytes } };
+}
+
+/// Rewind the machine to a captured snapshot (a deterministic state load at the
+/// serialized command boundary; charges no cycles). `Machine.restore` resets
+/// `cpu.st.cycles` to the snapshot's; we then re-sync the bus watches with the live
+/// breakpoint set (clear-then-rebuild) and clear `last_stop` for a coherent status —
+/// breakpoints PERSIST (LOCKED, like `reset`/`load`).
+fn restoreResp(ctrl: *Controller, snapshots: ?*SnapshotStore, seq: u64) Response {
+    const store = snapshots orelse return .{ .err = .load_failed };
+    if (!store.applyTo(ctrl.m, seq)) return .{ .err = .no_such_snapshot };
+    // Re-arm the snapshot-reverted bus watches from the live breakpoint set (§1.2 #2/D2).
+    ctrl.rearmWatches();
+    // A rewind invalidates any prior stop; mirror reset/load's clear so status is coherent.
+    ctrl.last_stop = null;
+    // TODO(branch-trace): clear the branch trace here when it lands (snapshot-restore-plan
+    // §4(b)) — a rewind would otherwise interleave two timelines whose at_cycle stamps
+    // overlap. The branch-trace feature does not exist yet; this is the wiring seam.
+    return .{ .snapshot_restored = .{ .seq = seq } };
+}
+
+fn listSnapshotsResp(snapshots: ?*SnapshotStore) Response {
+    const store = snapshots orelse return .{ .err = .load_failed };
+    return .{ .snapshot_list = store.list() };
+}
+
+fn deleteSnapshotResp(snapshots: ?*SnapshotStore, seq: u64) Response {
+    const store = snapshots orelse return .{ .err = .load_failed };
+    const remaining = store.delete(seq) orelse return .{ .err = .no_such_snapshot };
+    return .{ .snapshot_deleted = .{ .seq = seq, .count = remaining } };
+}
+
+// ===========================================================================
 // The worker thread entry: loop `waitDequeue → drainOne → complete`; exit on the
 // shutdown sentinel.
 // ===========================================================================
@@ -497,6 +555,10 @@ pub const Worker = struct {
     /// Null in headless/test builds (the keystone: no record ⇒ the fold arm is a no-op
     /// ⇒ zero added cycles ⇒ byte-identical to today). Set by the server at `--serve`.
     live_mouse: ?*LiveMouseState = null,
+    /// The server-owned per-session snapshot store (snapshot-restore-plan §2.2). Null in
+    /// a test harness that never wired one (snapshot/restore then fail loud). Set by the
+    /// server at both worker-spawn sites, exactly like `render`/`live_mouse`.
+    snapshots: ?*SnapshotStore = null,
 
     pub fn run(self: Worker) void {
         const mount: MountSource = .{ .dir = self.mount_dir, .io = self.io };
@@ -506,7 +568,7 @@ pub const Worker = struct {
                 self.queue.complete(ctx, .ok);
                 return;
             }
-            const resp = drainOne(self.ctrl, ctx, mount, self.render, self.live_mouse);
+            const resp = drainOne(self.ctrl, ctx, mount, self.render, self.live_mouse, self.snapshots);
             self.queue.complete(ctx, resp);
         }
     }

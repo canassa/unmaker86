@@ -346,7 +346,7 @@ pub const Server = struct {
         // the Server is at its final address.)
         if (self.session) |*s| {
             s.wireStream(self.io);
-            const w: worker_mod.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl, .mount_dir = s.mount_dir, .io = self.io, .render = s.render, .live_mouse = s.live_mouse };
+            const w: worker_mod.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl, .mount_dir = s.mount_dir, .io = self.io, .render = s.render, .live_mouse = s.live_mouse, .snapshots = s.snapshots };
             s.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
         }
 
@@ -904,6 +904,35 @@ pub const Conn = struct {
         if (std.mem.eql(u8, path, "/api/load")) {
             if (method != .POST) return self.methodNotAllowed(req);
             return self.handleLoad(req, body, is_json);
+        }
+
+        // --- snapshot / restore (snapshot-restore-plan §2.3 / §5) ---
+        // Parallel HTTP routes that build the SAME q.Commands the MCP tools build and
+        // share `writeResponseBody` (anti-drift). `/api/snapshots` (plural, GET) lists;
+        // `/api/snapshot` (POST) captures; `/api/snapshot/<handle>` (DELETE) frees;
+        // `/api/restore` (POST {snapshot}) rewinds. Placed before the `/api/snapshot/`
+        // prefix so the exact matches resolve first.
+        if (std.mem.eql(u8, path, "/api/snapshots")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            return self.submitAndRespond(req, .list_snapshots);
+        }
+        if (std.mem.eql(u8, path, "/api/snapshot")) {
+            if (method != .POST) return self.methodNotAllowed(req);
+            return self.submitAndRespond(req, .snapshot);
+        }
+        if (std.mem.startsWith(u8, path, "/api/snapshot/")) {
+            if (method != .DELETE) return self.methodNotAllowed(req);
+            const seq = mcp_tools.parseSnapHandle(path["/api/snapshot/".len..]) orelse
+                return self.respondError(req, .bad_request, "bad_request", "snapshot handle must be snap-<n>");
+            return self.submitAndRespond(req, .{ .delete_snapshot = .{ .seq = seq } });
+        }
+        if (std.mem.eql(u8, path, "/api/restore")) {
+            if (method != .POST) return self.methodNotAllowed(req);
+            if (!self.requireJson(req, is_json, body)) return;
+            const r = self.parseBody(struct { snapshot: []const u8 }, body) orelse return self.badJson(req);
+            const seq = mcp_tools.parseSnapHandle(r.snapshot) orelse
+                return self.respondError(req, .bad_request, "bad_request", "snapshot handle must be snap-<n>");
+            return self.submitAndRespond(req, .{ .restore = .{ .seq = seq } });
         }
 
         // --- paced free-run control (stream §5.2) ---
@@ -2482,6 +2511,10 @@ pub const Conn = struct {
             },
             .io_shadow => |io| try self.writeIoShadow(w, io),
             .search => |sr| try self.writeSearch(w, sr, opts.search_needle),
+            .snapshot_done => |d| try w.print("{{\"handle\":\"snap-{d}\",\"cycle\":{d},\"bytes\":{d}}}", .{ d.seq, d.cycle, d.bytes }),
+            .snapshot_restored => |d| try w.print("{{\"handle\":\"snap-{d}\"}}", .{d.seq}),
+            .snapshot_list => |l| try self.writeSnapshotList(w, l),
+            .snapshot_deleted => |d| try w.print("{{\"handle\":\"snap-{d}\",\"deleted\":true,\"count\":{d}}}", .{ d.seq, d.count }),
             // Pre-handled by every caller (see the doc comment). Reaching here is a bug.
             .err, .framebuffer => unreachable,
         }
@@ -2553,6 +2586,18 @@ pub const Conn = struct {
         try w.writeAll("{\"breakpoints\":");
         try std.json.Stringify.value(l.items[0..l.count], wire.stringify_options, w);
         try w.writeAll("}");
+    }
+
+    /// `{"snapshots":[{"handle":"snap-<n>","cycle":N,"bytes":N},...],"count":N,"max":N}`
+    /// — the `list_snapshots` tool body / `GET /api/snapshots` response (shared, anti-drift).
+    fn writeSnapshotList(self: *Conn, w: *std.Io.Writer, l: q.SnapshotListResult) std.Io.Writer.Error!void {
+        _ = self;
+        try w.writeAll("{\"snapshots\":[");
+        for (l.items[0..l.count], 0..) |it, i| {
+            if (i != 0) try w.writeAll(",");
+            try w.print("{{\"handle\":\"snap-{d}\",\"cycle\":{d},\"bytes\":{d}}}", .{ it.seq, it.cycle, it.bytes });
+        }
+        try w.print("],\"count\":{d},\"max\":{d}}}", .{ l.count, l.max });
     }
 
     fn writeRegions(self: *Conn, w: *std.Io.Writer, rg: q.RegionsResult) std.Io.Writer.Error!void {
@@ -2695,6 +2740,10 @@ pub const Conn = struct {
             // breakpoint_table_full idiom, input-injection.md §5.1b); `run` to drain
             // the controller via INT 09h, then retry.
             .input_buffer_full => .{ .status = .service_unavailable, .code = "input_buffer_full", .msg = "the 8042 keyboard output buffer is full" },
+            // All per-session snapshot slots are in use — 503 (the breakpoint_table_full
+            // idiom); reclaim with delete_snapshot, then retry.
+            .snapshot_limit_reached => .{ .status = .service_unavailable, .code = "snapshot_limit_reached", .msg = "all snapshot slots are in use; delete one first" },
+            .no_such_snapshot => .{ .status = .not_found, .code = "no_such_snapshot", .msg = "no snapshot with that handle" },
         };
     }
 

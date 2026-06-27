@@ -232,6 +232,7 @@ pub const SessionRegistry = struct {
             .io = self.io,
             .render = session.render,
             .live_mouse = session.live_mouse,
+            .snapshots = session.snapshots,
         };
         session.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
         errdefer {

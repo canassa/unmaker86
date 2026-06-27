@@ -291,6 +291,31 @@ pub const tools = [_]Tool{
         .description = "Read the run status: runnable, terminated, ret_code, cycles, last_stop.",
         .input_schema = SCHEMA_EMPTY,
     },
+    // --- snapshot / restore (snapshot-restore-plan §5; per-machine) ---
+    .{
+        .name = "snapshot",
+        .description = "Capture the full live machine state (CPU, RAM, all devices, scheduler, EMS, DOS process state, cycle counter) as a checkpoint; returns an opaque snap-<n> handle, the cycle it was taken at, and its size in bytes. Cycle-neutral (a pure read). Open guest file handles are NOT captured (a documented limitation).",
+        .input_schema = SCHEMA_EMPTY,
+    },
+    .{
+        .name = "restore",
+        .description = "Rewind the machine to a previously captured snapshot handle. Resets the cycle counter to the snapshot's cycle; breakpoints are preserved. Deterministic.",
+        .input_schema =
+        \\{"type":"object","properties":{"snapshot":{"type":"string","minLength":1,"description":"the snap-<n> handle from a prior snapshot"}},"required":["snapshot"],"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "list_snapshots",
+        .description = "Enumerate the live snapshot checkpoints (handle, cycle, bytes) plus the live count and the per-machine cap.",
+        .input_schema = SCHEMA_EMPTY,
+    },
+    .{
+        .name = "delete_snapshot",
+        .description = "Free a snapshot checkpoint by handle (explicit reclamation; there is no time/LRU eviction). Returns the freed handle and the remaining live count.",
+        .input_schema =
+        \\{"type":"object","properties":{"snapshot":{"type":"string","minLength":1,"description":"the snap-<n> handle to delete"}},"required":["snapshot"],"additionalProperties":false}
+        ,
+    },
     // --- machine lifecycle (machine-AGNOSTIC; server-special, like `load`) ---
     .{
         // Server-special (handled in `server.zig:handleMcpToolCall`, not via `buildCommand`):
@@ -674,6 +699,21 @@ fn isDeviceGroup(name: []const u8) bool {
 
 const IdReq = struct { id: u32 };
 const PortReq = struct { port: u16 };
+/// The `restore`/`delete_snapshot` argument: a `snap-<n>` handle string. Parsed to the
+/// integer `seq` by `parseSnapHandle` so the queue carries only a `u64` (never a string).
+const SnapReq = struct { snapshot: []const u8 };
+
+/// Parse a `snap-<n>` handle to its integer `seq` (the SHARED parser used by both
+/// `buildCommand` and the HTTP `/api/restore`/`/api/snapshot/<id>` routes — anti-drift).
+/// Integer-only; returns null on a malformed handle (a missing `snap-` prefix, empty or
+/// non-decimal digits). No clock/RNG.
+pub fn parseSnapHandle(s: []const u8) ?u64 {
+    const prefix = "snap-";
+    if (!std.mem.startsWith(u8, s, prefix)) return null;
+    const digits = s[prefix.len..];
+    if (digits.len == 0) return null;
+    return std.fmt.parseInt(u64, digits, 10) catch null;
+}
 const ScreenReq = struct { attrs: bool = false };
 const DevicesReq = struct { palette: bool = false, device: ?[]const u8 = null };
 const DisasmReq = struct { linear: ?u32 = null, seg: ?u16 = null, off: ?u32 = null, count: ?u32 = null };
@@ -837,6 +877,20 @@ pub fn buildCommand(
     }
     if (is(name, "reset")) return cmd(.reset, false);
     if (is(name, "status")) return cmd(.status, false);
+
+    // --- snapshot / restore (snapshot-restore-plan §2.3) ---
+    if (is(name, "snapshot")) return cmd(.snapshot, false);
+    if (is(name, "restore")) {
+        const r = parse(SnapReq, arena, args) orelse return invalid("restore expects {snapshot:\"snap-<n>\"}");
+        const seq = parseSnapHandle(r.snapshot) orelse return invalid("snapshot handle must be snap-<n>");
+        return cmd(.{ .restore = .{ .seq = seq } }, false);
+    }
+    if (is(name, "list_snapshots")) return cmd(.list_snapshots, false);
+    if (is(name, "delete_snapshot")) {
+        const r = parse(SnapReq, arena, args) orelse return invalid("delete_snapshot expects {snapshot:\"snap-<n>\"}");
+        const seq = parseSnapHandle(r.snapshot) orelse return invalid("snapshot handle must be snap-<n>");
+        return cmd(.{ .delete_snapshot = .{ .seq = seq } }, false);
+    }
 
     // `load` (recipe overlay/persist) and `screenshot` (session render buffers + image
     // response) are server-special — handled before this call, never reaching here.

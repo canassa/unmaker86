@@ -103,6 +103,7 @@ const run_control = @import("run_control.zig");
 const live_mouse_mod = @import("live_mouse.zig");
 const stream_mod = @import("stream.zig");
 const sf = @import("shared_frame.zig");
+const snapshot_store_mod = @import("snapshot_store.zig");
 
 const Io = std.Io;
 const Controller = debug.Controller;
@@ -298,6 +299,15 @@ pub const Session = struct {
     shared_frame: *sf.SharedFrame,
     stream_hub: *stream_mod.StreamHub,
 
+    /// The per-session snapshot store (snapshot-restore-plan §2.2/§3). Heap-allocated
+    /// ONCE so the worker can hold a stable `?*SnapshotStore` (reached like `render`).
+    /// The STRUCT itself (the slot array of `Machine.Snapshot` PODs + counters) is
+    /// allocated here; the big ~16.31 MiB out-of-band slabs hang off each slot as LAZY
+    /// heap pointers, allocated on the first `snapshot` into a slot (an idle session
+    /// pays zero for them) and freed by `store.deinit` in `Session.deinit` BEFORE the
+    /// store struct itself is destroyed (else the lazy slabs leak).
+    snapshots: *snapshot_store_mod.SnapshotStore,
+
     /// Allocate the per-session heap blocks and stand up the queue. Captures NO
     /// self-address (the stream hub is `.init`-wired later, in `Server.wireStream`,
     /// once the Session is at its final address). The errdefer chain frees every
@@ -320,6 +330,11 @@ pub const Session = struct {
         frame.* = sf.SharedFrame.init(io);
         errdefer gpa.destroy(frame);
         const hub = try gpa.create(stream_mod.StreamHub);
+        errdefer gpa.destroy(hub);
+        // The snapshot store: the small POD slot array is allocated now; its big slabs
+        // are lazy (allocated on first `snapshot`) and freed in `deinit`.
+        const snaps = try gpa.create(snapshot_store_mod.SnapshotStore);
+        snaps.* = snapshot_store_mod.SnapshotStore.init(gpa);
         return .{
             .id = id,
             .ctrl = ctrl,
@@ -331,6 +346,7 @@ pub const Session = struct {
             .live_mouse = lm,
             .shared_frame = frame,
             .stream_hub = hub,
+            .snapshots = snaps,
         };
     }
 
@@ -352,5 +368,10 @@ pub const Session = struct {
         gpa.destroy(self.live_mouse);
         gpa.destroy(self.shared_frame);
         gpa.destroy(self.stream_hub);
+        // Free every lazily-allocated snapshot slab BEFORE destroying the store struct
+        // (snapshot-restore-plan §3) — a bare `gpa.destroy(self.snapshots)` would leak
+        // each allocated slab.
+        self.snapshots.deinit();
+        gpa.destroy(self.snapshots);
     }
 };

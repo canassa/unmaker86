@@ -27,11 +27,13 @@ const mcp = @import("mcp.zig");
 const mcp_tools = @import("mcp_tools.zig");
 const session_mod = @import("session.zig");
 const session_registry = @import("session_registry.zig");
+const snapshot_store_mod = @import("snapshot_store.zig");
 
 // ---- the per-session bundle + the N-session registry (multi-machine plan §4, Phase 3) ----
 pub const Session = session_mod.Session;
 pub const SessionId = session_mod.SessionId;
 pub const SessionRegistry = session_registry.SessionRegistry;
+pub const SnapshotStore = snapshot_store_mod.SnapshotStore;
 
 // ---- the command queue + handoff (Phase 2) ----
 pub const Command = queue.Command;
@@ -87,7 +89,9 @@ test {
     _ = mcp_tools;
     _ = session_mod;
     _ = session_registry;
+    _ = snapshot_store_mod;
     _ = @import("json_wire_test.zig");
+    _ = @import("snapshot_store_test.zig");
     _ = @import("queue_test.zig");
     _ = @import("worker_test.zig");
     _ = @import("server_test.zig");

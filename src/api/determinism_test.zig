@@ -65,6 +65,13 @@ const api_sources = [_][]const u8{
     // variants the queue uses. Embedding it proves the multi-session routing added no
     // host-clock / RNG / float affordance to any api source.
     @embedFile("session_registry.zig"),
+    // The per-session snapshot store (snapshot-restore-plan §2.2). DETERMINISM-CLEAN by
+    // design: `snap-<n>` handles minted from a monotonic counter (NO clock, NO RNG),
+    // integer-only, no float; capture is a pure machine read and restore a deterministic
+    // state load. The big slabs are LAZY heap allocations (alloc/free), not a host-time
+    // affordance. Embedding it proves snapshot/restore added no host-clock/RNG/float to
+    // any api source.
+    @embedFile("snapshot_store.zig"),
 };
 
 test "src/api grep: no host time / RNG / env / floats / clock affordances" {
