@@ -293,7 +293,7 @@ pub const tools = [_]Tool{
     },
     .{
         .name = "input_mouse",
-        .description = "Inject a scripted/deterministic mouse event. NOTE: a buttons CLICK (the default) ADVANCES THE MACHINE — it presses, runs the CPU for ~100 ms of emulated time, then releases, so the cpu/cycle/screen state WILL move forward and the tool returns the run/stop result; that is expected, not a bug. (Motion-only or release:false injects add no run of their own — but if the event fires an installed INT 33h AX=0Ch handler, that handler runs synchronously and charges its cycles, so 'cycle-neutral' means 'no dwell run', not necessarily 'zero cycles'.) Two ways to address the cursor, plus relative motion and a buttons mask; per axis give at most one of {x|nx|dx} (and {y|ny|dy}); at least one field required. nx/ny: NORMALIZED per-myriad 0..10000 (0=left/top edge, 10000=right/bottom edge, 5000=center) — RANGE-INDEPENDENT, the robust way to address the screen since the guest may reprogram the range. x/y: the driver's LIVE virtual coords (the default per-mode range, e.g. mode 13h x 0..639 even × y 0..199, but a guest may set ANY range via INT 33h fn 7/8, e.g. Betrayal at Krondor → 0..1276 × 0..796) — read the live range + position back with read_mouse. dx/dy: relative motion. CLICK (default): a buttons mask presses, ADVANCES the machine by a human-realistic ~100 ms of EMULATED time (so the click is OBSERVABLE to a guest that LEVEL-SAMPLES the button once per frame/tick — e.g. Betrayal at Krondor's retrace menu), then releases. This DOES advance cycles and returns the run/stop result. A bare {buttons:1} just works — no manual run-tuning. hold_ms overrides the dwell (ms of emulated time; 0 = instant press+release, caught only by edge-latched guests). HOLD/DRAG: release:false sets the buttons mask RAW and HELD with NO auto-release (pure, cycle-neutral) — press {buttons:1,release:false}, move {dx,buttons:1,release:false} (run between), then release with {buttons:0}. hold_ms and release:false are mutually exclusive. SPICE/QEMU is the precedent: a click is just MOUSE_PRESS + MOUSE_RELEASE events with REAL time passing between them in the always-running VM — no synthesized hold; zdos advances that emulated time explicitly because it only runs on demand, and defaults a press to a click because that is the footgun-free common case.",
+        .description = "Inject a scripted/deterministic mouse event. NOTE: a buttons CLICK (the default) ADVANCES THE MACHINE — it presses, runs the CPU for ~100 ms of emulated time, then releases, so the cpu/cycle/screen state WILL move forward and the tool returns the run/stop result; that is expected, not a bug. (A buttons-less MOVE — absolute x/y/nx/ny or relative dx/dy with no buttons — that fires an installed INT 33h AX=0Ch event handler DELIVERS that callback: it advances a short deterministic dwell (~100 ms of emulated time) so the guest actually OBSERVES the move and redraws its cursor, then returns the run/stop result. This mirrors the live/browser path, which delivers every move via the pacer's per-slice run; without it a callback-only guest like Betrayal at Krondor — which never polls AX=03/0B and draws its cursor from the callback — never sees a one-shot move and its cursor never tracks. A buttons-less move with NO AX=0Ch handler installed stays cycle-neutral; a release:false drag (press/move/release) is also cycle-neutral by design — the caller's own run between steps delivers it.) Two ways to address the cursor, plus relative motion and a buttons mask; per axis give at most one of {x|nx|dx} (and {y|ny|dy}); at least one field required. nx/ny: NORMALIZED per-myriad 0..10000 (0=left/top edge, 10000=right/bottom edge, 5000=center) — RANGE-INDEPENDENT, the robust way to address the screen since the guest may reprogram the range. x/y: the driver's LIVE virtual coords (the default per-mode range, e.g. mode 13h x 0..639 even × y 0..199, but a guest may set ANY range via INT 33h fn 7/8, e.g. Betrayal at Krondor → 0..1276 × 0..796) — read the live range + position back with read_mouse. dx/dy: relative motion. CLICK (default): a buttons mask presses, ADVANCES the machine by a human-realistic ~100 ms of EMULATED time (so the click is OBSERVABLE to a guest that LEVEL-SAMPLES the button once per frame/tick — e.g. Betrayal at Krondor's retrace menu), then releases. This DOES advance cycles and returns the run/stop result. A bare {buttons:1} just works — no manual run-tuning. hold_ms overrides the dwell (ms of emulated time; 0 = instant press+release, caught only by edge-latched guests). HOLD/DRAG: release:false sets the buttons mask RAW and HELD with NO auto-release (pure, cycle-neutral) — press {buttons:1,release:false}, move {dx,buttons:1,release:false} (run between), then release with {buttons:0}. hold_ms and release:false are mutually exclusive. SPICE/QEMU is the precedent: a click is just MOUSE_PRESS + MOUSE_RELEASE events with REAL time passing between them in the always-running VM — no synthesized hold; zdos advances that emulated time explicitly because it only runs on demand, and defaults a press to a click because that is the footgun-free common case.",
         .input_schema =
         \\{"type":"object","properties":{"nx":{"type":"integer","minimum":0,"maximum":10000,"description":"normalized absolute X, per-myriad (0=left edge, 10000=right edge); range-independent (exclusive with x/dx)"},"ny":{"type":"integer","minimum":0,"maximum":10000,"description":"normalized absolute Y, per-myriad (0=top edge, 10000=bottom edge); range-independent (exclusive with y/dy)"},"x":{"type":"integer","minimum":-32768,"maximum":32767,"description":"absolute X in the driver's LIVE virtual coords (exclusive with nx/dx); clamped to the live range (read it via read_mouse)"},"y":{"type":"integer","minimum":-32768,"maximum":32767,"description":"absolute Y in the driver's LIVE virtual coords (exclusive with ny/dy); clamped to the live range"},"dx":{"type":"integer","minimum":-32768,"maximum":32767,"description":"relative X motion (exclusive with x/nx)"},"dy":{"type":"integer","minimum":-32768,"maximum":32767,"description":"relative Y motion (exclusive with y/ny)"},"buttons":{"type":"integer","minimum":0,"maximum":65535,"description":"button mask: bit0 left, bit1 right, bit2 middle. By default a non-zero mask is a CLICK (press -> ~100ms dwell -> release); buttons:0 releases all."},"hold_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"override the click dwell in ms of EMULATED time (default ~100; 0 = instant press+release). Needs a non-zero buttons mask; conflicts with release:false."},"release":{"type":"boolean","default":true,"description":"false = press-and-HOLD: set the buttons mask raw with NO auto-release (cycle-neutral), for drags. Release later with {buttons:0}. Conflicts with hold_ms."}},"additionalProperties":false}
         ,
@@ -313,7 +313,7 @@ pub const tools = [_]Tool{
     },
     .{
         .name = "reset",
-        .description = "Reset the machine to its post-boot state (clears guest RAM/CPU; re-load a program with `load`).",
+        .description = "Reboot the machine to a fresh post-provision state: re-runs BIOS POST + DOS init, re-mounts the drive, and re-loads the program from the persisted recipe — state byte-identical to a fresh provision (cycle 0). Deterministic. Breakpoints survive.",
         .input_schema = SCHEMA_EMPTY,
     },
     .{
@@ -753,11 +753,13 @@ pub fn parseSnapHandle(s: []const u8) ?u64 {
 }
 const ScreenReq = struct { attrs: bool = false };
 
-// Branch-trace MCP argument structs (docs/branch-trace-plan.md §6). `kinds` is an
-// optional array of BranchKind tag names → a `kind_mask`/`kind_trap_mask`.
-const BranchTraceArmReq = struct { enabled: bool = true, kinds: ?[]const []const u8 = null };
-const BranchTraceDumpReq = struct { limit: u32 = q.MAX_TRACE_DUMP, offset: u32 = 0, newest_first: bool = true };
-const BranchTrapArmReq = struct {
+// Branch-trace argument structs (docs/branch-trace-plan.md §6). `kinds` is an optional
+// array of BranchKind tag names → a `kind_mask`/`kind_trap_mask`. `pub` so the HTTP
+// `/api/branch-trace/*` handlers in server.zig parse the SAME structs the MCP path does
+// (anti-drift: one shape, one mapper — see `mapBranchTraceArm`/`Dump`/`mapBranchTrapArm`).
+pub const BranchTraceArmReq = struct { enabled: bool = true, kinds: ?[]const []const u8 = null };
+pub const BranchTraceDumpReq = struct { limit: u32 = q.MAX_TRACE_DUMP, offset: u32 = 0, newest_first: bool = true };
+pub const BranchTrapArmReq = struct {
     to_range: bool = false,
     to_lo: u32 = 0,
     to_hi: u32 = 0xFFFFF,
@@ -776,6 +778,43 @@ fn kindMaskFromNames(names: []const []const u8) ?u16 {
         mask |= @as(u16, 1) << @as(u4, @intCast(@intFromEnum(k)));
     }
     return mask;
+}
+
+const bad_kind: MapError = .{ .code = "bad_request", .message = "unknown branch kind name" };
+
+/// `branch_trace_arm`: a parsed `BranchTraceArmReq` → the arm command. Absent `kinds`
+/// means "all kinds" (0xFFFF); a named set folds via `kindMaskFromNames`. The EXTRACTED
+/// arm body — server.zig (HTTP) + `buildCommand` (MCP) share this (anti-drift).
+pub fn mapBranchTraceArm(r: BranchTraceArmReq) MapResult(q.Command) {
+    var mask: u16 = 0xFFFF;
+    if (r.kinds) |ks| mask = kindMaskFromNames(ks) orelse return .{ .fail = bad_kind };
+    return .{ .ok = .{ .branch_trace_arm = .{ .on = r.enabled, .kind_mask = mask } } };
+}
+
+/// `branch_trace_dump`: validate the page `limit` against `q.MAX_TRACE_DUMP` (a 0 or an
+/// over-cap limit is a hard error — no silent truncation) → the dump command.
+pub fn mapBranchTraceDump(r: BranchTraceDumpReq) MapResult(q.Command) {
+    if (r.limit == 0 or r.limit > q.MAX_TRACE_DUMP) return .{ .fail = .{ .code = "out_of_range", .message = "limit must be 1..1024" } };
+    return .{ .ok = .{ .branch_trace_dump = .{ .limit = r.limit, .offset = r.offset, .newest_first = r.newest_first } } };
+}
+
+/// `branch_trap_arm`: a parsed `BranchTrapArmReq` → the trap-predicate command. The
+/// OR-composed clauses (to-range / sp-range / kind-match) ride into `q.TrapArgs`; a named
+/// `kinds` set both flips `kind_match` and folds the mask (an unknown name is an error).
+pub fn mapBranchTrapArm(r: BranchTrapArmReq) MapResult(q.Command) {
+    var ta: q.TrapArgs = .{
+        .to_range = r.to_range,
+        .to_lo = r.to_lo,
+        .to_hi = r.to_hi,
+        .sp_range = r.sp_range,
+        .sp_lo = r.sp_lo,
+        .sp_hi = r.sp_hi,
+    };
+    if (r.kinds) |ks| {
+        ta.kind_match = true;
+        ta.kind_trap_mask = kindMaskFromNames(ks) orelse return .{ .fail = bad_kind };
+    }
+    return .{ .ok = .{ .branch_trap_arm = ta } };
 }
 const DevicesReq = struct { palette: bool = false, device: ?[]const u8 = null };
 const DisasmReq = struct { linear: ?u32 = null, seg: ?u16 = null, off: ?u32 = null, count: ?u32 = null };
@@ -856,40 +895,27 @@ pub fn buildCommand(
     // --- branch trace + trap (docs/branch-trace-plan.md §6) ---
     if (is(name, "branch_trace_arm")) {
         const r = parse(BranchTraceArmReq, arena, args) orelse return invalid("branch_trace_arm expects {enabled:bool, kinds?:[string]}");
-        var mask: u16 = 0xFFFF;
-        if (r.kinds) |ks| mask = kindMaskFromNames(ks) orelse return invalid("unknown branch kind name");
-        return cmd(.{ .branch_trace_arm = .{ .on = r.enabled, .kind_mask = mask } }, false);
+        return switch (mapBranchTraceArm(r)) {
+            .fail => |e| invalid(e.message),
+            .ok => |c| cmd(c, false),
+        };
     }
     if (is(name, "branch_trace_clear")) return cmd(.branch_trace_clear, false);
     if (is(name, "branch_trace_status")) return cmd(.branch_trace_status, false);
     if (is(name, "branch_trace_dump")) {
-        var limit: u32 = q.MAX_TRACE_DUMP;
-        var offset: u32 = 0;
-        var newest: bool = true;
-        if (args == .object) {
-            const r = parse(BranchTraceDumpReq, arena, args) orelse return invalid("branch_trace_dump expects {limit?:int, offset?:int, newest_first?:bool}");
-            limit = r.limit;
-            offset = r.offset;
-            newest = r.newest_first;
-        }
-        if (limit == 0 or limit > q.MAX_TRACE_DUMP) return invalid("limit must be 1..1024");
-        return cmd(.{ .branch_trace_dump = .{ .limit = limit, .offset = offset, .newest_first = newest } }, false);
+        var r: BranchTraceDumpReq = .{};
+        if (args == .object) r = parse(BranchTraceDumpReq, arena, args) orelse return invalid("branch_trace_dump expects {limit?:int, offset?:int, newest_first?:bool}");
+        return switch (mapBranchTraceDump(r)) {
+            .fail => |e| invalid(e.message),
+            .ok => |c| cmd(c, false),
+        };
     }
     if (is(name, "branch_trap_arm")) {
         const r = parse(BranchTrapArmReq, arena, args) orelse return invalid("branch_trap_arm expects {to_range?,to_lo?,to_hi?,sp_range?,sp_lo?,sp_hi?,kinds?}");
-        var ta: q.TrapArgs = .{
-            .to_range = r.to_range,
-            .to_lo = r.to_lo,
-            .to_hi = r.to_hi,
-            .sp_range = r.sp_range,
-            .sp_lo = r.sp_lo,
-            .sp_hi = r.sp_hi,
+        return switch (mapBranchTrapArm(r)) {
+            .fail => |e| invalid(e.message),
+            .ok => |c| cmd(c, false),
         };
-        if (r.kinds) |ks| {
-            ta.kind_match = true;
-            ta.kind_trap_mask = kindMaskFromNames(ks) orelse return invalid("unknown branch kind name");
-        }
-        return cmd(.{ .branch_trap_arm = ta }, false);
     }
     if (is(name, "branch_trap_clear")) return cmd(.branch_trap_clear, false);
 

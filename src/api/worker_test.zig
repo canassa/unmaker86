@@ -10,10 +10,12 @@ const debug = @import("debug");
 const cpu_mod = @import("cpu");
 const machine_mod = @import("machine");
 const timing = @import("timing");
+const run_control = @import("run_control.zig");
 
 const Machine = machine_mod.Machine;
 const Controller = debug.Controller;
 const Reg32 = cpu_mod.state.Reg32;
+const RunControl = run_control.RunControl;
 
 const PROG: u32 = 0x0500;
 fn loadNopProg(m: *Machine) void {
@@ -50,7 +52,7 @@ fn expectStateEqual(a: cpu_mod.State, b: cpu_mod.State) !void {
 /// thread-agnostic — the threading is exercised separately in queue_test).
 fn drain(ctrl: *Controller, cmd: q.Command) q.Response {
     var ctx: q.RequestCtx = .{ .cmd = cmd };
-    return worker.drainOne(ctrl, &ctx, .{}, null, null, null);
+    return worker.drainOne(ctrl, &ctx, .{}, null, null, null, null);
 }
 
 test "#1 queue-drive == direct-call: byte-identical state (CPU + RAM)" {
@@ -69,7 +71,7 @@ test "#1 queue-drive == direct-call: byte-identical state (CPU + RAM)" {
         ctx.scratch[0] = 0xde;
         ctx.scratch[1] = 0xad;
         ctx.scratch[2] = 0xbe;
-        _ = worker.drainOne(&ca, &ctx, .{}, null, null, null);
+        _ = worker.drainOne(&ca, &ctx, .{}, null, null, null, null);
     }
     _ = drain(&ca, .{ .mem_peek = .{ .phys = 0x600, .len = 3 } });
 
@@ -277,7 +279,7 @@ test "#5 bounded/retained-capacity: the queue ring + scratch do zero allocations
         _ = drain(&c, .cpu_get);
         _ = drain(&c, .{ .mem_peek = .{ .phys = 0x500, .len = 16 } });
         var ctx: q.RequestCtx = .{ .cmd = .{ .mem_write = .{ .phys = 0x600, .len = 4 } } };
-        _ = worker.drainOne(&c, &ctx, .{}, null, null, null);
+        _ = worker.drainOne(&c, &ctx, .{}, null, null, null, null);
         _ = drain(&c, .list_bp);
         _ = drain(&c, .status);
     }
@@ -417,3 +419,114 @@ const CountingAllocator = struct {
         self.backing.rawFree(buf, a, ra);
     }
 };
+
+// ===========================================================================
+// Preemptible-run robustness (a wedged/hanging guest must never jam the worker).
+// A `reset`/`stop` raises `RunControl.preempt_pending`; the worker polls it between
+// bounded run bursts and yields the in-flight run at a clean instruction boundary
+// (`stopped_by_request`). These prove (a) the yield is prompt and (b) a non-preempted
+// run is byte-identical to the old single unbounded call — determinism intact.
+// ===========================================================================
+
+/// A guest that ADVANCES cycles forever: `jmp $` (EB FE) at PROG. The no-progress
+/// watchdog can NOT catch this (the ledger keeps moving) — only the preempt signal can.
+fn loadSpinProg(m: *Machine) void {
+    const b = &m.bus;
+    b.writePhys8(PROG, 0xEB);
+    b.writePhys8(PROG + 1, 0xFE); // jmp -2 -> itself
+    m.cpu.loadSegment(.cs, 0);
+    m.cpu.loadSegment(.ds, 0);
+    m.cpu.loadSegment(.ss, 0);
+    m.cpu.st.setReg16(@intFromEnum(Reg32.esp), 0x7000);
+    m.cpu.st.eip = PROG;
+}
+fn makeSpinMachine(alloc: std.mem.Allocator) !*Machine {
+    const m = try alloc.create(Machine);
+    try m.init(alloc, &.{});
+    m.wire();
+    loadSpinProg(m);
+    return m;
+}
+
+fn drainRc(ctrl: *Controller, rc: *RunControl, cmd: q.Command) q.Response {
+    var ctx: q.RequestCtx = .{ .cmd = cmd };
+    return worker.drainOne(ctrl, &ctx, .{}, null, null, null, rc);
+}
+
+test "preempt: a control request yields an in-flight (effectively infinite) run promptly" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    var rc = RunControl.init(threaded.io());
+
+    const m = try makeSpinMachine(alloc);
+    defer destroy(alloc, m);
+    var c = Controller.init(m);
+
+    // Simulate a `reset`/`stop` that has already raised the preempt signal, then drive a
+    // run with an enormous cap (would never terminate on a spin loop). The worker must
+    // yield at the first burst boundary with `stopped_by_request` — never hang.
+    rc.beginPreempt();
+    const resp = drainRc(&c, &rc, .{ .run = .{ .cycle_cap = std.math.maxInt(u64) } });
+    rc.endPreempt();
+    try std.testing.expect(resp == .stop);
+    try std.testing.expect(resp.stop == .stopped_by_request);
+}
+
+test "preempt: an infinite run on a worker THREAD is abortable (the join must return)" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    var rc = RunControl.init(threaded.io());
+
+    const m = try makeSpinMachine(alloc);
+    defer destroy(alloc, m);
+    var c = Controller.init(m);
+
+    // Run a TRULY unbounded run (maxInt cap on a spin loop) on its own thread. Without the
+    // preempt path this thread would never return and the join would hang the test.
+    const Runner = struct {
+        fn go(ctrl: *Controller, rcp: *RunControl, out: *q.Response) void {
+            out.* = drainRc(ctrl, rcp, .{ .run = .{ .cycle_cap = std.math.maxInt(u64) } });
+        }
+    };
+    var out: q.Response = .ok;
+    const t = try std.Thread.spawn(.{}, Runner.go, .{ &c, &rc, &out });
+    // Raise the preempt signal (what `/api/reset`/`/api/run/stop` do). The run yields at
+    // its next burst boundary; the join then returns (the anti-hang guarantee).
+    rc.beginPreempt();
+    t.join();
+    rc.endPreempt();
+    try std.testing.expect(out == .stop);
+    try std.testing.expect(out.stop == .stopped_by_request);
+}
+
+test "determinism: a non-preempted run_to_cycle is byte-identical to the direct unbounded run (multi-burst)" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    var rc = RunControl.init(threaded.io());
+
+    // A target spanning several PREEMPT_BURST_CYCLES (1<<20) so the worker's burst loop
+    // resumes across MANY bursts — proving the slicing is invisible to the result.
+    const N: u64 = (1 << 20) * 3 + 12345;
+
+    // Path A: through the preemptible worker (preempt clear).
+    const ma = try makeSpinMachine(alloc);
+    defer destroy(alloc, ma);
+    var ca = Controller.init(ma);
+    const ra = drainRc(&ca, &rc, .{ .run_to_cycle = .{ .cycle = N } });
+
+    // Path B: the direct single unbounded runToCycle.
+    const mb = try makeSpinMachine(alloc);
+    defer destroy(alloc, mb);
+    var cb = Controller.init(mb);
+    const rb = try cb.runToCycle(N);
+
+    // Same reason (target_reached at the same cycle) and byte-identical CPU + RAM.
+    try std.testing.expect(ra == .stop);
+    try std.testing.expectEqualStrings(@tagName(rb), @tagName(ra.stop));
+    try std.testing.expectEqual(rb.target_reached.at_cycle, ra.stop.target_reached.at_cycle);
+    try expectStateEqual(ma.cpu.st, mb.cpu.st);
+    try std.testing.expectEqualSlices(u8, ma.bus.ram, mb.bus.ram);
+}

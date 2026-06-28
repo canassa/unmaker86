@@ -754,6 +754,58 @@ test "held click: deterministic — two fresh machines reach identical cycle + s
     try std.testing.expectEqual(ca.m.dos.mouse.press_count[0], cb.m.dos.mouse.press_count[0]);
 }
 
+test "scripted MOVE delivers the AX=0Ch callback to a callback-only guest (injectMouseDeliver); no handler ⇒ cycle-neutral" {
+    // The bug this guards: a guest that learns of the pointer ONLY through its installed
+    // INT 33h AX=0Ch callback (Betrayal at Krondor — it never polls AX=03/0B, and its
+    // software cursor is drawn from the callback-latched position) never SEES a one-shot
+    // MCP move, because the bare `injectMouse` only RAISES IRQ12 (Option C, deferred) and
+    // runs nothing. The live/browser fold path has no such gap (the pacer runs a slice
+    // every tick, delivering every fold's callback). `injectMouseDeliver` closes it for
+    // the one-shot tool: when the move left a callback PENDING it advances a short
+    // deterministic dwell so INT 74h actually runs the handler — and stays cycle-neutral
+    // when nothing is pending. `plantMouseHandler` latches CX/DX/BL exactly as BaK does.
+    const alloc = std.testing.allocator;
+
+    // --- WITH an AX=0Ch handler installed: a bare MOVE must REACH the guest ---
+    {
+        var ctx = try boot(alloc);
+        defer ctx.deinit();
+        const m = ctx.m;
+        plantMouseHandler(m);
+        installMouseHandler(m, 0x7F); // arm all events; AX=000C unmasks IRQ12 (ends HLT)
+        armMouseSpin(m); // IF=1 foreground spin so the deferred INT 74h can deliver
+        var ctrl = Controller.init(m);
+        try std.testing.expectEqual(@as(u16, 0), slot16(m, SLOT_CX)); // latch starts clear
+
+        const c0 = m.cpu.st.cycles;
+        // MOVE ONLY (no buttons): position to (210,118). A bare inject would raise IRQ12
+        // and run nothing — the latch would stay 0; injectMouseDeliver delivers it.
+        const stop = ctrl.injectMouseDeliver(.{ .x = 210, .y = 118, .set_x = true, .set_y = true });
+
+        try std.testing.expect(stop != null); // a real run happened (the callback delivered)
+        try std.testing.expect(m.cpu.st.cycles > c0); // cycles charged (no ledger hole)
+        // The handler RAN with the injected position — the move REACHED the guest, which a
+        // cycle-neutral inject never would (cf. the deferred-only assertion at line ~1157).
+        try std.testing.expectEqual(@as(u16, 210), slot16(m, SLOT_CX));
+        try std.testing.expectEqual(@as(u16, 118), slot16(m, SLOT_DX));
+        try std.testing.expectEqual(@as(u16, 0), m.dos.mouse.pending_event_mask); // consumed
+    }
+
+    // --- NO handler installed: the SAME move stays CYCLE-NEUTRAL (returns null) ---
+    {
+        var ctx = try boot(alloc);
+        defer ctx.deinit();
+        const m = ctx.m;
+        var ctrl = Controller.init(m);
+        const c0 = m.cpu.st.cycles;
+        const stop = ctrl.injectMouseDeliver(.{ .x = 210, .y = 118, .set_x = true, .set_y = true });
+        try std.testing.expect(stop == null); // nothing pending ⇒ no run is started
+        try std.testing.expectEqual(c0, m.cpu.st.cycles); // byte-identical to a pure inject
+        // The driver position DID update (the inject itself is unconditional).
+        try std.testing.expectEqual(@as(i16, 210), @as(i16, @bitCast(m.dos.mouse.posX())));
+    }
+}
+
 test "held click: the dwell->cycles budget scales with the configured CPU clock (reads the machine clock, not a constant)" {
     const alloc = std.testing.allocator;
 

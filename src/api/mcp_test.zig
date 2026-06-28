@@ -92,7 +92,10 @@ const TestServer = struct {
         const w = struct {
             fn run(s: *Server) void {
                 const worker = @import("worker.zig");
-                const ww: worker.Worker = .{ .queue = &s.session.?.queue, .ctrl = s.session.?.ctrl, .render = s.session.?.render };
+                // Wire the mount (dir + io) like the real default-worker spawn
+                // (server.zig) so `load`/`reset` can re-boot from the recipe — `reset`
+                // is now a full recipe re-boot, not a bare power-on, so it needs the mount.
+                const ww: worker.Worker = .{ .queue = &s.session.?.queue, .ctrl = s.session.?.ctrl, .mount_dir = s.session.?.mount_dir, .io = s.io, .render = s.session.?.render };
                 ww.run();
             }
         };
@@ -145,6 +148,13 @@ fn serveRaw(srv: *Server, raw: []const u8, out: []u8) Resp {
 fn get(ts: *TestServer, path: []const u8, out: []u8) Resp {
     var req_buf: [512]u8 = undefined;
     const raw = std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: x\r\n\r\n", .{path}) catch unreachable;
+    return splitResponse(ts.request(raw, out));
+}
+
+/// `POST path` with a JSON body (no session header → default session).
+fn post(ts: *TestServer, path: []const u8, body: []const u8, out: []u8) Resp {
+    var req_buf: [1024]u8 = undefined;
+    const raw = std.fmt.bufPrint(&req_buf, "POST {s} HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\ncontent-length: {d}\r\n\r\n{s}", .{ path, body.len, body }) catch unreachable;
     return splitResponse(ts.request(raw, out));
 }
 
@@ -1132,6 +1142,33 @@ test "equivalence: read_devices?palette tool body == GET /api/devices?palette=1"
 test "equivalence: read_devices{device} tool body == GET /api/device/pic" {
     try expectEquivGet(310, "read_devices", "{\"device\":\"pic\"}", "/api/device/pic");
 }
+test "equivalence: branch_trace_status tool body == GET /api/branch-trace/status" {
+    try expectEquivGet(311, "branch_trace_status", "{}", "/api/branch-trace/status");
+}
+test "equivalence: branch_trace_dump tool body == GET /api/branch-trace/dump" {
+    try expectEquivGet(312, "branch_trace_dump", "{\"limit\":8,\"offset\":0,\"newest_first\":true}", "/api/branch-trace/dump?limit=8&offset=0&newest_first=1");
+}
+
+// Anti-drift equivalence for a MUTATING-config POST: the MCP `branch_trap_arm` tool inner
+// body must equal the `POST /api/branch-trap/arm` body byte-for-byte on the SAME machine
+// (both return the resulting trace status via the shared `writeResponseBody`). Arming the
+// trap is a clockless config flip — cycle-neutral — so issue order does not matter.
+test "equivalence: branch_trap_arm tool body == POST /api/branch-trap/arm" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+
+    const args = "{\"to_range\":true,\"to_lo\":1280,\"to_hi\":1536,\"sp_range\":true,\"sp_lo\":256,\"sp_hi\":1024,\"kinds\":[\"call_near_direct\",\"ret_near\"]}";
+
+    var http_buf: [16 * 1024]u8 = undefined;
+    const httpr = post(&ts, "/api/branch-trap/arm", args, &http_buf);
+    try std.testing.expectEqual(@as(u16, 200), httpr.status);
+
+    const r = call(&ts, 313, "branch_trap_arm", args, &obuf);
+    var nav = try Nav.parse(std.testing.allocator, r.body);
+    defer nav.deinit();
+    try std.testing.expectEqualStrings(httpr.body, toolText(&nav));
+}
 
 // ===========================================================================
 // Phase 4 — HTTP `/api/*` session routing via the optional `X-Zdos-Session`
@@ -1591,6 +1628,32 @@ test "empty-start: a blank /api/* request is 409 (no machine provisioned)" {
     const r = emptyGet(&es, "/api/status", &obuf);
     try std.testing.expectEqual(@as(u16, 409), r.status);
     try std.testing.expect(std.mem.indexOf(u8, r.body, "no_machine") != null);
+}
+
+test "empty-start: GET /api/machines answers 200 with an empty list (above the 409 guard)" {
+    var es = try EmptyServer.init(std.testing.allocator);
+    defer es.deinit();
+    // Unlike every other /api/* route, /api/machines enumerates the registry rather than
+    // routing to a machine, so it must answer even with NO default machine (no 409).
+    const r = emptyGet(&es, "/api/machines", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"machines\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"live_machines\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"max_machines\":") != null);
+}
+
+test "empty-start: a provisioned machine appears in GET /api/machines" {
+    var es = try EmptyServer.init(std.testing.allocator);
+    defer es.deinit();
+
+    var bbuf: [1024]u8 = undefined;
+    const pbody = std.fmt.bufPrint(&bbuf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"provision_machine\",\"arguments\":{{\"mount_dir\":\"{s}\",\"file\":\"HELLO.COM\"}}}}}}", .{build_options.examples_dir}) catch unreachable;
+    try std.testing.expectEqual(@as(u16, 200), emptyMcp(&es, pbody, &obuf).status);
+
+    const r = emptyGet(&es, "/api/machines", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"live_machines\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "HELLO.COM") != null);
 }
 
 test "empty-start: provision -> drive by {machine} -> list -> deprovision all work" {

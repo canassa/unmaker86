@@ -25,6 +25,37 @@ fn untilDone(m: *Machine) bool {
     return m.cpu.st.halted or m.dos.terminated;
 }
 
+/// Parse a dotted-quad IPv4 (`"0.0.0.0"`, `"127.0.0.1"`) into 4 bytes. Returns null on any
+/// malformed input (wrong field count, non-numeric, > 255).
+fn parseIp4(s: []const u8) ?[4]u8 {
+    var out: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, s, '.');
+    var i: usize = 0;
+    while (it.next()) |part| : (i += 1) {
+        if (i >= 4) return null; // too many fields
+        out[i] = std.fmt.parseInt(u8, part, 10) catch return null;
+    }
+    return if (i == 4) out else null; // exactly four fields required
+}
+
+/// Parse the `--host` argument into a bind address. Accepts a dotted IPv4 (e.g. `0.0.0.0`,
+/// `127.0.0.1`) or the IPv6 wildcard `::` (dual-stack on Linux — accepts IPv6 AND IPv4, so
+/// it is the right choice to reach the server by an IPv6-only hostname). Null = unparseable.
+fn parseBindHost(s: []const u8) ?api_mod.Server.BindHost {
+    if (std.mem.eql(u8, s, "::")) return .{ .ip6 = @splat(0) }; // IPv6 any (::)
+    if (parseIp4(s)) |b| return .{ .ip4 = b };
+    return null;
+}
+
+/// Format a bind host for the (informational, URL-shaped) listen banner. IPv6 is only ever
+/// the `::` wildcard here, so it prints as the URL-bracketed `[::]`.
+fn fmtBindHost(host: api_mod.Server.BindHost, buf: []u8) []const u8 {
+    return switch (host) {
+        .ip4 => |b| std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }) catch "?",
+        .ip6 => "[::]",
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -41,6 +72,9 @@ pub fn main(init: std.process.Init) !void {
     _ = args_it.next(); // skip argv[0]
     var break_cycle: ?u64 = null;
     var serve_port: ?u16 = null;
+    // The address the `--serve` listener binds. Loopback by default (this-host-only); `--host
+    // 0.0.0.0` (IPv4 LAN) or `--host ::` (IPv6/dual-stack) opens it up. Reachability only.
+    var serve_host: api_mod.Server.BindHost = .{ .ip4 = .{ 127, 0, 0, 1 } };
     // The guest program path. NULL only on the EMPTY-START path (`--serve PORT` with no
     // program) — every other mode requires a program and exits below if it is missing.
     var path: ?[]const u8 = null;
@@ -74,13 +108,29 @@ pub fn main(init: std.process.Init) !void {
         // provisioning-plan §6): `--serve PORT` with no program starts EMPTY (no default
         // machine — an agent provisions machines on demand); `--serve PORT PROGRAM` auto-
         // provisions the default machine exactly as before.
-        if (args_it.next()) |tok| {
-            // --break-cycle and --serve are mutually exclusive (one or the other path).
-            if (std.mem.eql(u8, tok, "--break-cycle")) {
-                try stderr.writeStreamingAll(io, "zdos: --serve and --break-cycle are mutually exclusive\n");
-                std.process.exit(2);
+        if (args_it.next()) |tok0| {
+            var tok: ?[]const u8 = tok0;
+            // OPTIONAL `--host ADDR` immediately after the port (before any PROGRAM):
+            // binds the listener to ADDR instead of loopback (e.g. `0.0.0.0` for LAN access).
+            if (std.mem.eql(u8, tok0, "--host")) {
+                const h = args_it.next() orelse {
+                    try stderr.writeStreamingAll(io, "zdos: --host requires an IPv4 address\n");
+                    std.process.exit(2);
+                };
+                serve_host = parseBindHost(h) orelse {
+                    try stderr.writeStreamingAll(io, "zdos: --host expects an IPv4 (e.g. 0.0.0.0) or :: (IPv6/dual-stack)\n");
+                    std.process.exit(2);
+                };
+                tok = args_it.next(); // advance to the PROGRAM (or null = empty start)
             }
-            path = tok;
+            if (tok) |t| {
+                // --break-cycle and --serve are mutually exclusive (one or the other path).
+                if (std.mem.eql(u8, t, "--break-cycle")) {
+                    try stderr.writeStreamingAll(io, "zdos: --serve and --break-cycle are mutually exclusive\n");
+                    std.process.exit(2);
+                }
+                path = t;
+            }
         }
     } else {
         path = first;
@@ -95,20 +145,37 @@ pub fn main(init: std.process.Init) !void {
         const port = serve_port.?; // path is null ONLY on the --serve empty path
         var server = try api_mod.Server.initEmpty(gpa, io, port);
         defer server.deinit();
+        server.bind_host = serve_host;
         server.bind() catch |err| {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "zdos: --serve bind failed: {t}\n", .{err}) catch "zdos: --serve bind failed\n";
             try stderr.writeStreamingAll(io, msg);
             std.process.exit(1);
         };
+        var hbuf: [48]u8 = undefined;
+        const hs = fmtBindHost(serve_host, &hbuf);
         var sbuf: [96]u8 = undefined;
-        const banner = std.fmt.bufPrint(&sbuf, "\n[zdos] listening 127.0.0.1:{d}\n", .{server.boundPort()}) catch "\n[zdos] listening\n";
+        const banner = std.fmt.bufPrint(&sbuf, "\n[zdos] listening {s}:{d}\n", .{ hs, server.boundPort() }) catch "\n[zdos] listening\n";
         try stderr.writeStreamingAll(io, banner);
-        var mbuf: [128]u8 = undefined;
-        const mcp_banner = std.fmt.bufPrint(&mbuf, "[zdos] mcp endpoint: POST http://127.0.0.1:{d}/mcp (empty start — provision_machine to begin)\n", .{server.boundPort()}) catch "[zdos] mcp endpoint: POST /mcp (empty start)\n";
+        var mbuf: [160]u8 = undefined;
+        const mcp_banner = std.fmt.bufPrint(&mbuf, "[zdos] mcp endpoint: POST http://{s}:{d}/mcp (empty start — provision_machine to begin)\n", .{ hs, server.boundPort() }) catch "[zdos] mcp endpoint: POST /mcp (empty start)\n";
         try stderr.writeStreamingAll(io, mcp_banner);
-        // No host run-pacer: a minted machine is debugger-driven only (agent-provisioning-plan
-        // §13), and there is no default machine to pace. Just run the accept loop.
+        // The host-side MULTI-SESSION pacer (agent-provisioning live-play): there is no default
+        // machine to pace, but an agent `provision_machine`s machines into the registry, and each
+        // can be RUN IN REAL TIME (`/api/run/start` arms its clockless `RunControl`; a live stream
+        // auto-arms it). This one thread paces every armed minted session through its gated queue
+        // — the host CLOCK lives in `src/host/run_pacer.zig` (outside the api grep-gate, §5.1a),
+        // so it never perturbs any cycle ledger. Joined BEFORE `server.deinit()` (the `defer`
+        // below runs before the deferred `server.deinit`, which drains the minted workers), so no
+        // slice can race a worker shutdown sentinel.
+        var spacer: host_mod.SessionPacer = .{ .registry = server.sessionRegistry(), .io = io };
+        spacer.start() catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "zdos: --serve session-pacer start failed: {t}\n", .{err}) catch "zdos: --serve session-pacer start failed\n";
+            try stderr.writeStreamingAll(io, msg);
+            std.process.exit(1);
+        };
+        defer spacer.join();
         server.serve() catch |err| {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "zdos: --serve failed: {t}\n", .{err}) catch "zdos: --serve failed\n";
@@ -184,11 +251,13 @@ pub fn main(init: std.process.Init) !void {
         // worker thread (the sole owner of machine state) — see worker.zig loadResp.
         var server = try api_mod.Server.init(gpa, io, &ctrl, port, recipe, dir);
         defer server.deinit();
+        server.bind_host = serve_host;
 
         // Bind first so we can print the OS-RESOLVED port (when `--serve 0` was
         // given, the kernel picks an ephemeral port). The banner line is in a
         // STABLE, parseable format the black-box test harness greps for to learn
-        // which port to connect to: `\n[zdos] listening 127.0.0.1:<PORT>\n`.
+        // which port to connect to: `\n[zdos] listening <HOST>:<PORT>\n` (HOST is
+        // 127.0.0.1 unless `--host` widened it).
         server.bind() catch |err| {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "zdos: --serve bind failed: {t}\n", .{err}) catch "zdos: --serve bind failed\n";
@@ -196,15 +265,17 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
 
+        var hbuf: [48]u8 = undefined;
+        const hs = fmtBindHost(serve_host, &hbuf);
         var sbuf: [96]u8 = undefined;
-        const banner = std.fmt.bufPrint(&sbuf, "\n[zdos] listening 127.0.0.1:{d}\n", .{server.boundPort()}) catch "\n[zdos] listening\n";
+        const banner = std.fmt.bufPrint(&sbuf, "\n[zdos] listening {s}:{d}\n", .{ hs, server.boundPort() }) catch "\n[zdos] listening\n";
         try stderr.writeStreamingAll(io, banner);
 
         // Informational: the MCP (Model Context Protocol) JSON-RPC 2.0 endpoint rides the
         // SAME `--serve` port (mcp-plan.md §3.4). Purely a banner — no behavior change, no
         // wall clock (the bound port is the only datum).
         var mbuf: [96]u8 = undefined;
-        const mcp_banner = std.fmt.bufPrint(&mbuf, "[zdos] mcp endpoint: POST http://127.0.0.1:{d}/mcp\n", .{server.boundPort()}) catch "[zdos] mcp endpoint: POST /mcp\n";
+        const mcp_banner = std.fmt.bufPrint(&mbuf, "[zdos] mcp endpoint: POST http://{s}:{d}/mcp\n", .{ hs, server.boundPort() }) catch "[zdos] mcp endpoint: POST /mcp\n";
         try stderr.writeStreamingAll(io, mcp_banner);
 
         // The host-side run-pacer (stream §5): a separate thread that, while armed via
@@ -242,6 +313,22 @@ pub fn main(init: std.process.Init) !void {
                 p.join();
             }
         }.hook);
+
+        // The host-side MULTI-SESSION pacer: the `RunPacer` above paces the DEFAULT machine;
+        // this paces every armed registry-minted machine (`provision_machine` works in this mode
+        // too). Disjoint sessions/queues, so it never interferes with the default pacer. Its host
+        // clock also lives in `src/host/run_pacer.zig`. Joined via the `defer` below — which runs
+        // before the deferred `server.deinit()` (registry minted-worker drain), so no minted slice
+        // races a worker sentinel. (The default `RunPacer` is joined inside `serve` via the
+        // pre-shutdown hook above, before the default worker drain.)
+        var spacer: host_mod.SessionPacer = .{ .registry = server.sessionRegistry(), .io = io };
+        spacer.start() catch |err| {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "zdos: --serve session-pacer start failed: {t}\n", .{err}) catch "zdos: --serve session-pacer start failed\n";
+            try stderr.writeStreamingAll(io, msg);
+            std.process.exit(1);
+        };
+        defer spacer.join();
 
         server.serve() catch |err| {
             var buf: [128]u8 = undefined;

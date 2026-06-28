@@ -221,6 +221,16 @@ pub const SessionRegistry = struct {
         session.owned_ctrl = ctrl;
         session.owns_mount = owns_mount;
         session.destroyable = true;
+        // Sync the host pacer's slice to the APPLIED CPU mult (the same retune
+        // `/api/cpu/clock` + MCP `set_clock` do): without this a machine provisioned at a
+        // non-default mult keeps the mult-12 default slice, so the SessionPacer runs the
+        // wrong cycles-per-tick and the guest's timer (and the whole game) advances at the
+        // wrong WALL rate (slow when mult > 12). Done here while `create` still SOLELY owns
+        // the session (before the map publish below), so it cannot race a concurrent
+        // resolve/destroy. For the no-override case `applied_mult` is the boot default
+        // (12), so this stores the unchanged `DEFAULT_SLICE_CYCLES` — byte-identical pacing
+        // to the inline `--serve` default. WALL-ONLY: paced ≡ unpaced (no cycle golden move).
+        session.run_control.syncSliceToMult(applied_mult);
         // Wire the hub now that the session is at its final address.
         session.wireStream(self.io);
 
@@ -233,6 +243,7 @@ pub const SessionRegistry = struct {
             .render = session.render,
             .live_mouse = session.live_mouse,
             .snapshots = session.snapshots,
+            .run_ctl = session.run_control,
         };
         session.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
         errdefer {

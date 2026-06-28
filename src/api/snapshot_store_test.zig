@@ -55,7 +55,7 @@ fn destroy(alloc: std.mem.Allocator, m: *Machine) void {
 /// thread-agnostic; the threading itself is covered by queue_test).
 fn drain(ctrl: *Controller, store: *SnapshotStore, cmd: q.Command) q.Response {
     var ctx: q.RequestCtx = .{ .cmd = cmd };
-    return worker.drainOne(ctrl, &ctx, .{}, null, null, store);
+    return worker.drainOne(ctrl, &ctx, .{}, null, null, store, null);
 }
 
 test "double-mint: snapshot → mutate → restore is byte-identical (CPU + RAM + 3 DOS scalars + cycle)" {
@@ -260,7 +260,7 @@ test "store absent (no wired store) fails loud, never a fake capture" {
     defer destroy(alloc, m);
     var ctrl = Controller.init(m);
     var ctx: q.RequestCtx = .{ .cmd = .snapshot };
-    const r = worker.drainOne(&ctrl, &ctx, .{}, null, null, null);
+    const r = worker.drainOne(&ctrl, &ctx, .{}, null, null, null, null);
     try std.testing.expect(r == .err);
     try std.testing.expectEqual(q.ErrCode.load_failed, r.err);
 }

@@ -20,9 +20,25 @@ const json_wire = @import("json_wire.zig");
 const png = @import("png.zig");
 const live_mouse = @import("live_mouse.zig");
 const snapshot_store = @import("snapshot_store.zig");
+const run_control = @import("run_control.zig");
 
 const LiveMouseState = live_mouse.LiveMouseState;
 const SnapshotStore = snapshot_store.SnapshotStore;
+const RunControl = run_control.RunControl;
+
+/// The guest-cycle budget of ONE bounded burst between preempt polls (server-robustness:
+/// the worker advances a run in bursts of this size and, between bursts, checks the
+/// clockless abort flag so a wedged/unbounded run yields PROMPTLY to a `reset`/`stop`).
+/// Sized to bound the abort latency to ~one burst (a few ms at typical emulation rates)
+/// while adding negligible overhead to a normal run. DETERMINISM: a non-aborted run is
+/// byte-identical regardless of this value — an absolute-target run-to fires its one-shot
+/// at the same boundary however it is sliced, and a budgeted `run` tracks an ABSOLUTE
+/// deadline so the final burst lands on the exact same cycle as a single `runUntilEvent`.
+const PREEMPT_BURST_CYCLES: u64 = 1 << 20;
+
+/// The instruction batch of `step_n` between preempt polls (exact stepping has no
+/// overshoot, so `stepN(a)+stepN(b) == stepN(a+b)`; byte-identical regardless of batching).
+const PREEMPT_STEP_BATCH: u64 = 1 << 16;
 
 const Controller = debug.Controller;
 const Seg = cpu_mod.Seg;
@@ -94,19 +110,30 @@ fn inSlab(ctrl: *const Controller, start: u32, len: u32) bool {
 /// Dispatch exactly one command to one `Controller` method. Pure mapping; the only
 /// state it touches is via `ctrl` (the worker owns it) and `ctx.scratch` (the
 /// mem_write bytes, copied in by the handler before submit).
-pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render: ?*RenderBuffers, live: ?*LiveMouseState, snapshots: ?*SnapshotStore) Response {
+pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render: ?*RenderBuffers, live: ?*LiveMouseState, snapshots: ?*SnapshotStore, run_ctl: ?*RunControl) Response {
     return switch (ctx.cmd) {
         // ---- run / step ----------------------------------------------------
-        .run => |c| .{ .stop = ctrl.runUntilEvent(c.cycle_cap) },
-        // A paced free-run slice — identical to `.run`, a bounded deterministic
-        // `runUntilEvent`. The host run-pacer submits this each wall-clock tick;
-        // the worker just runs the slice on the single owned controller. The
-        // returned `StopReason` lets the pacer disarm on a terminal (§10).
-        .run_slice => |c| .{ .stop = ctrl.runUntilEvent(c.slice_cycles) },
-        .run_to_cycle => |c| .{ .stop = ctrl.runToCycle(c.cycle) catch |e| return errResp(e) },
-        .run_to_address => |c| .{ .stop = ctrl.runToAddress(c.linear) catch |e| return errResp(e) },
+        // Every run is PREEMPTIBLE: advanced in bounded bursts so a long/unbounded/wedged
+        // run yields PROMPTLY (`stopped_by_request`) when a `reset`/`stop` raises the abort
+        // flag — without that, one long run holds the single worker and jams the server.
+        // A non-aborted run is byte-identical to the old single `runUntilEvent` (see
+        // `PREEMPT_BURST_CYCLES`); `run_ctl == null` (in-process tests) ⇒ no poll, no chunking
+        // overhead beyond the absolute-deadline loop, same result.
+        .run => |c| runCapPreemptible(ctrl, run_ctl, c.cycle_cap),
+        // A paced free-run slice — the host run-pacer submits this each wall-clock tick. Also
+        // preemptible (a slice with a large `slice_cycles` against a wedged guest still yields),
+        // and the returned `StopReason` lets the pacer disarm on a terminal / on a preemption (§10).
+        .run_slice => |c| runCapPreemptible(ctrl, run_ctl, c.slice_cycles),
+        .run_to_cycle => |c| blk: {
+            const t = ctrl.beginRunToCycle(c.cycle) catch |e| break :blk errResp(e);
+            break :blk runToTargetPreemptible(ctrl, run_ctl, t);
+        },
+        .run_to_address => |c| blk: {
+            const t = ctrl.beginRunToAddress(c.linear) catch |e| break :blk errResp(e);
+            break :blk runToTargetPreemptible(ctrl, run_ctl, t);
+        },
         .step => .{ .stop = ctrl.stepInstruction() },
-        .step_n => |c| .{ .stop = ctrl.stepN(c.n) },
+        .step_n => |c| stepNPreemptible(ctrl, run_ctl, c.n),
         .step_over => blk: {
             const r = ctrl.stepOver();
             break :blk .{ .step_over = .{ .reason = r.reason, .stepped_into = r.stepped_into } };
@@ -155,10 +182,29 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
             // pure inject below. The wire mapper already guaranteed a non-zero button
             // mask, so there is a real down→…→up edge to hold.
             if (c.hold_ms) |ms| break :blk .{ .stop = ctrl.clickMouse(c, ms) };
-            // Pure inject: mutate INT 33h driver state at the one-command-in-flight
-            // boundary (no host clock, no sample-rate gate, cycle-neutral, NO auto-
-            // release). Always succeeds — driver-state injection has no FIFO to overflow
-            // (unlike the 8042 key path).
+            // A PURE MOVE (absolute/relative motion, NO buttons) must be DELIVERED to a
+            // callback-only guest — one that learns of the pointer ONLY via the INT 33h
+            // AX=0Ch event callback (e.g. Betrayal at Krondor: it never polls AX=03/0B, so
+            // its software cursor tracks ONLY the callback). The bare inject merely RAISES
+            // IRQ12 (Option C, deferred); the live/browser fold path delivers continuously
+            // (the pacer runs a slice every tick), but a one-shot MCP move runs nothing —
+            // so the move would be a SILENT NO-OP and the cursor would never track.
+            // `injectMouseDeliver` advances a short deterministic dwell to deliver the
+            // callback (mirroring the live path); it stays CYCLE-NEUTRAL (returns null) when
+            // nothing is pending (no handler / masked-out event), so a polling guest and the
+            // scripted-inject seam are byte-unchanged. A buttons-carrying inject is NOT
+            // routed here: a click already dwells (hold_ms above), and a `release:false`
+            // drag press/move/release is the explicit cycle-neutral "run between" primitive
+            // (the caller's own run delivers it) — both keep their existing semantics.
+            const moved = c.set_x or c.set_y or c.set_nx or c.set_ny or c.set_dx or c.set_dy;
+            if (moved and !c.set_buttons) {
+                if (ctrl.injectMouseDeliver(c)) |stop| break :blk .{ .stop = stop };
+                break :blk .ok;
+            }
+            // Pure buttons-bearing inject (a `release:false` drag press/move/release): mutate
+            // INT 33h driver state at the one-command-in-flight boundary (no host clock, no
+            // sample-rate gate, cycle-neutral, NO auto-release). Always succeeds — driver-
+            // state injection has no FIFO to overflow (unlike the 8042 key path).
             ctrl.injectMouse(c);
             break :blk .ok;
         },
@@ -215,6 +261,76 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
 
         .shutdown_worker => .ok,
     };
+}
+
+// ===========================================================================
+// Preemptible run drivers (server robustness). The control core runs only deterministic
+// bounded bursts and knows nothing of host scheduling (its `src/debug` determinism gate
+// forbids atomics); the WORKER (here, `src/api`) drives the burst loop and polls the
+// clockless abort flag between bursts. The abort stops the run at a CLEAN INSTRUCTION
+// BOUNDARY — the same property a breakpoint/interactive stop has — so the cycles that ran
+// are charged identically and the resulting state is a valid deterministic state at that
+// cycle (constraint #1). A non-aborted run is byte-identical to the old single call.
+// ===========================================================================
+
+/// True iff a control command (`reset`/`stop`) is waiting to seize the worker.
+fn preempting(run_ctl: ?*RunControl) bool {
+    return if (run_ctl) |rc| rc.preemptRequested() else false;
+}
+
+/// A worker-synthesized preemption stop at the current (clean) boundary. Stamps
+/// `last_stop` so `status()` stays coherent; the ledger is untouched.
+fn stoppedByRequest(ctrl: *Controller) Response {
+    return .{ .stop = ctrl.recordExternalStop(.{ .stopped_by_request = .{ .at_cycle = ctrl.currentCycle() } }) };
+}
+
+/// Advance a `run`/`run_slice` up to `cycle_cap` cycles, preemptibly. Tracks an ABSOLUTE
+/// deadline so the FINAL burst's deadline is exactly `start + cap` — making the chunked run
+/// byte-identical to one `runUntilEvent(cap)` (the intermediate bursts only change WHERE the
+/// deadline is evaluated, never the instruction stream). A small/bounded cap runs in one shot
+/// (no behavioral change at all). Returns `stopped_by_request` if a control command intervenes.
+fn runCapPreemptible(ctrl: *Controller, run_ctl: ?*RunControl, cycle_cap: u64) Response {
+    // Already-bounded caps (the common case, incl. pacer slices and small runs) run directly:
+    // identical to before, and nothing larger than one burst to preempt.
+    if (cycle_cap <= PREEMPT_BURST_CYCLES) return .{ .stop = ctrl.runUntilEvent(cycle_cap) };
+    const target = ctrl.currentCycle() +| cycle_cap; // saturating: maxInt cap ⇒ run forever (preemptibly)
+    while (true) {
+        if (preempting(run_ctl)) return stoppedByRequest(ctrl);
+        const cur = ctrl.currentCycle();
+        if (cur >= target) return .{ .stop = ctrl.recordExternalStop(.{ .cycle_budget_exhausted = .{ .at_cycle = cur } }) };
+        const burst = @min(target - cur, PREEMPT_BURST_CYCLES);
+        const r = ctrl.runUntilEvent(burst);
+        // Only a burst that merely ran out of its budget (target not yet reached) is resumed;
+        // any real event (terminal / breakpoint / no_progress) is surfaced immediately.
+        if (r != .cycle_budget_exhausted) return .{ .stop = r };
+    }
+}
+
+/// Drive an armed run-to-target (`run_to_cycle`/`run_to_address`) in bounded bursts,
+/// preemptibly. The one-shot fires at the same absolute boundary however the run is sliced,
+/// so the result is byte-identical to the single unbounded `runToCycle`/`runToAddress`.
+fn runToTargetPreemptible(ctrl: *Controller, run_ctl: ?*RunControl, t: Controller.RunTarget) Response {
+    if (t.already) return .{ .stop = ctrl.recordExternalStop(.{ .cycle_budget_exhausted = .{ .at_cycle = ctrl.currentCycle() } }) };
+    defer ctrl.endRunTarget(t);
+    while (true) {
+        if (preempting(run_ctl)) return stoppedByRequest(ctrl);
+        const r = ctrl.runTargetBurst(t, PREEMPT_BURST_CYCLES);
+        if (r != .cycle_budget_exhausted) return .{ .stop = r }; // target_reached / breakpoint / terminal
+    }
+}
+
+/// `step_n` in preempt-polled batches. Exact stepping has no overshoot, so this is
+/// byte-identical to a single `stepN(n)` (it just stops early on an event or a preemption).
+fn stepNPreemptible(ctrl: *Controller, run_ctl: ?*RunControl, n: u64) Response {
+    var remaining = n;
+    while (remaining > 0) {
+        if (preempting(run_ctl)) return stoppedByRequest(ctrl);
+        const batch = @min(remaining, PREEMPT_STEP_BATCH);
+        const r = ctrl.stepN(batch);
+        if (r != .step_complete) return .{ .stop = r };
+        remaining -= batch;
+    }
+    return .{ .stop = ctrl.recordExternalStop(.{ .step_complete = .{ .at_cycle = ctrl.currentCycle() } }) };
 }
 
 /// Map the debug-layer `TraceStatus` to the wire `q.TraceStatus` (identical fields).
@@ -622,17 +738,37 @@ pub const Worker = struct {
     /// a test harness that never wired one (snapshot/restore then fail loud). Set by the
     /// server at both worker-spawn sites, exactly like `render`/`live_mouse`.
     snapshots: ?*SnapshotStore = null,
+    /// The session's clockless run-control block — the worker polls its abort flag
+    /// (`preemptRequested`) BETWEEN bounded run bursts so a wedged/unbounded run yields
+    /// promptly to a `reset`/`stop`. Null in in-process tests (no preemption ⇒ a run still
+    /// completes byte-identically). Set by the server / registry at the worker-spawn sites,
+    /// exactly like `render`/`live_mouse`/`snapshots`.
+    run_ctl: ?*RunControl = null,
 
     pub fn run(self: Worker) void {
         const mount: MountSource = .{ .dir = self.mount_dir, .io = self.io };
+        // Publish the initial settled status so a never-commanded machine reports correct
+        // cycles/mult to `GET /api/machines` (which reads these atomics off-worker).
+        self.publishStatus();
         while (true) {
             const ctx = self.queue.waitDequeue();
             if (ctx.cmd == .shutdown_worker) {
                 self.queue.complete(ctx, .ok);
                 return;
             }
-            const resp = drainOne(self.ctrl, ctx, mount, self.render, self.live_mouse, self.snapshots);
+            const resp = drainOne(self.ctrl, ctx, mount, self.render, self.live_mouse, self.snapshots, self.run_ctl);
             self.queue.complete(ctx, resp);
+            // Stamp the published cycle/mult AFTER each command so `/api/machines` can report
+            // this machine's status WITHOUT submitting to (and being blocked by) this worker —
+            // the keystone that keeps the machine LIST responsive while a guest wedges.
+            self.publishStatus();
         }
+    }
+
+    /// Stamp the session's clockless published cycle/mult from the live machine (a pure read;
+    /// host-observability only — never an emulation input). No-op when no run-control is wired
+    /// (in-process tests), which simply leaves `/api/machines` to fall back to a `status` submit.
+    fn publishStatus(self: Worker) void {
+        if (self.run_ctl) |rc| rc.publishStatus(self.ctrl.currentCycle(), self.ctrl.clockMult());
     }
 };

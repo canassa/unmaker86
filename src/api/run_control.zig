@@ -48,6 +48,10 @@ pub const StopTag = enum(u8) {
     /// The no-progress watchdog tripped (a frozen ledger) — the paced run disarms so it
     /// does not busy-spin against the stuck machine. Not a program end.
     no_progress,
+    /// A paced slice was PREEMPTED by a control command (`/api/run/stop`/`/api/reset` raised
+    /// the abort signal). The pacer disarms (like a user stop) so it does not immediately
+    /// re-run past the preemption and re-jam the worker. NOT a program end.
+    stopped_by_request,
 };
 
 pub const RunControl = struct {
@@ -69,6 +73,47 @@ pub const RunControl = struct {
     /// The last slice's stop tag + the cycle it stopped at (for `/api/run/status`).
     last_stop: std.atomic.Value(u8) = .init(@intFromEnum(StopTag.none)),
     last_cycle: std.atomic.Value(u64) = .init(0),
+
+    /// The host-measured RAW emulation throughput (guest cycles/sec) on the CURRENT
+    /// workload, EMA-smoothed by the host pacer. CLOCK-FREE here (a plain atomic word):
+    /// the pacer in `src/host/run_pacer.zig` MEASURES it (it owns the wall clock —
+    /// `slice_cycles / slice_wall_time`) and STORES it via `setMeasuredHz`; the api layer
+    /// only READS it via `getMeasuredHz` to derive the UI-only `sustainableMult`. It is
+    /// NEVER an emulation input and NEVER an applied-mult clamp — it changes only how high
+    /// the browser's SPEED SLIDER can go (so a user can't pick a mult the host can't pace
+    /// in real time → slow-motion). The APPLIED mult stays host-independent (clamped only
+    /// by the STATIC `timing.MAX_MULT`), so determinism holds: same inputs ⇒ same machine
+    /// state on every host, fast or slow. 0 = never paced yet (no data → don't cap).
+    measured_hz: std.atomic.Value(u64) = .init(0),
+
+    /// The PREEMPT signal (robustness against a wedged/hanging guest). A clockless count
+    /// of in-flight control commands (`/api/run/stop`, `/api/reset`, MCP `reset`) that need
+    /// to seize the single worker NOW, away from a long/unbounded/wedged run. The WORKER's
+    /// run loop polls `preemptRequested()` BETWEEN its bounded `runUntilEvent` bursts and, if
+    /// set, abandons the run at a clean instruction boundary (`stopped_by_request`) so the
+    /// control command lands PROMPTLY. A COUNTER (not a bool) so it is non-starvable and
+    /// race-free: it stays raised across the WHOLE control span (begin→submit→end), so a run
+    /// that is in flight — or one that starts during the span — keeps yielding until the
+    /// control command has actually been serviced; a concurrent run can never clear another
+    /// command's pending preempt (the bug a single bool would have). A normal run never sees
+    /// it (it is raised only by a wall-clock control action), so determinism is untouched:
+    /// the abort changes only WHERE a run pauses, never which cycles ran (constraint #1).
+    /// CLOCKLESS atomic — legal in `src/api`, polled in the worker (also `src/api`), NEVER in
+    /// the control core (`src/debug`, where the determinism gate forbids atomics).
+    preempt_pending: std.atomic.Value(u32) = .init(0),
+
+    /// PUBLISHED machine status (clockless, host-observability only) — the last settled cycle
+    /// ledger + applied CPU:PIT mult, stamped by the WORKER after every command it services
+    /// (and once at worker start). It lets `GET /api/machines` report each machine's
+    /// cycles/mult WITHOUT submitting to that machine's worker — so the machine LIST can NEVER
+    /// be blocked by a wedged/long-running machine that is holding its own worker (the
+    /// server-robustness invariant: the list endpoint never depends on a stuck per-machine
+    /// worker). It is a best-effort observability snapshot (the value AT THE LAST command
+    /// boundary; a machine mid-run shows its last settled cycle), NEVER an emulation input —
+    /// the authoritative ledger stays `cpu.st.cycles`, read on the worker. `published_mult==0`
+    /// means "not yet stamped" (a never-commanded machine), which the reader maps to "unknown".
+    published_cycle: std.atomic.Value(u64) = .init(0),
+    published_mult: std.atomic.Value(u64) = .init(0),
 
     /// Serializes the owner transitions so start/stop and debugger commands cannot
     /// race. CLOCKLESS (`*Uncancelable`) — no timeout enters the api grep-gate.
@@ -100,7 +145,43 @@ pub const RunControl = struct {
     /// timer + all peripherals run at their faithful wall rates (timer 18.2 Hz, VGA
     /// 70.086 Hz). Recomputed for the live mult by the CPU-speed handler. Integer math
     /// (`PIT_TICK_RATE * mult`), no float — inline so the api grep-gate stays clean.
-    const SLICE_CYCLES_10MS: u64 = timing.PIT_TICK_RATE * timing.DEFAULT_MULT / 100; // 143_181
+    const SLICE_CYCLES_10MS: u64 = sliceForMult(timing.DEFAULT_MULT); // 143_181
+
+    /// The pacer slice (guest cycles per ~10 ms wall tick) for a given CPU:PIT `mult`, so
+    /// the timer's WALL rate stays ~18.2 Hz at ANY speed: `PIT_TICK_RATE * mult / 100`.
+    /// This is the SINGLE source of that formula — `DEFAULT_SLICE_CYCLES`, the
+    /// `/api/cpu/clock` retune, the MCP `set_clock` retune, AND the provision-time sync all
+    /// derive the slice from here, so it can never drift from the applied mult (the exact
+    /// drift that made a provisioned non-default-mult machine mis-paced). Integer-only, no
+    /// float — the api grep-gate stays clean. WALL-ONLY: the slice changes only how fast wall
+    /// time advances, never which guest cycles run (paced ≡ unpaced).
+    pub fn sliceForMult(mult: u64) u64 {
+        return timing.PIT_TICK_RATE * mult / 100;
+    }
+
+    /// The MAXIMUM CPU:PIT mult the host can emulate IN REAL TIME on the current workload —
+    /// for the browser to CAP its speed-slider range so a user can't pick a mult the host
+    /// can't pace (which runs the emulated clock slow → slow-motion). UI-ONLY: this is NOT
+    /// the applied-mult clamp (that stays the STATIC `timing.MAX_MULT`, host-independent for
+    /// determinism — an explicit API caller can still request up to `MAX_MULT` and it
+    /// applies on every host). Derived from the pacer's measured raw throughput with 10%
+    /// headroom: `floor(measured_hz * 9/10 / PIT_TICK_RATE)`, clamped to `[1, MAX_MULT]`.
+    /// `measured_hz == 0` (never paced) ⇒ `MAX_MULT` (no data → don't cap). Integer-only,
+    /// no float / no clock — the `src/api` determinism grep-gate stays clean.
+    pub fn sustainableMult(measured_hz: u64) u64 {
+        if (measured_hz == 0) return timing.MAX_MULT;
+        const s = measured_hz * 9 / 10 / timing.PIT_TICK_RATE;
+        return std.math.clamp(s, @as(u64, 1), timing.MAX_MULT);
+    }
+
+    /// Retune the pacer slice to match an APPLIED (already-clamped) CPU:PIT `mult` via the
+    /// canonical `sliceForMult`, so the timer wall rate tracks the CPU speed (game-pace
+    /// invariant). The pacer reads `slice_cycles` at the top of each slice, so the new value
+    /// takes effect next tick. Called by every speed front-end (`/api/cpu/clock`, MCP
+    /// `set_clock`, AND provision-time machine minting) so none can drift. WALL-ONLY.
+    pub fn syncSliceToMult(self: *RunControl, mult: u64) void {
+        self.slice_cycles.store(sliceForMult(mult), .release);
+    }
 
     pub fn getOwner(self: *const RunControl) RunOwner {
         return @enumFromInt(self.owner.load(.acquire));
@@ -180,6 +261,45 @@ pub const RunControl = struct {
         if (self.getOwner() == .paced) self.setOwner(.idle);
     }
 
+    /// Raise the preempt signal for the duration of a control command (`/api/run/stop`,
+    /// `/api/reset`, MCP `reset`). Paired with `endPreempt` (LIFO `defer`). While raised, the
+    /// worker's run loop yields any in-flight run at the next burst boundary so the control
+    /// command seizes the worker promptly — the non-starvation keystone. Increment/decrement
+    /// (a count) so overlapping control commands compose and none clears another's pending
+    /// state. clockless (a single atomic RMW); never touches a cycle or the wall clock.
+    pub fn beginPreempt(self: *RunControl) void {
+        _ = self.preempt_pending.fetchAdd(1, .acq_rel);
+    }
+
+    /// Drop this control command's preempt request (the worker stops yielding once the count
+    /// reaches zero). Called AFTER the command's own `queue.submit` has completed, so the
+    /// worker has actually serviced it before runs resume.
+    pub fn endPreempt(self: *RunControl) void {
+        _ = self.preempt_pending.fetchSub(1, .acq_rel);
+    }
+
+    /// True iff a control command is waiting to seize the worker. Polled by the worker's
+    /// bounded-burst run loop BETWEEN bursts (never inside the control core). Acquire-loaded
+    /// so the yielding worker sees the raising thread's prior writes.
+    pub fn preemptRequested(self: *const RunControl) bool {
+        return self.preempt_pending.load(.acquire) > 0;
+    }
+
+    /// Stamp the published machine status (the worker calls this after each command + once at
+    /// start). clockless host-observability only; never an emulation input.
+    pub fn publishStatus(self: *RunControl, cycle: u64, mult: u64) void {
+        self.published_cycle.store(cycle, .release);
+        self.published_mult.store(mult, .release);
+    }
+    /// The last settled cycle ledger (for `/api/machines`; non-blocking, off the worker).
+    pub fn publishedCycle(self: *const RunControl) u64 {
+        return self.published_cycle.load(.acquire);
+    }
+    /// The last settled CPU:PIT mult, or 0 = "not yet stamped" (never-commanded machine).
+    pub fn publishedMult(self: *const RunControl) u64 {
+        return self.published_mult.load(.acquire);
+    }
+
     pub fn recordStop(self: *RunControl, tag: StopTag, cycle: u64) void {
         self.last_cycle.store(cycle, .release);
         self.last_stop.store(@intFromEnum(tag), .release);
@@ -208,6 +328,18 @@ pub const RunControl = struct {
     }
     pub fn getFps(self: *const RunControl) u32 {
         return self.fps.load(.acquire);
+    }
+
+    /// Store the host pacer's EMA-smoothed measured throughput (guest cycles/sec). Called
+    /// ONLY from the host pacer (which owns the clock); CLOCK-FREE here. UI-only — see the
+    /// `measured_hz` field doc. Wall-pacing telemetry, never an emulation input.
+    pub fn setMeasuredHz(self: *RunControl, hz: u64) void {
+        self.measured_hz.store(hz, .release);
+    }
+    /// Read the last measured throughput (0 = never paced). Read by the api layer to derive
+    /// the UI-only `sustainableMult`; no clock.
+    pub fn getMeasuredHz(self: *const RunControl) u64 {
+        return self.measured_hz.load(.acquire);
     }
 
     fn ioless(self: *const RunControl) Io {

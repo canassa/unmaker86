@@ -15,6 +15,30 @@ body {
   background: #0c0d10;
   color: #e6e6e6;
   font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* Two-column shell: a fixed-width scrollable debugger sidebar + the player pane.
+   The player pane (#main) is a vertical flex (stage + hud), preserving the
+   original layout the live player assumes. */
+#app {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  height: 100%;
+}
+
+#sidebar {
+  overflow-y: auto;
+  background: #101216;
+  border-right: 1px solid #23262d;
+  padding: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+#main {
+  min-width: 0;
+  height: 100%;
   display: flex;
   flex-direction: column;
 }
@@ -41,6 +65,16 @@ body {
   image-rendering: crisp-edges;
   background: #000;
   outline: none;
+  cursor: crosshair;
+}
+
+/* A video pane that has captured the keyboard (focused) gets a ring + crosshair so it's
+   obvious where mouse/keyboard input is going. Click the pane to capture; click elsewhere
+   (a panel, the page) to release. */
+#screen:focus,
+#peek:focus {
+  outline: 2px solid #2e9b6b;
+  outline-offset: -2px;
   cursor: crosshair;
 }
 
@@ -122,3 +156,204 @@ body {
   color: #c8cdd6;
   font-variant-numeric: tabular-nums;
 }
+
+/* ===================================================================== */
+/* Debugger sidebar + peek frame                                         */
+/* ===================================================================== */
+
+/* The peek <img> sits in the same centered stage box as the canvas; only one of
+   the two is visible at a time (canvas for the default machine's live stream,
+   peek img for a selected paused/minted machine). */
+.peek {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  image-rendering: pixelated;
+  background: #000;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.peek-banner {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: 0.35rem;
+  background: rgba(26, 29, 35, 0.9);
+  color: #c8cdd6;
+  font-size: 0.8rem;
+}
+
+.panel {
+  background: #15171c;
+  border: 1px solid #23262d;
+  border-radius: 0.4rem;
+  padding: 0.4rem 0.5rem;
+}
+
+.panel-fixed { padding-bottom: 0.5rem; }
+
+.panel > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #8ce99a;
+  letter-spacing: 0.03em;
+  user-select: none;
+}
+
+.panel .body {
+  margin-top: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.row .grow { flex: 1 1 auto; min-width: 0; }
+.row label { color: #8990a0; min-width: 3.5rem; }
+
+.muted { color: #8990a0; }
+.small { font-size: 0.8rem; }
+
+button {
+  background: #23262d;
+  color: #e6e6e6;
+  border: 1px solid #31353d;
+  border-radius: 0.3rem;
+  padding: 0.25rem 0.55rem;
+  cursor: pointer;
+  font: inherit;
+}
+button:hover { background: #2c303a; }
+button:active { background: #353a45; }
+
+/* The Play (real-time run) button — the primary action, accented green. */
+button.play-btn {
+  background: #1f5f43;
+  border-color: #2e9b6b;
+  color: #d7ffe9;
+  font-weight: 600;
+}
+button.play-btn:hover { background: #267a55; }
+
+/* The Reset button — destructive (wipes the machine back to boot), so a faint
+   warning tint to set it apart from neutral controls without shouting. */
+button.reset-btn {
+  background: #3a2a23;
+  border-color: #6b4a36;
+  color: #ffd9c2;
+}
+button.reset-btn:hover { background: #4a352b; }
+
+input, select {
+  background: #0c0d10;
+  color: #e6e6e6;
+  border: 1px solid #31353d;
+  border-radius: 0.3rem;
+  padding: 0.2rem 0.4rem;
+  font: inherit;
+  min-width: 0;
+}
+
+input.num { width: 6rem; }
+
+.chk {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-width: 0;
+  color: #c8cdd6;
+}
+.chk input { width: auto; }
+
+hr {
+  border: none;
+  border-top: 1px solid #23262d;
+  margin: 0.2rem 0;
+  width: 100%;
+}
+
+.out {
+  margin: 0;
+  padding: 0.4rem;
+  background: #0c0d10;
+  border: 1px solid #23262d;
+  border-radius: 0.3rem;
+  font: 12px/1.35 ui-monospace, "SF Mono", Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 9rem;
+  overflow: auto;
+}
+
+.reg-strip {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.1rem 0.6rem;
+  font: 12px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+  color: #c8cdd6;
+}
+.reg-strip .flags {
+  grid-column: 1 / -1;
+  color: #8ce99a;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.list .item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.4rem;
+  background: #0c0d10;
+  border: 1px solid #23262d;
+  border-radius: 0.3rem;
+  font: 12px/1.35 ui-monospace, "SF Mono", Menlo, monospace;
+}
+.list .item .grow { flex: 1 1 auto; word-break: break-all; }
+
+.kinds {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.1rem 0.4rem;
+  font-size: 0.78rem;
+}
+
+.trace-out {
+  font: 11px/1.3 ui-monospace, "SF Mono", Menlo, monospace;
+  max-height: 14rem;
+  overflow: auto;
+  border: 1px solid #23262d;
+  border-radius: 0.3rem;
+}
+.trace-out table { border-collapse: collapse; width: 100%; }
+.trace-out th, .trace-out td {
+  padding: 0.1rem 0.35rem;
+  text-align: left;
+  white-space: nowrap;
+}
+.trace-out th { color: #8ce99a; position: sticky; top: 0; background: #15171c; }
+.trace-out tr:nth-child(even) td { background: #101216; }

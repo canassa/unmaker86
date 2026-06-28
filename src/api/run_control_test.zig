@@ -169,3 +169,38 @@ test "disarmTerminal stops the pacer on a terminal slice" {
     try std.testing.expectEqual(StopTag.program_terminated, rc.lastStop());
     try std.testing.expectEqual(@as(u64, 999), rc.lastCycle());
 }
+
+test "sustainableMult: UI-only host real-time ceiling math (integer, no clock)" {
+    // No data yet (never paced) → don't cap: report the static MAX_MULT.
+    try std.testing.expectEqual(timing.MAX_MULT, RunControl.sustainableMult(0));
+
+    // ~46M cyc/s (ReleaseFast-ish): floor(46_000_000 * 9/10 / PIT_TICK_RATE)
+    //   = floor(41_400_000 / 1_193_182) = 34, well under MAX_MULT (55) → 34.
+    try std.testing.expectEqual(@as(u64, 34), RunControl.sustainableMult(46_000_000));
+
+    // A blazing host clamps to the static MAX_MULT (the slider never exceeds it).
+    try std.testing.expectEqual(timing.MAX_MULT, RunControl.sustainableMult(1_000_000_000));
+
+    // A crawling host (Debug ~8M cyc/s) → floor(7_200_000 / 1_193_182) = 6.
+    try std.testing.expectEqual(@as(u64, 6), RunControl.sustainableMult(8_000_000));
+
+    // A near-zero throughput still floors to at least 1 (slider min), never 0.
+    try std.testing.expectEqual(@as(u64, 1), RunControl.sustainableMult(1_500_000));
+
+    // The 10% headroom actually bites: exactly PIT_TICK_RATE cyc/s would be mult 1
+    // without headroom, but * 9/10 floors it to 0 → clamped up to 1 (the floor).
+    try std.testing.expectEqual(@as(u64, 1), RunControl.sustainableMult(timing.PIT_TICK_RATE));
+}
+
+test "setMeasuredHz/getMeasuredHz round-trip (clock-free atomic telemetry)" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    var rc = RunControl.init(threaded.io());
+
+    try std.testing.expectEqual(@as(u64, 0), rc.getMeasuredHz());
+    rc.setMeasuredHz(46_000_000);
+    try std.testing.expectEqual(@as(u64, 46_000_000), rc.getMeasuredHz());
+    // The applied-mult path (sliceForMult) is INDEPENDENT of measured_hz — host-independent.
+    try std.testing.expectEqual(RunControl.sliceForMult(55), timing.PIT_TICK_RATE * 55 / 100);
+}

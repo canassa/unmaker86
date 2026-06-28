@@ -3,40 +3,231 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>zdos &mdash; live</title>
+<title>zdos &mdash; debugger</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div id="stage">
-  <!-- The WebGL2 surface. The backing store is resized to the guest resolution
-       on every (width,height) change; CSS scales it to the viewport (NEAREST +
-       image-rendering:pixelated keep the upscale crisp). -->
-  <canvas id="screen" width="320" height="200" tabindex="0"
-          data-marker="zdos-player-canvas"></canvas>
+<!-- Two-column shell: a scrollable debugger sidebar wrapped around the existing
+     live player. The player (#stage/#hud) is UNCHANGED; the sidebar drives the
+     selected machine through the REST debugger API. The non-negotiable rule:
+     switching the machine selector shows THAT machine's current (paused) frame. -->
+<div id="app">
 
-  <!-- Shown when the guest is in a mode the player can't render (text mode or an
-       unsupported flag), or while (re)connecting. Hidden during normal streaming.
-       The socket is NEVER torn down for an unsupported frame; streaming resumes
-       automatically when a renderable frame arrives. -->
-  <div id="overlay" class="overlay">
-    <div id="overlay-msg" class="overlay-msg">connecting&hellip;</div>
-  </div>
-</div>
+  <!-- ============================ SIDEBAR ============================ -->
+  <aside id="sidebar" data-marker="zdos-debugger-sidebar">
 
-<div id="hud" class="hud">
-  <span id="status" class="status pending">connecting&hellip;</span>
-  <span id="info" class="info"></span>
+    <!-- Machine switcher: drives `activeMachine`, which routes every /api/* fetch
+         (panels AND input) via the X-Zdos-Session header. -->
+    <section class="panel panel-fixed">
+      <div class="panel-head">
+        <strong>machine</strong>
+        <span id="machine-count" class="muted">&ndash;/&ndash;</span>
+      </div>
+      <div class="row">
+        <select id="machine-select" data-marker="zdos-machine-select" class="grow"></select>
+        <button id="machine-refresh" type="button" title="re-enumerate machines">&#x21bb;</button>
+      </div>
+      <div class="row">
+        <button id="machine-reset" type="button" class="reset-btn grow" data-marker="zdos-machine-reset"
+                title="restart this machine from its entry point (back to ~cycle 0) — discards current state">&#x21ba;&nbsp;reset machine</button>
+      </div>
+      <div id="machine-info" class="muted small"></div>
+    </section>
 
-  <!-- CPU SPEED knob (Phase 3). Changes CPU cycles/sec (rendering smoothness),
-       NOT game pace — the PIT/timer wall rate is invariant to this, so a faster
-       CPU only fixes frame-render lag. It is NOT a fast-forward. The label shows
-       the derived ≈MHz; the underlying control is the integer CPU:PIT multiplier
-       (mult). The initial value is synced from GET /api/cpu/clock. -->
-  <label id="cpu-knob" class="knob" title="CPU speed (smoothness) — does NOT change game pace">
-    <span class="knob-label">CPU</span>
-    <input id="cpu-speed" class="knob-range" type="range" min="1" max="55" step="1" value="12">
-    <span id="cpu-mhz" class="knob-val">&#8776;14.32 MHz</span>
-  </label>
+    <!-- CPU / register strip — refreshed by refreshAll() after every action. -->
+    <section class="panel panel-fixed">
+      <div class="panel-head"><strong>cpu</strong><span id="cpu-cycle" class="muted"></span></div>
+      <div id="reg-strip" class="reg-strip" data-marker="zdos-reg-strip"></div>
+    </section>
+
+    <!-- ---------------------------- EXECUTION ---------------------------- -->
+    <details class="panel" open>
+      <summary>execution</summary>
+      <div class="body">
+        <div class="row">
+          <button data-act="step" type="button">step</button>
+          <button data-act="step-over" type="button">step over</button>
+        </div>
+        <div class="row">
+          <button data-act="step-n" type="button">step&nbsp;n</button>
+          <input id="step-n" type="number" min="1" value="100" class="num">
+        </div>
+        <div class="row">
+          <button data-act="run" type="button">run</button>
+          <input id="run-cap" type="number" min="1" placeholder="cycle cap (opt)" class="grow">
+        </div>
+        <div class="row">
+          <button data-act="run-to-cycle" type="button">run&nbsp;&rarr;&nbsp;cycle</button>
+          <input id="run-cycle" type="number" min="0" placeholder="cycle" class="grow">
+        </div>
+        <div class="row">
+          <button data-act="run-to-address" type="button">run&nbsp;&rarr;&nbsp;addr</button>
+          <input id="run-addr" type="text" placeholder="linear (dec or 0x..)" class="grow">
+        </div>
+        <hr>
+        <div class="row">
+          <button data-act="run-start" type="button" class="play-btn" title="run the machine at real speed (live video)">&#9654;&nbsp;play</button>
+          <button data-act="run-stop" type="button">&#9208;&nbsp;pause</button>
+          <button data-act="run-status" type="button">status</button>
+        </div>
+        <div class="row">
+          <input id="run-slice" type="number" min="1" placeholder="slice_cycles" class="num">
+          <input id="run-fps" type="number" min="1" placeholder="fps" class="num">
+        </div>
+        <pre id="exec-out" class="out" data-marker="zdos-exec-out"></pre>
+      </div>
+    </details>
+
+    <!-- ---------------------------- BREAKPOINTS ---------------------------- -->
+    <details class="panel">
+      <summary>breakpoints</summary>
+      <div class="body">
+        <div class="row">
+          <select id="bp-kind" class="grow">
+            <option value="execution_address">execution_address</option>
+            <option value="cycle">cycle</option>
+            <option value="interrupt">interrupt</option>
+            <option value="memory">memory</option>
+            <option value="io">io</option>
+          </select>
+          <label class="chk"><input id="bp-oneshot" type="checkbox"> one-shot</label>
+        </div>
+        <div class="row" data-bp-field="linear">
+          <label>linear</label><input id="bp-linear" type="text" placeholder="dec or 0x.." class="grow">
+        </div>
+        <div class="row" data-bp-field="at_cycle">
+          <label>at_cycle</label><input id="bp-at-cycle" type="number" min="0" class="grow">
+        </div>
+        <div class="row" data-bp-field="vector">
+          <label>vector</label><input id="bp-vector" type="number" min="0" max="255" class="grow">
+        </div>
+        <div class="row" data-bp-field="port">
+          <label>port</label><input id="bp-port" type="number" min="0" max="65535" class="grow">
+        </div>
+        <div class="row" data-bp-field="len">
+          <label>len</label><input id="bp-len" type="number" min="0" class="grow">
+        </div>
+        <div class="row" data-bp-field="access">
+          <label>access</label>
+          <select id="bp-access" class="grow">
+            <option value="read">read</option>
+            <option value="write">write</option>
+            <option value="access">access</option>
+          </select>
+        </div>
+        <div class="row">
+          <button data-act="bp-add" type="button">add</button>
+          <button data-act="bp-list" type="button">refresh</button>
+          <button data-act="bp-clear" type="button">clear all</button>
+        </div>
+        <div id="bp-list" class="list" data-marker="zdos-bp-list"></div>
+      </div>
+    </details>
+
+    <!-- ---------------------------- SNAPSHOTS ---------------------------- -->
+    <details class="panel">
+      <summary>snapshots</summary>
+      <div class="body">
+        <div class="row">
+          <button data-act="snap-capture" type="button">capture</button>
+          <button data-act="snap-list" type="button">refresh</button>
+        </div>
+        <div id="snap-list" class="list" data-marker="zdos-snap-list"></div>
+      </div>
+    </details>
+
+    <!-- ---------------------------- BRANCH TRACE ---------------------------- -->
+    <details class="panel">
+      <summary>branch trace</summary>
+      <div class="body">
+        <div class="muted small">kinds filter (none checked = all)</div>
+        <div id="trace-kinds" class="kinds"></div>
+        <div class="row">
+          <button data-act="trace-arm" type="button">arm</button>
+          <button data-act="trace-disarm" type="button">disarm</button>
+          <button data-act="trace-clear" type="button">clear ring</button>
+          <button data-act="trace-status" type="button">status</button>
+        </div>
+        <div id="trace-status" class="muted small"></div>
+        <hr>
+        <div class="row">
+          <input id="trace-limit" type="number" min="1" value="50" placeholder="limit" class="num">
+          <input id="trace-offset" type="number" min="0" value="0" placeholder="offset" class="num">
+          <label class="chk"><input id="trace-newest" type="checkbox" checked> newest first</label>
+        </div>
+        <div class="row"><button data-act="trace-dump" type="button">dump</button></div>
+        <div id="trace-out" class="trace-out" data-marker="zdos-trace-out"></div>
+      </div>
+    </details>
+
+    <!-- ---------------------------- BRANCH TRAP ---------------------------- -->
+    <details class="panel">
+      <summary>branch trap</summary>
+      <div class="body">
+        <div class="row">
+          <label class="chk"><input id="trap-to-range" type="checkbox"> target out of range</label>
+        </div>
+        <div class="row">
+          <label>to_lo</label><input id="trap-to-lo" type="text" placeholder="0x0" class="num">
+          <label>to_hi</label><input id="trap-to-hi" type="text" placeholder="0xFFFFF" class="num">
+        </div>
+        <div class="row">
+          <label class="chk"><input id="trap-sp-range" type="checkbox"> SP out of range</label>
+        </div>
+        <div class="row">
+          <label>sp_lo</label><input id="trap-sp-lo" type="text" placeholder="0x0" class="num">
+          <label>sp_hi</label><input id="trap-sp-hi" type="text" placeholder="0xFFFF" class="num">
+        </div>
+        <div class="muted small">trap on kinds (none = no kind clause)</div>
+        <div id="trap-kinds" class="kinds"></div>
+        <div class="row">
+          <button data-act="trap-arm" type="button">arm</button>
+          <button data-act="trap-clear" type="button">clear</button>
+        </div>
+        <div id="trap-out" class="muted small"></div>
+      </div>
+    </details>
+
+  </aside>
+
+  <!-- ============================== MAIN ============================== -->
+  <main id="main">
+    <div id="stage">
+      <!-- The WebGL2 surface — the LIVE stream of the DEFAULT machine only. Shown
+           when the selected machine is the default; hidden for minted/debugger
+           machines (which are not live-streamed). -->
+      <canvas id="screen" width="320" height="200" tabindex="0"
+              data-marker="zdos-player-canvas"></canvas>
+
+      <!-- Peek frame: the selected machine's CURRENT framebuffer via
+           GET /api/framebuffer?format=png (header-routed), repainted on machine
+           switch and after every control action. THIS is how a paused, non-default
+           machine shows its frame. -->
+      <img id="peek" class="peek hidden" alt="machine framebuffer"
+           data-marker="zdos-peek-frame">
+
+      <div id="overlay" class="overlay">
+        <div id="overlay-msg" class="overlay-msg">connecting&hellip;</div>
+      </div>
+
+      <div id="peek-banner" class="peek-banner hidden">
+        <span id="peek-banner-text">debugger view &mdash; frame updates on step/run</span>
+        <button id="peek-refresh" type="button" title="refresh frame">&#x21bb;</button>
+      </div>
+    </div>
+
+    <div id="hud" class="hud">
+      <span id="status" class="status pending">connecting&hellip;</span>
+      <span id="info" class="info"></span>
+
+      <label id="cpu-knob" class="knob" title="CPU speed (smoothness) — does NOT change game pace. Slider capped at this host's real-time ceiling — higher = slow-motion.">
+        <span class="knob-label">CPU</span>
+        <input id="cpu-speed" class="knob-range" type="range" min="1" max="55" step="1" value="12" title="real-time ceiling — higher = slow-motion">
+        <span id="cpu-mhz" class="knob-val">&#8776;14.32 MHz</span>
+      </label>
+    </div>
+  </main>
+
 </div>
 
 <script src="app.js"></script>

@@ -158,9 +158,21 @@ const ConnSlot = struct {
 };
 
 pub const Server = struct {
+    /// The bind address family for `bind_host` (the port comes from `port`, applied in `bind`).
+    pub const BindHost = union(enum) {
+        ip4: [4]u8,
+        ip6: [16]u8,
+    };
+
     gpa: std.mem.Allocator,
     io: Io,
     port: u16,
+    /// The address the listener binds. Defaults to IPv4 loopback (127.0.0.1) so the server
+    /// is reachable only from this host. `--host` widens it: `0.0.0.0` (IPv4 LAN) or `::`
+    /// (IPv6 any, which is dual-stack on Linux — accepts IPv6 AND IPv4). This touches HTTP
+    /// reachability ONLY, never emulation (determinism constraint #4); the caller owns
+    /// network isolation.
+    bind_host: BindHost = .{ .ip4 = .{ 127, 0, 0, 1 } },
     net_server: ?net.Server = null,
 
     /// The OPTIONAL single default `Session` (multi-machine plan §4.1; the EMPTY-START
@@ -322,6 +334,31 @@ pub const Server = struct {
         return &self.session.?.queue;
     }
 
+    /// The N-session registry (for the host-side `SessionPacer` to pace every armed minted
+    /// session — agent-provisioning live-play). The pacer iterates it through the clockless
+    /// `snapshotLive`/`release` refcount seam and reaches each machine ONLY via that session's
+    /// gated queue, so this hands out no clock and never touches machine state off-worker.
+    pub fn sessionRegistry(self: *Server) *SessionRegistry {
+        return &self.registry;
+    }
+
+    /// Resolve a session selector (the `X-Zdos-Session` HTTP header, the `?machine=` stream
+    /// query, or the MCP routing) to the session that owns its machine; a BLANK selector, or the
+    /// default's own singleton id, → the DEFAULT session (un-refcounted; process-owned). Empty-
+    /// start mode (no default) + a blank selector → null. Any other id → the registry, with its
+    /// in-flight refcount BUMPED — the caller MUST pair a non-null minted result with
+    /// `registry.release` (a no-op on the default). The single resolver seam both the per-request
+    /// `/api/*` routing (via `Conn.resolveSession`) and the `/api/stream` upgrade share, so the
+    /// two can never drift in how a selector maps to a session.
+    pub fn resolveSession(self: *Server, sid: []const u8) ?*Session {
+        if (self.defaultSession()) |default| {
+            if (sid.len == 0 or default.id.eqlSlice(sid)) return default;
+        } else if (sid.len == 0) {
+            return null;
+        }
+        return self.registry.resolve(sid);
+    }
+
     /// Bind, spawn the worker, and run the accept loop until shutdown (= `bind` then
     /// `serve`). The worker (sole owner of `ctrl`) drains the queue; the listener
     /// (this thread) does all socket/HTTP/JSON work.
@@ -346,11 +383,14 @@ pub const Server = struct {
         // the Server is at its final address.)
         if (self.session) |*s| {
             s.wireStream(self.io);
-            const w: worker_mod.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl, .mount_dir = s.mount_dir, .io = self.io, .render = s.render, .live_mouse = s.live_mouse, .snapshots = s.snapshots };
+            const w: worker_mod.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl, .mount_dir = s.mount_dir, .io = self.io, .render = s.render, .live_mouse = s.live_mouse, .snapshots = s.snapshots, .run_ctl = s.run_control };
             s.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
         }
 
-        const addr: net.IpAddress = .{ .ip4 = .loopback(self.port) };
+        const addr: net.IpAddress = switch (self.bind_host) {
+            .ip4 => |b| .{ .ip4 = .{ .bytes = b, .port = self.port } },
+            .ip6 => |b| .{ .ip6 = .{ .bytes = b, .port = self.port } },
+        };
         self.net_server = try addr.listen(self.io, .{ .reuse_address = true });
         // Record the resolved (possibly ephemeral) port for `boundPort()`.
         self.port = self.net_server.?.socket.address.getPort();
@@ -467,20 +507,45 @@ pub const Server = struct {
             // request frame; `respondWebSocket` reads it immediately, before any body
             // reader invalidates head strings.
             //
-            // EMPTY-START guard (agent-provisioning-plan §6/§13): `/api/stream` binds ONLY the
-            // DEFAULT machine's `stream_hub` (a minted machine is debugger-driven and cannot be
-            // streamed — the §13 invariant). With no default session there is nothing to stream,
-            // so reject the upgrade with 409 (a guaranteed null-deref otherwise, since this runs
-            // BEFORE any routing). The loop then closes the socket.
-            if (self.session) |*s| {
+            // PER-SESSION live streaming (agent-provisioning live-play): `/api/stream` binds the
+            // SELECTED machine's `stream_hub`, not only the default's. The selector arrives as a
+            // `?machine=<id>` query param — the browser `WebSocket` API cannot set request
+            // headers, so the id rides the URL — or, for a programmatic client, the
+            // `X-Zdos-Session` header (the same one the `/api/*` routes use). Blank/absent + a
+            // default machine → the default (the back-compat path). Resolved through the SAME
+            // `resolveSession` seam + refcount discipline as every other routed request.
+            var sid_buf: [128]u8 = undefined;
+            var sid_len = streamSessionFromTarget(request.head.target, sid_buf[0..]);
+            if (sid_len == 0) sid_len = Conn.captureHeader(&request, API_SESSION_HEADER, sid_buf[0..]);
+            const sid = sid_buf[0..sid_len];
+            if (self.resolveSession(sid)) |s| {
+                // Hold the in-flight ref only ACROSS the upgrade. `upgrade` records the spawned
+                // stream thread in this session's hub, and `SessionRegistry.teardown` calls
+                // `stream_hub.shutdown()` (joining that thread) BEFORE freeing the session — so
+                // the thread is safe past this release, and a concurrent deprovision blocks on the
+                // ref until the upgrade has recorded the thread. `release` is a no-op on the
+                // process-owned default. (A minted session is debugger-driven by default, but it
+                // IS streamable while paced — the §13 "cannot be streamed" note predates live-play.)
+                defer self.registry.release(s);
                 if (s.stream_hub.upgrade(&request, stream.*, key)) return true; // claimed
                 return false; // rejected (503) — handler wrote the error; loop closes socket
             }
-            request.respond("{\"error\":{\"code\":\"no_machine\",\"message\":\"no machine provisioned; provision_machine first\"}}", .{
-                .status = .conflict,
-                .keep_alive = false,
-                .extra_headers = &json_content_type,
-            }) catch {};
+            // No machine resolved. An explicit but unknown/destroyed id → 404 (a typo must not
+            // silently stream the wrong machine); a blank selector with no default (empty-start)
+            // → 409 (nothing provisioned yet). The loop then closes the socket.
+            if (sid.len > 0) {
+                request.respond("{\"error\":{\"code\":\"unknown_session\",\"message\":\"unknown or destroyed machine; provision_machine first\"}}", .{
+                    .status = .not_found,
+                    .keep_alive = false,
+                    .extra_headers = &json_content_type,
+                }) catch {};
+            } else {
+                request.respond("{\"error\":{\"code\":\"no_machine\",\"message\":\"no machine provisioned; provision_machine first\"}}", .{
+                    .status = .conflict,
+                    .keep_alive = false,
+                    .extra_headers = &json_content_type,
+                }) catch {};
+            }
             return false;
         }
 
@@ -510,6 +575,27 @@ pub const Server = struct {
             .websocket => |maybe_key| maybe_key, // null key → invalid; caller treats as none
             else => null,
         };
+    }
+
+    /// Extract the `?machine=<id>` query value from a request target into `buf`, returning the
+    /// number of bytes copied (0 if absent). The browser `WebSocket` API cannot set request
+    /// headers, so the `/api/stream` upgrade carries the machine selector in the URL query; a
+    /// programmatic client may instead use the `X-Zdos-Session` header. Session ids are
+    /// `[a-z0-9-]` (`zdos-sess-<n>` / the singleton), so the raw value needs no percent-decoding.
+    /// Pure string work — no clock, no machine state (it stays inside the determinism grep-gate).
+    fn streamSessionFromTarget(target: []const u8, buf: []u8) usize {
+        const qmark = std.mem.indexOfScalar(u8, target, '?') orelse return 0;
+        var it = std.mem.splitScalar(u8, target[qmark + 1 ..], '&');
+        while (it.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            if (std.mem.eql(u8, pair[0..eq], "machine")) {
+                const val = pair[eq + 1 ..];
+                const n = @min(val.len, buf.len);
+                @memcpy(buf[0..n], val[0..n]);
+                return n;
+            }
+        }
+        return 0;
     }
 
     /// Handle exactly one HTTP request over an already-constructed `http.Server`. Used by
@@ -601,9 +687,17 @@ pub const Server = struct {
     }
 
     /// Back-pressure (§5.1): the connection cap is reached (or a spawn failed). Read the
-    /// request head and reply 503 + close — on the LISTENER thread (cheap; no worker hop).
-    /// A stuck client here can briefly stall new accepts, but only at saturation (the same
-    /// class of stall the prior single-threaded loop had on EVERY connection).
+    /// request head — on the LISTENER thread (cheap; no extra thread) — and either:
+    ///   - SERVE it inline, for a small set of LIVENESS/RECOVERY endpoints (see
+    ///     `isCriticalInline`), so a guest that wedges and lets stuck pollers hold all
+    ///     `MAX_CONNS_TOTAL` slots can NEVER lock out health, the machine list, or a
+    ///     `reset`/`stop` (the server-robustness invariant: those endpoints never time out,
+    ///     and `reset`/`stop` always get through — their preempt then frees the worker and
+    ///     drains the stuck pollers). These endpoints are bounded: health/machines are
+    ///     answered off-worker; `reset`/`stop` raise the preempt signal so they return
+    ///     promptly — so serving one inline stalls the accept loop only briefly.
+    ///   - else reply 503 + close (true back-pressure for the heavy/long endpoints, the same
+    ///     class of stall the prior single-threaded loop had on EVERY connection).
     fn rejectConnection(self: *Server, stream_in: net.Stream) void {
         var stream = stream_in;
         var rbuf: [HTTP_HEADER_MAX]u8 = undefined;
@@ -615,12 +709,39 @@ pub const Server = struct {
             stream.close(self.io);
             return;
         };
+        if (isCriticalInline(request.head.method, request.head.target)) {
+            // Serve it with a one-off `Conn` (no registry slot held — it runs on the accept
+            // thread and is bounded), exactly like the normal control path but cap-exempt.
+            const conn = self.gpa.create(Conn) catch {
+                stream.close(self.io);
+                return;
+            };
+            defer self.gpa.destroy(conn);
+            conn.* = Conn.init(self, self.defaultSession());
+            defer conn.deinit();
+            conn.serveRequest(&request);
+            stream.close(self.io);
+            return;
+        }
         request.respond("{\"error\":{\"code\":\"service_unavailable\",\"message\":\"connection cap reached\"}}", .{
             .status = .service_unavailable,
             .keep_alive = false,
             .extra_headers = &json_content_type,
         }) catch {};
         stream.close(self.io);
+    }
+
+    /// The LIVENESS/RECOVERY endpoints that are served inline even at the connection cap
+    /// (server robustness): `GET /api/health` + `GET /api/machines` (both off-worker, instant)
+    /// and `POST /api/reset` + `POST /api/run/stop` (both preempt-bounded). These must NEVER be
+    /// starved by stuck pollers holding every connection slot — so a wedged guest can always be
+    /// observed (health/machines) and recovered (reset/stop). Everything else hits 503 at the cap.
+    fn isCriticalInline(method: http.Method, target: []const u8) bool {
+        const qmark = std.mem.indexOfScalar(u8, target, '?');
+        const path = if (qmark) |i| target[0..i] else target;
+        if (method == .GET and (std.mem.eql(u8, path, "/api/health") or std.mem.eql(u8, path, "/api/machines"))) return true;
+        if (method == .POST and (std.mem.eql(u8, path, "/api/reset") or std.mem.eql(u8, path, "/api/run/stop"))) return true;
+        return false;
     }
 
     /// A connection thread's entry point (§5.1). Serves exactly one request via
@@ -699,6 +820,15 @@ pub const Conn = struct {
     /// off (one request per connection), so this is one alloc+free per capturing
     /// connection. Only capture-active connections pay; the static `Conn` footprint is unchanged.
     capture_buf: ?[]u8 = null,
+
+    /// The host-measured throughput (guest cycles/sec) of the session this response serves,
+    /// snapshotted just before the CPU-speed body is serialized so `writeCpuSpeed` can emit
+    /// the UI-only `sustainable_mult` (the slider cap). The MCP path routes by a `machine`
+    /// arg whose `target` may differ from `self.session`, so the value is captured from the
+    /// ACTUAL target in `handleMcpToolCall`; the HTTP path captures it in `respondCpuSpeed`
+    /// from `self.session`. 0 (the default / never-paced) ⇒ `sustainableMult` returns the
+    /// static `MAX_MULT` (don't cap). No clock: it is just the atomic the host pacer set.
+    cpu_measured_hz: u64 = 0,
 
     /// Build a fresh per-connection context. The big scratch arrays stay `undefined`
     /// (filled on use); only the arena needs a backing allocator (the thread-safe gpa).
@@ -825,6 +955,19 @@ pub const Conn = struct {
             return;
         }
 
+        // --- `/api/machines`: enumerate live machines for the console's machine switcher ---
+        // Like `/api/health`, slotted ABOVE the session-routing block and the empty-start 409
+        // guard: it enumerates the REGISTRY (+ the default session) rather than routing to one
+        // machine, so it must answer even in empty-start mode (no default) where every other
+        // `/api/*` route 409s. Shares `writeMachineList` with the MCP `list_machines` tool
+        // (anti-drift) — but `include_default = true` so the console can select the default too.
+        if (std.mem.eql(u8, path, "/api/machines")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            var w = std.Io.Writer.fixed(self.resp_buf[0..]);
+            self.writeMachineList(&w, true) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
+            return self.respondJson(req, .ok, w.buffered());
+        }
+
         // --- HTTP `/api/*` session routing (multi-machine plan §6 option B, Phase 4) ---
         // An optional `X-Zdos-Session` header selects which machine this `/api/*` request
         // drives. ABSENT/blank → the DEFAULT session (the mandatory back-compat path: every
@@ -899,7 +1042,29 @@ pub const Conn = struct {
         }
         if (std.mem.eql(u8, path, "/api/reset")) {
             if (method != .POST) return self.methodNotAllowed(req);
-            return self.submitAndRespond(req, .reset);
+            // Reset = a full re-BOOT from the persisted recipe (BIOS POST + DOS init +
+            // re-mount + re-load), NOT a bare `Machine.reset()`. A bare reset leaves no
+            // `post()` (no IVT/PIC/PIT/DOS callbacks), no mount, and no program, so the
+            // very next run falls into zeroed RAM and HLTs forever (halted_forever). The
+            // controller's `reset()` docstring makes this the CALLER's responsibility:
+            // re-load the program afterward. We do that here by driving the EXACT
+            // fresh-provision path (`Machine.boot` via the `.load` command), so reset+run
+            // reaches state byte-identical to a freshly-provisioned session. RECIPE span
+            // (session.zig CONTRACT #3), identical to `handleLoad`: hold `session.lock`
+            // across the recipe read AND the submit. No overlay — reset takes no body.
+            //
+            // ROBUSTNESS (reset must ALWAYS work): raise the preempt signal BEFORE reaching
+            // for `session.lock`, so an in-flight long/wedged debugger run (which holds
+            // `session.lock` across its whole `submitDebuggerAndRespond` span) yields at its
+            // next burst boundary — releasing the lock — and a paced/flooding pacer slice
+            // yields too (disarming the pacer). Without this, reset would block on the lock /
+            // the submit-gate behind the wedged run and "never reach the worker". `endPreempt`
+            // runs (LIFO) AFTER the load has been serviced, so runs only resume post-reboot.
+            self.session.?.run_control.beginPreempt();
+            defer self.session.?.run_control.endPreempt();
+            self.session.?.lock.lockUncancelable(self.server.io);
+            defer self.session.?.lock.unlock(self.server.io);
+            return self.submitAndRespond(req, .{ .load = self.session.?.recipe.toCmd() });
         }
         if (std.mem.eql(u8, path, "/api/load")) {
             if (method != .POST) return self.methodNotAllowed(req);
@@ -984,6 +1149,38 @@ pub const Conn = struct {
         if (std.mem.eql(u8, path, "/api/step-over")) {
             if (method != .POST) return self.methodNotAllowed(req);
             return self.submitDebuggerAndRespond(req, .step_over);
+        }
+
+        // --- branch trace + trap (docs/branch-trace-plan.md §6) ---
+        // Parallel HTTP routes mirroring the MCP `branch_trace_*`/`branch_trap_*` tools onto
+        // the SAME q.Commands + sharing the `mcp_tools.mapBranchTrace*`/`mapBranchTrapArm`
+        // mappers and the `writeResponseBody` `.trace_status`/`.trace_dump` serializers (no
+        // drift). All are CLOCKLESS config/peeks (arm/clear/status/dump) — the plain
+        // `submitAndRespond` path (NOT `submitDebuggerAndRespond`, which auto-disarms the
+        // pacer and is only for run/step).
+        if (std.mem.eql(u8, path, "/api/branch-trace/arm")) {
+            if (method != .POST) return self.methodNotAllowed(req);
+            return self.handleBranchTraceArm(req, body, is_json);
+        }
+        if (std.mem.eql(u8, path, "/api/branch-trace/clear")) {
+            if (method != .POST) return self.methodNotAllowed(req);
+            return self.submitAndRespond(req, .branch_trace_clear);
+        }
+        if (std.mem.eql(u8, path, "/api/branch-trace/status")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            return self.submitAndRespond(req, .branch_trace_status);
+        }
+        if (std.mem.eql(u8, path, "/api/branch-trace/dump")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            return self.handleBranchTraceDump(req, query);
+        }
+        if (std.mem.eql(u8, path, "/api/branch-trap/arm")) {
+            if (method != .POST) return self.methodNotAllowed(req);
+            return self.handleBranchTrapArm(req, body, is_json);
+        }
+        if (std.mem.eql(u8, path, "/api/branch-trap/clear")) {
+            if (method != .POST) return self.methodNotAllowed(req);
+            return self.submitAndRespond(req, .branch_trap_clear);
         }
 
         // --- breakpoints ---
@@ -1184,7 +1381,15 @@ pub const Conn = struct {
 
     /// `POST /api/run/stop` — disarm the pacer (owner=idle); return the run status
     /// (incl. the stop cycle). A stopped machine stays inspectable/steppable.
+    ///
+    /// ROBUSTNESS (stop must ALWAYS take effect): raise the preempt signal so an in-flight
+    /// run/slice — including a wedged, cycle-advancing one the no-progress watchdog can't
+    /// catch — yields at its next burst boundary (`stopped_by_request`) instead of grinding.
+    /// `stop()` then disarms the pacer, and `respondRunStatus`'s `status` submit (a pure peek)
+    /// gets the now-free worker. `endPreempt` runs after the status submit completes.
     fn handleRunStop(self: *Conn, req: *http.Server.Request) void {
+        self.session.?.run_control.beginPreempt();
+        defer self.session.?.run_control.endPreempt();
         self.session.?.run_control.stop();
         self.respondRunStatus(req);
     }
@@ -1261,7 +1466,10 @@ pub const Conn = struct {
     /// post-step), so the two transports can never drift in the retune (anti-drift). The
     /// prior slice the worker returns is unused.
     fn retunePacerSlice(session: *Session, applied: u64) void {
-        _ = session.run_control.setSlice(timing.PIT_TICK_RATE * applied / 100);
+        // The canonical `PIT_TICK_RATE * mult / 100` slice — the SAME helper the
+        // provision-time machine minting (`SessionRegistry.create`) calls, so the
+        // `/api/cpu/clock`, MCP `set_clock`, and provision retunes can never drift.
+        session.run_control.syncSliceToMult(applied);
     }
 
     fn handleCpuSpeedSet(self: *Conn, req: *http.Server.Request, body: []const u8, is_json: bool) void {
@@ -1298,18 +1506,27 @@ pub const Conn = struct {
     /// Pure body-builder (mcp-plan.md §3.2) for the CPU-speed view — shared by the HTTP
     /// `respondCpuSpeed` wrapper and the MCP `get_clock`/`set_clock` tools (anti-drift).
     fn writeCpuSpeed(self: *Conn, w: *std.Io.Writer, mult: u64) std.Io.Writer.Error!void {
-        _ = self;
         const cpu_hz: u64 = timing.PIT_TICK_RATE * mult;
         const mhz_int: u64 = cpu_hz / 1_000_000;
         const mhz_frac: u64 = (cpu_hz % 1_000_000) / 10_000; // 2 decimals
         const slice: u64 = cpu_hz / 100;
+        // `sustainable_mult` (UI-only): the highest mult the host can pace IN REAL TIME on
+        // the current workload, derived from the pacer's measured throughput (`cpu_measured_hz`,
+        // captured by the caller from THIS response's session). The browser caps its slider at
+        // it so a user can't pick a slow-motion mult. It does NOT bound the APPLIED mult — that
+        // stays `[1, max_mult]`, host-independent (determinism). `RunControl.sustainableMult`
+        // is integer-only (no float/clock — the api grep-gate stays clean).
+        const sustainable: u64 = run_control.RunControl.sustainableMult(self.cpu_measured_hz);
         try w.print(
-            "{{\"mult\":{d},\"cpu_hz\":{d},\"mhz\":\"{d}.{d:0>2}\",\"slice_cycles\":{d},\"max_mult\":{d}}}",
-            .{ mult, cpu_hz, mhz_int, mhz_frac, slice, timing.MAX_MULT },
+            "{{\"mult\":{d},\"cpu_hz\":{d},\"mhz\":\"{d}.{d:0>2}\",\"slice_cycles\":{d},\"max_mult\":{d},\"sustainable_mult\":{d}}}",
+            .{ mult, cpu_hz, mhz_int, mhz_frac, slice, timing.MAX_MULT, sustainable },
         );
     }
 
     fn respondCpuSpeed(self: *Conn, req: *http.Server.Request, mult: u64) void {
+        // Snapshot the host-measured throughput of THIS session for the slider cap (see
+        // `cpu_measured_hz` / `writeCpuSpeed`). The `/api/*` guard already proved non-null.
+        self.cpu_measured_hz = self.session.?.run_control.getMeasuredHz();
         var w = std.Io.Writer.fixed(self.resp_buf[0..]);
         self.writeCpuSpeed(&w, mult) catch return self.respondError(req, .service_unavailable, "internal", "response too large");
         self.respondJson(req, .ok, w.buffered());
@@ -1387,6 +1604,43 @@ pub const Conn = struct {
         if (!self.requireJson(req, is_json, body)) return;
         const r = self.parseBody(wire.EnableBpReq, body) orelse return self.badJson(req);
         self.submitAndRespond(req, .{ .enable_bp = .{ .id = id, .on = r.enabled } });
+    }
+
+    // --- branch trace + trap handlers (docs/branch-trace-plan.md §6) ---
+    // Each parses the SHARED `mcp_tools` request struct then routes through the SHARED
+    // `mcp_tools.mapBranchTrace*`/`mapBranchTrapArm` mapper, so the HTTP path builds a
+    // command byte-identical to the MCP path (a fail maps to a 400 like every other handler).
+
+    fn handleBranchTraceArm(self: *Conn, req: *http.Server.Request, body: []const u8, is_json: bool) void {
+        if (!self.requireJson(req, is_json, body)) return;
+        const r = self.parseBody(mcp_tools.BranchTraceArmReq, body) orelse return self.badJson(req);
+        switch (mcp_tools.mapBranchTraceArm(r)) {
+            .fail => |e| return self.respondError(req, .bad_request, e.code, e.message),
+            .ok => |c| self.submitAndRespond(req, c),
+        }
+    }
+
+    /// `GET /api/branch-trace/dump?limit=&offset=&newest_first=` — a pure ring read. The
+    /// query params overlay the struct defaults (`limit` defaults to the full ring,
+    /// `newest_first` defaults true; `?newest_first=0` flips it, mirroring the `attrs` idiom).
+    fn handleBranchTraceDump(self: *Conn, req: *http.Server.Request, query: []const u8) void {
+        var r: mcp_tools.BranchTraceDumpReq = .{};
+        if (self.queryU32(query, "limit")) |v| r.limit = v;
+        if (self.queryU32(query, "offset")) |v| r.offset = v;
+        if (self.queryU32(query, "newest_first")) |v| r.newest_first = v != 0;
+        switch (mcp_tools.mapBranchTraceDump(r)) {
+            .fail => |e| return self.respondError(req, .bad_request, e.code, e.message),
+            .ok => |c| self.submitAndRespond(req, c),
+        }
+    }
+
+    fn handleBranchTrapArm(self: *Conn, req: *http.Server.Request, body: []const u8, is_json: bool) void {
+        if (!self.requireJson(req, is_json, body)) return;
+        const r = self.parseBody(mcp_tools.BranchTrapArmReq, body) orelse return self.badJson(req);
+        switch (mcp_tools.mapBranchTrapArm(r)) {
+            .fail => |e| return self.respondError(req, .bad_request, e.code, e.message),
+            .ok => |c| self.submitAndRespond(req, c),
+        }
     }
 
     fn handleRegSet(self: *Conn, req: *http.Server.Request, body: []const u8, is_json: bool) void {
@@ -1710,15 +1964,10 @@ pub const Conn = struct {
     /// replies a JSON-RPC error). The returned default session is NOT refcounted (it is
     /// process-owned and never destroyed; `release` is a no-op on it).
     fn resolveSession(self: *Conn, sid: []const u8) ?*Session {
-        if (self.server.defaultSession()) |default| {
-            // A blank id, or the default's own singleton id, → the default session
-            // (un-refcounted; process-owned). Any other id falls through to the registry.
-            if (sid.len == 0 or default.id.eqlSlice(sid)) return default;
-        } else if (sid.len == 0) {
-            // Empty-start mode (no default machine) + a blank selector → nothing to resolve.
-            return null;
-        }
-        return self.server.registry.resolve(sid);
+        // Delegate to the shared `Server.resolveSession` seam (so the `/api/*` header routing
+        // and the `/api/stream` upgrade resolve a selector identically). The refcount/release
+        // discipline is unchanged: a non-null minted result is refcounted; the caller releases.
+        return self.server.resolveSession(sid);
     }
 
     /// Handle one `POST /mcp` JSON-RPC 2.0 request (mcp-plan.md §5/§6). The reply shape:
@@ -1917,52 +2166,78 @@ pub const Conn = struct {
     /// queue the `status`/`get_clock` tools use (cycle-neutral; off-worker reads are banned),
     /// and the `file`/`drive` recipe fields under the session lock (the off-queue read CONTRACT).
     fn handleMcpListMachines(self: *Conn, req: *http.Server.Request, id: ?mcp.Id) void {
+        var bw = std.Io.Writer.fixed(self.mcp_body_buf[0..]);
+        // The MCP tool enumerates ONLY registry-minted machines (the model's own pool);
+        // the default session is the `--serve PROGRAM` process-owned machine, not a tool
+        // creation, so it is excluded here (`include_default = false`).
+        self.writeMachineList(&bw, false) catch return self.respondRpcError(req, id, .internal, "response too large");
+        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
+        mcp.writeTextResult(&w, id, bw.buffered(), false) catch return self.respondRpcError(req, id, .internal, "response too large");
+        self.respondJson(req, .ok, w.buffered());
+    }
+
+    /// Shared body-builder for the machine list (multi-machine plan §3/§9), emitting
+    /// `{"machines":[{machine,file,drive,mult,cycles}...],"live_machines":N,"max_machines":M}`.
+    /// Called by BOTH the MCP `list_machines` tool and the HTTP `GET /api/machines` route
+    /// (anti-drift: one shape, one walk). Every registry session is PINNED (refcount) for
+    /// the read so a concurrent deprovision can't free it mid-walk. `include_default`
+    /// prepends the process-owned default session (if any) as a selectable machine for the
+    /// console's switcher; the MCP tool passes `false` (it lists only registry-minted ones).
+    fn writeMachineList(self: *Conn, w: *std.Io.Writer, include_default: bool) std.Io.Writer.Error!void {
         var sessions: [SessionRegistry.MAX_SESSIONS]*Session = undefined;
         const n = self.server.registry.snapshotLive(sessions[0..]);
         // Release EVERY pin on every exit path (the resolve/release discipline).
         defer for (sessions[0..n]) |s| self.server.registry.release(s);
 
-        var bw = std.Io.Writer.fixed(self.mcp_body_buf[0..]);
-        const built = blk: {
-            bw.writeAll("{\"machines\":[") catch break :blk false;
-            for (sessions[0..n], 0..) |s, i| {
-                if (i != 0) bw.writeAll(",") catch break :blk false;
-                // recipe (file/drive) under the session lock — an off-queue per-session read
-                // (session.zig CONTRACT #4: a load writer overlays `recipe` under this lock).
-                var file_buf: [13]u8 = undefined;
-                var flen: usize = 0;
-                var drive: u8 = 0;
-                {
-                    s.lock.lockUncancelable(self.server.io);
-                    defer s.lock.unlock(self.server.io);
-                    flen = s.recipe.file_len;
-                    @memcpy(file_buf[0..flen], s.recipe.file[0..flen]);
-                    drive = s.recipe.drive;
-                }
-                // cycles + applied mult via the gated queue (cycle-neutral peeks).
-                var sctx: q.RequestCtx = .{ .cmd = .status };
-                const cycles: u64 = switch (s.queue.submit(&sctx)) {
-                    .status => |st| st.cycles,
-                    else => 0,
-                };
-                var cctx: q.RequestCtx = .{ .cmd = .clock_get };
-                const mult: u64 = switch (s.queue.submit(&cctx)) {
-                    .clock => |mv| mv,
-                    else => 0,
-                };
-                bw.writeAll("{\"machine\":") catch break :blk false;
-                std.json.Stringify.encodeJsonString(s.id.slice(), .{}, &bw) catch break :blk false;
-                bw.writeAll(",\"file\":") catch break :blk false;
-                std.json.Stringify.encodeJsonString(file_buf[0..flen], .{}, &bw) catch break :blk false;
-                bw.print(",\"drive\":{d},\"mult\":{d},\"cycles\":{d}}}", .{ drive, mult, cycles }) catch break :blk false;
-            }
-            bw.print("],\"live_machines\":{d},\"max_machines\":{d}}}", .{ n, SessionRegistry.MAX_SESSIONS }) catch break :blk false;
-            break :blk true;
-        };
-        if (!built) return self.respondRpcError(req, id, .internal, "response too large");
-        var w = std.Io.Writer.fixed(self.resp_buf[0..]);
-        mcp.writeTextResult(&w, id, bw.buffered(), false) catch return self.respondRpcError(req, id, .internal, "response too large");
-        self.respondJson(req, .ok, w.buffered());
+        const default_sess: ?*Session = if (include_default) self.server.defaultSession() else null;
+
+        try w.writeAll("{\"machines\":[");
+        var emitted: usize = 0;
+        if (default_sess) |ds| {
+            try self.writeMachineEntry(w, ds, emitted);
+            emitted += 1;
+        }
+        for (sessions[0..n]) |s| {
+            try self.writeMachineEntry(w, s, emitted);
+            emitted += 1;
+        }
+        try w.print("],\"live_machines\":{d},\"max_machines\":{d}}}", .{ emitted, SessionRegistry.MAX_SESSIONS });
+    }
+
+    /// One `{machine,file,drive,mult,cycles}` object for `writeMachineList` (prefixed with a
+    /// comma for every entry past the first).
+    ///
+    /// SERVER ROBUSTNESS (the machine LIST must never block on a wedged machine): EVERY read
+    /// here is NON-BLOCKING, so a guest that wedges and holds its own worker (and `session.lock`,
+    /// via an in-flight `submitDebuggerAndRespond` span) can NEVER make `/api/machines` time out:
+    ///   - `cycles`/`mult` come from the clockless atomics the worker PUBLISHES after each
+    ///     command (`run_control.published{Cycle,Mult}`) — NOT a `status`/`clock_get` submit that
+    ///     would block on the wedged worker's gate. For an idle machine this equals the live
+    ///     value (the last command settled it); for a running machine it is the last settled
+    ///     boundary (best-effort, honest), never a torn off-worker read.
+    ///   - the recipe (`file`/`drive`) is read under a NON-BLOCKING `tryLock`: if `session.lock`
+    ///     is contended (a wedged run / a concurrent load holds it) we emit a blank file rather
+    ///     than block — the machine is still listed by id + cycles. Uncontended (the normal case,
+    ///     incl. every test) it reads the recipe exactly as before (session.zig CONTRACT #4: the
+    ///     load writer overlays `recipe` under this lock, so the `tryLock` read never tears).
+    fn writeMachineEntry(self: *Conn, w: *std.Io.Writer, s: *Session, index: usize) std.Io.Writer.Error!void {
+        if (index != 0) try w.writeAll(",");
+        var file_buf: [13]u8 = undefined;
+        var flen: usize = 0;
+        var drive: u8 = 0;
+        if (s.lock.tryLock()) {
+            defer s.lock.unlock(self.server.io);
+            flen = s.recipe.file_len;
+            @memcpy(file_buf[0..flen], s.recipe.file[0..flen]);
+            drive = s.recipe.drive;
+        }
+        const cycles: u64 = s.run_control.publishedCycle();
+        const mult: u64 = s.run_control.publishedMult();
+        try w.writeAll("{\"machine\":");
+        try std.json.Stringify.encodeJsonString(s.id.slice(), .{}, w);
+        try w.writeAll(",\"file\":");
+        try std.json.Stringify.encodeJsonString(file_buf[0..flen], .{}, w);
+        try w.print(",\"drive\":{d},\"mult\":{d},\"cycles\":{d}}}", .{ drive, mult, cycles });
     }
 
     /// `tools/call`: validate `name`+`arguments` → build the worker command → submit →
@@ -2036,10 +2311,25 @@ pub const Conn = struct {
         // the stuck-owner fix). Every other tool is a pure queue command and stays LOCK-FREE
         // (the `submit_gate` already serializes it). Order `lock` → `run_control.arb` →
         // `submit_gate`, never inverted.
-        const resp: q.Response = if (std.mem.eql(u8, name, "load")) load: {
+        // `reset` is a full re-BOOT from the persisted recipe (NOT a bare power-on), so it
+        // re-runs BIOS POST + DOS init + re-mount + re-load and reaches state byte-identical
+        // to a fresh provision — otherwise the next run HLTs forever with no IVT/program. It
+        // therefore takes the SAME recipe path as `load`, just with NO overlay (it has no
+        // args), so it is server-special here exactly like `load`.
+        const is_reset = std.mem.eql(u8, name, "reset");
+        // ROBUSTNESS (MCP `reset` must ALWAYS work): like the HTTP `/api/reset` path, raise the
+        // preempt signal BEFORE reaching for `target.lock`, so an in-flight long/wedged run on
+        // this machine yields at its next burst boundary (releasing the lock / disarming the
+        // pacer) and reset seizes the worker promptly. A no-op for `load`. `endPreempt` runs
+        // (LIFO) after the reboot is serviced.
+        if (is_reset) target.run_control.beginPreempt();
+        defer if (is_reset) target.run_control.endPreempt();
+        const resp: q.Response = if (std.mem.eql(u8, name, "load") or is_reset) load: {
             target.lock.lockUncancelable(self.server.io);
             defer target.lock.unlock(self.server.io);
-            ctx.cmd = self.buildMcpLoad(req, id, target, args) orelse return; // error reply done inside; defer unlocks
+            // `reset` ignores any args (no overlay) → pass `.null`; `load` overlays its fields.
+            const recipe_args: std.json.Value = if (is_reset) .null else args;
+            ctx.cmd = self.buildMcpLoad(req, id, target, recipe_args) orelse return; // error reply done inside; defer unlocks
             break :load target.queue.submit(&ctx);
         } else built: {
             const b = switch (mcp_tools.buildCommand(self.arena.allocator(), name, args, &ctx)) {
@@ -2065,6 +2355,12 @@ pub const Conn = struct {
             .clock => |applied| retunePacerSlice(target, applied),
             else => {},
         };
+
+        // Snapshot the TARGET's host-measured throughput for the CPU-speed view's UI-only
+        // `sustainable_mult` (the `get_clock`/`set_clock` `.clock` arm of `writeResponseBody`
+        // reads `cpu_measured_hz`). Captured from `target` — NOT `self.session` — because the
+        // `machine` arg may route to a non-default session. A plain atomic read (no clock).
+        self.cpu_measured_hz = target.run_control.getMeasuredHz();
 
         // Build the inner tool body into `mcp_body_buf` via the SHARED `writeResponseBody`
         // builder — the SAME bytes the matching HTTP route emits (the anti-drift

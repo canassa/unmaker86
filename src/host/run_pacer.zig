@@ -34,6 +34,8 @@ const RunControl = api.RunControl;
 const StopTag = api.StopTag;
 const StreamHub = api.StreamHub;
 const LiveMouseState = api.LiveMouseState;
+const SessionRegistry = api.SessionRegistry;
+const Session = api.Session;
 
 /// One paced free-run driver. Created by the server with a `*CommandQueue` (to submit
 /// `run_slice` via the submit-gate), the shared `*RunControl` (the clockless arm flag
@@ -177,11 +179,181 @@ pub const RunPacer = struct {
         // sleep and run the next slice immediately — we NEVER shrink/grow a slice to
         // "catch up" (no smear).
         const t1 = Io.Clock.Timestamp.now(io, .awake);
-        const elapsed_ms = t0.durationTo(t1).raw.toMilliseconds();
+        const dur = t0.durationTo(t1).raw;
+
+        // Sustainable-mult telemetry (UI-only): the slice's PURE wall-time (measured BEFORE
+        // the inter-slice sleep) brackets the host's raw emulation throughput on the live
+        // workload. `slice_cycles / elapsed` (in cycles/sec) feeds the browser's slider cap
+        // so a user can't pick a mult the host can't pace in real time. This is host-clock
+        // telemetry (correct in src/host); it reaches the api layer only via the CLOCK-FREE
+        // atomic `RunControl.setMeasuredHz`, never as an emulation input.
+        recordThroughput(self.control, slice, dur);
+
+        const elapsed_ms = dur.toMilliseconds();
         const remaining_ms = TARGET_SLICE_MS - elapsed_ms;
         if (remaining_ms > 0) {
             io.sleep(Io.Duration.fromMilliseconds(remaining_ms), .awake) catch return;
         }
+    }
+};
+
+/// EMA-fold one slice's measured raw throughput into the session's `RunControl.measured_hz`
+/// (UI-only sustainable-mult telemetry). `slice` = guest cycles run; `dur` = the slice's
+/// PURE wall-time (no inter-slice sleep). MICROsecond resolution — a ~10 ms slice is too
+/// coarse in ms for an accurate cycles/sec. Guards `elapsed_us == 0` (skip — no divide).
+/// Smoothing is ASYMMETRIC (drop-fast / rise-slow) so the cap reflects the worst-case
+/// (busiest) recent scene, not a momentarily-idle one; seeded directly on the first sample
+/// (old==0) so it doesn't ramp up from zero. Host-side (it consumes the host clock `dur`);
+/// the only write into the api layer is the clock-free `setMeasuredHz`.
+fn recordThroughput(control: *RunControl, slice: u64, dur: Io.Duration) void {
+    const elapsed_us_i = dur.toMicroseconds();
+    if (elapsed_us_i <= 0) return; // clock skew / zero-time slice: no data this tick
+    const elapsed_us: u64 = @intCast(elapsed_us_i);
+    const sample = slice * 1_000_000 / elapsed_us; // cycles per second (this slice's flat-out rate)
+    const prev = control.getMeasuredHz();
+    // Conservative tracking: the slider cap must reflect the HEAVIEST recent scene, not a
+    // momentarily-idle one (the menu's HLT-poll loop emulates far faster than the 3D world).
+    // Drop FAST toward a slower (busier) sample so a CPU-heavy scene immediately tightens the
+    // ceiling; rise SLOW so a brief idle stretch doesn't re-open it to an unsustainable mult.
+    const ema = if (prev == 0)
+        sample
+    else if (sample < prev)
+        (prev + sample * 3) / 4 // busier slice: 75% toward the lower (worst-case) rate
+    else
+        (prev * 15 + sample) / 16; // lighter slice: 6% toward the higher rate
+    control.setMeasuredHz(ema);
+}
+
+/// The host-side MULTI-SESSION pacer (agent-provisioning live-play): one thread that
+/// paces EVERY armed registry-minted session, the same way `RunPacer` paces the single
+/// default session. A `provision_machine`'d session has its own clockless `RunControl`
+/// arm flag (flipped by `/api/run/start|stop` or the stream's auto-start), but — unlike
+/// the default — nothing drove it before; this is what advances it in real time.
+///
+/// WHY HERE (the grep-gate, §5.1a): like `RunPacer` it needs a host clock (the
+/// inter-slice sleep), so it lives in `src/host/`, OUTSIDE the `src/api`
+/// `determinism_test.zig` embedded set. It reaches each session's worker ONLY through
+/// that session's submit-gated `queue` (`run_slice` / `input_mouse_fold`) and the
+/// cycle-neutral `stream_hub.produceFrame()` peek — never machine state directly — so it
+/// never perturbs any cycle ledger. Determinism holds per session exactly as for the
+/// single pacer: a paced run to cycle N is byte-identical to an unpaced one; the wall
+/// clock decides only how fast wall time advances, never which guest cycles run.
+///
+/// LIFECYCLE SAFETY (don't free-race a deprovision): each tick it pins the live sessions
+/// via `SessionRegistry.snapshotLive` (refcount++ under the registry mutex) and releases
+/// them at the tick's end — the SAME refcount discipline `list_machines` uses. A
+/// concurrent `deprovision`/`DELETE /mcp` removes the id from the map then BLOCKS in
+/// `destroy` until the refcount drains, so a session this pacer is mid-slice on can never
+/// be torn down under it. At shutdown the host joins this pacer BEFORE the registry drains
+/// the minted workers (`server.deinit` → `registry.deinit`), so no slice can race a
+/// worker sentinel.
+pub const SessionPacer = struct {
+    registry: *SessionRegistry,
+    io: Io,
+    thread: ?std.Thread = null,
+
+    /// Shared frame-sample tick (the fps cadence). One counter for the whole pacer:
+    /// each session still samples at ITS OWN fps via `tick % ticks_per_frame(fps)`, so a
+    /// per-session counter is unnecessary (and would be churn-prone as sessions come and
+    /// go). Host-side observation cadence only — it never touches a guest cycle.
+    sample_tick: u32 = 0,
+
+    /// Thread shutdown flag (the loop exits at server shutdown). There is no separate
+    /// "armed" flag — arming is PER SESSION on each `RunControl`; this thread loops while
+    /// the process lives and simply skips sessions that are not armed.
+    stop_loop: std.atomic.Value(bool) = .init(false),
+
+    pub fn start(self: *SessionPacer) !void {
+        self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+    }
+
+    /// Signal the loop to exit and join the thread. The host calls this BEFORE the
+    /// registry tears down the minted workers (shutdown ordering), so no pacer slice can
+    /// race a worker shutdown sentinel. Idempotent.
+    pub fn join(self: *SessionPacer) void {
+        self.stop_loop.store(true, .release);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+    }
+
+    fn runLoop(self: *SessionPacer) void {
+        const io = self.io;
+        while (!self.stop_loop.load(.acquire)) {
+            const t0 = Io.Clock.Timestamp.now(io, .awake);
+            self.tickAllSessions();
+            // Sleep the rest of the wall-clock tick (host pacing ONLY). If servicing the
+            // armed sessions already overran the target (many armed machines / slow host),
+            // skip the sleep and run the next tick immediately — we NEVER shrink a slice to
+            // "catch up" (no smear); the streams just run slower. With no armed sessions the
+            // tick is ~free, so this idle-sleeps the full target and costs ~nothing.
+            const t1 = Io.Clock.Timestamp.now(io, .awake);
+            const elapsed_ms = t0.durationTo(t1).raw.toMilliseconds();
+            const remaining_ms = RunPacer.TARGET_SLICE_MS - elapsed_ms;
+            if (remaining_ms > 0) {
+                io.sleep(Io.Duration.fromMilliseconds(remaining_ms), .awake) catch return;
+            }
+        }
+    }
+
+    /// One tick: pin the live minted sessions (refcount++), advance each armed one by a
+    /// slice, then release every pin. Pinning bounds a concurrent deprovision OUT of the
+    /// whole tick (it blocks on the refcount), so every `*Session` here stays valid.
+    fn tickAllSessions(self: *SessionPacer) void {
+        var sessions: [SessionRegistry.MAX_SESSIONS]*Session = undefined;
+        const n = self.registry.snapshotLive(sessions[0..]);
+        defer for (sessions[0..n]) |s| self.registry.release(s);
+
+        // Advance the shared sample cadence once per pacer tick (not per session), so a
+        // session connected by N stream clients still samples once per fps period.
+        self.sample_tick +%= 1;
+
+        for (sessions[0..n]) |s| {
+            if (!s.run_control.isArmed()) continue; // a paused/idle machine costs ~nothing
+            self.runSessionSlice(s);
+        }
+    }
+
+    /// Submit ONE `run_slice` for `s` through its submit-gate, classify the stop, sample a
+    /// frame at the session's fps cadence, and fold any live mouse input. Mirrors
+    /// `RunPacer.runOneSlice` exactly, but scoped to ONE of the N minted sessions. On a
+    /// terminal stop, self-disarm that session (don't spin against a dead machine, §10).
+    fn runSessionSlice(self: *SessionPacer, s: *Session) void {
+        const control = s.run_control;
+        const slice = control.sliceCycles();
+
+        // The slice itself, via the SUBMIT-GATE (serializes against a mid-tick debugger
+        // command on the same session queue, §5.1). Bracket JUST the slice submit with the
+        // host clock so `slice_cycles / elapsed` measures THIS session's raw throughput for
+        // the UI-only sustainable-mult cap (mirrors `RunPacer.runOneSlice`; the value
+        // reaches the api layer only via the clock-free `RunControl.setMeasuredHz`).
+        const t0 = Io.Clock.Timestamp.now(self.io, .awake);
+        var ctx: RequestCtx = .{ .cmd = .{ .run_slice = .{ .slice_cycles = slice } } };
+        const resp = s.queue.submit(&ctx);
+        const t1 = Io.Clock.Timestamp.now(self.io, .awake);
+        recordThroughput(control, slice, t0.durationTo(t1).raw);
+
+        const cls = recordAndClassify(control, resp);
+        if (cls.terminal) {
+            // Program-end (program_terminated/halted_forever): publish the one-shot
+            // "stopped" stream control frame (idempotent). NOT a breakpoint/user-stop.
+            if (cls.program_end) s.stream_hub.markStopped(cls.reason, cls.cycle);
+            control.disarmTerminal();
+            return;
+        }
+
+        // Frame sample at the session's OWN fps (every Nth ~10 ms tick). `produceFrame`
+        // no-ops when no client is watching this session, so it is free when nobody is.
+        const fps: u32 = @max(control.getFps(), 1);
+        const ticks_per_sec: u32 = @intCast(@max(@divTrunc(@as(i64, 1000), @max(RunPacer.TARGET_SLICE_MS, 1)), 1));
+        const ticks_per_frame: u32 = @max(ticks_per_sec / fps, 1);
+        if (self.sample_tick % ticks_per_frame == 0) s.stream_hub.produceFrame();
+
+        // Live-mouse fold: ALWAYS submit one `input_mouse_fold` per slice through the same
+        // gated queue. The race-free gate is on the worker (`takeFold()` returns null UNDER
+        // THE MUTEX when clean), so this is a no-op — ZERO guest cycles — unless a POST made
+        // the record dirty; the keystone determinism invariant (no input ⇒ byte-identical).
+        var fold_ctx: RequestCtx = .{ .cmd = .input_mouse_fold };
+        _ = s.queue.submit(&fold_ctx);
     }
 };
 
@@ -222,6 +394,11 @@ fn recordAndClassify(control: *RunControl, resp: api.Response) Classification {
                 // The no-progress watchdog: disarm so the pacer doesn't busy-spin against
                 // a frozen-ledger machine. NOT a program end.
                 .no_progress => |t| .{ .no_progress, t.at_cycle, true },
+                // A control command (`/api/run/stop` / `/api/reset`) preempted the slice:
+                // DISARM (like a user stop) so the pacer stops flooding the worker and does
+                // not immediately re-run past the preemption — the non-starvation keystone
+                // that lets the control command seize the worker. NOT a program end.
+                .stopped_by_request => |t| .{ .stopped_by_request, t.at_cycle, true },
             };
             control.recordStop(tag, cycle);
             // Program-end terminals only (NOT breakpoint, step, budget, or shutdown):

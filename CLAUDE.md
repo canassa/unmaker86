@@ -27,7 +27,8 @@ These outrank any task goal.
 Run from the repo root (Zig 0.16 is on PATH via direnv; `zig version` must print `0.16.0`).
 
 ```sh
-zig build                 # compile -> zig-out/bin/zdos
+zig build                 # compile -> zig-out/bin/zdos (Debug; ~5x slower interpreter)
+zig build -Doptimize=ReleaseFast   # ALWAYS use this for any server/guest you'll actually run — Debug is too slow for real-time guest play (e.g. games slow-motion)
 zig build test            # run the test suite (keep it green)
 zig fmt src/              # format in place
 zig fmt --check src/      # verify formatting

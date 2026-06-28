@@ -127,6 +127,18 @@ pub const StopReason = union(enum) {
     /// spins forever; complementary to `branch_trap` (which catches a LIVE-ledger
     /// derail that DOES charge cycles). Reporting-only — non-terminal, not a program end.
     no_progress: struct { at_cycle: u64 },
+    /// The in-flight run was PREEMPTED by an out-of-band control request (a human/agent
+    /// `/api/run/stop` or `/api/reset` raised the clockless abort signal). The run yields
+    /// at a CLEAN INSTRUCTION BOUNDARY, exactly like a breakpoint / interactive stop:
+    /// every cycle that DID run was charged identically, so the machine is in a VALID,
+    /// deterministic state at `at_cycle` (a later `run-to-cycle at_cycle` reaches the
+    /// byte-identical state). This reason is NEVER produced by the control core itself —
+    /// the control core only ever runs deterministic bounded bursts and knows nothing of
+    /// host scheduling. It is synthesized by the WORKER (the threading layer) when, BETWEEN
+    /// two bounded bursts, it observes the abort signal and abandons the run. So the abort
+    /// changes only WHERE the run pauses, never WHICH cycles ran or in what order
+    /// (constraint #1). Non-terminal, reporting-only.
+    stopped_by_request: struct { at_cycle: u64 },
 };
 
 pub const StepOverResult = struct {
@@ -895,6 +907,84 @@ pub const Controller = struct {
         self.set.remove(id) catch {};
     }
 
+    // -----------------------------------------------------------------------
+    // PREEMPTIBLE run-to-target (worker-driven). `runToCycle`/`runToAddress` above run
+    // the whole journey inside ONE unbounded `runUntilEvent(maxInt)` call, which holds
+    // the single worker for the entire (possibly unbounded) duration. To make a long
+    // run abortable WITHOUT pulling any host-scheduling/atomic awareness into the
+    // control core (the `src/debug` determinism gate forbids atomics outright), the journey
+    // is split into the SAME bounded `runUntilEvent` bursts the control core already
+    // runs — and the WORKER (the threading layer in `src/api`, where atomics are legal)
+    // drives the burst loop, polling its clockless abort flag between bursts.
+    //
+    // DETERMINISM (byte-identical to the single unbounded run): the one-shot target is an
+    // ABSOLUTE coordinate (a `.cycle{at_cycle}` / `.execution_address{linear}` breakpoint),
+    // so it fires at the EXACT same instruction boundary no matter how the run was sliced —
+    // there is no relative-budget overshoot to perturb (a burst that merely exhausts its
+    // cap reports `cycle_budget_exhausted` and is transparently resumed). The same one-shot,
+    // the same ascending-id tie-break against user breakpoints, and the same `target_reached`
+    // translation as `runToCycle`/`runToAddress` are reused verbatim, so the observable
+    // result (including the bp-id tie-break edge cases) is identical.
+    // -----------------------------------------------------------------------
+
+    /// A live preemptible run-to-target handle (the armed one-shot + its kind). `already`
+    /// is set when the cycle target was already in the past — the worker then returns
+    /// `cycle_budget_exhausted{current}` immediately, exactly like `runToCycle`'s past-target
+    /// case, and `endRunTarget` arms/discards nothing.
+    pub const RunTarget = struct {
+        id: u32 = 0,
+        already: bool = false,
+    };
+
+    /// Arm the one-shot `.cycle{c}` target (the worker then drives `runTargetBurst` until it
+    /// fires). `c <= current` ⇒ `already` (immediate past-target), matching `runToCycle`.
+    pub fn beginRunToCycle(self: *Controller, c: u64) Error!RunTarget {
+        if (c <= self.m.cpu.st.cycles) return .{ .already = true };
+        const id = try self.set.add(.{ .cycle = .{ .at_cycle = c } }, true);
+        return .{ .id = id };
+    }
+
+    /// Arm the one-shot `.execution_address{linear}` target (the worker drives bursts).
+    pub fn beginRunToAddress(self: *Controller, linear: u32) Error!RunTarget {
+        const id = try self.set.add(.{ .execution_address = .{ .linear = linear } }, true);
+        return .{ .id = id };
+    }
+
+    /// Run ONE bounded burst toward an armed target. Returns:
+    ///   - `cycle_budget_exhausted` ⇒ the burst ran out WITHOUT the target firing: the
+    ///     worker polls its abort flag and, if clear, calls again to resume (the machine
+    ///     is at a clean boundary, no state perturbed by the slice).
+    ///   - `target_reached`         ⇒ the internal one-shot fired (the target was hit) —
+    ///     translated from the internal bp's own hit exactly as `runToCycle`/`runToAddress` do.
+    ///   - anything else            ⇒ a USER breakpoint / terminal / `no_progress`: surface it.
+    pub fn runTargetBurst(self: *Controller, t: RunTarget, burst: u64) StopReason {
+        const r = self.runUntilEvent(burst);
+        if (r == .breakpoint and r.breakpoint.id == t.id) {
+            return self.record(.{ .target_reached = .{ .at_cycle = r.breakpoint.at_cycle } });
+        }
+        return r;
+    }
+
+    /// Discard the armed one-shot once the run is over (idempotent; a no-op for `already`).
+    pub fn endRunTarget(self: *Controller, t: RunTarget) void {
+        if (!t.already) self.discardOneShot(t.id);
+    }
+
+    /// Record a stop reason the WORKER synthesized off the bounded-burst loop (today only
+    /// `stopped_by_request`) so `status()`'s `last_stop` stays coherent. The cycle ledger is
+    /// untouched — this only stamps the observable reason at the boundary the burst loop
+    /// left the machine on. Pure book-keeping; charges no cycle.
+    pub fn recordExternalStop(self: *Controller, r: StopReason) StopReason {
+        return self.record(r);
+    }
+
+    /// The live cycle ledger (the worker reads it to bound a preemptible `run`/`run_slice`
+    /// to an ABSOLUTE deadline across bursts, so the chunking is byte-identical to a single
+    /// `runUntilEvent(cap)`). A pure read; the CPU stays the sole writer (constraint #1).
+    pub fn currentCycle(self: *const Controller) u64 {
+        return self.m.cpu.st.cycles;
+    }
+
     /// Option A REP sizer (plans/step-over-rep.md): peek the bytes at CS:EIP and,
     /// IFF the instruction is a REP/REPE/REPNE-prefixed STRING op, return the linear
     /// address of the instruction that FOLLOWS it. REP legally prefixes only the
@@ -1203,6 +1293,43 @@ pub const Controller = struct {
     /// (Option C). Small but ample for `serviceInterrupts` to deliver the deferred
     /// IRQ12/INT 74h release callback at the next IF=1 boundary.
     const RELEASE_TICK_MS: u32 = 1;
+
+    /// Inject a mouse MOVE and DELIVER the AX=0Ch event callback it raises, so a guest
+    /// that learns of the pointer ONLY through that callback observes the move. Betrayal
+    /// at Krondor is exactly such a guest: it installs an AX=0Ch handler (mask 0x1F) and
+    /// NEVER polls AX=0003/000B — injected motion reaches it ONLY when INT 74h runs, and
+    /// its software cursor is drawn from the callback-latched position. The bare
+    /// `injectMouse` only RAISES IRQ12 (Option C, deferred); with no subsequent run the
+    /// callback never fires, so a one-shot motion inject is a SILENT NO-OP to such a guest
+    /// (its cursor never tracks). The live/browser fold path does not have this gap: the
+    /// pacer runs a `run_slice` every ~10 ms slice, delivering every fold's callback
+    /// continuously. Mirror that here — when the inject left a mouse callback PENDING,
+    /// advance a SHORT, human-realistic dwell (`MOVE_DELIVER_MS` of EMULATED time, derived
+    /// from the machine's OWN clock by `dwellCycles` — no host clock/RNG, byte-reproducible)
+    /// so `serviceInterrupts` delivers INT 74h and the guest's main loop redraws the cursor
+    /// at the new position, exactly as a live browser move does. Returns the run stop reason.
+    ///
+    /// Returns `null` when the inject left NOTHING pending (no AX=0Ch handler installed, or a
+    /// masked-out event): then it is CYCLE-NEUTRAL, byte-identical to the pure `injectMouse`,
+    /// so a guest that polls AX=03 (or a program with no mouse handler) and the deterministic
+    /// scripted-inject seam the oracle/tests rely on are completely unaffected.
+    pub fn injectMouseDeliver(self: *Controller, req: MouseInject) ?StopReason {
+        self.injectMouse(req);
+        // Nothing intersected an installed handler ⇒ no INT 74h to deliver ⇒ stay
+        // cycle-neutral (the pure-inject contract for non-callback guests + the oracle).
+        if (self.m.dos.mouse.pending_event_mask == 0) return null;
+        return self.runDwell(self.dwellCycles(MOVE_DELIVER_MS));
+    }
+
+    /// The move-delivery dwell budget (ms of EMULATED time) for `injectMouseDeliver`. A
+    /// callback-only guest (BaK) redraws its software cursor from its MAIN LOOP, which in
+    /// the 3D world renders a full first-person frame per iteration, so unlike the 1 ms
+    /// `RELEASE_TICK_MS` (which only needs to reach the next IF=1 boundary to deliver an
+    /// IRQ) the move dwell must span at least one such frame for the cursor to visibly
+    /// track. ~100 ms (symmetric with the `DEFAULT_CLICK_MS` click dwell) covers a full
+    /// render with margin and is harmless human-realistic emulated time; the value is a
+    /// fixed cycle budget from the machine's own clock, so it stays deterministic.
+    const MOVE_DELIVER_MS: u32 = 100;
 
     /// Run a click/tap DWELL and report a completed hold as `dwell_complete` rather than
     /// the generic `cycle_budget_exhausted` (which is the "you hit the `run` cap" signal

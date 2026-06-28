@@ -10,6 +10,7 @@
 const run_pacer = @import("run_pacer.zig");
 
 pub const RunPacer = run_pacer.RunPacer;
+pub const SessionPacer = run_pacer.SessionPacer;
 
 test {
     _ = run_pacer;

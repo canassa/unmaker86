@@ -51,7 +51,7 @@ fn destroy(alloc: std.mem.Allocator, m: *Machine) void {
 
 fn drain(ctrl: *Controller, store: *SnapshotStore, cmd: q.Command) q.Response {
     var ctx: q.RequestCtx = .{ .cmd = cmd };
-    return worker.drainOne(ctrl, &ctx, .{}, null, null, store);
+    return worker.drainOne(ctrl, &ctx, .{}, null, null, store, null);
 }
 
 test "worker: arm → run records → status/dump reflect the ring" {

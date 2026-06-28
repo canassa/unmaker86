@@ -216,6 +216,153 @@ test "POST /api/breakpoints kind:io is accepted (port watchpoint, now implemente
     try std.testing.expect(std.mem.indexOf(u8, r.body, "\"id\":") != null);
 }
 
+test "POST /api/branch-trace/arm enables the trace and returns the status" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = post(&ts, "/api/branch-trace/arm", "{\"enabled\":true}", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"armed\":true") != null);
+}
+
+test "POST /api/branch-trace/arm with kinds narrows the kind_mask" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = post(&ts, "/api/branch-trace/arm", "{\"enabled\":true,\"kinds\":[\"call_near_direct\",\"ret_near\"]}", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"armed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"kind_mask\":") != null);
+}
+
+test "POST /api/branch-trace/arm with an unknown kind → 400" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = post(&ts, "/api/branch-trace/arm", "{\"enabled\":true,\"kinds\":[\"nope\"]}", &obuf);
+    try std.testing.expectEqual(@as(u16, 400), r.status);
+}
+
+test "POST /api/branch-trace/clear empties the ring (status ok)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = post(&ts, "/api/branch-trace/clear", "", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"len\":0") != null);
+}
+
+test "GET /api/branch-trace/status reports the armed/ring fields" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = get(&ts, "/api/branch-trace/status", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"armed\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"capacity\":") != null);
+}
+
+test "GET /api/branch-trace/dump returns the ring page" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    // Arm, run a few cycles so the ring fills, then page it.
+    _ = post(&ts, "/api/branch-trace/arm", "{\"enabled\":true}", &obuf);
+    _ = post(&ts, "/api/run", "{\"cycle_cap\":2000}", &obuf);
+    const r = get(&ts, "/api/branch-trace/dump?limit=5", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"trace\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"capacity\":") != null);
+}
+
+test "GET /api/branch-trace/dump?limit=0 → 400 out_of_range" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = get(&ts, "/api/branch-trace/dump?limit=0", &obuf);
+    try std.testing.expectEqual(@as(u16, 400), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"out_of_range\"") != null);
+}
+
+test "GET /api/branch-trace/dump?limit over MAX_TRACE_DUMP → 400 out_of_range" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = get(&ts, "/api/branch-trace/dump?limit=1025", &obuf);
+    try std.testing.expectEqual(@as(u16, 400), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"out_of_range\"") != null);
+}
+
+test "POST /api/branch-trap/arm with to_range arms the trap" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = post(&ts, "/api/branch-trap/arm", "{\"to_range\":true,\"to_lo\":1280,\"to_hi\":1536}", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"trap_armed\":true") != null);
+}
+
+test "POST /api/branch-trap/arm with sp_range arms the trap" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = post(&ts, "/api/branch-trap/arm", "{\"sp_range\":true,\"sp_lo\":256,\"sp_hi\":1024}", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"trap_armed\":true") != null);
+}
+
+test "POST /api/branch-trap/arm with kinds arms the trap" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = post(&ts, "/api/branch-trap/arm", "{\"kinds\":[\"call_near_direct\"]}", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"trap_armed\":true") != null);
+}
+
+test "POST /api/branch-trap/arm with an unknown kind → 400" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = post(&ts, "/api/branch-trap/arm", "{\"kinds\":[\"nope\"]}", &obuf);
+    try std.testing.expectEqual(@as(u16, 400), r.status);
+}
+
+test "POST /api/branch-trap/clear disarms the trap" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    _ = post(&ts, "/api/branch-trap/arm", "{\"to_range\":true,\"to_lo\":0,\"to_hi\":16}", &obuf);
+    const r = post(&ts, "/api/branch-trap/clear", "", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"trap_armed\":false") != null);
+}
+
+test "GET /api/machines lists the default machine with the expected shape" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = get(&ts, "/api/machines", &obuf);
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"machines\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"machine\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"file\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"drive\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"mult\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"cycles\":") != null);
+    // The default session is selectable (include_default) → at least one machine.
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"live_machines\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"max_machines\":") != null);
+}
+
+test "POST /api/branch-trace/status → 405 (read is GET-only)" {
+    var ts = try TestServer.init(std.testing.allocator);
+    try ts.start();
+    defer ts.deinit();
+    const r = post(&ts, "/api/branch-trace/status", "", &obuf);
+    try std.testing.expectEqual(@as(u16, 405), r.status);
+}
+
 test "GET /api/mem/search finds a hex pattern (single match, seg:off decomposition)" {
     var ts = try TestServer.init(std.testing.allocator);
     try ts.start();

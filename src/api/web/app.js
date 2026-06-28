@@ -39,6 +39,29 @@
   const FLAG_UNSUPPORTED = 1 << 1;
   const PALETTE_LEN = 768;
 
+  // ===================================================================
+  // Active-machine routing (multi-machine §6 option B). `activeMachine` is the
+  // selected machine handle ("" = the default/singleton machine, which needs no
+  // header). EVERY /api/* fetch goes through `api()` so the selector drives the
+  // whole console — panels AND input. `/api/machines` is PRE-routing and must NOT
+  // carry the header; it calls plain `fetch`.
+  // ===================================================================
+  let activeMachine = "";
+  const DEFAULT_SINGLETON = "zdos-mcp-singleton";
+
+  function api(path, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign({}, opts.headers);
+    if (activeMachine) opts.headers["X-Zdos-Session"] = activeMachine;
+    return fetch(path, opts);
+  }
+
+  // The default machine is the only one the WebSocket player live-streams; minted
+  // (debugger) machines are shown via the peek <img>. "" or the singleton id ⇒ default.
+  function isDefaultMachine() {
+    return activeMachine === "" || activeMachine === DEFAULT_SINGLETON;
+  }
+
   // ---- DOM ----
   const canvas = document.getElementById("screen");
   const overlay = document.getElementById("overlay");
@@ -283,10 +306,46 @@ void main() {
   let ws = null;
   let reconnectTimer = null;
   let everConnected = false;
+  // The live WS stream runs while a streamable machine is selected: ALWAYS the default, and a
+  // minted machine WHILE IT IS PLAYING (paced start → live; paced stop → back to peek). A
+  // paused minted machine has nothing live to show, so the stream stays OFF for it (peek mode);
+  // otherwise `/api/stream` 4xxs and the reconnect loop flips connecting/disconnected forever.
+  let wantStream = false;
+  // True when the selected MINTED machine is being run in real time (paced start). The default
+  // machine is always considered streamable (see `isDefaultMachine`), so `playing` only gates
+  // minted machines. Reset on machine switch and on paced stop.
+  let playing = false;
+
+  // Start the stream for the default machine (idempotent — no-op if already up/connecting).
+  function connectStream() {
+    wantStream = true;
+    if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+    connect();
+  }
+
+  // Tear the stream down for peek mode — quietly, without arming a reconnect.
+  function disconnectStream() {
+    wantStream = false;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (ws) {
+      try {
+        ws.onclose = null; // suppress the reconnect path on an intentional close
+        ws.close();
+      } catch (e) {}
+      ws = null;
+    }
+  }
 
   function connect() {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = proto + "//" + location.host + "/api/stream";
+    // The browser WebSocket API can't set request headers, so the selected MINTED machine is
+    // named in the URL query (`?machine=<id>`); the server resolves it to that session's stream
+    // hub. The default machine ("") needs no selector (it streams the default).
+    let url = proto + "//" + location.host + "/api/stream";
+    if (activeMachine) url += "?machine=" + encodeURIComponent(activeMachine);
     setStatus("pending", everConnected ? "reconnecting…" : "connecting…");
     showOverlay(everConnected ? "reconnecting…" : "connecting…");
 
@@ -314,6 +373,7 @@ void main() {
     };
 
     ws.onclose = function () {
+      if (!wantStream) return; // intentional teardown (peek mode) — stay quiet
       setStatus("err", "disconnected");
       scheduleReconnect();
     };
@@ -339,10 +399,10 @@ void main() {
   }
 
   function scheduleReconnect() {
-    if (reconnectTimer) return;
+    if (reconnectTimer || !wantStream) return;
     reconnectTimer = setTimeout(function () {
       reconnectTimer = null;
-      connect();
+      if (wantStream) connect();
     }, 1000);
   }
 
@@ -409,8 +469,9 @@ void main() {
   };
 
   function postJSON(path, obj) {
-    // Fire-and-forget; keepalive so a key-up still flushes on tab close.
-    fetch(path, {
+    // Fire-and-forget; keepalive so a key-up still flushes on tab close. Routed via
+    // api() so input goes to the SELECTED machine (the X-Zdos-Session header).
+    api(path, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(obj),
@@ -440,10 +501,32 @@ void main() {
     cpuMhz.textContent = "≈" + (mult * PIT_MHZ).toFixed(2) + " MHz";
   }
 
+  // Cap the slider's RANGE at min(max_mult, sustainable_mult). `max_mult` is the static
+  // hard ceiling the server applies; `sustainable_mult` is the host's measured real-time
+  // ceiling (higher → the host can't pace it → slow-motion). This is UI-ONLY: it bounds
+  // only how far the slider can travel, never the APPLIED mult (an explicit POST still
+  // applies up to max_mult, deterministically). We touch only `.max`, never `.value`, so a
+  // live cap drop never silently changes the applied speed.
+  function applyCpuCap(j) {
+    if (!cpuSpeed || !j) return;
+    var hard = j.max_mult ? parseInt(j.max_mult, 10) : 55;
+    var sust = j.sustainable_mult ? parseInt(j.sustainable_mult, 10) : hard;
+    var cap = Math.min(hard, sust);
+    if (cap >= 1) cpuSpeed.max = String(cap);
+  }
+
+  // Re-read the live ceiling so the slider cap tracks the current scene (it drops in heavy
+  // scenes the host can't pace at full speed). Read-only; never POSTs / changes applied mult.
+  async function refreshCpuCap() {
+    if (!cpuSpeed) return;
+    const r = await call("GET", "/api/cpu/clock");
+    if (r.json) applyCpuCap(r.json);
+  }
+
   function setCpuSpeed(mult) {
     // Apply at the serialized worker boundary; the server clamps + echoes the
     // applied mult (and retunes the pacer slice). We render the derived MHz.
-    fetch("/api/cpu/clock", {
+    api("/api/cpu/clock", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ mult: mult }),
@@ -452,7 +535,7 @@ void main() {
         if (!j) return;
         if (cpuSpeed) {
           cpuSpeed.value = String(j.mult);
-          if (j.max_mult) cpuSpeed.max = String(j.max_mult);
+          applyCpuCap(j);
         }
         renderCpuMhz(j.mult);
       }).catch(function () { /* best-effort */ });
@@ -461,10 +544,10 @@ void main() {
   function initCpuKnob() {
     if (!cpuSpeed) return;
     // Sync the initial value from the server (the GET reflects the applied mult).
-    fetch("/api/cpu/clock").then(function (r) { return r.ok ? r.json() : null; })
+    api("/api/cpu/clock").then(function (r) { return r.ok ? r.json() : null; })
       .then(function (j) {
         if (!j) return;
-        if (j.max_mult) cpuSpeed.max = String(j.max_mult);
+        applyCpuCap(j);
         cpuSpeed.value = String(j.mult);
         renderCpuMhz(j.mult);
       }).catch(function () { /* keep the HTML default */ });
@@ -481,7 +564,16 @@ void main() {
   // single make and we don't spam breaks.
   const held = Object.create(null);
 
+  // Keyboard goes to the guest ONLY while the video pane (the live canvas or the peek
+  // image) is focused. Otherwise the debugger's own text inputs (run-to-cycle, etc.) would
+  // be hijacked and their keystrokes swallowed. Click the video pane to "capture" input.
+  function gameInputFocused() {
+    const a = document.activeElement;
+    return a === canvas || (a && a.id === "peek");
+  }
+
   window.addEventListener("keydown", function (e) {
+    if (!gameInputFocused()) return;
     const m = KEYMAP[e.code];
     if (!m) return;
     e.preventDefault(); // game owns these keys; don't scroll/navigate
@@ -491,6 +583,7 @@ void main() {
   });
 
   window.addEventListener("keyup", function (e) {
+    if (!gameInputFocused()) return;
     const m = KEYMAP[e.code];
     if (!m) return;
     e.preventDefault();
@@ -518,11 +611,16 @@ void main() {
   // only sets the IMAGE ASPECT for the contain math — the OUTPUT is normalized, so the
   // half-speed-X bug (mapping to 320 px) is gone. Falls back to the canvas aspect
   // before the first frame (texW/texH == 0).
+  // Works for EITHER video surface — the live canvas or the peek <img> — using whichever
+  // the event fired on (`e.currentTarget`). For the canvas the guest resolution is the live
+  // texture (`texW/texH`); for the peek image it is the PNG's natural size.
   function guestCoordsNorm(e) {
-    const rect = canvas.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return null;
-    const gw = texW || canvas.width;
-    const gh = texH || canvas.height;
+    const el = e.currentTarget;
+    const isCanvas = el === canvas;
+    const gw = isCanvas ? (texW || canvas.width) : (el.naturalWidth || 320);
+    const gh = isCanvas ? (texH || canvas.height) : (el.naturalHeight || 200);
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0 || !gw || !gh) return null;
     const scale = Math.min(rect.width / gw, rect.height / gh);
     const dispW = gw * scale, dispH = gh * scale;
     const offX = (rect.width - dispW) / 2, offY = (rect.height - dispH) / 2;
@@ -534,7 +632,7 @@ void main() {
     return { nx_q16: Math.round(nx * Q16), ny_q16: Math.round(ny * Q16) };
   }
 
-  canvas.addEventListener("mousemove", function (e) {
+  function onSurfaceMouseMove(e) {
     if (mouseThrottle) return;
     mouseThrottle = true;
     requestAnimationFrame(function () { mouseThrottle = false; });
@@ -548,7 +646,7 @@ void main() {
       mdx: e.movementX | 0,
       mdy: e.movementY | 0,
     });
-  });
+  }
 
   // DOM MouseEvent.buttons mask: bit0 left(1), bit1 right(2), bit2 middle(4).
   // The server's mouse `buttons` mask: bit0 left, bit1 right, bit2 middle
@@ -574,29 +672,592 @@ void main() {
     postJSON("/api/input/mouse", body);
   }
 
-  canvas.addEventListener("mousedown", function (e) {
-    canvas.focus();
+  function onSurfaceMouseDown(e) {
+    e.currentTarget.focus(); // clicking the pane captures the keyboard for the guest
     sendButtons(e);
-  });
-  canvas.addEventListener("mouseup", sendButtons);
-  // Suppress the context menu so right-click is usable in-game.
-  canvas.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+  }
+
+  // Wire a video surface (the live canvas OR the peek <img>) for live mouse + keyboard.
+  // The peek image is made focusable so clicking a PAUSED machine's frame captures input
+  // too — moves/clicks are injected and take effect when the machine next advances.
+  function bindSurface(el) {
+    if (!el) return;
+    if (el !== canvas) el.tabIndex = 0; // canvas already carries tabindex in the HTML
+    el.addEventListener("mousemove", onSurfaceMouseMove);
+    el.addEventListener("mousedown", onSurfaceMouseDown);
+    el.addEventListener("mouseup", sendButtons);
+    el.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+  }
+
+  bindSurface(canvas);
+
+  // ===================================================================
+  // Debugger shell (REST panels). Every fetch goes through api() so the selected
+  // machine drives the whole console. Determinism: this layer is DISPLAY-ONLY —
+  // it never derives an emulator value from Date.now(); every cycle/at_cycle shown
+  // comes verbatim from a server `cycle`/`at_cycle` field. The 1s poll is a pure
+  // display cadence and only READS (never submits a step/run).
+  // ===================================================================
+
+  // BranchKind tag names, indexed by the enum value (src/cpu/branch_trace.zig:25).
+  const BRANCH_KINDS = [
+    "call_near_direct", "ret_near", "ret_far", "iret", "call_near_ind",
+    "jmp_near_ind", "call_far", "call_far_ind", "jmp_far", "jmp_far_ind",
+    "interrupt",
+  ];
+
+  const $ = function (id) { return document.getElementById(id); };
+
+  // Parse a decimal or 0x-hex string to an integer; "" / NaN -> 0.
+  function parseNum(s) {
+    if (s == null) return 0;
+    s = String(s).trim();
+    if (s === "") return 0;
+    const n = /^0[xX]/.test(s) ? parseInt(s, 16) : parseInt(s, 10);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  // One JSON request helper: returns {ok,status,json}. `json` may carry the server's
+  // {code,message} error body (rendered as such). Never throws on a non-2xx.
+  async function call(method, path, body) {
+    const opts = { method: method };
+    if (body !== undefined) {
+      opts.headers = { "content-type": "application/json" };
+      opts.body = JSON.stringify(body);
+    }
+    let r;
+    try {
+      r = await api(path, opts);
+    } catch (e) {
+      return { ok: false, status: 0, json: { code: "network", message: String(e) } };
+    }
+    let j = null;
+    try { j = await r.json(); } catch (e) { /* some bodies are empty */ }
+    return { ok: r.ok, status: r.status, json: j };
+  }
+
+  // ---- peek frame (the per-machine paused view) ----
+  const peekImg = $("peek");
+  const peekBanner = $("peek-banner");
+  const peekBannerText = $("peek-banner-text");
+
+  // Make the paused-frame image accept live mouse + keyboard too (same handlers as the
+  // canvas), so you can interact with a machine whether it is playing or paused.
+  bindSurface(peekImg);
+
+  function setPeekBanner(text) {
+    if (peekBannerText) peekBannerText.textContent = text;
+  }
+
+  async function repaintPeek() {
+    // The default machine is live-streamed on the canvas; a PLAYING minted machine is too —
+    // only a paused minted machine uses the peek <img>, so skip the fetch otherwise.
+    if (isDefaultMachine() || playing) return;
+    let r;
+    try {
+      r = await api("/api/framebuffer?format=png");
+    } catch (e) {
+      setPeekBanner("debugger view — frame fetch failed");
+      return;
+    }
+    if (!r.ok) {
+      setPeekBanner("debugger view — no renderable frame (text/unsupported mode)");
+      return;
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    if (peekImg._url) URL.revokeObjectURL(peekImg._url);
+    peekImg._url = url;
+    peekImg.src = url;
+    setPeekBanner("debugger view — frame updates on step/run");
+  }
+
+  // Show the canvas (live) or the peek <img> (selected paused machine). The canvas is live for
+  // the default machine, AND for a minted machine while it is PLAYING (paced start) — both need
+  // WebGL2; otherwise (a paused minted machine, or no WebGL2) fall back to the peek frame.
+  function updateVideoView() {
+    if ((isDefaultMachine() || playing) && gl) {
+      canvas.classList.remove("hidden");
+      peekImg.classList.add("hidden");
+      peekBanner.classList.add("hidden");
+      connectStream(); // default, or a playing minted machine (the WS streams the selected one)
+      canvas.focus(); // capture keyboard immediately so the live machine is playable
+    } else {
+      canvas.classList.add("hidden");
+      peekImg.classList.remove("hidden");
+      peekBanner.classList.remove("hidden");
+      disconnectStream(); // minted machine: peek only, no stream (stops the connect/disconnect flip)
+      hideOverlay(); // peek owns the pane — don't let a stream/WebGL overlay sit over it
+      setStatus("ok", "debugger view (paused frame)");
+      repaintPeek();
+    }
+  }
+
+  // ---- CPU / register strip ----
+  const regStrip = $("reg-strip");
+  const cpuCycle = $("cpu-cycle");
+
+  function h8(v) { return (v >>> 0).toString(16).padStart(8, "0"); }
+  function h4(v) { return (v & 0xffff).toString(16).padStart(4, "0"); }
+
+  async function refreshRegs() {
+    const c = await call("GET", "/api/cpu");
+    if (!c.ok || !c.json) return;
+    const s = c.json;
+    const rows = [
+      ["eax", s.eax], ["esi", s.esi],
+      ["ebx", s.ebx], ["edi", s.edi],
+      ["ecx", s.ecx], ["ebp", s.ebp],
+      ["edx", s.edx], ["esp", s.esp],
+    ];
+    let html = "";
+    for (const [k, v] of rows) html += "<div>" + k + " " + h8(v) + "</div>";
+    html += "<div>cs:ip " + h4(s.cs) + ":" + h4(s.eip) + "</div>";
+    html += "<div>ss:sp " + h4(s.ss) + ":" + h4(s.esp) + "</div>";
+    html += "<div>ds " + h4(s.ds) + " es " + h4(s.es) + "</div>";
+    html += "<div>fs " + h4(s.fs) + " gs " + h4(s.gs) + "</div>";
+    const fl = ["cf", "pf", "af", "zf", "sf", "df", "of", "iff", "tf"]
+      .filter(function (f) { return s[f]; }).join(" ");
+    html += '<div class="flags">flags: ' + (fl || "(none)") +
+      (s.halted ? " · HALTED" : "") + (s.shutdown ? " · SHUTDOWN" : "") + "</div>";
+    regStrip.innerHTML = html;
+    if (cpuCycle) cpuCycle.textContent = "cyc " + s.cycles;
+  }
+
+  // ---- execution panel ----
+  const execOut = $("exec-out");
+
+  function fmtStop(j) {
+    if (!j) return "(no response)";
+    if (j.code) return "error: " + j.code + " — " + (j.message || "");
+    if (j.stop) {
+      const key = Object.keys(j.stop)[0];
+      const d = j.stop[key] || {};
+      let s = key;
+      if (d.at_cycle != null) s += " @ cycle " + d.at_cycle;
+      if (key === "breakpoint" && d.id != null) s += " (bp #" + d.id + ")";
+      if (key === "program_terminated" && d.ret_code != null) s += " ret=" + d.ret_code;
+      if (j.stepped_into) s += " [fell back to step-into]";
+      return s;
+    }
+    if (j.running != null) {
+      return "run: " + (j.running ? "RUNNING" : "stopped") + " · owner=" + j.owner +
+        " · cycle=" + j.cycle + " · last=" + j.last_stop_reason;
+    }
+    return JSON.stringify(j);
+  }
+
+  function showExec(text) { if (execOut) execOut.textContent = text; }
+
+  async function control(method, path, body) {
+    showExec("…");
+    const res = await call(method, path, body);
+    showExec(fmtStop(res.json));
+    refreshAll();
+  }
+
+  // ---- breakpoints ----
+  const bpList = $("bp-list");
+
+  function buildBpKind() {
+    const kind = $("bp-kind").value;
+    switch (kind) {
+      case "execution_address":
+        return { execution_address: { linear: parseNum($("bp-linear").value) } };
+      case "cycle":
+        return { cycle: { at_cycle: parseNum($("bp-at-cycle").value) } };
+      case "interrupt":
+        return { interrupt: { vector: parseNum($("bp-vector").value) } };
+      case "memory":
+        return { memory: {
+          linear: parseNum($("bp-linear").value),
+          len: parseNum($("bp-len").value),
+          access: $("bp-access").value,
+        } };
+      case "io":
+        return { io: { port: parseNum($("bp-port").value), access: $("bp-access").value } };
+    }
+    return null;
+  }
+
+  // Show only the inputs the selected kind needs.
+  const BP_FIELDS = {
+    execution_address: ["linear"],
+    cycle: ["at_cycle"],
+    interrupt: ["vector"],
+    memory: ["linear", "len", "access"],
+    io: ["port", "access"],
+  };
+  function updateBpFields() {
+    const need = BP_FIELDS[$("bp-kind").value] || [];
+    const rows = document.querySelectorAll("[data-bp-field]");
+    rows.forEach(function (row) {
+      const f = row.getAttribute("data-bp-field");
+      row.classList.toggle("hidden", need.indexOf(f) < 0);
+    });
+  }
+
+  async function addBp() {
+    const kind = buildBpKind();
+    if (!kind) return;
+    const res = await call("POST", "/api/breakpoints",
+      { kind: kind, one_shot: $("bp-oneshot").checked });
+    if (!res.ok) { showExec(fmtStop(res.json)); return; }
+    loadBpList();
+  }
+
+  async function loadBpList() {
+    const res = await call("GET", "/api/breakpoints");
+    const items = (res.json && res.json.breakpoints) || [];
+    bpList.innerHTML = "";
+    if (items.length === 0) { bpList.innerHTML = '<div class="muted small">none</div>'; return; }
+    items.forEach(function (bp) {
+      const div = document.createElement("div");
+      div.className = "item";
+      const kindStr = JSON.stringify(bp.kind);
+      div.innerHTML = '<span class="grow">#' + bp.id + " " + kindStr +
+        (bp.one_shot ? " (one-shot)" : "") + (bp.enabled ? "" : " [off]") + "</span>";
+      const del = document.createElement("button");
+      del.type = "button";
+      del.textContent = "✕";
+      del.addEventListener("click", async function () {
+        await call("DELETE", "/api/breakpoints/" + bp.id);
+        loadBpList();
+      });
+      div.appendChild(del);
+      bpList.appendChild(div);
+    });
+  }
+
+  async function clearBp() {
+    await call("DELETE", "/api/breakpoints");
+    loadBpList();
+  }
+
+  // ---- snapshots ----
+  const snapList = $("snap-list");
+
+  async function captureSnap() {
+    const res = await call("POST", "/api/snapshot");
+    if (!res.ok) { showExec(fmtStop(res.json)); }
+    loadSnapList();
+  }
+
+  async function loadSnapList() {
+    const res = await call("GET", "/api/snapshots");
+    const items = (res.json && res.json.snapshots) || [];
+    snapList.innerHTML = "";
+    if (items.length === 0) { snapList.innerHTML = '<div class="muted small">none</div>'; return; }
+    items.forEach(function (sn) {
+      const div = document.createElement("div");
+      div.className = "item";
+      div.innerHTML = '<span class="grow">' + sn.handle + " · cyc " + sn.cycle +
+        " · " + sn.bytes + " B</span>";
+      const restore = document.createElement("button");
+      restore.type = "button";
+      restore.textContent = "restore";
+      restore.addEventListener("click", async function () {
+        const r = await call("POST", "/api/restore", { snapshot: sn.handle });
+        showExec(r.ok ? "restored " + sn.handle : fmtStop(r.json));
+        refreshAll();
+      });
+      const del = document.createElement("button");
+      del.type = "button";
+      del.textContent = "✕";
+      del.addEventListener("click", async function () {
+        await call("DELETE", "/api/snapshot/" + sn.handle);
+        loadSnapList();
+      });
+      div.appendChild(restore);
+      div.appendChild(del);
+      snapList.appendChild(div);
+    });
+  }
+
+  // ---- branch trace + trap ----
+  const traceStatusEl = $("trace-status");
+  const traceOut = $("trace-out");
+  const trapOut = $("trap-out");
+
+  // Build the shared kind checkboxes into a container.
+  function buildKindChecks(container) {
+    container.innerHTML = "";
+    BRANCH_KINDS.forEach(function (name) {
+      const label = document.createElement("label");
+      label.className = "chk";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = name;
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(" " + name));
+      container.appendChild(label);
+    });
+  }
+  function collectKinds(container) {
+    const out = [];
+    container.querySelectorAll("input[type=checkbox]").forEach(function (cb) {
+      if (cb.checked) out.push(cb.value);
+    });
+    return out;
+  }
+
+  async function traceArm(enabled) {
+    const kinds = collectKinds($("trace-kinds"));
+    const body = { enabled: enabled };
+    if (enabled && kinds.length > 0) body.kinds = kinds;
+    await call("POST", "/api/branch-trace/arm", body);
+    loadTraceStatus();
+  }
+  async function traceClear() {
+    await call("POST", "/api/branch-trace/clear");
+    loadTraceStatus();
+  }
+  async function loadTraceStatus() {
+    const res = await call("GET", "/api/branch-trace/status");
+    const s = res.json;
+    if (!s) { traceStatusEl.textContent = ""; return; }
+    traceStatusEl.textContent = "armed=" + s.armed + " · ring " + s.len + "/" + s.capacity +
+      " · total " + s.total + " · trap=" + s.trap_armed;
+  }
+  async function traceDump() {
+    const q = "?limit=" + parseNum($("trace-limit").value) +
+      "&offset=" + parseNum($("trace-offset").value) +
+      "&newest_first=" + ($("trace-newest").checked ? 1 : 0);
+    const res = await call("GET", "/api/branch-trace/dump" + q);
+    const rows = (res.json && res.json.trace) || [];
+    let html = "<table><thead><tr><th>kind</th><th>from</th><th>to</th>" +
+      "<th>sp</th><th>at_cycle</th></tr></thead><tbody>";
+    rows.forEach(function (e) {
+      const kn = BRANCH_KINDS[e.kind] || ("?" + e.kind);
+      html += "<tr><td>" + kn + "</td><td>" + h4(e.from_cs) + ":" + h4(e.from_ip) +
+        "</td><td>" + h4(e.to_cs) + ":" + h4(e.to_ip) + "</td><td>" + h4(e.sp) +
+        "</td><td>" + e.at_cycle + "</td></tr>";
+    });
+    html += "</tbody></table>";
+    if (rows.length === 0) html = '<div class="muted small">empty</div>';
+    traceOut.innerHTML = html;
+  }
+
+  async function trapArm() {
+    const kinds = collectKinds($("trap-kinds"));
+    const body = {
+      to_range: $("trap-to-range").checked,
+      to_lo: parseNum($("trap-to-lo").value),
+      to_hi: $("trap-to-hi").value.trim() === "" ? 0xFFFFF : parseNum($("trap-to-hi").value),
+      sp_range: $("trap-sp-range").checked,
+      sp_lo: parseNum($("trap-sp-lo").value),
+      sp_hi: $("trap-sp-hi").value.trim() === "" ? 0xFFFF : parseNum($("trap-sp-hi").value),
+    };
+    if (kinds.length > 0) body.kinds = kinds;
+    const res = await call("POST", "/api/branch-trap/arm", body);
+    trapOut.textContent = res.ok ? "trap armed" : fmtStop(res.json);
+    loadTraceStatus();
+  }
+  async function trapClear() {
+    await call("POST", "/api/branch-trap/clear");
+    trapOut.textContent = "trap cleared";
+    loadTraceStatus();
+  }
+
+  // ---- action dispatch (event delegation on the sidebar) ----
+  const ACTIONS = {
+    "step": function () { control("POST", "/api/step"); },
+    "step-over": function () { control("POST", "/api/step-over"); },
+    "step-n": function () { control("POST", "/api/step-n", { n: parseNum($("step-n").value) || 1 }); },
+    "run": function () {
+      const cap = $("run-cap").value.trim();
+      control("POST", "/api/run", cap === "" ? {} : { cycle_cap: parseNum(cap) });
+    },
+    "run-to-cycle": function () { control("POST", "/api/run-to-cycle", { cycle: parseNum($("run-cycle").value) }); },
+    "run-to-address": function () { control("POST", "/api/run-to-address", { linear: parseNum($("run-addr").value) }); },
+    "run-start": function () {
+      const body = {};
+      const slice = $("run-slice").value.trim();
+      const fps = $("run-fps").value.trim();
+      if (slice !== "") body.slice_cycles = parseNum(slice);
+      if (fps !== "") body.fps = parseNum(fps);
+      control("POST", "/api/run/start", body);
+      // A minted machine now runs in real time (the host SessionPacer advances it): go LIVE —
+      // connect the stream to this machine and show the canvas instead of the paused peek.
+      if (!isDefaultMachine()) { playing = true; updateVideoView(); }
+    },
+    "run-stop": function () {
+      control("POST", "/api/run/stop");
+      // Paused again: drop the live stream and return to the per-machine peek frame.
+      if (!isDefaultMachine()) { playing = false; updateVideoView(); }
+    },
+    "run-status": async function () { const r = await call("GET", "/api/run/status"); showExec(fmtStop(r.json)); },
+    "bp-add": addBp,
+    "bp-list": loadBpList,
+    "bp-clear": clearBp,
+    "snap-capture": captureSnap,
+    "snap-list": loadSnapList,
+    "trace-arm": function () { traceArm(true); },
+    "trace-disarm": function () { traceArm(false); },
+    "trace-clear": traceClear,
+    "trace-status": loadTraceStatus,
+    "trace-dump": traceDump,
+    "trap-arm": trapArm,
+    "trap-clear": trapClear,
+  };
+
+  // ---- refresh discipline ----
+  function refreshAll() {
+    refreshRegs();
+    if (bpList.closest("details").open) loadBpList();
+    if (snapList.closest("details").open) loadSnapList();
+    if (traceStatusEl.closest("details").open) loadTraceStatus();
+    repaintPeek();
+  }
+
+  // ---- machine switcher ----
+  const machineSelect = $("machine-select");
+  const machineCount = $("machine-count");
+  const machineInfo = $("machine-info");
+  let lastMachineKey = "";
+
+  async function refreshMachines() {
+    let r;
+    try {
+      r = await fetch("/api/machines"); // PRE-routing: NO X-Zdos-Session header.
+    } catch (e) { return; }
+    if (!r.ok) return;
+    const j = await r.json();
+    const machines = j.machines || [];
+    machineCount.textContent = j.live_machines + "/" + j.max_machines;
+    // Rebuild the <select> only when the membership changed (don't clobber the
+    // user's current selection on every poll).
+    const key = machines.map(function (m) { return m.machine; }).join("|");
+    if (key !== lastMachineKey) {
+      lastMachineKey = key;
+      machineSelect.innerHTML = "";
+      if (machines.length === 0) {
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "(no machines)";
+        machineSelect.appendChild(opt);
+      }
+      machines.forEach(function (m) {
+        const opt = document.createElement("option");
+        opt.value = m.machine;
+        const isDef = m.machine === DEFAULT_SINGLETON;
+        opt.textContent = m.machine + (isDef ? " (default)" : "") +
+          (m.file ? " · " + m.file : "");
+        machineSelect.appendChild(opt);
+      });
+      // If nothing is selected yet, adopt the first machine.
+      if (activeMachine === "" && machines.length > 0) {
+        activeMachine = machines[0].machine;
+        machineSelect.value = activeMachine;
+        onMachineSelected();
+      } else if (machines.some(function (m) { return m.machine === activeMachine; })) {
+        machineSelect.value = activeMachine;
+      }
+    }
+    // Refresh the info line for the active machine.
+    const cur = machines.find(function (m) { return m.machine === activeMachine; });
+    machineInfo.textContent = cur
+      ? ("drive " + cur.drive + " · mult " + cur.mult + " · cyc " + cur.cycles)
+      : "";
+  }
+
+  // Reset the selected machine back to boot (re-runs its load recipe → ~cycle 0).
+  // Destructive — confirm first so a stray click can't nuke a session. Routed via
+  // call()/api() (the X-Zdos-Session header), so it hits whichever machine is selected.
+  async function resetMachine() {
+    const name = activeMachine || "the default machine";
+    if (!window.confirm("Reset " + name + " back to boot? This discards its current state.")) return;
+    showExec("resetting…");
+    const r = await call("POST", "/api/reset");
+    if (!r.ok) { showExec(fmtStop(r.json)); return; }
+    // Back at the entry point (peek frame likely black until it's run — that's correct).
+    showExec("reset → boot" + (r.json && r.json.cycle != null ? " @ cycle " + r.json.cycle : ""));
+    refreshAll();
+  }
+
+  function onMachineSelected() {
+    // A fresh selection starts in PAUSED/peek mode (the newly selected minted machine isn't
+    // being driven live yet); paced start switches it to live. The default ignores `playing`.
+    playing = false;
+    updateVideoView();
+    refreshAll();
+  }
+
+  // ---- 1s display-only poll: pure reads, and only while a run is in flight. ----
+  function startPoll() {
+    setInterval(async function () {
+      const r = await call("GET", "/api/run/status");
+      if (!r.json) return;
+      // While running, surface progress: refresh registers + the peek frame. NEVER
+      // submit a step/run from here — display cadence only.
+      if (r.json.running) {
+        refreshRegs();
+        repaintPeek();
+        // Track the live real-time ceiling: the host's sustainable mult drops in heavy
+        // scenes, so re-cap the slider as the workload changes (read-only — no apply).
+        refreshCpuCap();
+        if (execOut) showExec(fmtStop(r.json));
+      }
+    }, 1000);
+  }
+
+  function initDebugger() {
+    buildKindChecks($("trace-kinds"));
+    buildKindChecks($("trap-kinds"));
+    updateBpFields();
+    $("bp-kind").addEventListener("change", updateBpFields);
+
+    // Event delegation: every [data-act] button maps to ACTIONS.
+    document.getElementById("sidebar").addEventListener("click", function (e) {
+      const btn = e.target.closest("[data-act]");
+      if (!btn) return;
+      const fn = ACTIONS[btn.getAttribute("data-act")];
+      if (fn) fn();
+    });
+
+    machineSelect.addEventListener("change", function () {
+      activeMachine = machineSelect.value;
+      onMachineSelected();
+    });
+    $("machine-refresh").addEventListener("click", refreshMachines);
+    $("machine-reset").addEventListener("click", resetMachine);
+    $("peek-refresh").addEventListener("click", repaintPeek);
+
+    // Re-fetch an open panel's contents when it is expanded.
+    document.querySelectorAll("#sidebar details").forEach(function (d) {
+      d.addEventListener("toggle", function () { if (d.open) refreshAll(); });
+    });
+
+    refreshMachines();
+    setInterval(refreshMachines, 2000); // display-only enumeration cadence
+    refreshRegs();
+    updateVideoView();
+    startPoll();
+  }
 
   // ===================================================================
   // Boot
   // ===================================================================
   function main() {
+    let glReady = true;
     try {
       initGL();
     } catch (err) {
+      // WebGL2 backs ONLY the default machine's live WS stream. The debugger console
+      // (panels + per-machine paused-frame peek via /api/framebuffer) does not use it,
+      // so a GL failure must NOT abort init — it only disables the live canvas; every
+      // machine then displays through the peek <img>.
+      glReady = false;
       setStatus("err", err.message);
-      showOverlay("WebGL2 unavailable: " + err.message);
-      return;
+      showOverlay("WebGL2 unavailable: " + err.message + " — live stream off; using paused-frame peek");
     }
-    requestAnimationFrame(renderLoop);
-    connect();
+    if (glReady) requestAnimationFrame(renderLoop);
+    // The stream is NOT started here — `updateVideoView()` connects it only when a
+    // streamable (default) machine is selected, and uses peek mode for minted machines.
+    setStatus("pending", "select a machine");
     initCpuKnob();
-    canvas.focus();
+    initDebugger();
+    if (glReady) canvas.focus();
   }
 
   main();
