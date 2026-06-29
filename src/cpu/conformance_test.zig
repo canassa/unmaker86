@@ -67,6 +67,11 @@ test "conformance regression: curated opcodes pass 100%" {
             return error.ConformanceRegression;
         }
     }
+    // Coverage is enforced by the loop (any vector failure returns an error
+    // above) plus this floor. No stderr diagnostic: a unit test that writes to
+    // stderr makes `zig build test`'s `--listen` Run step report the command as
+    // failed (the build runner expects the test child's stderr to be empty),
+    // even though every assertion passes.
     try std.testing.expect(total > 0);
-    std.debug.print("conformance guard: {d}/{d} vectors over {d} curated opcodes\n", .{ total_pass, total, fully_passing.len });
+    try std.testing.expectEqual(total_pass, total);
 }

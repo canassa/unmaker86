@@ -47,13 +47,13 @@ test "disasm golden: byte -> text + length" {
         // ADD AL, imm8
         .{ .bytes = &.{ 0x04, 0x10 }, .text = "add al, 0x10", .len = 2 },
         // INC reg
-        .{ .bytes = &.{ 0x40 }, .text = "inc ax", .len = 1 },
-        .{ .bytes = &.{ 0x48 }, .text = "dec ax", .len = 1 },
+        .{ .bytes = &.{0x40}, .text = "inc ax", .len = 1 },
+        .{ .bytes = &.{0x48}, .text = "dec ax", .len = 1 },
         // PUSH / POP reg
-        .{ .bytes = &.{ 0x50 }, .text = "push ax", .len = 1 },
-        .{ .bytes = &.{ 0x5D }, .text = "pop bp", .len = 1 },
+        .{ .bytes = &.{0x50}, .text = "push ax", .len = 1 },
+        .{ .bytes = &.{0x5D}, .text = "pop bp", .len = 1 },
         // NOP
-        .{ .bytes = &.{ 0x90 }, .text = "nop", .len = 1 },
+        .{ .bytes = &.{0x90}, .text = "nop", .len = 1 },
         // disp16-direct memory: MOV ax, [0x1234]
         .{ .bytes = &.{ 0x8B, 0x06, 0x34, 0x12 }, .text = "mov ax, [0x1234]", .len = 4 },
         // BP defaults to SS (symbolic only renders base): mov ax, [bp+0x4]
@@ -85,12 +85,12 @@ test "disasm golden: byte -> text + length" {
         // far CALL direct 9A
         .{ .bytes = &.{ 0x9A, 0x00, 0x00, 0x20, 0x00 }, .text = "call far 0x20:0x0", .len = 5 },
         // RET / RET imm16 / RETF
-        .{ .bytes = &.{ 0xC3 }, .text = "ret", .len = 1 },
+        .{ .bytes = &.{0xC3}, .text = "ret", .len = 1 },
         .{ .bytes = &.{ 0xC2, 0x04, 0x00 }, .text = "ret 0x4", .len = 3 },
-        .{ .bytes = &.{ 0xCB }, .text = "retf", .len = 1 },
+        .{ .bytes = &.{0xCB}, .text = "retf", .len = 1 },
         // INT n / INT3
         .{ .bytes = &.{ 0xCD, 0x21 }, .text = "int 0x21", .len = 2 },
-        .{ .bytes = &.{ 0xCC }, .text = "int3", .len = 1 },
+        .{ .bytes = &.{0xCC}, .text = "int3", .len = 1 },
         // Grp1: ADD word [bx], imm8 (sign-extended) -- 83 /0 ib
         .{ .bytes = &.{ 0x83, 0x07, 0x05 }, .text = "add word [bx], 0x5", .len = 3 },
         // Grp1: CMP byte [bx], imm8 -- 80 /7 ib
@@ -134,8 +134,8 @@ test "disasm golden: byte -> text + length" {
         .{ .bytes = &.{ 0xE4, 0x60 }, .text = "in al, 0x60", .len = 2 },
         .{ .bytes = &.{ 0xE6, 0x61 }, .text = "out 0x61, al", .len = 2 },
         // flag ops
-        .{ .bytes = &.{ 0xFA }, .text = "cli", .len = 1 },
-        .{ .bytes = &.{ 0xFB }, .text = "sti", .len = 1 },
+        .{ .bytes = &.{0xFA}, .text = "cli", .len = 1 },
+        .{ .bytes = &.{0xFB}, .text = "sti", .len = 1 },
         // no-FPU ESC range: render honestly, correct length (D8 modrm)
         .{ .bytes = &.{ 0xD8, 0x06, 0x00, 0x10 }, .text = "(no-fpu) esc 0xd8", .len = 4 },
         // unknown opcode -> db 0x<lead> length 1 (0F 0B = UD2, no entry)
@@ -185,10 +185,10 @@ test "disasm: a NULL byte source yields db 0x00, length 1 (no fake, no crash)" {
 /// distance, not the encoded length. Those lengths are pinned exactly by the
 /// golden TEXT suite above (je/jne/jmp/call/ret/far cases) instead.
 const length_check_files = [_][]const u8{
-    "90",   "00",   "01",   "02",   "03",   "05",
-    "88",   "89",   "8A",   "8B",   "40",   "48",
-    "20",   "08",   "30",   "38",   "0FAF", "50",
-    "58",   "AA",   "AC",   "0FB6", "0FBE",
+    "90", "00", "01", "02",   "03",   "05",
+    "88", "89", "8A", "8B",   "40",   "48",
+    "20", "08", "30", "38",   "0FAF", "50",
+    "58", "AA", "AC", "0FB6", "0FBE",
 };
 
 fn cpuConsumedLen(a: std.mem.Allocator, t: pt.ProcessorTest) !?u8 {
@@ -262,8 +262,11 @@ test "disasm length == cpu-consumed length over conformance vectors" {
             if (try cpuConsumedLen(a, t)) |_| checked += 1;
         }
     }
+    // The `> 100` floor is the coverage guard. No stderr diagnostic: a unit
+    // test that writes to stderr makes `zig build test`'s `--listen` Run step
+    // report the command as failed (the build runner expects the test child's
+    // stderr to be empty), even though every assertion passes.
     try std.testing.expect(checked > 100);
-    std.debug.print("disasm length cross-check: {d} vectors matched cpu-consumed length\n", .{checked});
 }
 
 // ---------------------------------------------------------------------------
