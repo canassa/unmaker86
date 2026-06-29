@@ -13,6 +13,7 @@ const dta_mod = @import("dta.zig");
 const sft_mod = @import("sft.zig");
 const mcb_mod = @import("mcb.zig");
 const fcb_mod = @import("fcb.zig");
+const dos_mod = @import("dos.zig");
 
 const EAX = @intFromEnum(Reg32.eax);
 const EBX = @intFromEnum(Reg32.ebx);
@@ -111,6 +112,7 @@ pub fn Int21(comptime Cpu: type) type {
                 0x1A => { // set DTA = DS:DX
                     dos.dta_seg = cpu.st.selector[@intFromEnum(Seg.ds)];
                     dos.dta_off = cpu.st.getReg16(EDX);
+                    dos.writeSdaContext(); // keep the SDA's DTA mirror current
                 },
                 0x2F => { // get DTA -> ES:BX
                     cpu.loadSegment(.es, dos.dta_seg);
@@ -140,11 +142,20 @@ pub fn Int21(comptime Cpu: type) type {
                 0x0E => { // select drive DL -> AL = number of drives
                     dos.current_drive = cpu.st.getReg8(2);
                     cpu.st.setReg8(0, 26);
+                    dos.writeSdaContext(); // keep the SDA's drive mirror current
                 },
 
                 // ---- PSP ----
-                0x50 => dos.current_psp = cpu.st.getReg16(EBX), // set PSP
+                0x50 => { // set PSP
+                    dos.current_psp = cpu.st.getReg16(EBX);
+                    dos.writeSdaContext(); // keep the SDA's PSP mirror current
+                },
                 0x51, 0x62 => cpu.st.setReg16(EBX, dos.current_psp), // get PSP
+                0x34 => { // get InDOS flag address -> ES:BX (the SDA InDOS byte)
+                    cpu.loadSegment(.es, dos_mod.DOS_SDA_SEG);
+                    cpu.st.setReg16(EBX, 0x01);
+                },
+                0x5D => sda5d(dos, cpu, br), // server/SDA functions (AL=06 -> SDA addr)
 
                 // ---- File handles ----
                 0x3C => createFile(dos, cpu, br),
@@ -1164,6 +1175,29 @@ pub fn Int21(comptime Cpu: type) type {
             // The documented "List of Lists" pointer points into the block, so
             // [ES:BX-2] is the first-MCB segment (the real arena anchor, D9).
             cpu.st.setReg16(EBX, sysvars_lol_off);
+            // blockDevices (LoL+0x20, abs 0x46) is recomputed per call: 2 floppies
+            // plus each present non-removable block drive (dos.cpp:1257-1259). dosbox's
+            // loop `while count<26 && Drives[count] && !IsRemovable()` stops at the first
+            // absent/removable slot; zdos models only non-removable host-dir drives, so
+            // the IsRemovable() term is unconditionally false here and the presence test
+            // alone is dosbox-exact (a sparse mount stops early in BOTH, by design).
+            var count: u8 = 2;
+            while (count < 26 and dos.drivePtr(count) != null) : (count += 1) {}
+            cpu.bus.writePhys8((@as(u32, sv) << 4) + 0x46, count);
+        }
+
+        /// AH=5Dh server/SDA functions (dos.cpp:1401). Only AL=06 (Get SDA Address) is
+        /// serviced: DS:SI -> the Swappable Data Area, CX = "swap if InDOS" region
+        /// length (0x80, real-DOS canonical), DX = "swap always" length (0x1A, the
+        /// bytes zdos actually models). The SDA is a live mirror (writeSdaContext), so
+        /// no per-call materialization is needed. Other AL values are unsupported.
+        fn sda5d(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
+            if (cpu.st.getReg8(0) != 0x06) return dos.unsupported(cpu, br, 0x21);
+            cpu.loadSegment(.ds, dos_mod.DOS_SDA_SEG);
+            cpu.st.setReg16(@intFromEnum(Reg32.esi), 0);
+            cpu.st.setReg16(ECX, 0x80);
+            cpu.st.setReg16(EDX, 0x1A);
+            br.setGuestCF(false);
         }
 
         /// AH=29 parse filename into FCB (dos.cpp:743). DS:SI -> source string,

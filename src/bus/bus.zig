@@ -251,6 +251,25 @@ pub const Bus = struct {
         }
     }
 
+    /// Mark a page-aligned region as plain RAM (`page_kind = .ram`), so the
+    /// physical slab becomes readable/writable there. zdos's page map defaults the
+    /// ROM window (0xC0000..0xEFFFF) to `.unmapped`; DOS carves its resident table
+    /// pool from 0xC8000 (dosbox `DOS_PRIVATE_SEGMENT`), which lives in that window,
+    /// so it must be claimed before the tables are planted. The slab physically
+    /// backs the region (asserted). Deterministic + idempotent: `page_kind` is in
+    /// the serialized hot prefix (survives snapshot/restore) and `dosInit` re-runs
+    /// this on every `post()`. No handler, no allocation — just a kind flip.
+    pub fn mapRam(self: *Bus, phys_start: u32, len: u32) void {
+        std.debug.assert(phys_start % memmap.page_size == 0);
+        std.debug.assert(len % memmap.page_size == 0 and len != 0);
+        std.debug.assert(phys_start + len <= memmap.ram_total_size);
+        const first = memmap.pageIndex(phys_start);
+        const count = len >> memmap.page_shift;
+        std.debug.assert(first + count <= memmap.page_count);
+        var p: u32 = 0;
+        while (p < count) : (p += 1) self.page_kind[first + p] = .ram;
+    }
+
     // -----------------------------------------------------------------------
     // A20 (B5) — the bus is the sole owner.
     // -----------------------------------------------------------------------

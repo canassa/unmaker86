@@ -303,3 +303,108 @@ test "AH=58 set UMB link fails (no UMB region)" {
     try std.testing.expect(m.cpu.st.eflags.cf);
     try std.testing.expectEqual(@as(u16, 1), m.cpu.st.getReg16(@intFromEnum(Reg32.eax)));
 }
+
+// ---- Phase 2: resident-DOS internals (List-of-Lists / device chain / SDA / CDS) ----
+
+const ES = @intFromEnum(Seg.es);
+const DS = @intFromEnum(Seg.ds);
+const ESI = @intFromEnum(Reg32.esi);
+const EBX = @intFromEnum(Reg32.ebx);
+const ECX = @intFromEnum(Reg32.ecx);
+const EDX = @intFromEnum(Reg32.edx);
+
+test "Phase 2: List-of-Lists is byte-faithful to dosbox (sDIB fields + 0xFF gaps)" {
+    var ctx = try boot(std.testing.allocator);
+    defer ctx.deinit();
+    const m = ctx.m;
+    const lol: u32 = 0x80 << 4; // AH=52 returns 0x80:0x26; offsets here are absolute
+    try std.testing.expectEqual(@as(u16, 0x0001), m.bus.readPhys16(lol + 0x04)); // magicWord
+    try std.testing.expectEqual(@as(u16, 0x016F), m.bus.readPhys16(lol + 0x24)); // firstMCB
+    try std.testing.expectEqual(@as(u32, 0x008000CC), m.bus.readPhys32(lol + 0x2A)); // firstFileTable
+    try std.testing.expectEqual(@as(u16, 0x0200), m.bus.readPhys16(lol + 0x36)); // maxSectorLength
+    try std.testing.expectEqual(@as(u32, 0x01080000), m.bus.readPhys32(lol + 0x3C)); // curDirStructure
+    try std.testing.expectEqual(@as(u32, 0xC82F0000), m.bus.readPhys32(lol + 0x40)); // fcbTable
+    try std.testing.expectEqual(@as(u8, 0x01), m.bus.readPhys8(lol + 0x47)); // lastdrive
+    try std.testing.expectEqual(@as(u32, 0x00A00000), m.bus.readPhys32(lol + 0x48)); // nulNextDriver
+    try std.testing.expectEqual(@as(u16, 0x8004), m.bus.readPhys16(lol + 0x4C)); // nulAttributes
+    try std.testing.expectEqual(@as(u16, 50), m.bus.readPhys16(lol + 0x65)); // buffers_x
+    try std.testing.expectEqual(@as(u16, 50), m.bus.readPhys16(lol + 0x67)); // buffers_y
+    try std.testing.expectEqual(@as(u8, 1), m.bus.readPhys8(lol + 0x6A)); // useDwordMov
+    try std.testing.expectEqual(@as(u16, 0), m.bus.readPhys16(lol + 0x6B)); // extendedSize (no XMS)
+    try std.testing.expectEqual(@as(u32, 0xC8460000), m.bus.readPhys32(lol + 0x6D)); // diskBufferHeadPt
+    try std.testing.expectEqual(@as(u16, 0xFFFF), m.bus.readPhys16(lol + 0x8C)); // startOfUMBChain
+    try std.testing.expectEqual(@as(u16, 0x016F), m.bus.readPhys16(lol + 0x8E)); // memAllocScanStart
+    // nulString "NUL     "
+    try std.testing.expectEqualSlices(u8, "NUL     ", &[_]u8{
+        m.bus.readPhys8(lol + 0x52), m.bus.readPhys8(lol + 0x53), m.bus.readPhys8(lol + 0x54),
+        m.bus.readPhys8(lol + 0x55), m.bus.readPhys8(lol + 0x56), m.bus.readPhys8(lol + 0x57),
+        m.bus.readPhys8(lol + 0x58), m.bus.readPhys8(lol + 0x59),
+    });
+    // The five dosbox 0xFF gaps stay 0xFF; protFCBs (0x44) is explicitly zeroed (NOT a gap).
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), m.bus.readPhys32(lol + 0x26)); // firstDPB gap
+    try std.testing.expectEqual(@as(u8, 0xFF), m.bus.readPhys8(lol + 0x14)); // stuff gap
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), m.bus.readPhys32(lol + 0x2E)); // activeClock gap
+    try std.testing.expectEqual(@as(u16, 0), m.bus.readPhys16(lol + 0x44)); // protFCBs (zeroed)
+}
+
+test "Phase 2: device chain CON header + a walk reaches end-of-chain" {
+    var ctx = try boot(std.testing.allocator);
+    defer ctx.deinit();
+    const m = ctx.m;
+    // Walk from the LoL device-chain head (LoL+0x22 = abs 0x48).
+    const head = m.bus.readPhys32((0x80 << 4) + 0x48);
+    try std.testing.expectEqual(@as(u32, 0x00A00000), head); // -> CON 0xA0:0
+    const con: u32 = 0xA0 << 4;
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), m.bus.readPhys32(con + 0x00)); // next = end
+    try std.testing.expectEqual(@as(u16, 0x8013), m.bus.readPhys16(con + 0x04)); // attributes
+    try std.testing.expectEqual(@as(u32, 0x204E4F43), m.bus.readPhys32(con + 0x0A)); // "CON "
+    try std.testing.expectEqual(@as(u32, 0x20202020), m.bus.readPhys32(con + 0x0E)); // "    "
+    // The fake CDS "C:\" the LoL curDirStructure points at.
+    try std.testing.expectEqual(@as(u32, 0x005C3A43), m.bus.readPhys32(0x108 << 4));
+}
+
+test "Phase 2: AH=34 returns the SDA InDOS-flag address (0xB2:0x01)" {
+    var ctx = try boot(std.testing.allocator);
+    defer ctx.deinit();
+    const m = ctx.m;
+    loadCode(m, &.{ 0xB4, 0x34, 0xCD, 0x21, 0xF4 }); // mov ah,34 ; int 21 ; hlt
+    run(m);
+    try std.testing.expectEqual(@as(u16, 0xB2), m.cpu.st.selector[ES]);
+    try std.testing.expectEqual(@as(u16, 0x01), m.cpu.st.getReg16(@intFromEnum(Reg32.ebx)));
+    // dosbox-exact: InDOS (0x01) stays 0, critical-error (0x00) 0, drive_crit_error (0x02) 0xFF.
+    try std.testing.expectEqual(@as(u8, 0), m.bus.readPhys8((0xB2 << 4) + 0x00));
+    try std.testing.expectEqual(@as(u8, 0), m.bus.readPhys8((0xB2 << 4) + 0x01));
+    try std.testing.expectEqual(@as(u8, 0xFF), m.bus.readPhys8((0xB2 << 4) + 0x02));
+}
+
+test "Phase 2: AH=5D06 returns the SDA address + region lengths (CX=0x80, DX=0x1A)" {
+    var ctx = try boot(std.testing.allocator);
+    defer ctx.deinit();
+    const m = ctx.m;
+    loadCode(m, &.{ 0xB8, 0x06, 0x5D, 0xCD, 0x21, 0xF4 }); // mov ax,5D06 ; int 21 ; hlt
+    run(m);
+    try std.testing.expectEqual(@as(u16, 0xB2), m.cpu.st.selector[DS]);
+    try std.testing.expectEqual(@as(u16, 0), m.cpu.st.getReg16(ESI));
+    try std.testing.expectEqual(@as(u16, 0x80), m.cpu.st.getReg16(ECX));
+    try std.testing.expectEqual(@as(u16, 0x1A), m.cpu.st.getReg16(EDX));
+    try std.testing.expect(!m.cpu.st.eflags.cf);
+}
+
+test "Phase 2: SDA live-mirrors current PSP, and AH=52 sets blockDevices=3 (A,B,C)" {
+    var ctx = try boot(std.testing.allocator);
+    defer ctx.deinit();
+    const m = ctx.m;
+    // The SDA PSP mirror reflects the resident shell installed during post().
+    try std.testing.expectEqual(m.dos.current_psp, m.bus.readPhys16((0xB2 << 4) + 0x10));
+    // One snippet: AH=50 set-PSP (updates the live mirror), then AH=52 (recomputes
+    // blockDevices = 2 floppies + C: present = 3). (loadCode does not clear `halted`,
+    // so both calls must run before the single HLT.)
+    loadCode(m, &.{
+        0xB4, 0x50, 0xBB, 0x34, 0x12, 0xCD, 0x21, // mov ah,50; mov bx,1234; int 21
+        0xB4, 0x52, 0xCD, 0x21, // mov ah,52; int 21
+        0xF4, // hlt
+    });
+    run(m);
+    try std.testing.expectEqual(@as(u16, 0x1234), m.bus.readPhys16((0xB2 << 4) + 0x10));
+    try std.testing.expectEqual(@as(u8, 3), m.bus.readPhys8((0x80 << 4) + 0x46));
+}

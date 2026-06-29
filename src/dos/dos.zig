@@ -52,10 +52,24 @@ pub const DOS_VER_MINOR: u8 = 0;
 // List-of-Lists sub-structures); zdos services those host-side today.
 pub const DOS_INFOBLOCK_SEG: u16 = 0x80; // List-of-Lists / SysVars block (AH=52)
 pub const DOS_CONDRV_SEG: u16 = 0xA0; // CON device header (Phase 2)
+pub const DOS_CONSTRING_SEG: u16 = 0xA8; // "CON" >20-files detection strings (Phase 2)
 pub const DOS_SDA_SEG: u16 = 0xB2; // Swappable Data Area (Phase 2)
 pub const DOS_CDS_SEG: u16 = 0x108; // Current Directory Structure (Phase 2)
 pub const DOS_FIRST_SHELL: u16 = 0x118; // the resident COMMAND.COM PSP
 pub const DOS_MEM_START: u16 = 0x16F; // first MCB header (top of low DOS)
+// DOS private table pool (dosbox DOS_PRIVATE_SEGMENT 0xC800..0xD000). zdos plants
+// the secondary resident tables here at dosbox's exact bump-allocated segments; the
+// region is .unmapped by default (ROM window) so dosInit `mapRam`s it first. The
+// sub-segments below are the result of dosbox's DOS_GetMemory(pages) call order
+// (dos_tables.cpp:64-184).
+pub const DOS_PRIV_SEG: u16 = 0xC800;
+pub const PRIV_DBCS_SEG: u16 = 0xC808; // double-byte lead-byte table (12 paras)
+pub const PRIV_FNCHAR_SEG: u16 = 0xC814; // filename char table (2 paras)
+pub const PRIV_COLLATE_SEG: u16 = 0xC816; // collating seq + upcase (25 paras)
+pub const PRIV_FCBSFT_SEG: u16 = 0xC82F; // fake FCB system file table (4 paras)
+pub const PRIV_DPB_SEG: u16 = 0xC833; // fake drive parameter block (16 paras)
+pub const PRIV_DISKBUF_SEG: u16 = 0xC846; // fake disk buffer head (6 paras)
+pub const PRIV_MUXSFT_SEG: u16 = 0xC84C; // fake SFT for MUX AX=1216 (60 paras)
 pub const UMB_START_SEG: u16 = 0x9FFF; // no-UMB sentinel boundary (dos_memory.cpp:22)
 pub const ARENA_TOP: u16 = 0x9FFE; // last owned conventional paragraph
 
@@ -306,28 +320,26 @@ pub fn Dos(comptime Cpu: type) type {
             self.cpu.bus.writePhys32(0x04 * 4, iret_stub);
             self.cpu.bus.writePhys32(0x0F * 4, iret_stub);
 
-            // ---- The List-of-Lists / SysVars block (AH=52, D20) ----
+            // ---- The DOS private table pool (dos_tables.cpp:27-41) ----
+            // dosbox carves resident tables from 0xC800 (DOS_PRIVATE_SEGMENT); that
+            // segment is in zdos's .unmapped ROM window, so claim its first page as
+            // RAM before planting. Idempotent + boot-invariant (re-run every post()).
+            self.cpu.bus.mapRam(@as(u32, DOS_PRIV_SEG) << 4, 0x1000);
+
+            // ---- The List-of-Lists / SysVars block + sub-structures (AH=52, D20) ----
             // dosbox places the DOS InfoBlock at DOS_INFOBLOCK_SEG (0x80); AH=52
             // returns ES:BX = 0x80:0x26 and [0x80:0x24] (= BX-2) is the firstMCB
-            // anchor — the REAL arena MCB segment (DOS_MEM_START), not a faked
-            // pointer. NOTE (determinism, correction G1): `sysvars_seg` is a
-            // boot-INVARIANT constant recomputed by every `post()`; it is NOT
-            // snapshotted and is NEVER mutated at runtime — it survives a restore
-            // only because `post()` re-runs this. Same for `arena_first_mcb` below.
+            // anchor — the REAL arena MCB segment (DOS_MEM_START). NOTE (determinism,
+            // correction G1): `sysvars_seg`/`arena_first_mcb` are boot-INVARIANT
+            // constants recomputed by every `post()`; NOT snapshotted, NEVER mutated
+            // at runtime — they survive a restore only because `post()` re-runs this.
             self.sysvars_seg = DOS_INFOBLOCK_SEG;
-            const lol = Int21.sysvars_lol_off;
-            var z: u16 = 0;
-            while (z < 64) : (z += 1) self.cpu.bus.writePhys8((@as(u32, self.sysvars_seg) << 4) + z, 0);
-            // startOfUMBChain (InfoBlock+0x8C) = 0xFFFF when no UMBs are linked,
-            // exactly dosbox (dos_tables.cpp: DOS_InfoBlock ctor / SetStartOfUMBChain).
-            // 0x8C is past the 64-byte zero-fill, so set it explicitly.
-            self.cpu.bus.writePhys16((@as(u32, self.sysvars_seg) << 4) + 0x8C, 0xFFFF);
-
-            // ---- The pre-fragmented arena MCB chain (dos_memory.cpp:484-565) ----
             self.arena_first_mcb = DOS_MEM_START;
-            self.mcb().initPreFragmented();
-            // First-MCB segment anchor at [block:LoL-2] = 0x80:0x24.
-            self.cpu.bus.writePhys16((@as(u32, self.sysvars_seg) << 4) + lol - 2, self.arena_first_mcb);
+            self.mcb().initPreFragmented(); // pre-fragmented arena (dos_memory.cpp:484)
+            self.buildSysVars(); // full sDIB + SFT chain + CDS/device/table pointers
+            self.buildDeviceChain(); // CON header @0xA0 + CON-detection strings @0xA8
+            self.buildDosTables(); // fake FCB-SFT / DPB / disk-buffer / etc. @0xC800
+            self.buildSda(); // Swappable Data Area @0xB2 (context filled by the shell)
 
             // Standard handles 0-4 -> CON/CON/CON/AUX/PRN (D17).
             self.sft.openDeviceAt(0, &self.dev_table.con, .read_only); // stdin
@@ -338,6 +350,187 @@ pub fn Dos(comptime Cpu: type) type {
 
             // ---- The resident COMMAND.COM shell PSP + env (shell.cpp:1280-1357) ----
             self.installResidentShell();
+        }
+
+        /// Build the full DOS InfoBlock / List-of-Lists at DOS_INFOBLOCK_SEG (0x80),
+        /// byte-faithful to dosbox `DOS_InfoBlock::SetLocation` (dos_classes.cpp:50-114)
+        /// plus the device-chain / CDS / FCB / disk-buffer wiring from `DOS_SetupTables`
+        /// (dos_tables.cpp). AH=52 returns ES:BX = 0x80:0x26; the documented LoL
+        /// offsets are relative to that. Init is `memset(0xFF,144)` then `memset(0,14)`
+        /// then every SSET (incl. the zero-valued ones), so the only bytes left 0xFF
+        /// are dosbox's five gaps (0x14-0x19, 0x1E-0x21, 0x26-0x29, 0x2E-0x35, 0x7E-0x88
+        /// — firstDPB/activeClock/activeCon/diskBufPtr/stuff/unknown3). Every write is a
+        /// compile-time constant (determinism).
+        fn buildSysVars(self: *Self) void {
+            const cpu = self.cpu;
+            const seg = self.sysvars_seg; // 0x80
+            const base: u32 = @as(u32, seg) << 4;
+            var i: u32 = 0;
+            while (i < 0x90) : (i += 1) cpu.bus.writePhys8(base + i, 0xFF); // clear to 0xFF
+            i = 0;
+            while (i < 14) : (i += 1) cpu.bus.writePhys8(base + i, 0x00); // first 14 -> 0
+            // Every SSET_* from SetLocation, in struct-offset order.
+            cpu.bus.writePhys16(base + 0x04, 0x0001); // magicWord (DOS5+)
+            cpu.bus.writePhys16(base + 0x0E, 0); // regCXfrom5e
+            cpu.bus.writePhys16(base + 0x10, 0); // countLRUcache
+            cpu.bus.writePhys16(base + 0x12, 0); // countLRUopens
+            cpu.bus.writePhys16(base + 0x1A, 0); // sharingCount
+            cpu.bus.writePhys16(base + 0x1C, 0); // sharingDelay
+            cpu.bus.writePhys16(base + 0x22, 0); // ptrCONinput (no unread input)
+            cpu.bus.writePhys16(base + 0x24, self.arena_first_mcb); // firstMCB anchor (D9)
+            // firstFileTable -> seg:0xCC; a 2-node fake SFT chain of 100 files each so
+            // programs see 100 handles (dos_classes.cpp:104-114). sft_offset =
+            // offsetof(firstFileTable)+0xa2 = 0x2A+0xA2 = 0xCC; node #2 at seg+0x26=0xA6.
+            cpu.bus.writePhys32(base + 0x2A, (@as(u32, seg) << 16) | 0xCC);
+            cpu.bus.writePhys32(base + 0xCC, (@as(u32, seg + 0x26) << 16)); // node1.next -> 0xA6:0
+            cpu.bus.writePhys16(base + 0xD0, 100); // node1.numFiles
+            const n2: u32 = @as(u32, seg + 0x26) << 4;
+            cpu.bus.writePhys32(n2 + 0x00, 0xFFFFFFFF); // node2.next = end
+            cpu.bus.writePhys16(n2 + 0x04, 100); // node2.numFiles
+            cpu.bus.writePhys16(base + 0x36, 0x0200); // maxSectorLength
+            cpu.bus.writePhys32(base + 0x38, (@as(u32, seg) << 16) | 0x6D); // diskInfoBuffer -> self:0x6D
+            cpu.bus.writePhys32(base + 0x3C, @as(u32, DOS_CDS_SEG) << 16); // curDirStructure -> 0x108:0
+            cpu.bus.writePhys32(base + 0x40, @as(u32, PRIV_FCBSFT_SEG) << 16); // fcbTable -> 0xC82F:0
+            cpu.bus.writePhys16(base + 0x44, 0); // protFCBs
+            cpu.bus.writePhys8(base + 0x46, 0); // blockDevices (recomputed by AH=52)
+            cpu.bus.writePhys8(base + 0x47, 0x01); // lastdrive (LASTDRIVE)
+            cpu.bus.writePhys32(base + 0x48, @as(u32, DOS_CONDRV_SEG) << 16); // nulNextDriver -> CON 0xA0:0
+            cpu.bus.writePhys16(base + 0x4C, 0x8004); // nulAttributes (NUL char dev)
+            cpu.bus.writePhys32(base + 0x4E, 0); // nulStrategy
+            cpu.bus.writePhys8(base + 0x52, 0x4E); // nulString "NUL     "
+            cpu.bus.writePhys8(base + 0x53, 0x55);
+            cpu.bus.writePhys8(base + 0x54, 0x4C);
+            cpu.bus.writePhys8(base + 0x55, 0x20);
+            cpu.bus.writePhys8(base + 0x56, 0x20);
+            cpu.bus.writePhys8(base + 0x57, 0x20);
+            cpu.bus.writePhys8(base + 0x58, 0x20);
+            cpu.bus.writePhys8(base + 0x59, 0x20);
+            cpu.bus.writePhys8(base + 0x5A, 0); // joindedDrives
+            cpu.bus.writePhys16(base + 0x5B, 0); // specialCodeSeg
+            cpu.bus.writePhys32(base + 0x5D, 0); // setverPtr
+            cpu.bus.writePhys16(base + 0x61, 0); // a20FixOfs
+            cpu.bus.writePhys16(base + 0x63, 0); // pspLastIfHMA
+            cpu.bus.writePhys16(base + 0x65, 50); // buffers_x
+            cpu.bus.writePhys16(base + 0x67, 50); // buffers_y
+            cpu.bus.writePhys8(base + 0x69, 0); // bootDrive
+            cpu.bus.writePhys8(base + 0x6A, 1); // useDwordMov
+            // extendedSize = total extended KB. zdos models 1 MiB + HMA only and INT 15h
+            // AH=88 reports 0 extended KB, so this is 0 (consistent, honest — no XMS).
+            cpu.bus.writePhys16(base + 0x6B, 0); // extendedSize
+            cpu.bus.writePhys32(base + 0x6D, @as(u32, PRIV_DISKBUF_SEG) << 16); // diskBufferHeadPt -> 0xC846:0
+            cpu.bus.writePhys16(base + 0x71, 0); // dirtyDiskBuffers
+            cpu.bus.writePhys32(base + 0x73, 0); // lookaheadBufPt
+            cpu.bus.writePhys16(base + 0x77, 0); // lookaheadBufNumber
+            cpu.bus.writePhys8(base + 0x79, 0); // bufferLocation
+            cpu.bus.writePhys32(base + 0x7A, 0); // workspaceBuffer
+            cpu.bus.writePhys8(base + 0x89, 0); // chainingUMB
+            cpu.bus.writePhys16(base + 0x8A, 0); // minMemForExec
+            cpu.bus.writePhys16(base + 0x8C, 0xFFFF); // startOfUMBChain (no UMBs)
+            cpu.bus.writePhys16(base + 0x8E, DOS_MEM_START); // memAllocScanStart
+        }
+
+        /// Plant the resident device-driver chain head: the CON device header at
+        /// DOS_CONDRV_SEG (0xA0) and the "CON" >20-files detection strings at
+        /// DOS_CONSTRING_SEG (0xA8), byte-faithful to dos_tables.cpp:76-87. The LoL
+        /// nulNextDriver field (set in buildSysVars) points here; CON's `next` ends the
+        /// chain. NUL/LPT1 stay host-serviced (dosbox plants no RAM header for them);
+        /// strategy/interrupt are invalid far pointers (device I/O is host-serviced).
+        fn buildDeviceChain(self: *Self) void {
+            const cpu = self.cpu;
+            const con: u32 = @as(u32, DOS_CONDRV_SEG) << 4;
+            cpu.bus.writePhys32(con + 0x00, 0xFFFFFFFF); // next -> end of chain
+            cpu.bus.writePhys16(con + 0x04, 0x8013); // attr: char|special|stdout|stdin
+            cpu.bus.writePhys32(con + 0x06, 0xFFFFFFFF); // strategy+interrupt (invalid)
+            cpu.bus.writePhys32(con + 0x0A, 0x204E4F43); // name "CON " (43 4F 4E 20)
+            cpu.bus.writePhys32(con + 0x0E, 0x20202020); // name "    " -> "CON     "
+            const cs: u32 = @as(u32, DOS_CONSTRING_SEG) << 4;
+            cpu.bus.writePhys32(cs + 0x0A, 0x204E4F43); // "CON " detection strings
+            cpu.bus.writePhys32(cs + 0x1A, 0x204E4F43);
+            cpu.bus.writePhys32(cs + 0x2A, 0x204E4F43);
+            // The fake CDS: a single ASCIIZ "C:\" at DOS_CDS_SEG:0 (dos_tables.cpp:88-92);
+            // the LoL curDirStructure (buildSysVars) points here. Directory state is kept
+            // host-side (cwd[]/current_drive) exactly as dosbox keeps it in DOS_Drive.
+            cpu.bus.writePhys32(@as(u32, DOS_CDS_SEG) << 4, 0x005C3A43); // "C:\\" + NUL
+        }
+
+        /// Plant the secondary resident tables in the 0xC800 private pool at dosbox's
+        /// exact bump-allocated segments (dos_tables.cpp:96-184), so the LoL pointers
+        /// (fcbTable, diskBufferHeadPt) and a literal-segment peek both resolve to real
+        /// structures. Country/MUX tables are planted for byte-exactness even where
+        /// zdos services the consuming call host-side.
+        fn buildDosTables(self: *Self) void {
+            const cpu = self.cpu;
+            // DBCS lead-byte table: empty (a single 0 dword terminator).
+            cpu.bus.writePhys32(@as(u32, PRIV_DBCS_SEG) << 4, 0);
+            // Filename character table (dos_tables.cpp:100-123): a fixed 0x18-byte blob.
+            const fnc: u32 = @as(u32, PRIV_FNCHAR_SEG) << 4;
+            const fnchar = [_]u8{ 0x16, 0x00, 0x01, 0x00, 0xFF, 0x00, 0x00, 0x20, 0x02, 0x0E, 0x2E, 0x22, 0x2F, 0x5C, 0x5B, 0x5D, 0x3A, 0x7C, 0x3C, 0x3E, 0x2B, 0x3D, 0x3B, 0x2C };
+            for (fnchar, 0..) |b, off| cpu.bus.writePhys8(fnc + @as(u32, @intCast(off)), b);
+            // Collating sequence (word 0x100 + 256 identity bytes) + upcase table at
+            // +258 (word 0x80 + 128 bytes 0x80+i) (dos_tables.cpp:126-131).
+            const col: u32 = @as(u32, PRIV_COLLATE_SEG) << 4;
+            cpu.bus.writePhys16(col, 0x100);
+            var c: u32 = 0;
+            while (c < 256) : (c += 1) cpu.bus.writePhys8(col + 2 + c, @intCast(c));
+            cpu.bus.writePhys16(col + 258, 0x80);
+            c = 0;
+            while (c < 128) : (c += 1) cpu.bus.writePhys8(col + 258 + 2 + c, @intCast(0x80 + c));
+            // Fake FCB system file table (LoL fcbTable -> here): next=end, 100 files.
+            const fcb: u32 = @as(u32, PRIV_FCBSFT_SEG) << 4;
+            cpu.bus.writePhys32(fcb + 0, 0xFFFFFFFF);
+            cpu.bus.writePhys16(fcb + 4, 100);
+            // Fake DPB array: per drive {drive#, unit#, 0x0200 bytes/sector, mediaid 0}.
+            const dpb: u32 = @as(u32, PRIV_DPB_SEG) << 4;
+            var d: u32 = 0;
+            while (d < 26) : (d += 1) {
+                cpu.bus.writePhys8(dpb + d * 9 + 0, @intCast(d)); // drive number
+                cpu.bus.writePhys8(dpb + d * 9 + 1, @intCast(d)); // unit number
+                cpu.bus.writePhys16(dpb + d * 9 + 2, 0x0200); // bytes per sector
+                cpu.bus.writePhys16(dpb + 0x17 + d * 9, 0); // media id
+            }
+            // Fake disk-buffer head (LoL diskBufferHeadPt -> here): first 0x20 zeroed,
+            // then fwd/back ptr 0xFFFF, not-in-use 0xFF, #FATs 1, DPB ptr 0xFFFFFFFF.
+            const db: u32 = @as(u32, PRIV_DISKBUF_SEG) << 4;
+            var k: u32 = 0;
+            while (k < 0x20) : (k += 1) cpu.bus.writePhys8(db + k, 0);
+            cpu.bus.writePhys16(db + 0x00, 0xFFFF);
+            cpu.bus.writePhys16(db + 0x02, 0xFFFF);
+            cpu.bus.writePhys8(db + 0x04, 0xFF);
+            cpu.bus.writePhys8(db + 0x0A, 0x01);
+            cpu.bus.writePhys32(db + 0x0D, 0xFFFFFFFF);
+            // Fake SFT for MUX AX=1216 (separate from firstFileTable): hdr next=end,
+            // 16 entries (dos_tables.cpp:172-183). SftNextTableOffset=0, NumFiles@4.
+            const mux: u32 = @as(u32, PRIV_MUXSFT_SEG) << 4;
+            cpu.bus.writePhys32(mux + 0, 0xFFFFFFFF);
+            cpu.bus.writePhys8(mux + 4, 16);
+        }
+
+        /// Build the Swappable Data Area at DOS_SDA_SEG (0xB2), 26 bytes, byte-faithful
+        /// to dosbox `DOS_SDA::Init` (dos_classes.cpp:635-640): zero-filled, then
+        /// drive_crit_error (+0x02) = 0xFF. The InDOS flag (+0x01) and critical-error
+        /// flag (+0x00) stay 0 — dosbox never increments InDOS, so a TSR polling it
+        /// always sees "DOS idle" (matched exactly). The live context fields (current
+        /// PSP/DTA/drive) are mirrored from the host kernel state by `writeSdaContext`.
+        fn buildSda(self: *Self) void {
+            const cpu = self.cpu;
+            const base: u32 = @as(u32, DOS_SDA_SEG) << 4;
+            var i: u32 = 0;
+            while (i < 0x1A) : (i += 1) cpu.bus.writePhys8(base + i, 0);
+            cpu.bus.writePhys8(base + 0x02, 0xFF); // drive_crit_error
+        }
+
+        /// Mirror the authoritative host kernel context (current PSP / DTA / drive) into
+        /// the SDA's guest-RAM bytes, so a raw guest peek of 0xB2:0x10/0x0C/0x16 (the
+        /// redirector / TSR pattern) is always current — exactly dosbox, where the SDA
+        /// in RAM is the single source of truth. Called at every context-mutation site.
+        /// All writes are deterministic projections of already-serialized state.
+        pub fn writeSdaContext(self: *Self) void {
+            const cpu = self.cpu;
+            const base: u32 = @as(u32, DOS_SDA_SEG) << 4;
+            cpu.bus.writePhys16(base + 0x0C, self.dta_off); // current DTA off
+            cpu.bus.writePhys16(base + 0x0E, self.dta_seg); // current DTA seg
+            cpu.bus.writePhys16(base + 0x10, self.current_psp); // current PSP
+            cpu.bus.writePhys8(base + 0x16, self.current_drive); // current drive
         }
 
         /// Install the resident COMMAND.COM shell as the current process so the
@@ -412,6 +605,7 @@ pub fn Dos(comptime Cpu: type) type {
             while (h < 5) : (h += 1) p.jftSet(h, @intCast(h));
             self.dta_seg = shell;
             self.dta_off = 0x80;
+            self.writeSdaContext(); // mirror the initial PSP/DTA/drive into the SDA
         }
 
         /// Plant a fixed MCB header (sig + owner + size + zeroed 8-byte name) for a
@@ -558,6 +752,7 @@ pub fn Dos(comptime Cpu: type) type {
             self.current_psp = parent_psp_seg;
             self.dta_seg = parent_psp_seg;
             self.dta_off = 0x80;
+            self.writeSdaContext(); // mirror the restored parent context into the SDA
             // (e) restore the parent SS:SP from the parent PSP's saved-stack field.
             const parent = Psp.at(cpu, parent_psp_seg);
             const pss = parent.getStackSeg();

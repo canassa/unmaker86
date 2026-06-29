@@ -206,6 +206,7 @@ pub fn Loader(comptime Cpu: type) type {
             dos.current_psp = psp_seg;
             dos.dta_seg = psp_seg;
             dos.dta_off = 0x80;
+            dos.writeSdaContext(); // mirror the new child context into the SDA
 
             const res: Result = .{
                 .psp_seg = psp_seg,
@@ -269,6 +270,7 @@ pub fn Loader(comptime Cpu: type) type {
             dos.current_psp = psp_seg;
             dos.dta_seg = psp_seg;
             dos.dta_off = 0x80;
+            dos.writeSdaContext(); // mirror the new child context into the SDA
 
             // Load the file flat at PSP:0x100.
             try copyFileToGuest(cpu, drive, hf, 0, (@as(u32, psp_seg) << 4) + 0x100, @intCast(fsize));
@@ -643,6 +645,7 @@ pub fn Loader(comptime Cpu: type) type {
             const res = loadProgramExec(dos, cpu, r.drive, hn, ct, .load_and_run, params, 0) catch |e| {
                 cpu.bus.writePhys32(0x22 * 4, old_int22);
                 dos.current_psp = parent_psp;
+                dos.writeSdaContext(); // restore the parent context in the SDA
                 // (parent SS:SP/regs were never overwritten — loadProgramExec only
                 // calls setupRun on SUCCESS; the un-pushed block bytes are dead.)
                 dos.dosError(cpu, br, switch (e) {
