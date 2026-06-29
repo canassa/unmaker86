@@ -17,6 +17,14 @@ pub const Harness = struct {
 
     pub fn init(self: *Harness, alloc: std.mem.Allocator) void {
         self.bus = TestBus.init(alloc);
+        // Tests construct the harness as `var h: Harness = undefined`, so the
+        // `pic`/`sched` default field initializers above DO NOT run — they only
+        // apply to struct-literal construction. Reset them explicitly here (the
+        // CPU stores `&self.sched` and reads `sched.nextEventCycle()` inside
+        // step()), otherwise `self.sched.next` is stale stack memory from a prior
+        // test and makes execution order-dependent (cf. interrupts_test H.init).
+        self.pic = .{};
+        self.sched = .{};
         self.cpu = Cpu.init(&self.bus, &self.pic, &self.sched);
         self.cpu.loadSegment(.cs, 0);
         self.cpu.loadSegment(.ds, 0);
