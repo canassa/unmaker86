@@ -11,6 +11,7 @@ const Reg32 = @import("cpu").state.Reg32;
 const vfs = @import("vfs.zig");
 const name83 = @import("name83.zig");
 const psp_mod = @import("psp.zig");
+const mcb_mod = @import("mcb.zig");
 
 const EAX = @intFromEnum(Reg32.eax);
 const EBX = @intFromEnum(Reg32.ebx);
@@ -85,13 +86,17 @@ pub fn Loader(comptime Cpu: type) type {
             host_name: []const u8,
             cmdtail: []const u8,
             mode: LoadMode,
+            parent_psp: u16,
         ) LoadError!Result {
-            return loadProgramExec(dos, cpu, drive_idx, host_name, cmdtail, mode, null);
+            return loadProgramExec(dos, cpu, drive_idx, host_name, cmdtail, mode, null, parent_psp);
         }
 
         /// Like `loadProgram` but with the optional parsed EXEC param block (a child
         /// EXEC). `params == null` is the initial boot load (synthesized env, empty
-        /// tail, root parent).
+        /// tail); `boot_parent` is then the PSP the boot program links to as parent
+        /// (DOS_FIRST_SHELL — the resident shell) or 0 to self-parent (root). When
+        /// `params != null` (a child EXEC) `boot_parent` is unused: the parent comes
+        /// from the param block.
         pub fn loadProgramExec(
             dos: *Dos,
             cpu: *Cpu,
@@ -100,6 +105,7 @@ pub fn Loader(comptime Cpu: type) type {
             cmdtail: []const u8,
             mode: LoadMode,
             params: ?ExecParams,
+            boot_parent: u16,
         ) LoadError!Result {
             const drive = dos.drivePtr(drive_idx) orelse return error.NotFound;
             const hf = drive.open(host_name, .read_only) catch return error.NotFound;
@@ -118,9 +124,9 @@ pub fn Loader(comptime Cpu: type) type {
             const prog_path = canonicalProgPath(drive_idx, host_name, &path_buf);
 
             if (sig == MZ_MAGIC1 or sig == MZ_MAGIC2) {
-                return loadExe(dos, cpu, drive, hf, fsize, cmdtail, mode, prog_path, params);
+                return loadExe(dos, cpu, drive, hf, fsize, cmdtail, mode, prog_path, params, boot_parent);
             }
-            return loadCom(dos, cpu, drive, hf, fsize, cmdtail, mode, prog_path, params);
+            return loadCom(dos, cpu, drive, hf, fsize, cmdtail, mode, prog_path, params, boot_parent);
         }
 
         // ----------------------------------------------------------------
@@ -136,6 +142,7 @@ pub fn Loader(comptime Cpu: type) type {
             mode: LoadMode,
             prog_path: []const u8,
             params: ?ExecParams,
+            boot_parent: u16,
         ) LoadError!Result {
             var hdr_bytes: [28]u8 = undefined;
             const n = drive.readAt(hf, 0, &hdr_bytes) catch return error.IoFailed;
@@ -195,7 +202,7 @@ pub fn Loader(comptime Cpu: type) type {
             applyRelocations(cpu, drive, hf, h, load_seg) catch return error.IoFailed;
 
             // Build the PSP + env + JFT inherit.
-            buildPsp(cpu, psp_seg, env_seg, want, cmdtail, params);
+            buildPsp(cpu, psp_seg, env_seg, want, cmdtail, params, boot_parent);
             dos.current_psp = psp_seg;
             dos.dta_seg = psp_seg;
             dos.dta_off = 0x80;
@@ -240,6 +247,7 @@ pub fn Loader(comptime Cpu: type) type {
             mode: LoadMode,
             prog_path: []const u8,
             params: ?ExecParams,
+            boot_parent: u16,
         ) LoadError!Result {
             if (fsize > 0xFE00) return error.BadImage; // COM max ~64KB - PSP - stack
 
@@ -257,7 +265,7 @@ pub fn Loader(comptime Cpu: type) type {
                 return error.NoMemory;
             };
 
-            buildPsp(cpu, psp_seg, env_seg, largest, cmdtail, params);
+            buildPsp(cpu, psp_seg, env_seg, largest, cmdtail, params, boot_parent);
             dos.current_psp = psp_seg;
             dos.dta_seg = psp_seg;
             dos.dta_off = 0x80;
@@ -325,19 +333,27 @@ pub fn Loader(comptime Cpu: type) type {
             cpu.st.setReg16(EBX, 0x0000);
         }
 
-        fn buildPsp(cpu: *Cpu, psp_seg: u16, env_seg: u16, total_paras: u16, cmdtail: []const u8, params: ?ExecParams) void {
+        fn buildPsp(cpu: *Cpu, psp_seg: u16, env_seg: u16, total_paras: u16, cmdtail: []const u8, params: ?ExecParams, boot_parent: u16) void {
             const p = Psp.at(cpu, psp_seg);
             const mem_top = psp_seg + total_paras;
-            // The parent link (PSP 0x16): the caller PSP for a child EXEC, else
-            // SELF (the root program self-parents, exactly like the DOS shell —
-            // shell.cpp:1345 `psp.SetParent(psp_seg)`). `dos.terminate` keys "is
-            // this the root?" off `parent == self`: a self-parented PSP surfaces
-            // `program_terminated` to the controller (no unwind); a child PSP runs
-            // the full parent unwind. (Before the nested-EXEC de-nest the root's
-            // parent was the throwaway boot PSP, which `terminate` only ever
-            // flagged on — the de-nest makes the parent link load-bearing.)
-            const parent = if (params) |pp| pp.parent_psp else psp_seg;
+            // The parent link (PSP 0x16): the caller PSP for a child EXEC; for the
+            // boot load it is `boot_parent` (the resident shell, DOS_FIRST_SHELL —
+            // so AH=4C takes the parent==shell stop branch), or, when boot_parent
+            // is 0, SELF (the root program self-parents like shell.cpp:1345
+            // `psp.SetParent(psp_seg)`). `terminateTsr` keys off the parent link: a
+            // self-parented (or shell-parented) PSP stops the machine; any other
+            // child PSP runs the full parent unwind.
+            const parent = if (params) |pp| pp.parent_psp else (if (boot_parent != 0) boot_parent else psp_seg);
             p.build(mem_top, env_seg, parent, cmdtail);
+            // Re-tag the program's PSP-MCB and env-MCB owner to the new PSP
+            // (correction C; dosbox `setup_psp`, dos_execute.cpp:256-270). The
+            // blocks were allocated owned by the EXEC caller (`owner_for_alloc` =
+            // current_psp, the shell at boot); ownership transfers to the child so a
+            // guest MCB-walk sees them program-owned and `freeByOwner(child)`
+            // reclaims them on exit. The owner field is the u16 at MCB+0x01.
+            cpu.bus.writePhys16((@as(u32, psp_seg - 1) << 4) + mcb_mod.OFF_OWNER, psp_seg);
+            if (env_seg != 0)
+                cpu.bus.writePhys16((@as(u32, env_seg - 1) << 4) + mcb_mod.OFF_OWNER, psp_seg);
             // Snapshot INT 22/23/24 from the current IVT (dos_execute.cpp:486
             // SaveVectors) — done by the EXEC caller AFTER setting INT 22 to the
             // caller's return CS:IP, so the child's saved INT22 = parent resume.
@@ -624,7 +640,7 @@ pub fn Loader(comptime Cpu: type) type {
             // parent CS:IP/SS:SP).
             var hostbuf: [13]u8 = undefined;
             const hn = r.name.display(&hostbuf);
-            const res = loadProgramExec(dos, cpu, r.drive, hn, ct, .load_and_run, params) catch |e| {
+            const res = loadProgramExec(dos, cpu, r.drive, hn, ct, .load_and_run, params, 0) catch |e| {
                 cpu.bus.writePhys32(0x22 * 4, old_int22);
                 dos.current_psp = parent_psp;
                 // (parent SS:SP/regs were never overwritten — loadProgramExec only

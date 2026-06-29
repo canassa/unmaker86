@@ -44,6 +44,21 @@ pub const ems_backing_pages: u16 = @import("ems.zig").BACKING_PAGES;
 pub const DOS_VER_MAJOR: u8 = 5;
 pub const DOS_VER_MINOR: u8 = 0;
 
+// ---- Real-DOS low-memory map (dosbox-staging dos.h:96-106, Phase 1) ----
+// The fixed segments the resident COMMAND.COM shell + the conventional arena
+// live at, mirroring dosbox `DOS_SetupMemory` / `SHELL_Init` so a guest sees a
+// real low-DOS layout (a program loaded as a CHILD of the shell at ~0x190, not
+// as a root at a tuned base). DOS_CONDRV/SDA/CDS are reserved for Phase 2 (real
+// List-of-Lists sub-structures); zdos services those host-side today.
+pub const DOS_INFOBLOCK_SEG: u16 = 0x80; // List-of-Lists / SysVars block (AH=52)
+pub const DOS_CONDRV_SEG: u16 = 0xA0; // CON device header (Phase 2)
+pub const DOS_SDA_SEG: u16 = 0xB2; // Swappable Data Area (Phase 2)
+pub const DOS_CDS_SEG: u16 = 0x108; // Current Directory Structure (Phase 2)
+pub const DOS_FIRST_SHELL: u16 = 0x118; // the resident COMMAND.COM PSP
+pub const DOS_MEM_START: u16 = 0x16F; // first MCB header (top of low DOS)
+pub const UMB_START_SEG: u16 = 0x9FFF; // no-UMB sentinel boundary (dos_memory.cpp:22)
+pub const ARENA_TOP: u16 = 0x9FFE; // last owned conventional paragraph
+
 /// The serviced DOS-layer INTs (each = one callback id; handler switches on AH).
 pub const DosInt = enum {
     int20, // terminate
@@ -252,10 +267,13 @@ pub fn Dos(comptime Cpu: type) type {
         // DTA, drive table, device table + standard handles.
         // -------------------------------------------------------------------
 
-        /// Initialize the DOS kernel structures in guest RAM. `arena_start_seg` is
-        /// the segment of the first MCB header (top of low DOS, below the program
-        /// load area). `arena_paras` is the arena size in paragraphs.
-        pub fn dosInit(self: *Self, br: *Bridge, arena_start_seg: u16, arena_paras: u16) void {
+        /// Initialize the DOS kernel structures in guest RAM, mirroring dosbox's
+        /// `DOS_SetupMemory` + `SHELL_Init`: the 0x70 IRET stub, the List-of-Lists
+        /// at 0x80, the standard-PC pre-fragmented MCB chain at DOS_MEM_START, and
+        /// the resident COMMAND.COM shell PSP/env at DOS_FIRST_SHELL. The low map is
+        /// FIXED (no memsize dependence — conventional memory is 640 KiB), so this
+        /// takes no arena args. Every write is a compile-time constant (determinism).
+        pub fn dosInit(self: *Self, br: *Bridge) void {
             // Vectors: point the DOS-serviced INTs at their stubs.
             br.setRealVec(self.ids.get(.int20), 0x20);
             br.setRealVec(self.ids.get(.int21), 0x21);
@@ -275,20 +293,40 @@ pub fn Dos(comptime Cpu: type) type {
             self.cpu.bus.writePhys16(0x74 * 4, t.off);
             self.cpu.bus.writePhys16(0x74 * 4 + 2, t.seg);
 
-            // The arena MCB chain: one big free block.
-            self.arena_first_mcb = arena_start_seg;
-            self.mcb().initArena(arena_paras - 1);
+            // ---- The 0x0070 IRET stub (dos_memory.cpp:474-481) ----
+            // dosbox lets DOS claim a few BIOS interrupts so buggy games that
+            // compare against the IVT (broken linked-list probes) see a real
+            // handler. Plant a lone IRET at 0x70:0xF4 and point INT 01/02/03/04/0F
+            // at it. Moving SysVars off 0x70 (to 0x80) frees this paragraph.
+            self.cpu.bus.writePhys8((@as(u32, 0x70) << 4) + 0xF4, 0xCF); // IRET
+            const iret_stub: u32 = (@as(u32, 0x70) << 16) | 0xF4;
+            self.cpu.bus.writePhys32(0x01 * 4, iret_stub);
+            self.cpu.bus.writePhys32(0x02 * 4, iret_stub);
+            self.cpu.bus.writePhys32(0x03 * 4, iret_stub);
+            self.cpu.bus.writePhys32(0x04 * 4, iret_stub);
+            self.cpu.bus.writePhys32(0x0F * 4, iret_stub);
 
-            // The List-of-Lists / SysVars block (AH=52, D20). Placed in the low
-            // DOS data area at a fixed segment; the documented LoL pointer (BX) is
-            // `sysvars_lol_off` into the block, and [block:LoL-2] is the first-MCB
-            // segment — the REAL arena anchor (D9), not a faked pointer.
-            self.sysvars_seg = 0x0070;
+            // ---- The List-of-Lists / SysVars block (AH=52, D20) ----
+            // dosbox places the DOS InfoBlock at DOS_INFOBLOCK_SEG (0x80); AH=52
+            // returns ES:BX = 0x80:0x26 and [0x80:0x24] (= BX-2) is the firstMCB
+            // anchor — the REAL arena MCB segment (DOS_MEM_START), not a faked
+            // pointer. NOTE (determinism, correction G1): `sysvars_seg` is a
+            // boot-INVARIANT constant recomputed by every `post()`; it is NOT
+            // snapshotted and is NEVER mutated at runtime — it survives a restore
+            // only because `post()` re-runs this. Same for `arena_first_mcb` below.
+            self.sysvars_seg = DOS_INFOBLOCK_SEG;
             const lol = Int21.sysvars_lol_off;
-            // Zero the SysVars block region first (deterministic).
             var z: u16 = 0;
             while (z < 64) : (z += 1) self.cpu.bus.writePhys8((@as(u32, self.sysvars_seg) << 4) + z, 0);
-            // First-MCB segment anchor at [block:LoL-2].
+            // startOfUMBChain (InfoBlock+0x8C) = 0xFFFF when no UMBs are linked,
+            // exactly dosbox (dos_tables.cpp: DOS_InfoBlock ctor / SetStartOfUMBChain).
+            // 0x8C is past the 64-byte zero-fill, so set it explicitly.
+            self.cpu.bus.writePhys16((@as(u32, self.sysvars_seg) << 4) + 0x8C, 0xFFFF);
+
+            // ---- The pre-fragmented arena MCB chain (dos_memory.cpp:484-565) ----
+            self.arena_first_mcb = DOS_MEM_START;
+            self.mcb().initPreFragmented();
+            // First-MCB segment anchor at [block:LoL-2] = 0x80:0x24.
             self.cpu.bus.writePhys16((@as(u32, self.sysvars_seg) << 4) + lol - 2, self.arena_first_mcb);
 
             // Standard handles 0-4 -> CON/CON/CON/AUX/PRN (D17).
@@ -298,20 +336,104 @@ pub fn Dos(comptime Cpu: type) type {
             self.sft.openDeviceAt(3, &self.dev_table.aux, .read_write); // aux
             self.sft.openDeviceAt(4, &self.dev_table.prn, .write_only); // prn
 
-            // Build an INITIAL PSP so the JFT (file-table) exists even before a
-            // program is loaded (real DOS always has a current PSP). The loader
-            // builds the real program PSP later; this is the bootstrap PSP whose
-            // JFT maps the standard handles 0-4 -> SFT slots 0-4. Placed at the
-            // arena's first data segment.
-            const boot_psp: u16 = arena_start_seg + 1;
-            self.current_psp = boot_psp;
-            const p = Psp.at(self.cpu, boot_psp);
-            p.build(boot_psp + 0x10, 0, 0, "");
+            // ---- The resident COMMAND.COM shell PSP + env (shell.cpp:1280-1357) ----
+            self.installResidentShell();
+        }
+
+        /// Install the resident COMMAND.COM shell as the current process so the
+        /// boot program loads as its CHILD (shell.cpp:1280-1357): the shell PSP at
+        /// DOS_FIRST_SHELL (0x118) + env at 0x12B, both as MCB-owned blocks BELOW
+        /// DOS_MEM_START (so a DOS MCB-walk from firstMCB never sees them — exactly
+        /// dosbox). The shell has no command loop: its INT22 is a guest HLT (the
+        /// byte-faithful analog of dosbox's `call_shellstop`/`CBRET_STOP`); the real
+        /// machine-stop is `terminateTsr`'s parent==shell branch. INT24 chains to
+        /// the old critical-error vector via a far-jmp; INT23 -> shell PSP:0; INT2E
+        /// -> the safe 0x70 IRET (zdos does NOT fake an INT 2Eh command handler).
+        fn installResidentShell(self: *Self) void {
+            const cpu = self.cpu;
+            const shell = DOS_FIRST_SHELL; // 0x118
+            const env_seg: u16 = shell + 19; // 0x12B (dosbox: DOS_FIRST_SHELL+19)
+            const stub_off: u16 = 0x110; // (16+1)<<4 — the stub paragraph at PSP+0x11 (0x129)
+
+            // Shell PSP-MCB at 0x117 (owner=shell, size 0x12) and env-MCB at 0x12A
+            // (owner=shell, size DOS_MEM_START-env_seg=0x44). 'M' (link) headers;
+            // standalone (not anchored by firstMCB). owner-name fields zeroed.
+            plantMcb(cpu, shell - 1, mcb_mod.SIG_LINK, shell, 0x10 + 2);
+            plantMcb(cpu, env_seg - 1, mcb_mod.SIG_LINK, shell, DOS_MEM_START - env_seg);
+
+            // The shell PSP: self-parented (root-of-DOS, like shell.cpp:1345), mem
+            // top at shell+0x12, env at 0x12B, empty command tail.
+            const p = Psp.at(cpu, shell);
+            p.build(shell + 0x12, env_seg, shell, "");
+
+            // The environment block (shell.cpp:1311-1320): PATH / COMSPEC, the
+            // double-NUL terminator, the 0x0001 entry-count word, then the program
+            // path. These advertise the Z: utility-drive structure statically.
+            var eoff: u32 = @as(u32, env_seg) << 4;
+            writeEnvStr(cpu, &eoff, "PATH=Z:\\");
+            writeEnvStr(cpu, &eoff, "COMSPEC=Z:\\COMMAND.COM");
+            cpu.bus.writePhys8(eoff, 0); // second NUL of the double-NUL
+            eoff += 1;
+            cpu.bus.writePhys16(eoff, 0x0001); // entry-count word
+            eoff += 2;
+            writeEnvStr(cpu, &eoff, "Z:\\COMMAND.COM");
+
+            // The stub paragraph at 0x118:0x110 (= 0x129:0). INT24 far-jmp chaining
+            // to the OLD critical-error vector, then the INT22 HLT backstop at
+            // +0x115 (NOT +0x110, which the far-jmp occupies — correction E/F).
+            const sbase: u32 = (@as(u32, shell) << 4) + stub_off;
+            const old_int24 = cpu.bus.readPhys32(0x24 * 4);
+            cpu.bus.writePhys8(sbase + 0, 0xEA); // JMP FAR ptr16:16
+            cpu.bus.writePhys32(sbase + 1, old_int24); // -> old INT24 handler
+            cpu.bus.writePhys8(sbase + 5, 0xF4); // HLT — the INT22 byte-faithful stop
+
+            // Repoint the vectors at the shell stubs (shell.cpp:1287-1297):
+            //   INT24 -> 0x118:0x110 (the far-jmp), INT23 -> 0x118:0 ("int 20"),
+            //   INT22 -> 0x118:0x115 (the HLT), INT2E -> 0x70:0xF4 (safe IRET).
+            cpu.bus.writePhys32(0x24 * 4, (@as(u32, shell) << 16) | stub_off);
+            cpu.bus.writePhys32(0x23 * 4, @as(u32, shell) << 16);
+            cpu.bus.writePhys32(0x22 * 4, (@as(u32, shell) << 16) | (stub_off + 5));
+            cpu.bus.writePhys32(0x2E * 4, (@as(u32, 0x70) << 16) | 0xF4);
+
+            // The shell PSP's saved INT22/23/24 capture the just-installed vectors
+            // (dosbox MakeNew SaveVectors order — IVT set BEFORE the PSP snapshots).
+            // So the boot program's own `saveVectors` at load time inherits the
+            // shell-halt INT22 as its parent-resume address (correction E).
+            p.saveVectors(
+                cpu.bus.readPhys32(0x22 * 4),
+                cpu.bus.readPhys32(0x23 * 4),
+                cpu.bus.readPhys32(0x24 * 4),
+            );
+
+            // The shell becomes the current process; its JFT maps the standard
+            // handles 0-4 -> SFT slots 0-4. DTA defaults to shell:0x80.
+            self.current_psp = shell;
             var h: u16 = 0;
             while (h < 5) : (h += 1) p.jftSet(h, @intCast(h));
-            // The DTA defaults to the boot PSP's 0x80 offset.
-            self.dta_seg = boot_psp;
+            self.dta_seg = shell;
             self.dta_off = 0x80;
+        }
+
+        /// Plant a fixed MCB header (sig + owner + size + zeroed 8-byte name) for a
+        /// permanently-resident block (an install, not an allocation).
+        fn plantMcb(cpu: *Cpu, seg: u16, sig: u8, own: u16, sz: u16) void {
+            const base: u32 = @as(u32, seg) << 4;
+            cpu.bus.writePhys8(base + mcb_mod.OFF_SIG, sig);
+            cpu.bus.writePhys16(base + mcb_mod.OFF_OWNER, own);
+            cpu.bus.writePhys16(base + mcb_mod.OFF_SIZE, sz);
+            var i: u32 = 8;
+            while (i < 16) : (i += 1) cpu.bus.writePhys8(base + i, 0);
+        }
+
+        /// Write a NUL-terminated string into the environment block and advance the
+        /// running physical offset past the terminator.
+        fn writeEnvStr(cpu: *Cpu, off: *u32, s: []const u8) void {
+            for (s) |c| {
+                cpu.bus.writePhys8(off.*, c);
+                off.* += 1;
+            }
+            cpu.bus.writePhys8(off.*, 0);
+            off.* += 1;
         }
 
         // -------------------------------------------------------------------
@@ -396,6 +518,29 @@ pub fn Dos(comptime Cpu: type) type {
                 cpu.bus.writePhys32(0x22 * 4, child.getInt22());
                 cpu.bus.writePhys32(0x23 * 4, child.getInt23());
                 cpu.bus.writePhys32(0x24 * 4, child.getInt24());
+                self.terminated = true;
+                return;
+            }
+
+            // TERMINATE-TO-SHELL (correction A): a program whose parent IS the
+            // resident COMMAND.COM shell terminates ROOT-STYLE — the shell has no
+            // command loop to resume into and its PSP carries NO valid saved stack
+            // (0x2E == 0), so running the normal unwind below would read the IVT as
+            // the parent register block and plant an IRET frame over page 0 (the
+            // INT 3/4 vectors). Instead restore the child's INT22/23/24, reclaim the
+            // child's files + memory, and surface termination (the dosbox
+            // `call_shellstop`/`CBRET_STOP` analog — the shell just halts). This is
+            // detected EARLY, before any SS:SP restore / register pop / IRET-frame
+            // write. A grandchild whose parent != shell still takes the full unwind
+            // below; only an unwind whose parent IS the shell stops here. (Mutually
+            // exclusive with the root guard above: the shell self-parents, so the
+            // shell terminating itself is caught there, never here.)
+            if (parent_psp_seg == DOS_FIRST_SHELL) {
+                cpu.bus.writePhys32(0x22 * 4, child.getInt22());
+                cpu.bus.writePhys32(0x23 * 4, child.getInt23());
+                cpu.bus.writePhys32(0x24 * 4, child.getInt24());
+                if (!tsr) self.closeProcessFiles(cpu, child_psp_seg);
+                if (!tsr) self.mcb().freeByOwner(child_psp_seg);
                 self.terminated = true;
                 return;
             }

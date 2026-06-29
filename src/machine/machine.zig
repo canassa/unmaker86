@@ -540,16 +540,15 @@ pub const Machine = struct {
         br.plantTrampoline();
         // BIOS POST: PIC/PIT/A20 + IVT (unhandled-default + serviced) + BDA.
         self.bios.post(br);
-        // DOS init: vectors + arena MCB + standard handles. The arena spans low
-        // DOS memory; place the first MCB at segment 0x0800 (32 KiB) and let it run
-        // up to 0xA000 — the 640 KiB video-RAM wall (the UMA/VGA framebuffer starts
-        // at 0xA0000; see src/bus/memmap.zig conventional_end=0x9FFFF). That is the
-        // faithful real-DOS conventional-memory ceiling (no EBDA is modeled, so the
-        // wall is the full 640 KiB, exactly what INT 12h / BDA 0040:0013 report).
-        // 0xA000 - 0x0800 = 0x9800 paragraphs. This makes the largest free far block
-        // ~275 KiB > BaK's MEM.DAT minimum (243,000 bytes) so check_memory_or_die
-        // passes. Keep this CONSISTENT with bda.OFF_MEMSIZE_KB (640) and INT 12h.
-        self.dos.dosInit(br, 0x0800, 0x9800);
+        // DOS init: vectors + the real-DOS low map (0x70 IRET stub, List-of-Lists
+        // at 0x80, the standard-PC pre-fragmented MCB chain at DOS_MEM_START=0x16F
+        // ending at 0xA000 — the 640 KiB video-RAM wall, see memmap.zig
+        // conventional_end=0x9FFFF / bda.OFF_MEMSIZE_KB=640 / INT 12h) + the
+        // resident COMMAND.COM shell PSP/env at DOS_FIRST_SHELL=0x118. The map is
+        // FIXED (no memsize dependence), so dosInit takes no arena args. The big
+        // free block is ~632 KiB (0x9E77 paras) > BaK's MEM.DAT minimum (243,000
+        // bytes) so check_memory_or_die passes.
+        self.dos.dosInit(br);
         // NOTE: the EMS page-frame MMIO window is mapped in `wire()` (fixed power-on
         // hardware, like VRAM), NOT here — so `post()` stays re-runnable after a
         // `reset()` (the `--serve` reset→load path re-runs `post()`). See `wire` (e1).
@@ -559,7 +558,10 @@ pub const Machine = struct {
     /// machine, after `post`, calls this to load BaK (or a test program) as the
     /// initial process, then runs.
     pub fn bootProgram(self: *Machine, drive: u8, host_name: []const u8, cmdtail: []const u8) !void {
-        _ = try Dos.LoaderType.loadProgram(&self.dos, &self.cpu, drive, host_name, cmdtail, .load_and_run);
+        // The boot program loads as a CHILD of the resident COMMAND.COM shell
+        // (DOS_FIRST_SHELL): its PSP parent link points at the shell, so its
+        // AH=4C/INT 20h takes `terminateTsr`'s parent==shell stop branch.
+        _ = try Dos.LoaderType.loadProgram(&self.dos, &self.cpu, drive, host_name, cmdtail, .load_and_run, dos_mod.DOS_FIRST_SHELL);
     }
 
     /// The complete deterministic fresh-launch boot sequence, factored out so the

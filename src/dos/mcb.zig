@@ -71,6 +71,35 @@ pub fn McbChain(comptime Cpu: type) type {
             while (i < 16) : (i += 1) self.wr8(self.first, i, 0);
         }
 
+        /// Build the standard-PC pre-fragmented arena chain dosbox plants in
+        /// `DOS_SetupMemory` for a non-Tandy/non-PCjr machine (dos_memory.cpp:
+        /// 484-565). `self.first` MUST be `DOS_MEM_START` (0x16F). Four blocks,
+        /// ending at `ARENA_TOP` (0x9FFE), leaving 0x9FFF a bare unowned paragraph
+        /// (faithful real-DOS-without-UMBs — no 0x9FFF UMB-cover MCB):
+        ///   first+0x00 (0x16F) 'M' owner 0x0008 (DOS)  size 1      — device dummy
+        ///   first+0x02 (0x171) 'M' owner 0 (free)       size 4      — grown-env remnant
+        ///   first+0x07 (0x176) 'M' owner 0x0040         size 16     — loadfix lock
+        ///   first+0x18 (0x187) 'Z' owner 0 (free)       size 0x9E77 — big free, last
+        /// All owner-name fields zeroed (determinism). The non-free dummy(8)/
+        /// loadfix(0x40) blocks are non-coalescible, so the first user alloc lands
+        /// in the 'Z' block (data ~0x188) — env then program ~0x190.
+        pub fn initPreFragmented(self: Self) void {
+            const dummy = self.first; // 0x16F
+            const small = self.first + 2; // 0x171
+            const lock = self.first + 7; // 0x176
+            const big = self.first + 0x18; // 0x187
+            self.setHeader(dummy, SIG_LINK, OWNER_DOS, 1);
+            self.setHeader(small, SIG_LINK, OWNER_FREE, 4);
+            self.setHeader(lock, SIG_LINK, 0x0040, 16);
+            // The big free block is sized to end exactly at ARENA_TOP (0x9FFE):
+            // size = 0x9FFE - big (== 0x9FFE - first - 0x18 == 0x9E77 for 0x16F).
+            self.setHeader(big, SIG_LAST, OWNER_FREE, 0x9FFE - big);
+            for ([_]u16{ dummy, small, lock, big }) |h| {
+                var i: u16 = 8;
+                while (i < 16) : (i += 1) self.wr8(h, i, 0);
+            }
+        }
+
         /// Allocate `paras` paragraphs for `owner_psp`, honoring the DOS allocation
         /// strategy (`self.strategy`): fit-type = `strategy & 0x3f` (0=first, 1=best,
         /// >=2=last). Returns the DATA segment, or null if nothing fits. The free list
@@ -291,6 +320,40 @@ const TestCpu = struct {
 };
 
 const TestChain = McbChain(TestCpu);
+
+test "initPreFragmented lays the standard-PC 4-block low-DOS chain" {
+    // Needs a full conventional-memory buffer (the big block ends at 0x9FFE).
+    const ram = try std.testing.allocator.alloc(u8, 0xA0000);
+    defer std.testing.allocator.free(ram);
+    @memset(ram, 0);
+    var cpu = TestCpu{ .bus = .{ .ram = ram } };
+    var ch = TestChain.init(&cpu, 0x16F); // DOS_MEM_START
+    ch.initPreFragmented();
+    // device dummy: 'M', DOS-owned, 1 para.
+    try std.testing.expectEqual(SIG_LINK, ch.sig(0x16F));
+    try std.testing.expectEqual(OWNER_DOS, ch.owner(0x16F));
+    try std.testing.expectEqual(@as(u16, 1), ch.size(0x16F));
+    // small free: 'M', free, 4 paras.
+    try std.testing.expectEqual(SIG_LINK, ch.sig(0x171));
+    try std.testing.expectEqual(OWNER_FREE, ch.owner(0x171));
+    try std.testing.expectEqual(@as(u16, 4), ch.size(0x171));
+    // loadfix lock: 'M', owner 0x40, 16 paras.
+    try std.testing.expectEqual(SIG_LINK, ch.sig(0x176));
+    try std.testing.expectEqual(@as(u16, 0x0040), ch.owner(0x176));
+    try std.testing.expectEqual(@as(u16, 16), ch.size(0x176));
+    // big free: 'Z' (last), free, 0x9E77 paras; its data ends at 0x9FFF.
+    try std.testing.expectEqual(SIG_LAST, ch.sig(0x187));
+    try std.testing.expectEqual(OWNER_FREE, ch.owner(0x187));
+    try std.testing.expectEqual(@as(u16, 0x9E77), ch.size(0x187));
+    try std.testing.expectEqual(@as(u32, 0x9FFF), @as(u32, 0x188) + 0x9E77);
+    // largest free block == the big block.
+    try std.testing.expectEqual(@as(u16, 0x9E77), ch.largestFree());
+    // owner-name fields zeroed on every header.
+    for ([_]u16{ 0x16F, 0x171, 0x176, 0x187 }) |h| {
+        var i: u16 = 8;
+        while (i < 16) : (i += 1) try std.testing.expectEqual(@as(u8, 0), ch.rd8(h, i));
+    }
+}
 
 test "alloc first-fit claims the low end, remainder above" {
     const ram = try std.testing.allocator.alloc(u8, 0x1000);

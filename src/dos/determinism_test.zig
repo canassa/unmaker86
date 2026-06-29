@@ -24,6 +24,14 @@ const dos_input_sources = [_][]const u8{
     // at POST (Krondor milestone Stage 1). The header is fixed comptime data —
     // gated here so it can never grow a host-clock/RNG/float dependence.
     @embedFile("ems.zig"),
+    // The resident COMMAND.COM shell + real-DOS low-memory map (Phase 1). Every
+    // value the new `dosInit`/`installResidentShell`, `initPreFragmented`, and the
+    // boot-parent threading writes is a compile-time constant via host `writePhys`
+    // — gated here (incl. the FLOAT needle the broader dos_test grep omits) so it
+    // can never grow a host-clock/RNG/thread/float/env dependence.
+    @embedFile("dos.zig"),
+    @embedFile("mcb.zig"),
+    @embedFile("loader.zig"),
 };
 
 test "src/dos input grep: no host time / RNG / thread / env / float" {
@@ -35,6 +43,8 @@ test "src/dos input grep: no host time / RNG / thread / env / float" {
         // No host clock driving emulation (constraint #2).
         "std.time",
         "nanoTimestamp",
+        "Timer",
+        "Instant",
         // No RNG (constraint #5 — deterministic init/state only).
         "std.Random",
         "std.rand",
