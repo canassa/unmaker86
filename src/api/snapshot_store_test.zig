@@ -69,7 +69,7 @@ test "double-mint: snapshot → mutate → restore is byte-identical (CPU + RAM 
     // Advance to a non-trivial state, and set the three guest-mutable DOS scalars to
     // distinctive non-default values BEFORE the snapshot.
     _ = drain(&ctrl, &store, .{ .run = .{ .cycle_cap = 500 } });
-    m.dos.strategy = .last_fit;
+    m.dos.strategy = 2; // last-fit
     m.dos.last_error = 0x1234;
     m.dos.breakcheck = true;
     // Poke some RAM so the slab capture is exercised (not all-zero).
@@ -92,7 +92,7 @@ test "double-mint: snapshot → mutate → restore is byte-identical (CPU + RAM 
     ctrl.setReg32(.eax, 0xDEADBEEF);
     m.bus.writePhys8(0x0600, 0x00);
     m.bus.writePhys8(0x0601, 0x00);
-    m.dos.strategy = .first_fit;
+    m.dos.strategy = 0; // first-fit
     m.dos.last_error = 0;
     m.dos.breakcheck = false;
     try std.testing.expect(m.cpu.st.cycles != ref_cycle);
@@ -105,7 +105,7 @@ test "double-mint: snapshot → mutate → restore is byte-identical (CPU + RAM 
     try std.testing.expectEqual(ref_cycle, m.cpu.st.cycles);
     try std.testing.expectEqual(@as(u16, 0x1234), m.dos.last_error);
     try std.testing.expectEqual(true, m.dos.breakcheck);
-    try std.testing.expect(m.dos.strategy == .last_fit);
+    try std.testing.expectEqual(@as(u8, 2), m.dos.strategy); // last-fit survives snapshot/restore
 }
 
 test "run-from-restored == run-from-original (same end state after an identical forward run)" {

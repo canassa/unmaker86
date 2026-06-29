@@ -112,6 +112,60 @@ test "AH=09 print string routes to the CON device" {
     try std.testing.expectEqualStrings("Hi!", m.dos.dev_table.con.output());
 }
 
+test "AH=42 SEEK_SET treats the 32-bit offset as unsigned (no signed clamp)" {
+    // Faithful localFile::Seek (drive_local.cpp:656-713): SEEK_SET to a high
+    // 32-bit offset (CX:DX = 0x8000:0x0000 = 0x80000000) must return that exact
+    // position in DX:AX, NOT clamp to 0 (the old signed-i32 interpretation
+    // treated it as negative). DOS allows seeking past EOF.
+    var ctx = try boot(std.testing.allocator);
+    defer ctx.deinit();
+    const m = ctx.m;
+    putStr(m, 0x200, "SEEK.DAT");
+    loadCode(m, &.{
+        0xB4, 0x3C, 0x33, 0xC9, 0xBA, 0x00, 0x02, 0xCD, 0x21, // create C:\SEEK.DAT
+        0x8B, 0xD8, // MOV BX,AX
+        0xB4, 0x42, 0xB0, 0x00, 0xB9, 0x00, 0x80, 0xBA, 0x00, 0x00, 0xCD, 0x21, // seek SET 0x80000000
+        0xF4, // HLT (DX:AX hold the seek result)
+    });
+    run(m);
+    try std.testing.expectEqual(@as(u16, 0x8000), m.cpu.st.getReg16(@intFromEnum(Reg32.edx)));
+    try std.testing.expectEqual(@as(u16, 0x0000), m.cpu.st.getReg16(@intFromEnum(Reg32.eax)));
+}
+
+test "AH=42 SEEK_SET to a small offset still works" {
+    var ctx = try boot(std.testing.allocator);
+    defer ctx.deinit();
+    const m = ctx.m;
+    putStr(m, 0x200, "SEEK.DAT");
+    loadCode(m, &.{
+        0xB4, 0x3C, 0x33, 0xC9, 0xBA, 0x00, 0x02, 0xCD, 0x21, // create
+        0x8B, 0xD8, // MOV BX,AX
+        0xB4, 0x42, 0xB0, 0x00, 0xB9, 0x00, 0x00, 0xBA, 0x34, 0x12, 0xCD, 0x21, // seek SET 0x00001234
+        0xF4,
+    });
+    run(m);
+    try std.testing.expectEqual(@as(u16, 0x0000), m.cpu.st.getReg16(@intFromEnum(Reg32.edx)));
+    try std.testing.expectEqual(@as(u16, 0x1234), m.cpu.st.getReg16(@intFromEnum(Reg32.eax)));
+}
+
+test "AH=42 SEEK_CUR wraps unsigned (no signed clamp-to-0)" {
+    // From position 0 (freshly created file), SEEK_CUR by 0x80000000 must land at
+    // 0x80000000 (32-bit unsigned add), not clamp to 0 like the old signed path.
+    var ctx = try boot(std.testing.allocator);
+    defer ctx.deinit();
+    const m = ctx.m;
+    putStr(m, 0x200, "SEEK.DAT");
+    loadCode(m, &.{
+        0xB4, 0x3C, 0x33, 0xC9, 0xBA, 0x00, 0x02, 0xCD, 0x21, // create (pos = 0)
+        0x8B, 0xD8, // MOV BX,AX
+        0xB4, 0x42, 0xB0, 0x01, 0xB9, 0x00, 0x80, 0xBA, 0x00, 0x00, 0xCD, 0x21, // seek CUR 0x80000000
+        0xF4,
+    });
+    run(m);
+    try std.testing.expectEqual(@as(u16, 0x8000), m.cpu.st.getReg16(@intFromEnum(Reg32.edx)));
+    try std.testing.expectEqual(@as(u16, 0x0000), m.cpu.st.getReg16(@intFromEnum(Reg32.eax)));
+}
+
 test "open EMMXXXX0 resolves the EMS device before the VFS (D17)" {
     var ctx = try boot(std.testing.allocator);
     defer ctx.deinit();
@@ -201,4 +255,51 @@ test "find-first / find-next over a few files with 8.3 munging (D10)" {
     try std.testing.expect(!m.cpu.st.eflags.cf);
     const base = @as(u32, CODE_SEG) << 4;
     try std.testing.expectEqual(@as(u8, 'A'), m.bus.readPhys8(base + 0x500 + 0x1E));
+}
+
+test "AH=58 set allocation strategy to last-fit" {
+    var ctx = try boot(std.testing.allocator);
+    defer ctx.deinit();
+    const m = ctx.m;
+    // mov ax,5801 ; mov bx,2 ; int 21h ; hlt
+    loadCode(m, &.{ 0xB8, 0x01, 0x58, 0xBB, 0x02, 0x00, 0xCD, 0x21, 0xF4 });
+    run(m);
+    try std.testing.expectEqual(@as(u8, 2), m.dos.strategy);
+    try std.testing.expect(!m.cpu.st.eflags.cf);
+}
+
+test "AH=58 invalid strategy is rejected (CF set, value unchanged)" {
+    var ctx = try boot(std.testing.allocator);
+    defer ctx.deinit();
+    const m = ctx.m;
+    m.dos.strategy = 1; // best-fit, the pre-existing value
+    // mov ax,5801 ; mov bx,3 (invalid: &0x3f >= 3) ; int 21h ; hlt
+    loadCode(m, &.{ 0xB8, 0x01, 0x58, 0xBB, 0x03, 0x00, 0xCD, 0x21, 0xF4 });
+    run(m);
+    try std.testing.expectEqual(@as(u8, 1), m.dos.strategy); // unchanged
+    try std.testing.expect(m.cpu.st.eflags.cf);
+    try std.testing.expectEqual(@as(u16, 1), m.cpu.st.getReg16(@intFromEnum(Reg32.eax)));
+}
+
+test "AH=58 get allocation strategy returns the stored byte (incl. high bit)" {
+    var ctx = try boot(std.testing.allocator);
+    defer ctx.deinit();
+    const m = ctx.m;
+    m.dos.strategy = 0x42; // last-fit (0x02) with a high/UMB bit set -> kept verbatim
+    // mov ax,5800 ; int 21h ; hlt
+    loadCode(m, &.{ 0xB8, 0x00, 0x58, 0xCD, 0x21, 0xF4 });
+    run(m);
+    try std.testing.expectEqual(@as(u16, 0x42), m.cpu.st.getReg16(@intFromEnum(Reg32.eax)));
+    try std.testing.expect(!m.cpu.st.eflags.cf);
+}
+
+test "AH=58 set UMB link fails (no UMB region)" {
+    var ctx = try boot(std.testing.allocator);
+    defer ctx.deinit();
+    const m = ctx.m;
+    // mov ax,5803 (set UMB link) ; mov bx,1 ; int 21h ; hlt
+    loadCode(m, &.{ 0xB8, 0x03, 0x58, 0xBB, 0x01, 0x00, 0xCD, 0x21, 0xF4 });
+    run(m);
+    try std.testing.expect(m.cpu.st.eflags.cf);
+    try std.testing.expectEqual(@as(u16, 1), m.cpu.st.getReg16(@intFromEnum(Reg32.eax)));
 }

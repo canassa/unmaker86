@@ -99,7 +99,7 @@ pub fn Dos(comptime Cpu: type) type {
         dta_seg: u16 = 0,
         dta_off: u16 = 0,
         arena_first_mcb: u16 = 0,
-        strategy: mcb_mod.Strategy = .first_fit,
+        strategy: u8 = 0, // INT 21h AH=58 strategy byte (fit-type & 0x3f, UMB bits & 0xc0)
         ret_code: u16 = 0, // last AH=4C/00 exit code (for AH=4D)
         ret_type: u8 = 0, // 0=normal exit, 1=Ctrl-C, 2=critical, 3=TSR
         last_error: u16 = 0, // last DOS error code (for AH=59 extended error)
@@ -143,7 +143,7 @@ pub fn Dos(comptime Cpu: type) type {
             self.ids = .initFill(0xFF);
             self.current_psp = 0;
             self.current_drive = 2;
-            self.strategy = .first_fit;
+            self.strategy = 0;
             self.ret_code = 0;
             self.ret_type = 0;
             self.last_error = 0;

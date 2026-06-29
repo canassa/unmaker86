@@ -716,11 +716,16 @@ pub fn Int21(comptime Cpu: type) type {
             const whence = cpu.st.getReg8(0); // AL: 0=SET,1=CUR,2=END
             const offset: u32 = (@as(u32, cpu.st.getReg16(ECX)) << 16) | cpu.st.getReg16(EDX);
             const e = sftFor(dos, handle) orelse return dos.dosError(cpu, br, Dos.ERR_INVALID_HANDLE);
-            const ioff: i64 = @as(i32, @bitCast(offset));
-            var newpos: i64 = undefined;
+            // Faithful localFile::Seek (drive_local.cpp:656-713): the 32-bit offset is
+            // treated as UNSIGNED, and SEEK_CUR/SEEK_END add it to the current/end
+            // position with 32-bit WRAPAROUND — NOT a signed clamp-to-0. Some installers
+            // (WinG on Win3.1) and games (Blackthorne) depend on the wrap and on the
+            // resulting position exceeding 2 GiB. DOS file positions are 32-bit (DX:AX),
+            // so all arithmetic is done in u32.
+            var newpos: u32 = undefined;
             switch (whence) {
-                0 => newpos = ioff,
-                1 => newpos = @as(i64, @intCast(e.position)) + ioff,
+                0 => newpos = offset, // SEEK_SET: absolute, unsigned
+                1 => newpos = @as(u32, @truncate(e.position)) +% offset, // SEEK_CUR: 32-bit wrap
                 2 => {
                     var end: u64 = 0;
                     if (e.ref == .file) {
@@ -728,14 +733,13 @@ pub fn Int21(comptime Cpu: type) type {
                             end = d.size(e.ref.file) catch 0;
                         }
                     }
-                    newpos = @as(i64, @intCast(end)) + ioff;
+                    newpos = @as(u32, @truncate(end)) +% offset; // SEEK_END: 32-bit wrap
                 },
                 else => return dos.dosError(cpu, br, Dos.ERR_INVALID_FUNC),
             }
-            if (newpos < 0) newpos = 0;
-            e.position = @intCast(newpos);
-            cpu.st.setReg16(EDX, @truncate(@as(u32, @intCast(e.position)) >> 16));
-            cpu.st.setReg16(EAX, @truncate(@as(u32, @intCast(e.position))));
+            e.position = newpos;
+            cpu.st.setReg16(EDX, @truncate(newpos >> 16));
+            cpu.st.setReg16(EAX, @truncate(newpos));
             br.setGuestCF(false);
         }
 
@@ -1419,15 +1423,32 @@ pub fn Int21(comptime Cpu: type) type {
                 dos.dosError(cpu, br, Dos.ERR_NOT_ENOUGH_MEM);
             }
         }
+        // AH=58 get/set allocation strategy + UMB-link state (mirrors dos.cpp:1307-1336).
         fn allocStrategy(dos: *Dos, cpu: *Cpu, br: *Bridge) void {
-            const al = cpu.st.getReg8(0);
-            if (al == 0) { // get
-                cpu.st.setReg16(EAX, @intFromEnum(dos.strategy));
-            } else { // set
-                const s = cpu.st.getReg16(EBX) & 0x3;
-                dos.strategy = @enumFromInt(@as(u2, @intCast(s)));
+            switch (cpu.st.getReg8(0)) { // AL = subfunction
+                0 => { // get allocation strategy -> AX
+                    cpu.st.setReg16(EAX, @as(u16, dos.strategy));
+                    br.setGuestCF(false);
+                },
+                1 => { // set allocation strategy from BL: fit-type (&0x3f) < 3, high/UMB bits kept
+                    const bx = cpu.st.getReg16(EBX);
+                    if ((bx & 0x3f) < 3) {
+                        dos.strategy = @truncate(bx);
+                        br.setGuestCF(false);
+                    } else {
+                        cpu.st.setReg16(EAX, 1); // invalid function -> CF set
+                        br.setGuestCF(true);
+                    }
+                },
+                2 => { // get UMB-link state -> AL (always unlinked: zdos has no UMB region)
+                    cpu.st.setReg8(0, 0);
+                    br.setGuestCF(false);
+                },
+                else => { // 3 = set UMB-link (fails with no UMB region), and any AL>3
+                    cpu.st.setReg16(EAX, 1);
+                    br.setGuestCF(true);
+                },
             }
-            br.setGuestCF(false);
         }
 
         // ===================================================================
