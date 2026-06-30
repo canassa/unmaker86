@@ -510,8 +510,14 @@ pub fn build(b: *std.Build) void {
         .{ .name = "timing", .mod = timing_mod },
     };
     const debug_tests = MachineTest.add(b, target, optimize, "src/debug/debug.zig", &debug_imports);
+    // The symbol-layer LIVE integration test: boots a real machine, loads the committed
+    // BC++ 3.1 debug-info fixture (BB.EXE), attaches the TDS overlay to the live PSP, sets
+    // a source `file:line` breakpoint and runs to it, then resolves the live CS:IP back to
+    // function/line/locals. Same machine-building import set as the control-core tests.
+    const debug_symbols_integration = MachineTest.add(b, target, optimize, "src/debug/symbols_integration_test.zig", &debug_imports);
     const debug_test_step = b.step("test-debug", "Run the debugger control-core tests");
     debug_test_step.dependOn(&debug_tests.step);
+    debug_test_step.dependOn(&debug_symbols_integration.step);
 
     // ---- HTTP/JSON API server tests (test-api) ----
     // The api test root imports the api module's own submodules (via the module
