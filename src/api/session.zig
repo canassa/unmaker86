@@ -316,6 +316,16 @@ pub const Session = struct {
     /// `attachOnLoad`. Allocated from the Session `gpa` in `init`, freed in `deinit`.
     source_debugger: ?*debug.SourceDebugger = null,
 
+    /// The configured source-search roots (M-S1.5, debug-source-inlining-plan §A.2). Opened
+    /// host `Io.Dir`s, fed ONLY by `load source_path` / `provision_machine source_path` (no
+    /// CLI). INLINE (the worker borrows `&session.source_roots`, stable once the Session is at
+    /// rest). The Session OWNS these fds: swapped (old closed) by `load source_path`, and
+    /// CLOSED at teardown (`SessionRegistry.teardown` for a minted session, `Server.deinit`
+    /// for the default) — NOT in `Session.deinit`, mirroring `mount_dir` so a `create`-failure
+    /// path never double-closes (the server closes the roots it built on create error). They
+    /// NEVER cross the pointer-free queue.
+    source_roots: worker_mod.SourceRoots = .{},
+
     /// Allocate the per-session heap blocks and stand up the queue. Captures NO
     /// self-address (the stream hub is `.init`-wired later, in `Server.wireStream`,
     /// once the Session is at its final address). The errdefer chain frees every

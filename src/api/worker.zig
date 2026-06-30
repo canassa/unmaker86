@@ -58,6 +58,44 @@ const Io = std.Io;
 pub const MountSource = struct {
     dir: ?Io.Dir = null,
     io: ?Io = null,
+    /// The configured source-search roots (M-S1.5) — a SEPARATE host handle from the C:
+    /// `dir` (the guest drive). Used ONLY to read debug SOURCE TEXT at load time; the
+    /// Session owns the dirs (swapped by `load source_path`). Null ⇒ no source windows.
+    source_roots: ?*const SourceRoots = null,
+};
+
+/// The per-session configured source-search path (debug-source-inlining-plan §A): an
+/// ordered, bounded list of opened host directories the worker reads debug SOURCE TEXT
+/// from at load time (resolution is deterministic: ascending root order, relative-path-
+/// then-basename). The Session OWNS these `Io.Dir` handles (opened by `load source_path` /
+/// `provision_machine source_path`, closed on swap / teardown) — they NEVER cross the
+/// pointer-free queue; the worker only borrows a `*const SourceRoots`. `names[i]` is a
+/// bounded display basename, NOT a full host path (finding #9 — no operator layout leak).
+pub const MAX_SOURCE_ROOTS = 8;
+pub const SOURCE_ROOT_NAME_CAP = 64;
+pub const SourceRoots = struct {
+    dirs: [MAX_SOURCE_ROOTS]Io.Dir = undefined,
+    names: [MAX_SOURCE_ROOTS][SOURCE_ROOT_NAME_CAP]u8 = undefined,
+    name_lens: [MAX_SOURCE_ROOTS]u8 = @splat(0),
+    count: u8 = 0,
+
+    /// Append an opened root + its display name (truncated to the cap). Silently ignores
+    /// an over-cap push (bounded; the agent can re-order roots if it picked wrong).
+    pub fn push(self: *SourceRoots, dir: Io.Dir, name: []const u8) void {
+        if (self.count >= MAX_SOURCE_ROOTS) return;
+        const i = self.count;
+        self.dirs[i] = dir;
+        const n = @min(name.len, SOURCE_ROOT_NAME_CAP);
+        @memcpy(self.names[i][0..n], name[0..n]);
+        self.name_lens[i] = @intCast(n);
+        self.count += 1;
+    }
+
+    /// Close every opened root (swap / teardown). Idempotent (resets `count`).
+    pub fn close(self: *SourceRoots, io: Io) void {
+        for (self.dirs[0..self.count]) |*d| d.close(io);
+        self.count = 0;
+    }
 };
 
 /// The server-owned fixed render buffers (B1). Allocated ONCE at server startup and
@@ -265,15 +303,17 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
         // Delegate to the `?*SourceDebugger` the worker holds. A null `sd` (an in-
         // process test harness that never wired one) fails loud with `not_implemented`
         // rather than faking a debug result.
-        .dbg_where => dbgWhere(sd),
+        .dbg_where => |c| dbgWhere(sd, c.context),
         .dbg_set_src_bp => |c| dbgSetSrcBp(sd, c),
         .dbg_set_fn_bp => |c| dbgSetFnBp(sd, c),
         .dbg_clear_bp => |c| dbgClearBp(sd, c.id),
         .dbg_list_bp => dbgListBp(sd),
-        .dbg_step_line => dbgStep(ctrl, sd, run_ctl, .line, null, 0),
-        .dbg_step_in => dbgStep(ctrl, sd, run_ctl, .in, null, 0),
-        .dbg_step_out => dbgStep(ctrl, sd, run_ctl, .out, null, 0),
-        .dbg_run_to_line => |c| dbgStep(ctrl, sd, run_ctl, .to_line, c.file[0..c.file_len], c.line),
+        .dbg_step_line => |c| dbgStep(ctrl, sd, run_ctl, .line, null, 0, c.context),
+        .dbg_step_in => |c| dbgStep(ctrl, sd, run_ctl, .in, null, 0, c.context),
+        .dbg_step_out => |c| dbgStep(ctrl, sd, run_ctl, .out, null, 0, c.context),
+        .dbg_run_to_line => |c| dbgStep(ctrl, sd, run_ctl, .to_line, c.file[0..c.file_len], c.line, c.context),
+        .dbg_read_source => |c| dbgReadSource(sd, c),
+        .dbg_list_sources => dbgListSources(sd),
 
         .shutdown_worker => .ok,
     };
@@ -679,7 +719,7 @@ fn loadResp(ctrl: *Controller, sd: ?*SourceDebugger, c: q.LoadCmd, mount: MountS
     // it reads the EXE/.MAP back off the same mount the boot used and re-resolves every
     // retained breakpoint spec against the new load_para. An unreadable image ⇒ no
     // symbols (graceful), never a panic.
-    if (sd) |s| attachSymbols(s, dir, io, c.file[0..c.file_len], ctrl.m.dos.current_psp);
+    if (sd) |s| attachSymbols(s, dir, io, c.file[0..c.file_len], ctrl.m.dos.current_psp, mount.source_roots);
     // A fresh load invalidates any prior stop; mirror reset's clear so status is
     // coherent. (boot does not own last_stop; clearing it is the server's job —
     // done here on the worker, the sole owner of controller state.)
@@ -789,7 +829,7 @@ fn sameStem(out: []u8, file: []const u8, ext: []const u8) ?[]const u8 {
 /// sidecar) back off the same mount, then call `SourceDebugger.attachOnLoad`. The temp
 /// read buffers are freed once `Symbols.open` has parsed them (it copies what it
 /// retains). Load-path only (debug-core-plan.md §2.1).
-fn attachSymbols(sd: *SourceDebugger, dir: Io.Dir, io: Io, file: []const u8, psp_seg: u16) void {
+fn attachSymbols(sd: *SourceDebugger, dir: Io.Dir, io: Io, file: []const u8, psp_seg: u16, roots: ?*const SourceRoots) void {
     const gpa = sd.gpa;
     const exe = readHostFile(gpa, dir, io, file);
     defer if (exe) |b| gpa.free(b);
@@ -800,6 +840,66 @@ fn attachSymbols(sd: *SourceDebugger, dir: Io.Dir, io: Io, file: []const u8, psp
         null;
     defer if (map_bytes) |b| gpa.free(b);
     sd.attachOnLoad(exe, map_bytes, psp_seg);
+    // EAGER source-text cache (debug-source-inlining-plan §A.3): after the overlay exists,
+    // resolve every recorded source name across the CONFIGURED roots and hand the owned
+    // bytes to the core. Load-time host I/O only (never per-cycle), so determinism-safe.
+    if (roots) |r| cacheSourcesFromRoots(sd, io, r);
+}
+
+/// Resolve + read every source file the overlay knows, across the configured roots, in
+/// ASCENDING `file_id` order (so the cache-admission decision is query-order-independent —
+/// finding #8). For each file: try the RELATIVE path (drive/leading-sep stripped, `\`→`/`)
+/// under each root in order, then the BASENAME; first hit (root, form) wins and is cached
+/// with its root index. Misses are skipped (`window.has=false`). Load-path only.
+fn cacheSourcesFromRoots(sd: *SourceDebugger, io: Io, roots: *const SourceRoots) void {
+    const gpa = sd.gpa;
+    const n = sd.sourceFileCount();
+    var file_id: u32 = 0;
+    while (file_id < n) : (file_id += 1) {
+        const recorded = sd.sourceFileName(file_id) orelse continue;
+        var rel_buf: [q.DBG_PATH_CAP]u8 = undefined;
+        const rel = relativeSourcePath(&rel_buf, recorded);
+        const base = sourceBasename(recorded);
+        var root_index: u8 = 0;
+        const bytes: ?[]u8 = blk: while (root_index < roots.count) : (root_index += 1) {
+            const d = roots.dirs[root_index];
+            if (rel) |rp| {
+                if (readHostFile(gpa, d, io, rp)) |b| break :blk b;
+            }
+            if (readHostFile(gpa, d, io, base)) |b| break :blk b;
+        } else null;
+        if (bytes) |b| {
+            defer gpa.free(b);
+            sd.cacheSource(file_id, root_index, b);
+        }
+    }
+}
+
+/// The RELATIVE form of a recorded source name: drop a `X:` drive prefix and any leading
+/// separators, keep inner dirs, normalize `\`→`/`. Returns null when there is no inner
+/// directory (a bare basename — the basename probe alone covers it). `out` must be ≥ the
+/// recorded length; an over-long name yields null (basename fallback still applies).
+fn relativeSourcePath(out: []u8, recorded: []const u8) ?[]const u8 {
+    var s = recorded;
+    if (s.len >= 2 and s[1] == ':') s = s[2..]; // drop drive prefix
+    while (s.len > 0 and (s[0] == '\\' or s[0] == '/')) s = s[1..]; // leading seps
+    // A relative path is only meaningful if it still contains an inner separator.
+    var has_sep = false;
+    for (s) |c| {
+        if (c == '\\' or c == '/') has_sep = true;
+    }
+    if (!has_sep or s.len == 0 or s.len > out.len) return null;
+    for (s, 0..) |c, i| out[i] = if (c == '\\') '/' else c;
+    return out[0..s.len];
+}
+
+/// The basename of a recorded source name (split on `\` or `/`).
+fn sourceBasename(recorded: []const u8) []const u8 {
+    var start: usize = 0;
+    for (recorded, 0..) |c, i| {
+        if (c == '\\' or c == '/') start = i + 1;
+    }
+    return recorded[start..];
 }
 
 /// Map a `core.Error` to the transport-neutral `q.ErrCode`.
@@ -889,22 +989,97 @@ fn flattenStop(ss: core.StopState) q.DbgStopResult {
     return r;
 }
 
-fn dbgWhere(sd: ?*SourceDebugger) Response {
+/// Flatten a neutral `core.SourceWindow` into the pointer-free wire POD (copies the
+/// borrowed UTF-8 line slices — already transcoded — into the fixed `[DBG_SRC_LINE_CAP]u8`
+/// buffers; the core already truncated each to `MAX_LINE_BYTES` on a codepoint boundary).
+fn flattenWindow(win: core.SourceWindow) q.SourceWindow {
+    var r = q.SourceWindow{
+        .has = true,
+        .clamped = win.clamped,
+        .file_id = win.file_id,
+        .active_line = win.active_line,
+        .count = @intCast(win.lines.len),
+    };
+    if (win.root_index) |ri| {
+        r.has_root = true;
+        r.root = ri;
+    }
+    for (win.lines, 0..) |ln, i| {
+        var sl = q.SourceLine{ .number = ln.number, .active = ln.active, .truncated = ln.truncated };
+        const n = @min(ln.text.len, sl.text.len);
+        @memcpy(sl.text[0..n], ln.text[0..n]);
+        sl.len = @intCast(n);
+        r.lines[i] = sl;
+    }
+    return r;
+}
+
+/// Build the inlined source window for `(file_id, line, context)`; `has=false` when the
+/// file is not cached (no source root configured / basename in no root / over cap). Pure
+/// in-memory render — no host I/O, no machine touch.
+fn buildWindow(s: *SourceDebugger, file_id: u32, line: u32, context: u16) q.SourceWindow {
+    var scratch: [core.MAX_WINDOW_LINES]core.SrcLine = undefined;
+    const win = s.sourceWindow(file_id, line, context, &scratch) orelse return .{};
+    return flattenWindow(win);
+}
+
+fn dbgWhere(sd: ?*SourceDebugger, context: u16) Response {
     const s = sd orelse return .{ .err = .not_implemented };
     const loc = s.pcLocation() catch |e| return dbgErr(e);
-    return .{ .dbg_where = flattenPc(loc) };
+    var r = flattenPc(loc);
+    if (r.has_source) r.window = buildWindow(s, r.file_id, r.line, context);
+    return .{ .dbg_where = r };
 }
 
 fn dbgSetSrcBp(sd: ?*SourceDebugger, c: q.DbgSrcBpCmd) Response {
     const s = sd orelse return .{ .err = .not_implemented };
     const rb = s.setBreakpoint(.{ .source = .{ .file = c.file[0..c.file_len], .line = c.line } }) catch |e| return dbgErr(e);
-    return .{ .dbg_bp = flattenBp(rb) };
+    return .{ .dbg_bp_set = bpSet(s, rb, c.context) };
 }
 
 fn dbgSetFnBp(sd: ?*SourceDebugger, c: q.DbgFnBpCmd) Response {
     const s = sd orelse return .{ .err = .not_implemented };
     const rb = s.setBreakpoint(.{ .function = .{ .name = c.name[0..c.name_len] } }) catch |e| return dbgErr(e);
-    return .{ .dbg_bp = flattenBp(rb) };
+    return .{ .dbg_bp_set = bpSet(s, rb, q.DBG_CONTEXT_DEFAULT) };
+}
+
+/// The R6 set-confirm POD: the flattened breakpoint + a placement window centered on the
+/// BOUND source line (so the agent visually confirms the resolution). No source ⇒ has=false.
+fn bpSet(s: *SourceDebugger, rb: core.ResolvedBreakpoint, context: u16) q.DbgBpSetResult {
+    var r = q.DbgBpSetResult{ .bp = flattenBp(rb) };
+    if (r.bp.has_source) r.window = buildWindow(s, r.bp.file_id, r.bp.src_line, context);
+    return r;
+}
+
+/// `read_source` — a windowed view of any source file, addressed by an echoed `file_id`
+/// or a name (resolved exact→basename). NOT gated on Stopped (a pure cache read).
+fn dbgReadSource(sd: ?*SourceDebugger, c: q.DbgReadSrcCmd) Response {
+    const s = sd orelse return .{ .err = .not_implemented };
+    var file_id: u32 = undefined;
+    if (c.has_file_id) {
+        file_id = c.file_id;
+    } else {
+        if (s.sourceFileCount() == 0) return .{ .err = .no_symbols };
+        file_id = s.fileIdForName(c.file[0..c.file_len]) orelse return .{ .err = .unresolved };
+    }
+    return .{ .dbg_source = buildWindow(s, file_id, c.line, c.context) };
+}
+
+/// `list_sources` — a thin pass-through over `sourceFileCount`/`sourceFileName`, plus the
+/// per-file `cached` flag (so the agent knows which files have windows).
+fn dbgListSources(sd: ?*SourceDebugger) Response {
+    const s = sd orelse return .{ .err = .not_implemented };
+    var res: q.SourceFilesResult = .{};
+    const n = @min(s.sourceFileCount(), @as(u32, q.DBG_MAX_SOURCES));
+    var file_id: u32 = 0;
+    while (file_id < n) : (file_id += 1) {
+        const name = s.sourceFileName(file_id) orelse continue;
+        var row = q.SourceFile{ .file_id = file_id, .cached = s.isSourceCached(file_id) };
+        row.path_len = copyInline(&row.path, name);
+        res.items[res.count] = row;
+        res.count += 1;
+    }
+    return .{ .dbg_sources = res };
 }
 
 fn dbgClearBp(sd: ?*SourceDebugger, id: u32) Response {
@@ -932,7 +1107,7 @@ fn dbgListBp(sd: ?*SourceDebugger) Response {
 /// `.pause` stop — under the fixed anti-wedge `STEP_WEDGE_CAP_CYCLES` ceiling. The pure
 /// core never polls an atomic / imports `src/api`; the budget + cap are FIXED compile-
 /// time cycle constants (defined in the core), never host-derived.
-fn dbgStep(ctrl: *Controller, sd: ?*SourceDebugger, run_ctl: ?*RunControl, kind: core.StepKind, file: ?[]const u8, line: u32) Response {
+fn dbgStep(ctrl: *Controller, sd: ?*SourceDebugger, run_ctl: ?*RunControl, kind: core.StepKind, file: ?[]const u8, line: u32, context: u16) Response {
     const s = sd orelse return .{ .err = .not_implemented };
     s.beginStep(kind, file, line) catch |e| return dbgErr(e);
     var spent: u64 = 0;
@@ -940,20 +1115,28 @@ fn dbgStep(ctrl: *Controller, sd: ?*SourceDebugger, run_ctl: ?*RunControl, kind:
         if (preempting(run_ctl)) {
             s.endStep();
             const reason = ctrl.recordExternalStop(.{ .stopped_by_request = .{ .at_cycle = ctrl.currentCycle() } });
-            return .{ .dbg_stop = flattenStop(s.projectStop(reason)) };
+            return .{ .dbg_stop = stopWithWindow(s, s.projectStop(reason), context) };
         }
         switch (s.stepBurst(core.STEP_BURST_CYCLES)) {
-            .stopped => |ss| return .{ .dbg_stop = flattenStop(ss) },
+            .stopped => |ss| return .{ .dbg_stop = stopWithWindow(s, ss, context) },
             .budget_exhausted => {
                 spent +|= core.STEP_BURST_CYCLES;
                 if (spent >= core.STEP_WEDGE_CAP_CYCLES) {
                     s.endStep();
                     const reason = ctrl.recordExternalStop(.{ .step_complete = .{ .at_cycle = ctrl.currentCycle() } });
-                    return .{ .dbg_stop = flattenStop(s.projectStop(reason)) };
+                    return .{ .dbg_stop = stopWithWindow(s, s.projectStop(reason), context) };
                 }
             },
         }
     }
+}
+
+/// Flatten a stop and inline the source window on its `pc` (M-S1.5), when the PC resolved
+/// to a source line. No source ⇒ `pc.window.has=false`.
+fn stopWithWindow(s: *SourceDebugger, ss: core.StopState, context: u16) q.DbgStopResult {
+    var r = flattenStop(ss);
+    if (r.has_pc and r.pc.has_source) r.pc.window = buildWindow(s, r.pc.file_id, r.pc.line, context);
+    return r;
 }
 
 // ===========================================================================
@@ -988,6 +1171,10 @@ pub const Worker = struct {
     /// harness that never wired one (the `dbg_*` commands then fail loud). Set by the
     /// server / registry at the worker-spawn sites, exactly like `render`/`run_ctl`.
     sd: ?*SourceDebugger = null,
+    /// The session's configured source-search roots (M-S1.5) — a stable `*const SourceRoots`
+    /// the worker borrows for the load-time source-text reads. Null ⇒ no source windows.
+    /// Set by the server / registry at the worker-spawn sites, beside `.sd`/`.mount_dir`.
+    source_roots: ?*const SourceRoots = null,
     /// The initially-loaded program (from the session recipe), for the STARTUP symbol
     /// attach (investigation point #3): the default `--serve` session boots via
     /// `bootProgram` BEFORE any debug command, so without this initial `attachOnLoad`
@@ -997,7 +1184,7 @@ pub const Worker = struct {
     initial_file_len: u8 = 0,
 
     pub fn run(self: Worker) void {
-        const mount: MountSource = .{ .dir = self.mount_dir, .io = self.io };
+        const mount: MountSource = .{ .dir = self.mount_dir, .io = self.io, .source_roots = self.source_roots };
         // Startup symbol attach for the program the machine already booted (investigation
         // point #3): read the EXE/.MAP off the mount and build the overlay for the live
         // load, on THIS (the machine-owning) thread, before servicing any command — so a
@@ -1005,7 +1192,7 @@ pub const Worker = struct {
         if (self.sd) |sd| {
             if (self.initial_file_len != 0) {
                 if (mount.dir) |dir| if (mount.io) |io|
-                    attachSymbols(sd, dir, io, self.initial_file[0..self.initial_file_len], self.ctrl.m.dos.current_psp);
+                    attachSymbols(sd, dir, io, self.initial_file[0..self.initial_file_len], self.ctrl.m.dos.current_psp, self.source_roots);
             }
         }
         // Publish the initial settled status so a never-commanded machine reports correct

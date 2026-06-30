@@ -154,7 +154,7 @@ pub const SessionRegistry = struct {
     /// records whether the new session OWNS its `mount_dir` fd (a `provision_machine` opens
     /// a fresh dir → `true`; an `initialize` clone of the default shares `main.zig`'s dir →
     /// `false`); `teardown` closes the fd iff owned (the §5 fd-leak fix).
-    pub fn create(self: *SessionRegistry, recipe: LoadRecipe, mount_dir: Io.Dir, cpu_mult: u64, owns_mount: bool) CreateError!CreateResult {
+    pub fn create(self: *SessionRegistry, recipe: LoadRecipe, mount_dir: Io.Dir, cpu_mult: u64, owns_mount: bool, source_roots: worker_mod.SourceRoots) CreateError!CreateResult {
         // Reserve a slot + a seq under the lock (the cap is enforced here, atomically).
         self.mutex.lockUncancelable(self.io);
         if (self.count >= MAX_SESSIONS) {
@@ -220,6 +220,13 @@ pub const SessionRegistry = struct {
         session.owned_machine = m;
         session.owned_ctrl = ctrl;
         session.owns_mount = owns_mount;
+        // Install the configured source roots BEFORE the worker spawn so the STARTUP eager
+        // source-text cache (the worker's first `attachSymbols`) resolves them. The session
+        // now owns these fds (closed at teardown). On a create FAILURE after this point the
+        // session is freed without closing them — by design: the provision handler closes the
+        // roots it built on ANY create error (mirroring `mount_dir`), so they close exactly
+        // once. `Session.deinit` deliberately does NOT touch them (the no-double-close rule).
+        session.source_roots = source_roots;
         session.destroyable = true;
         // Sync the host pacer's slice to the APPLIED CPU mult (the same retune
         // `/api/cpu/clock` + MCP `set_clock` do): without this a machine provisioned at a
@@ -245,6 +252,7 @@ pub const SessionRegistry = struct {
             .snapshots = session.snapshots,
             .run_ctl = session.run_control,
             .sd = session.source_debugger,
+            .source_roots = &session.source_roots,
             .initial_file_len = session.recipe.file_len,
         };
         @memcpy(w.initial_file[0..session.recipe.file_len], session.recipe.file[0..session.recipe.file_len]);
@@ -332,6 +340,9 @@ pub const SessionRegistry = struct {
         // last, once nothing can touch the dir).
         const owns_mount = session.owns_mount;
         const mount_dir = session.mount_dir;
+        // Close the session-owned source roots (M-S1.5) — the worker is joined, so nothing can
+        // touch them now. Always owned by the session (no shared default), so always closed.
+        session.source_roots.close(self.io);
         if (session.owned_machine) |m| {
             m.deinit();
             self.gpa.destroy(m);

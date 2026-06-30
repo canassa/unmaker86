@@ -318,9 +318,9 @@ pub const tools = [_]Tool{
     },
     .{
         .name = "load",
-        .description = "Load a program via the server-held recipe; any of drive/file/cmdtail overlays + persists the recipe, then (re)loads.",
+        .description = "Load a program via the server-held recipe; any of drive/file/cmdtail overlays + persists the recipe, then (re)loads. source_path sets the HOST source directory/directories (a string or array) the inlined source window (whereami/read_source) reads debug source TEXT from — separate from the guest drive; omit to keep the current roots (a machine with none shows no source text).",
         .input_schema =
-        \\{"type":"object","properties":{"drive":{"type":"integer","minimum":0,"maximum":255},"file":{"type":"string"},"cmdtail":{"type":"string"}},"additionalProperties":false}
+        \\{"type":"object","properties":{"drive":{"type":"integer","minimum":0,"maximum":255},"file":{"type":"string"},"cmdtail":{"type":"string"},"source_path":{"description":"host source-search root(s) for the inlined source window: a single dir string or an array of dir strings (cwd-relative)","oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]}},"additionalProperties":false}
         ,
     },
     .{
@@ -356,19 +356,21 @@ pub const tools = [_]Tool{
     // --- source-level debug core (M-S1, debug-core-plan.md §3.3) ---
     .{
         .name = "whereami",
-        .description = "Resolve the live CS:IP to its function + source file:line via the loaded program's TDS debug info (attached on load). Valid only when the machine is stopped. Returns {addr:{seg,off,linear}, function|null, source:{file_id,path,line}|null}; null fields mean the PC isn't covered by symbols (a stripped image or library code).",
-        .input_schema = SCHEMA_EMPTY,
+        .description = "Resolve the live CS:IP to its function + source file:line via the loaded program's TDS debug info (attached on load). Valid only when the machine is stopped. Returns {addr:{seg,off,linear}, function|null, source:{file_id,path,line}|null, window} where window is a numbered source view around the active line (active:true) — source TEXT inlined so you don't open the file yourself (requires a source_path configured via load/provision_machine; window.has=false otherwise). Pass context (default 5) to widen/narrow the lines above/below.",
+        .input_schema =
+        \\{"type":"object","properties":{"context":{"type":"integer","minimum":0,"description":"source lines above/below the active line (default 5; clamped to the per-call max, then page with read_source)"}},"additionalProperties":false}
+        ,
     },
     .{
         .name = "set_source_breakpoint",
-        .description = "Set a breakpoint at a source file:line, resolved through the TDS line table to a runtime address. Returns the breakpoint {id, kind, verified, spec, resolved, source}: verified=false means file:line mapped to no code (kept and re-resolved on reload). Clear it with clear_source_breakpoint.",
+        .description = "Set a breakpoint at a source file:line, resolved through the TDS line table to a runtime address. Returns the breakpoint {id, kind, verified, spec, resolved, source, window}: verified=false means file:line mapped to no code (kept and re-resolved on reload). window inlines the numbered source around the BOUND line (active:true) so you can confirm placement (window.has=false when no source_path is configured). Clear it with clear_source_breakpoint.",
         .input_schema =
         \\{"type":"object","properties":{"file":{"type":"string","minLength":1,"description":"source file name as the compiler recorded it (e.g. BB.C)"},"line":{"type":"integer","minimum":1,"description":"1-based source line"}},"required":["file","line"],"additionalProperties":false}
         ,
     },
     .{
         .name = "set_function_breakpoint",
-        .description = "Set a breakpoint at a function's post-prologue entry, resolved through the symbol table. Returns the breakpoint {id, kind, verified, spec, resolved, source}. verified=false means the name was not found (kept and re-resolved on reload).",
+        .description = "Set a breakpoint at a function's post-prologue entry, resolved through the symbol table. Returns the breakpoint {id, kind, verified, spec, resolved, source, window} (window inlines the numbered source around the bound line; window.has=false when no source_path is configured). verified=false means the name was not found (kept and re-resolved on reload).",
         .input_schema =
         \\{"type":"object","properties":{"name":{"type":"string","minLength":1,"description":"function symbol name (Borland C decorates with a leading underscore, e.g. _main)"}},"required":["name"],"additionalProperties":false}
         ,
@@ -387,25 +389,43 @@ pub const tools = [_]Tool{
     },
     .{
         .name = "step_line",
-        .description = "Source-line step OVER calls (the debugger 'next'): advance to the next source line in the same or a shallower frame; a CALL is run to completion. ADVANCES the machine and returns the stop {kind, cycle, pc:{addr,function,source}}.",
-        .input_schema = SCHEMA_EMPTY,
+        .description = "Source-line step OVER calls (the debugger 'next'): advance to the next source line in the same or a shallower frame; a CALL is run to completion. ADVANCES the machine and returns the stop {kind, cycle, pc:{addr,function,source,window}} — pc.window inlines the numbered source around the new line. Pass context (default 5) to size it.",
+        .input_schema =
+        \\{"type":"object","properties":{"context":{"type":"integer","minimum":0,"description":"source lines above/below the active line (default 5)"}},"additionalProperties":false}
+        ,
     },
     .{
         .name = "step_in",
-        .description = "Source-line step INTO calls (the debugger 'step'): stop at the next source line, descending into a symbolized callee's first line. An unsymbolized callee (C runtime/library) is run back out. ADVANCES the machine and returns the stop {kind, cycle, pc}.",
-        .input_schema = SCHEMA_EMPTY,
+        .description = "Source-line step INTO calls (the debugger 'step'): stop at the next source line, descending into a symbolized callee's first line. An unsymbolized callee (C runtime/library) is run back out. ADVANCES the machine and returns the stop {kind, cycle, pc} with pc.window inlining the numbered source. Pass context (default 5).",
+        .input_schema =
+        \\{"type":"object","properties":{"context":{"type":"integer","minimum":0,"description":"source lines above/below the active line (default 5)"}},"additionalProperties":false}
+        ,
     },
     .{
         .name = "step_out",
-        .description = "Run to the current function's caller return (the debugger 'finish'): near/far return chosen from the function's TDS type. ADVANCES the machine and returns the stop {kind, cycle, pc} in the caller. Unreliable without BP frame pointers (optimized builds).",
-        .input_schema = SCHEMA_EMPTY,
+        .description = "Run to the current function's caller return (the debugger 'finish'): near/far return chosen from the function's TDS type. ADVANCES the machine and returns the stop {kind, cycle, pc} (pc.window inlines the numbered source) in the caller. Unreliable without BP frame pointers (optimized builds). Pass context (default 5).",
+        .input_schema =
+        \\{"type":"object","properties":{"context":{"type":"integer","minimum":0,"description":"source lines above/below the active line (default 5)"}},"additionalProperties":false}
+        ,
     },
     .{
         .name = "run_to_line",
-        .description = "Run the guest until it reaches a source file:line (a one-shot target breakpoint). ADVANCES the machine and returns the stop {kind, cycle, pc}. Errors (unresolved) if the line maps to no code.",
+        .description = "Run the guest until it reaches a source file:line (a one-shot target breakpoint). ADVANCES the machine and returns the stop {kind, cycle, pc} with pc.window inlining the numbered source. Errors (unresolved) if the line maps to no code. Pass context (default 5).",
         .input_schema =
-        \\{"type":"object","properties":{"file":{"type":"string","minLength":1,"description":"source file name (e.g. BB.C)"},"line":{"type":"integer","minimum":1,"description":"1-based source line"}},"required":["file","line"],"additionalProperties":false}
+        \\{"type":"object","properties":{"file":{"type":"string","minLength":1,"description":"source file name (e.g. BB.C)"},"line":{"type":"integer","minimum":1,"description":"1-based source line"},"context":{"type":"integer","minimum":0,"description":"source lines above/below the active line (default 5)"}},"required":["file","line"],"additionalProperties":false}
         ,
+    },
+    .{
+        .name = "read_source",
+        .description = "Read guest source code with line numbers and the active line flagged. ALWAYS prefer this tool when you need to read the guest's source — it returns numbered lines so you never have to guess line positions. Pass the file_id from whereami/list_sources (robust), or a file name (resolved exact then by basename). context sets the lines above/below (default 5); for a window larger than the per-call max it is clamped (clamped:true) — call again at a later line to page. Use whereami / the step tools for the source at the current stop instead. Requires a source_path configured via load/provision_machine (else window.has=false).",
+        .input_schema =
+        \\{"type":"object","properties":{"file":{"type":"string","minLength":1,"description":"source file name (e.g. BB.C); resolved exact then by basename"},"file_id":{"type":"integer","minimum":0,"description":"the file_id from whereami/list_sources (preferred — echo it back)"},"line":{"type":"integer","minimum":1,"description":"1-based center line"},"context":{"type":"integer","minimum":0,"description":"source lines above/below (default 5; clamped to the per-call max, then page)"}},"required":["line"],"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "list_sources",
+        .description = "List the guest program's source files {file_id, path, cached}. path is the compiler-recorded name (not a host path); cached:true means its TEXT is loaded (a window is available). Pass a file_id to read_source to view any of them.",
+        .input_schema = SCHEMA_EMPTY,
     },
     // --- machine lifecycle (machine-AGNOSTIC; server-special, like `load`) ---
     .{
@@ -414,9 +434,9 @@ pub const tools = [_]Tool{
         // returns the handle IN THE RESULT (no header). `cpu` reuses the shared `mapCpuSpeed`
         // (mult xor mhz); `drive` defaults to 2; `cmdtail` is the DOS command tail.
         .name = "provision_machine",
-        .description = "Provision a NEW emulated machine: mount host dir `mount_dir` as the DOS drive, load `file` (.COM/.EXE) within it, and return its zdos-sess-<n> handle in the result. Pass that handle as the `machine` arg to the per-machine tools to drive it; deprovision to free it.",
+        .description = "Provision a NEW emulated machine: mount host dir `mount_dir` as the DOS drive, load `file` (.COM/.EXE) within it, and return its zdos-sess-<n> handle in the result. Pass that handle as the `machine` arg to the per-machine tools to drive it; deprovision to free it. source_path sets the HOST source directory/directories the inlined source window reads debug source TEXT from (separate from mount_dir).",
         .input_schema =
-        \\{"type":"object","properties":{"mount_dir":{"type":"string","minLength":1,"description":"host dir mounted as the DOS drive (opened cwd-relative)"},"file":{"type":"string","minLength":1,"maxLength":12,"description":"program (.COM/.EXE) within mount_dir; DOS 8.3 name, <=12 chars incl. dot+ext"},"cmdtail":{"type":"string","maxLength":127,"description":"DOS command tail"},"drive":{"type":"integer","minimum":0,"maximum":25,"default":2,"description":"DOS drive index (0=A..25=Z)"},"cpu":{"type":"object","description":"CPU speed; give exactly one of mult/mhz","oneOf":[{"properties":{"mult":{"type":"integer","minimum":1,"description":"CPU:PIT multiplier (clamped to [1,55])"}},"required":["mult"]},{"properties":{"mhz":{"type":"integer","minimum":1,"description":"target MHz, converted to the nearest mult"}},"required":["mhz"]}]}},"required":["mount_dir","file"],"additionalProperties":false}
+        \\{"type":"object","properties":{"mount_dir":{"type":"string","minLength":1,"description":"host dir mounted as the DOS drive (opened cwd-relative)"},"file":{"type":"string","minLength":1,"maxLength":12,"description":"program (.COM/.EXE) within mount_dir; DOS 8.3 name, <=12 chars incl. dot+ext"},"cmdtail":{"type":"string","maxLength":127,"description":"DOS command tail"},"drive":{"type":"integer","minimum":0,"maximum":25,"default":2,"description":"DOS drive index (0=A..25=Z)"},"cpu":{"type":"object","description":"CPU speed; give exactly one of mult/mhz","oneOf":[{"properties":{"mult":{"type":"integer","minimum":1,"description":"CPU:PIT multiplier (clamped to [1,55])"}},"required":["mult"]},{"properties":{"mhz":{"type":"integer","minimum":1,"description":"target MHz, converted to the nearest mult"}},"required":["mhz"]}]},"source_path":{"description":"host source-search root(s) for the inlined source window: a single dir string or an array of dir strings (cwd-relative)","oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]}},"required":["mount_dir","file"],"additionalProperties":false}
         ,
         .per_machine = false,
     },
@@ -508,6 +528,10 @@ pub const ProvisionArgs = struct {
     cmdtail: ?[]const u8 = null,
     drive: u8 = 2,
     cpu: ?CpuArg = null,
+    /// Optional host source-search root(s) for the inlined source window (M-S1.5): a single
+    /// dir string or an array of dir strings. Opened by `handleMcpProvision` and stored on the
+    /// minted Session (a machine with none → `window.has=false`). Never crosses the queue.
+    source_path: ?std.json.Value = null,
 };
 
 /// `deprovision` arguments — the handle to destroy (its OWN arg, not the routing arg).
@@ -810,12 +834,30 @@ const ScreenReq = struct { attrs: bool = false };
 // Source-level debug (M-S1) argument structs. `file`/`name` are arena slices copied
 // into the fixed-inline command PODs by `fillSrcBp`/`fillFnBp` (no borrowed slice on
 // the queue).
-const SrcLineReq = struct { file: []const u8, line: u32 };
+const SrcLineReq = struct { file: []const u8, line: u32, context: ?u32 = null };
 const FnNameReq = struct { name: []const u8 };
+const CtxReq = struct { context: ?u32 = null };
+const ReadSrcReq = struct { file: ?[]const u8 = null, file_id: ?u32 = null, line: u32, context: ?u32 = null };
 
-/// Copy a `file:line` into the pointer-free `DbgSrcBpCmd` (truncating an over-long path).
-fn fillSrcBp(file: []const u8, line: u32) q.DbgSrcBpCmd {
-    var c = q.DbgSrcBpCmd{ .line = line };
+/// Narrow an optional JSON `context` to the wire `u16` (default 5; saturated to u16 so an
+/// oversize request still rides to the worker, which clamps + flags `clamped`).
+fn ctxFrom(context: ?u32) u16 {
+    const c = context orelse return q.DBG_CONTEXT_DEFAULT;
+    return @intCast(@min(c, std.math.maxInt(u16)));
+}
+
+/// Parse an optional `{context}` from a tool's `arguments` (default when absent / no
+/// object). The window size is advisory — a malformed value falls back to the default.
+fn parseCtx(arena: std.mem.Allocator, args: std.json.Value) u16 {
+    if (args != .object) return q.DBG_CONTEXT_DEFAULT;
+    const r = parse(CtxReq, arena, args) orelse return q.DBG_CONTEXT_DEFAULT;
+    return ctxFrom(r.context);
+}
+
+/// Copy a `file:line` (+ window `context`) into the pointer-free `DbgSrcBpCmd` (truncating
+/// an over-long path).
+fn fillSrcBp(file: []const u8, line: u32, context: u16) q.DbgSrcBpCmd {
+    var c = q.DbgSrcBpCmd{ .line = line, .context = context };
     const n = @min(file.len, c.file.len);
     @memcpy(c.file[0..n], file[0..n]);
     c.file_len = @intCast(n);
@@ -1102,10 +1144,10 @@ pub fn buildCommand(
     // Inspection ops (whereami / list / set / clear) are pure-ish queue commands like
     // add_breakpoint (needs_debugger=false). The STEP ops run the guest, so they take
     // the debugger owner (needs_debugger=true) exactly like run/step.
-    if (is(name, "whereami")) return cmd(.dbg_where, false);
+    if (is(name, "whereami")) return cmd(.{ .dbg_where = .{ .context = parseCtx(arena, args) } }, false);
     if (is(name, "set_source_breakpoint")) {
         const r = parse(SrcLineReq, arena, args) orelse return invalid("set_source_breakpoint expects {file:string, line:integer>=1}");
-        return cmd(.{ .dbg_set_src_bp = fillSrcBp(r.file, r.line) }, false);
+        return cmd(.{ .dbg_set_src_bp = fillSrcBp(r.file, r.line, q.DBG_CONTEXT_DEFAULT) }, false);
     }
     if (is(name, "set_function_breakpoint")) {
         const r = parse(FnNameReq, arena, args) orelse return invalid("set_function_breakpoint expects {name:string}");
@@ -1116,13 +1158,28 @@ pub fn buildCommand(
         const r = parse(IdReq, arena, args) orelse return invalid("clear_source_breakpoint expects {id:integer}");
         return cmd(.{ .dbg_clear_bp = .{ .id = r.id } }, false);
     }
-    if (is(name, "step_line")) return cmd(.dbg_step_line, true);
-    if (is(name, "step_in")) return cmd(.dbg_step_in, true);
-    if (is(name, "step_out")) return cmd(.dbg_step_out, true);
+    if (is(name, "step_line")) return cmd(.{ .dbg_step_line = .{ .context = parseCtx(arena, args) } }, true);
+    if (is(name, "step_in")) return cmd(.{ .dbg_step_in = .{ .context = parseCtx(arena, args) } }, true);
+    if (is(name, "step_out")) return cmd(.{ .dbg_step_out = .{ .context = parseCtx(arena, args) } }, true);
     if (is(name, "run_to_line")) {
         const r = parse(SrcLineReq, arena, args) orelse return invalid("run_to_line expects {file:string, line:integer>=1}");
-        return cmd(.{ .dbg_run_to_line = fillSrcBp(r.file, r.line) }, true);
+        return cmd(.{ .dbg_run_to_line = fillSrcBp(r.file, r.line, ctxFrom(r.context)) }, true);
     }
+    if (is(name, "read_source")) {
+        const r = parse(ReadSrcReq, arena, args) orelse return invalid("read_source expects {file?:string, file_id?:integer, line:integer>=1, context?:integer}");
+        if (r.file == null and r.file_id == null) return invalid("read_source needs one of file or file_id");
+        var c = q.DbgReadSrcCmd{ .line = r.line, .context = ctxFrom(r.context) };
+        if (r.file_id) |fid| {
+            c.has_file_id = true;
+            c.file_id = fid;
+        } else if (r.file) |f| {
+            const n = @min(f.len, c.file.len);
+            @memcpy(c.file[0..n], f[0..n]);
+            c.file_len = @intCast(n);
+        }
+        return cmd(.{ .dbg_read_source = c }, false);
+    }
+    if (is(name, "list_sources")) return cmd(.dbg_list_sources, false);
 
     // `load` (recipe overlay/persist) and `screenshot` (session render buffers + image
     // response) are server-special — handled before this call, never reaching here.

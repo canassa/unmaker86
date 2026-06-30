@@ -94,6 +94,43 @@ pub const StopState = struct {
     exit_code: ?u16 = null, // set when kind == .exit/.terminated
 };
 
+// ─────────────────────────── source window (M-S1.5) ───────────────────────────
+// The neutral, slice-bearing source-window DTO (debug-source-inlining-plan §5/§8). The
+// worker flattens it into the pointer-free `q.SourceWindow` POD. `text` borrows owned
+// bytes out of the `SourceDebugger` source cache (UTF-8, already transcoded), valid for
+// the program's lifetime (the same Stopped-epoch borrow `SourceLoc.path` uses). EXCLUDED
+// from the reflection gate (transient, frontend-facing, never snapshotted) like the other
+// neutral DTOs — covered by the grep gate only.
+
+/// `±DEFAULT_SOURCE_CONTEXT` ≈ 11 total (gdb/pdb/Delve convention, verified plan §1).
+pub const DEFAULT_SOURCE_CONTEXT: u16 = 5;
+/// The hard cap on rows in one window (so `context` is effectively ≤ 16 each side).
+pub const MAX_WINDOW_LINES: u8 = 33;
+/// The per-line text cap, in UTF-8 bytes (mirrors `q.DBG_SRC_LINE_CAP`); a longer line is
+/// truncated on a codepoint boundary and `truncated` is set. EXPLICIT, never a silent drop.
+pub const MAX_LINE_BYTES: u16 = 160;
+
+/// One source line of a window: its 1-based `number`, the (borrowed, ≤MAX_LINE_BYTES,
+/// UTF-8) `text`, whether it is the active (location) line, and whether the text was
+/// truncated to `MAX_LINE_BYTES`.
+pub const SrcLine = struct {
+    number: u32,
+    text: []const u8,
+    active: bool,
+    truncated: bool,
+};
+
+/// A windowed, line-numbered view around an active source line. `root_index` is the
+/// configured source-root INDEX that supplied the text (never a host path — finding #9);
+/// `clamped` is set when the requested context exceeded `MAX_WINDOW_LINES`.
+pub const SourceWindow = struct {
+    file_id: u32,
+    active_line: u32,
+    clamped: bool,
+    root_index: ?u8 = null,
+    lines: []const SrcLine,
+};
+
 /// Which kind of source step is in flight (set by `beginStep`).
 pub const StepKind = enum { line, in, out, to_line };
 

@@ -70,6 +70,12 @@ pub const LoadReq = struct {
     drive: ?u8 = null,
     file: ?[]const u8 = null,
     cmdtail: ?[]const u8 = null,
+    /// Optional host source-search root(s) for the inlined source window (M-S1.5): a single
+    /// dir string, or an array of dir strings. A per-request ARENA/WIRE field — NOT a queue
+    /// POD: it is CONSUMED SERVER-SIDE (the listener opens each `Io.Dir` and swaps the
+    /// Session's source roots under `session.lock` BEFORE submitting `.load`), so it never
+    /// crosses the pointer-free queue and is NOT part of `LoadRecipe`/`LoadCmd`.
+    source_path: ?std.json.Value = null,
 };
 
 pub const MemPeekReq = struct { phys: u32, len: u32 };

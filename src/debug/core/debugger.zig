@@ -98,6 +98,60 @@ const StepSession = struct {
 
 const State = enum { configuring, running, stopped, terminated };
 
+// ─────────────────────────── source cache (M-S1.5) ───────────────────────────
+// A bounded, SourceDebugger-owned table of source-file TEXT (host-side, OUTSIDE the
+// machine — never snapshotted), built eagerly at load from the configured source roots
+// (the worker does the host reads; the core only STORES + RENDERS owned bytes). Same
+// lifetime as the symbol overlay: freed/rebuilt by `attachOnLoad`, freed in `deinit`.
+
+/// Max distinct source files cached (a fixed slot table, never an LRU).
+pub const MAX_CACHED_SOURCES = 64;
+/// Per-file cap on the STORED (transcoded) bytes; a larger file is SKIPPED (`has=false`,
+/// graceful) — never truncated mid-file.
+pub const MAX_SOURCE_BYTES: usize = 512 * 1024;
+/// Total source-cache budget across all files; a file that would push past it is SKIPPED
+/// in ascending `file_id` order — never evicts an already-admitted file (finding #8), so
+/// the cached set is a pure function of `(file_id order, sizes, budget)`.
+pub const MAX_TOTAL_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+
+/// One cached source file: owned UTF-8 (CP437-transcoded, TAB-expanded, CR-stripped)
+/// bytes with NEWLINES REMOVED (pure separators), plus a `line_starts` index where
+/// `line_starts[i]` is the byte offset of line `i+1` and `line_starts[len-1] == bytes.len`
+/// (so line `n`'s content == `bytes[line_starts[n-1]..line_starts[n]]`, an O(1) slice).
+const CachedSource = struct {
+    file_id: u32 = 0,
+    root_index: u8 = 0,
+    active: bool = false,
+    bytes: []u8 = &.{},
+    line_starts: []u32 = &.{},
+};
+
+/// CP437 high-half (0x80..0xFF) → Unicode scalar table. The standard IBM PC code page;
+/// ASCII 0x00..0x7F is identity (handled separately). Used by `cacheSource` to transcode
+/// DOS source to valid UTF-8 so the wire body is never invalid-UTF-8 / a lone high byte
+/// (plan §5/R1, CLAUDE.md §2 — no silent smear).
+const cp437_high = [128]u21{
+    0x00C7, 0x00FC, 0x00E9, 0x00E2, 0x00E4, 0x00E0, 0x00E5, 0x00E7,
+    0x00EA, 0x00EB, 0x00E8, 0x00EF, 0x00EE, 0x00EC, 0x00C4, 0x00C5,
+    0x00C9, 0x00E6, 0x00C6, 0x00F4, 0x00F6, 0x00F2, 0x00FB, 0x00F9,
+    0x00FF, 0x00D6, 0x00DC, 0x00A2, 0x00A3, 0x00A5, 0x20A7, 0x0192,
+    0x00E1, 0x00ED, 0x00F3, 0x00FA, 0x00F1, 0x00D1, 0x00AA, 0x00BA,
+    0x00BF, 0x2310, 0x00AC, 0x00BD, 0x00BC, 0x00A1, 0x00AB, 0x00BB,
+    0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556,
+    0x2555, 0x2563, 0x2551, 0x2557, 0x255D, 0x255C, 0x255B, 0x2510,
+    0x2514, 0x2534, 0x252C, 0x251C, 0x2500, 0x253C, 0x255E, 0x255F,
+    0x255A, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256C, 0x2567,
+    0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256B,
+    0x256A, 0x2518, 0x250C, 0x2588, 0x2584, 0x258C, 0x2590, 0x2580,
+    0x03B1, 0x00DF, 0x0393, 0x03C0, 0x03A3, 0x03C3, 0x00B5, 0x03C4,
+    0x03A6, 0x0398, 0x03A9, 0x03B4, 0x221E, 0x03C6, 0x03B5, 0x2229,
+    0x2261, 0x00B1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00F7, 0x2248,
+    0x00B0, 0x2219, 0x00B7, 0x221A, 0x207F, 0x00B2, 0x25A0, 0x00A0,
+};
+
+/// The tab stop used when expanding `\t` at cache time (plan §5: expand, do not escape).
+const TAB_STOP = 8;
+
 pub const SourceDebugger = struct {
     gpa: std.mem.Allocator,
     ctrl: *Controller,
@@ -109,6 +163,11 @@ pub const SourceDebugger = struct {
     specs: [MAX_SPECS]SpecSlot = @splat(.{}),
     step: StepSession = .{},
     state: State = .configuring,
+    /// The bounded source-TEXT cache (M-S1.5). Owned host-side bytes, NEVER snapshotted;
+    /// freed/rebuilt by `attachOnLoad` (same lifetime as `syms`/`map`).
+    sources: [MAX_CACHED_SOURCES]CachedSource = @splat(.{}),
+    source_count: usize = 0,
+    source_bytes_total: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, ctrl: *Controller) SourceDebugger {
         return .{ .gpa = gpa, .ctrl = ctrl };
@@ -118,6 +177,7 @@ pub const SourceDebugger = struct {
         if (self.syms) |*s| s.deinit();
         self.syms = null;
         self.map = null;
+        self.freeSourceCache();
     }
 
     // ─────────────────────────── attach-on-load ───────────────────────────
@@ -131,6 +191,9 @@ pub const SourceDebugger = struct {
         if (self.syms) |*old| old.deinit();
         self.syms = null;
         self.map = null;
+        // Drop the prior source-text cache; the worker re-fills it eagerly AFTER this
+        // returns (resolving each recorded file across the configured roots).
+        self.freeSourceCache();
         if (exe) |bytes| {
             self.syms = Symbols.open(self.gpa, bytes, opt_map) catch null;
         }
@@ -287,6 +350,195 @@ pub const SourceDebugger = struct {
         return .{ .file_id = file_id, .path = path, .line = line };
     }
 
+    // ─────────────────────────── source cache (M-S1.5) ───────────────────────────
+
+    /// Free every cached source slot (bytes + line index) and reset the counters. Called
+    /// on every `attachOnLoad` (before the worker re-fills) and in `deinit`.
+    fn freeSourceCache(self: *SourceDebugger) void {
+        for (self.sources[0..self.source_count]) |*s| {
+            if (s.bytes.len != 0) self.gpa.free(s.bytes);
+            if (s.line_starts.len != 0) self.gpa.free(s.line_starts);
+            s.* = .{};
+        }
+        self.source_count = 0;
+        self.source_bytes_total = 0;
+    }
+
+    /// Admit one source file's raw bytes into the cache, transcoding **CP437→UTF-8**,
+    /// **expanding TABs**, and **stripping CR** while copying, and building the `\n`
+    /// line-offset index (newlines are dropped — pure separators). Admission is
+    /// query-order-independent (finding #8): over the per-file cap or the total budget ⇒
+    /// SKIPPED (the file simply has no window), never evicting an already-admitted file.
+    /// The worker MUST call this in ascending `file_id` order so the cached set is a pure
+    /// function of `(file_id order, sizes, budget)`. Load-time host work; no machine touch.
+    pub fn cacheSource(self: *SourceDebugger, file_id: u32, root_index: u8, raw: []const u8) void {
+        if (self.source_count >= MAX_CACHED_SOURCES) return;
+        if (self.findSource(file_id) != null) return; // already cached (defensive)
+        if (raw.len > MAX_SOURCE_BYTES) return; // cheap pre-check on the raw size
+
+        var bytes: std.ArrayListUnmanaged(u8) = .empty;
+        var starts: std.ArrayListUnmanaged(u32) = .empty;
+        var ok = true;
+        starts.append(self.gpa, 0) catch {
+            ok = false;
+        };
+        var col: usize = 0;
+        if (ok) for (raw) |b| {
+            switch (b) {
+                '\r' => {}, // strip CR (CRLF → LF; lone CR dropped too)
+                '\n' => {
+                    starts.append(self.gpa, @intCast(bytes.items.len)) catch {
+                        ok = false;
+                        break;
+                    };
+                    col = 0;
+                },
+                '\t' => {
+                    const n = TAB_STOP - (col % TAB_STOP);
+                    bytes.appendNTimes(self.gpa, ' ', n) catch {
+                        ok = false;
+                        break;
+                    };
+                    col += n;
+                },
+                else => {
+                    if (b < 0x80) {
+                        bytes.append(self.gpa, b) catch {
+                            ok = false;
+                            break;
+                        };
+                    } else {
+                        var u8buf: [4]u8 = undefined;
+                        const len = std.unicode.utf8Encode(cp437_high[b - 0x80], &u8buf) catch unreachable;
+                        bytes.appendSlice(self.gpa, u8buf[0..len]) catch {
+                            ok = false;
+                            break;
+                        };
+                    }
+                    col += 1;
+                },
+            }
+            if (bytes.items.len > MAX_SOURCE_BYTES) {
+                ok = false;
+                break;
+            }
+        };
+        // Final sentinel: if the file did not end on a newline, close the last line.
+        if (ok and (starts.items.len == 0 or starts.getLast() != bytes.items.len)) {
+            starts.append(self.gpa, @intCast(bytes.items.len)) catch {
+                ok = false;
+            };
+        }
+        const total_after = self.source_bytes_total + bytes.items.len;
+        if (!ok or bytes.items.len > MAX_SOURCE_BYTES or total_after > MAX_TOTAL_SOURCE_BYTES) {
+            bytes.deinit(self.gpa);
+            starts.deinit(self.gpa);
+            return; // graceful skip — the file just has no window
+        }
+        const owned_bytes = bytes.toOwnedSlice(self.gpa) catch {
+            bytes.deinit(self.gpa);
+            starts.deinit(self.gpa);
+            return;
+        };
+        const owned_starts = starts.toOwnedSlice(self.gpa) catch {
+            self.gpa.free(owned_bytes);
+            starts.deinit(self.gpa);
+            return;
+        };
+        self.sources[self.source_count] = .{
+            .file_id = file_id,
+            .root_index = root_index,
+            .active = true,
+            .bytes = owned_bytes,
+            .line_starts = owned_starts,
+        };
+        self.source_count += 1;
+        self.source_bytes_total += owned_bytes.len;
+    }
+
+    fn findSource(self: *SourceDebugger, file_id: u32) ?*const CachedSource {
+        for (self.sources[0..self.source_count]) |*s| {
+            if (s.active and s.file_id == file_id) return s;
+        }
+        return null;
+    }
+
+    /// True iff `file_id`'s text is in the source cache (for `list_sources`' `cached`).
+    pub fn isSourceCached(self: *SourceDebugger, file_id: u32) bool {
+        return self.findSource(file_id) != null;
+    }
+
+    /// Render a windowed view around `line` of `file_id` into the caller-provided `scratch`
+    /// (borrowed slices into the owned cache bytes). `requested_ctx` lines each side, CLAMPED
+    /// so `2*ctx+1 ≤ MAX_WINDOW_LINES` (sets `clamped`); the window is `min(2*ctx+1,
+    /// num_lines)` rows, shifted to stay in `[1,num_lines]` while including `line`. Null when
+    /// the file is not cached. Pure in-memory slicing — no host I/O, no machine touch.
+    pub fn sourceWindow(self: *SourceDebugger, file_id: u32, line: u32, requested_ctx: u32, scratch: []core.SrcLine) ?core.SourceWindow {
+        const slot = self.findSource(file_id) orelse return null;
+        const num_lines: u32 = @intCast(slot.line_starts.len - 1);
+        if (num_lines == 0) return null;
+        const max_ctx: u32 = (core.MAX_WINDOW_LINES - 1) / 2;
+        var ctx = requested_ctx;
+        var clamped = false;
+        if (ctx > max_ctx) {
+            ctx = max_ctx;
+            clamped = true;
+        }
+        const target = @min(2 * ctx + 1, num_lines);
+        const center = std.math.clamp(line, 1, num_lines);
+        var start: u32 = if (center > ctx) center - ctx else 1;
+        var end: u32 = start + target - 1;
+        if (end > num_lines) {
+            end = num_lines;
+            start = end + 1 - target;
+        }
+        if (start < 1) start = 1;
+        var n: usize = 0;
+        var ln = start;
+        while (ln <= end and n < scratch.len) : (ln += 1) {
+            const content = slot.bytes[slot.line_starts[ln - 1]..slot.line_starts[ln]];
+            var text = content;
+            var truncated = false;
+            if (text.len > core.MAX_LINE_BYTES) {
+                var cut: usize = core.MAX_LINE_BYTES;
+                while (cut > 0 and (text[cut] & 0xC0) == 0x80) cut -= 1;
+                text = text[0..cut];
+                truncated = true;
+            }
+            scratch[n] = .{ .number = ln, .text = text, .active = (ln == line), .truncated = truncated };
+            n += 1;
+        }
+        return .{
+            .file_id = file_id,
+            .active_line = line,
+            .clamped = clamped,
+            .root_index = slot.root_index,
+            .lines = scratch[0..n],
+        };
+    }
+
+    // ── source-file discovery (M-S1.5: list_sources / read_source name lookup) ──
+
+    /// The number of source files the symbol overlay knows (0 when stripped).
+    pub fn sourceFileCount(self: *SourceDebugger) u32 {
+        if (self.syms) |*s| return s.index.sourceFileCount();
+        return 0;
+    }
+
+    /// The compiler-recorded name of source `file_id` (NOT a host path), or null.
+    pub fn sourceFileName(self: *SourceDebugger, file_id: u32) ?[]const u8 {
+        if (self.syms) |*s| return s.index.sourceFile(file_id);
+        return null;
+    }
+
+    /// Resolve a caller-supplied name to a `file_id`: strict exact match first, then a
+    /// basename fallback (finding #3 — a full-path-recorded TDS name still resolves to the
+    /// bare basename an agent passes). Null when no symbols / no match.
+    pub fn fileIdForName(self: *SourceDebugger, name: []const u8) ?u32 {
+        if (self.syms) |*s| return s.index.fileId(name) orelse s.index.fileIdByBasename(name);
+        return null;
+    }
+
     fn addrFor(self: *SourceDebugger, linear: u32) Addr {
         var a = Addr{ .seg = 0, .off = 0, .linear = linear };
         if (self.map) |m| {
@@ -389,7 +641,10 @@ pub const SourceDebugger = struct {
             .start_line = self.lineKey(snap.cs_base +% snap.eip),
             .start_sp = @as(u16, @truncate(snap.esp)),
         };
-        self.state = .running;
+        // Arm any one-shot FIRST; only mark the session `running` once arming has succeeded.
+        // (An arming failure — e.g. an unresolved `run_to_line` target — resets `self.step`
+        // and propagates the error, leaving `state` at its prior `stopped`/`configuring` value
+        // so a later `whereami`/inspection is not wedged into a spurious `not_stopped`.)
         switch (kind) {
             .line, .in => {},
             .out => try self.armStepOut(snap),
@@ -413,6 +668,7 @@ pub const SourceDebugger = struct {
                 self.step.oneshot_id = try self.ctrl.addBreakpoint(.{ .execution_address = .{ .linear = lin } }, true);
             },
         }
+        self.state = .running;
     }
 
     fn armStepOut(self: *SourceDebugger, snap: anytype) Error!void {

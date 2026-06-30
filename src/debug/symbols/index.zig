@@ -368,6 +368,29 @@ pub const SymbolIndex = struct {
         return null;
     }
 
+    /// 0-based file id matched by BASENAME (the relaxed sibling of the strict-`eql`
+    /// `fileId`): drops any drive/dir prefix from BOTH the recorded name and `name` before
+    /// comparing, so a full-path-recorded TDS name (`C:\PROJ\BB.C`) still resolves to the
+    /// bare basename an agent passes (`BB.C`) — `read_source`/the window resolver share one
+    /// id space (plan finding #3). First match wins; null if none.
+    pub fn fileIdByBasename(self: *const SymbolIndex, name: []const u8) ?u32 {
+        const tds = self.tds orelse return null;
+        const want = pathBasename(name);
+        for (tds.sources, 0..) |sf, i| {
+            if (std.mem.eql(u8, pathBasename(tds.name(sf.name)), want)) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// The last path component of `s`, split on either DOS `\` or POSIX `/`.
+    fn pathBasename(s: []const u8) []const u8 {
+        var start: usize = 0;
+        for (s, 0..) |c, i| {
+            if (c == '/' or c == '\\') start = i + 1;
+        }
+        return s[start..];
+    }
+
     /// The function name behind a `FuncRef` (resolves its `name_index` through the name
     /// pool), so callers need not reach into the raw `Tds`. Null for a `.map`-backed
     /// index (no shared name pool — use `nameToSymbol` for `.map` names).

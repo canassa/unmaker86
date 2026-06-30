@@ -58,7 +58,7 @@ const Fixture = struct {
         // and `owns_mount = false` — every session here shares the ONE fixture `dir`, which the
         // fixture closes at `deinit`; an owning teardown would double-close it (the fd-close
         // path is exercised by the dedicated test below).
-        const res = try self.reg.create(self.recipe(), self.dir, 0, false);
+        const res = try self.reg.create(self.recipe(), self.dir, 0, false, .{});
         return res.session;
     }
 
@@ -229,7 +229,7 @@ test "registry: a provisioned (owned) mount fd is CLOSED on deprovision — no f
     var cycle: usize = 0;
     while (cycle < 4) : (cycle += 1) {
         const dir = try Io.Dir.cwd().openDir(fx.io, build_options.examples_dir, .{ .iterate = true });
-        const res = try fx.reg.create(fx.recipe(), dir, 0, true);
+        const res = try fx.reg.create(fx.recipe(), dir, 0, true, .{});
         try std.testing.expect(fx.reg.destroy(res.id.slice()));
     }
     try std.testing.expect(openFdCount(fx.io) <= baseline);
@@ -247,7 +247,7 @@ test "registry: a failed (boot) create does NOT leak the reserved slot" {
     // slot (the errdefer at session_registry.zig:144), not consume one. `owns_mount=false`
     // here so the failure path does not touch the shared fixture dir.
     const bad = LoadRecipe.init(2, "NOPE.COM", "");
-    try std.testing.expectError(error.ProgramNotFound, fx.reg.create(bad, fx.dir, 0, false));
+    try std.testing.expectError(error.ProgramNotFound, fx.reg.create(bad, fx.dir, 0, false, .{}));
     try std.testing.expectEqual(SessionRegistry.MAX_SESSIONS - 1, fx.reg.liveCount());
 
     // The released slot is reusable: one more good create reaches the cap, and only THEN is
@@ -264,7 +264,7 @@ test "registry: a no-cpu (cpu_mult=0) provision keeps the boot-default clock —
     // `cpu_mult = 0` is the "no override" sentinel: `create` SKIPS `setCpuMult`, so the fresh
     // machine keeps its EXACT boot default (provably byte-identical to the inline `--serve`
     // default, which never calls `setCpuMult`). The applied mult rides back in `CreateResult`.
-    const res = try fx.reg.create(fx.recipe(), fx.dir, 0, false);
+    const res = try fx.reg.create(fx.recipe(), fx.dir, 0, false, .{});
     try std.testing.expectEqual(timing.DEFAULT_MULT, res.mult);
     // And the live machine truly carries the boot default (the cycle-neutral read-back), proving
     // no override was applied — the echo reports the machine's real default, not a guess.
@@ -273,7 +273,7 @@ test "registry: a no-cpu (cpu_mult=0) provision keeps the boot-default clock —
     // A SAME-cycle explicit `cpu_mult = DEFAULT_MULT` lands the machine on the identical mult
     // (boot is at cycle 0, where `setCpuMult`'s `syncDeviceTime` delta is 0), so the override
     // path and the skip path agree on the observable clock state — the determinism guarantee.
-    const res2 = try fx.reg.create(fx.recipe(), fx.dir, timing.DEFAULT_MULT, false);
+    const res2 = try fx.reg.create(fx.recipe(), fx.dir, timing.DEFAULT_MULT, false, .{});
     try std.testing.expectEqual(timing.DEFAULT_MULT, res2.mult);
     try std.testing.expectEqual(clockMultOf(res.session), clockMultOf(res2.session));
 }

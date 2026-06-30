@@ -297,7 +297,12 @@ pub const Server = struct {
         // `*Session` (no refcount wait needed). Then free the default session's heap blocks
         // (only when one was provisioned — empty-start mode has no default to free).
         self.registry.deinit();
-        if (self.session) |*s| s.deinit(self.gpa);
+        if (self.session) |*s| {
+            // Close the default session's configured source roots (M-S1.5) — owned by the
+            // session, opened by `load source_path` (the minted ones close in `teardown`).
+            s.source_roots.close(self.io);
+            s.deinit(self.gpa);
+        }
     }
 
     // INVARIANT for the four pacer/stream accessors below: they are called ONLY by
@@ -383,7 +388,7 @@ pub const Server = struct {
         // the Server is at its final address.)
         if (self.session) |*s| {
             s.wireStream(self.io);
-            var w: worker_mod.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl, .mount_dir = s.mount_dir, .io = self.io, .render = s.render, .live_mouse = s.live_mouse, .snapshots = s.snapshots, .run_ctl = s.run_control, .sd = s.source_debugger, .initial_file_len = s.recipe.file_len };
+            var w: worker_mod.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl, .mount_dir = s.mount_dir, .io = self.io, .render = s.render, .live_mouse = s.live_mouse, .snapshots = s.snapshots, .run_ctl = s.run_control, .sd = s.source_debugger, .source_roots = &s.source_roots, .initial_file_len = s.recipe.file_len };
             @memcpy(w.initial_file[0..s.recipe.file_len], s.recipe.file[0..s.recipe.file_len]);
             s.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
         }
@@ -1669,6 +1674,9 @@ pub const Conn = struct {
         if (body.len > 0) {
             const r = self.parseBody(wire.LoadReq, body) orelse return self.badJson(req);
             recipe.overlay(r);
+            // `source_path` (M-S1.5) is consumed SERVER-SIDE under the held `session.lock`,
+            // BEFORE the `.load` submit — it never crosses the queue (it is not in the recipe).
+            self.swapSourceRoots(self.session.?, r.source_path);
         }
         // Persist the updated recipe so a later `POST /api/load {}` re-loads it.
         self.session.?.recipe = recipe;
@@ -2098,11 +2106,16 @@ pub const Conn = struct {
         var dir = std.Io.Dir.cwd().openDir(self.server.io, pa.mount_dir, .{ .iterate = true }) catch
             return self.respondRpcError(req, id, .invalid_params, "mount_dir not found or not a directory");
 
+        // Open the configured source roots (M-S1.5) — a SEPARATE host handle from the C: mount.
+        // On a `create` failure ownership did not transfer, so close them alongside `dir`.
+        var source_roots: worker_mod.SourceRoots = if (pa.source_path) |sp| self.openSourceRoots(sp) else .{};
+
         const recipe = session_mod.LoadRecipe.init(pa.drive, pa.file, cmdtail);
-        const created = self.server.registry.create(recipe, dir, cpu_mult, true) catch |err| {
-            // create FAILED → ownership of `dir` did NOT transfer; close it (the §5 fd hygiene)
-            // and map the cause to its precise code.
+        const created = self.server.registry.create(recipe, dir, cpu_mult, true, source_roots) catch |err| {
+            // create FAILED → ownership of `dir`/`source_roots` did NOT transfer; close them
+            // (the §5 fd hygiene) and map the cause to its precise code.
             dir.close(self.server.io);
+            source_roots.close(self.server.io);
             return switch (err) {
                 error.ProgramNotFound => self.respondRpcError(req, id, .invalid_params, "file_not_found: the program file is not in the mount dir"),
                 error.SessionLimitReached => self.respondMcpToolError(req, id, "machine_limit_reached", "at the machine cap; deprovision an existing one or call list_machines"),
@@ -2542,14 +2555,48 @@ pub const Conn = struct {
         var recipe = session.recipe;
         if (args == .object) {
             const r = std.json.parseFromValueLeaky(wire.LoadReq, self.arena.allocator(), args, wire.parse_options) catch {
-                self.respondRpcError(req, id, .invalid_params, "load expects {drive?,file?,cmdtail?}");
+                self.respondRpcError(req, id, .invalid_params, "load expects {drive?,file?,cmdtail?,source_path?}");
                 return null;
             };
             // The SAME overlay the HTTP `handleLoad` applies (anti-drift).
             recipe.overlay(r);
+            // `source_path` (M-S1.5) is consumed SERVER-SIDE here (under the caller's held
+            // `session.lock`), BEFORE the `.load` submit — it never crosses the queue.
+            self.swapSourceRoots(session, r.source_path);
         }
         session.recipe = recipe;
         return .{ .load = recipe.toCmd() };
+    }
+
+    /// Build a fresh `SourceRoots` from a `source_path` JSON value (a single dir string or an
+    /// array of dir strings), opening each cwd-relative; a bad path is SKIPPED (graceful —
+    /// the window is just `has=false`). Bounded to `MAX_SOURCE_ROOTS`.
+    fn openSourceRoots(self: *Conn, sp: std.json.Value) worker_mod.SourceRoots {
+        var roots: worker_mod.SourceRoots = .{};
+        switch (sp) {
+            .string => |s| self.openOneRoot(&roots, s),
+            .array => |arr| for (arr.items) |it| {
+                if (it == .string) self.openOneRoot(&roots, it.string);
+            },
+            else => {},
+        }
+        return roots;
+    }
+
+    fn openOneRoot(self: *Conn, roots: *worker_mod.SourceRoots, path: []const u8) void {
+        if (path.len == 0 or roots.count >= worker_mod.MAX_SOURCE_ROOTS) return;
+        const dir = std.Io.Dir.cwd().openDir(self.server.io, path, .{}) catch return;
+        roots.push(dir, std.fs.path.basename(path));
+    }
+
+    /// Swap the Session's configured source roots from a `load source_path` value, under the
+    /// caller's already-held `session.lock`: open the new roots, CLOSE the prior ones, install
+    /// the new. ABSENT (`null`) ⇒ keep the existing roots (a `load {}` does not clear them).
+    fn swapSourceRoots(self: *Conn, session: *Session, sp: ?std.json.Value) void {
+        const v = sp orelse return;
+        const newroots = self.openSourceRoots(v);
+        session.source_roots.close(self.server.io);
+        session.source_roots = newroots;
     }
 
     /// A JSON-RPC `error` envelope (mcp-plan.md §6.2). Always HTTP 200 — a well-formed
@@ -2816,9 +2863,11 @@ pub const Conn = struct {
             .trace_dump => |d| try self.writeTraceDump(w, d),
             // ---- source-level debug core (M-S1) — flat PODs → JSON ----
             .dbg_where => |loc| try self.writeWhere(w, loc),
-            .dbg_bp => |bp| try self.writeDbgBreakpoint(w, bp),
+            .dbg_bp_set => |r| try self.writeDbgBpSet(w, r),
             .dbg_bp_list => |l| try self.writeDbgBpList(w, l),
             .dbg_stop => |st| try self.writeDbgStop(w, st),
+            .dbg_source => |win| try self.writeSourceWindow(w, win),
+            .dbg_sources => |sf| try self.writeDbgSources(w, sf),
             // Pre-handled by every caller (see the doc comment). Reaching here is a bug.
             .err, .framebuffer => unreachable,
         }
@@ -2850,6 +2899,40 @@ pub const Conn = struct {
             try std.json.Stringify.encodeJsonString(loc.path[0..loc.path_len], .{}, w);
             try w.print(",\"line\":{d}}}", .{loc.line});
         } else try w.writeAll("null");
+        // The inlined source window (M-S1.5) — always an OBJECT (`has:false` signals
+        // absence; never a bare `null`, so a client can always read `window.has`).
+        try w.writeAll(",\"window\":");
+        try self.writeSourceWindow(w, loc.window);
+    }
+
+    /// Emit a `SourceWindow` (M-S1.5) as JSON. The `text` bytes are ALREADY UTF-8
+    /// (CP437-transcoded at `cacheSource` time), so `encodeJsonString` produces valid-UTF-8
+    /// JSON without `escape_unicode` (which would panic on a lone high byte) and escapes any
+    /// remaining C0 control char as `\u00XX`. ALWAYS an object — `has:false` signals absence.
+    fn writeSourceWindow(self: *Conn, w: *std.Io.Writer, win: q.SourceWindow) std.Io.Writer.Error!void {
+        _ = self;
+        try w.print("{{\"has\":{},\"clamped\":{},\"has_root\":{},\"root\":{d},\"file_id\":{d},\"active_line\":{d},\"count\":{d},\"lines\":[", .{ win.has, win.clamped, win.has_root, win.root, win.file_id, win.active_line, win.count });
+        for (win.lines[0..win.count], 0..) |ln, i| {
+            if (i != 0) try w.writeAll(",");
+            try w.print("{{\"number\":{d},\"active\":{},\"truncated\":{},\"text\":", .{ ln.number, ln.active, ln.truncated });
+            try std.json.Stringify.encodeJsonString(ln.text[0..ln.len], .{}, w);
+            try w.writeAll("}");
+        }
+        try w.writeAll("]}");
+    }
+
+    /// `list_sources` → `{"files":[{file_id,path,cached},...]}` (path = the TDS-recorded
+    /// name, NOT a host path — no operator layout leak).
+    fn writeDbgSources(self: *Conn, w: *std.Io.Writer, sf: q.SourceFilesResult) std.Io.Writer.Error!void {
+        _ = self;
+        try w.writeAll("{\"files\":[");
+        for (sf.items[0..sf.count], 0..) |it, i| {
+            if (i != 0) try w.writeAll(",");
+            try w.print("{{\"file_id\":{d},\"path\":", .{it.file_id});
+            try std.json.Stringify.encodeJsonString(it.path[0..it.path_len], .{}, w);
+            try w.print(",\"cached\":{}}}", .{it.cached});
+        }
+        try w.writeAll("]}");
     }
 
     fn writeWhere(self: *Conn, w: *std.Io.Writer, loc: q.PcLocationResult) std.Io.Writer.Error!void {
@@ -2859,7 +2942,25 @@ pub const Conn = struct {
     }
 
     fn writeDbgBreakpoint(self: *Conn, w: *std.Io.Writer, bp: q.DbgBreakpoint) std.Io.Writer.Error!void {
-        try w.print("{{\"id\":{d},\"kind\":\"{s}\",\"verified\":{},\"spec\":", .{ bp.id, @tagName(bp.kind), bp.verified });
+        try w.writeAll("{");
+        try self.writeDbgBpInner(w, bp);
+        try w.writeAll("}");
+    }
+
+    /// The R6 set-confirm: the breakpoint object PLUS its placement `window` (M-S1.5). The
+    /// list row (`writeDbgBreakpoint`) stays window-free (finding #1).
+    fn writeDbgBpSet(self: *Conn, w: *std.Io.Writer, r: q.DbgBpSetResult) std.Io.Writer.Error!void {
+        try w.writeAll("{");
+        try self.writeDbgBpInner(w, r.bp);
+        try w.writeAll(",\"window\":");
+        try self.writeSourceWindow(w, r.window);
+        try w.writeAll("}");
+    }
+
+    /// The breakpoint object body WITHOUT outer braces (shared by the list row + the
+    /// set-confirm).
+    fn writeDbgBpInner(self: *Conn, w: *std.Io.Writer, bp: q.DbgBreakpoint) std.Io.Writer.Error!void {
+        try w.print("\"id\":{d},\"kind\":\"{s}\",\"verified\":{},\"spec\":", .{ bp.id, @tagName(bp.kind), bp.verified });
         // spec: source → {file,line}; function → {name}; addr → {linear}
         switch (bp.kind) {
             .source => {
@@ -2884,7 +2985,6 @@ pub const Conn = struct {
             try std.json.Stringify.encodeJsonString(bp.path[0..bp.path_len], .{}, w);
             try w.print(",\"line\":{d}}}", .{bp.src_line});
         } else try w.writeAll("null");
-        try w.writeAll("}");
     }
 
     fn writeDbgBpList(self: *Conn, w: *std.Io.Writer, l: q.DbgBpListResult) std.Io.Writer.Error!void {

@@ -213,9 +213,9 @@ pub const Command = union(enum) {
     // the single machine-owning thread (no second path to the machine). All M-S1
     // results are FLAT pointer-free PODs (the DisasmResult flatten pattern, §3.1a) —
     // no worker-side JSON body seam (that is M-S2).
-    /// `whereami` — resolve the live CS:IP to function + source line (PcLocation).
-    /// A pure inspection (cycle-neutral); valid only at a clean stop boundary.
-    dbg_where: void,
+    /// `whereami` — resolve the live CS:IP to function + source line (PcLocation), and
+    /// inline a `context`-sized source window (M-S1.5). Cycle-neutral; valid at a stop.
+    dbg_where: DbgStepReq,
     /// Set a SOURCE breakpoint (`file:line`); the file path rides inline (fixed cap).
     dbg_set_src_bp: DbgSrcBpCmd,
     /// Set a FUNCTION breakpoint (post-prologue entry); the name rides inline.
@@ -225,13 +225,18 @@ pub const Command = union(enum) {
     /// Enumerate the source-spec breakpoints (≤ DBG_MAX_SPECS rows).
     dbg_list_bp: void,
     /// Source-line step (`next` — step OVER calls), driven preemptibly by the worker.
-    dbg_step_line: void,
+    dbg_step_line: DbgStepReq,
     /// Source step INTO a callee's first line.
-    dbg_step_in: void,
+    dbg_step_in: DbgStepReq,
     /// Run to the caller's return (stepOut).
-    dbg_step_out: void,
+    dbg_step_out: DbgStepReq,
     /// Run to a `file:line` one-shot target (runToLine).
     dbg_run_to_line: DbgSrcBpCmd,
+    /// `read_source` — a windowed, line-numbered view of any source file (M-S1.5). Pure
+    /// host-side cache read; NOT gated on Stopped.
+    dbg_read_source: DbgReadSrcCmd,
+    /// `list_sources` — enumerate the program's source files (id, path, cached).
+    dbg_list_sources: void,
 
     /// The worker-shutdown sentinel: the worker loop exits when it dequeues this.
     shutdown_worker: void,
@@ -247,12 +252,83 @@ pub const DBG_NAME_CAP = 128;
 /// Mirrors `core.MAX_SPECS` — the SourceDebugger spec table size.
 pub const DBG_MAX_SPECS = 64;
 
-/// `dbg_set_src_bp` / `dbg_run_to_line` argument: a source `file:line` with the file
-/// name copied into a fixed inline buffer (the handler/`buildCommand` copies it).
-pub const DbgSrcBpCmd = struct {
-    line: u32,
+// ---- source-code inlining (M-S1.5, debug-source-inlining-plan §4/§5) ----------
+/// `±context` default ≈ 11 total (gdb/pdb/Delve, verified). Mirrors `core.DEFAULT_SOURCE_CONTEXT`.
+pub const DBG_CONTEXT_DEFAULT: u16 = 5;
+/// Hard cap on rows in one window POD (context effectively ≤ 16/side). Mirrors `core.MAX_WINDOW_LINES`.
+pub const DBG_WINDOW_LINES_MAX = 33;
+/// Bytes of (transcoded UTF-8) text per line; longer ⇒ `truncated=true`. Mirrors `core.MAX_LINE_BYTES`.
+pub const DBG_SRC_LINE_CAP = 160;
+/// Max source files `list_sources` enumerates inline.
+pub const DBG_MAX_SOURCES = 64;
+
+/// One source line of a window (flattened `core.SrcLine`): the 1-based `number`, the
+/// `active`/`truncated` flags, and the UTF-8 (CP437-transcoded) `text` in a fixed buffer.
+pub const SourceLine = struct {
+    number: u32 = 0,
+    active: bool = false,
+    truncated: bool = false,
+    len: u16 = 0,
+    text: [DBG_SRC_LINE_CAP]u8 = undefined,
+};
+
+/// A windowed, line-numbered source view (flattened `core.SourceWindow`). Pointer-free:
+/// integers/bools/fixed arrays only. `root` is a bounded INDEX into the configured source
+/// roots (NEVER a host path — finding #9); `has=false` ⇒ no text (file absent / no symbols
+/// / not cached). Rides ONLY single-frame results (`PcLocationResult`/`DbgStopResult`/
+/// `DbgBpSetResult`) + the standalone `dbg_source` — never the `[64]`-row list (§B.5).
+pub const SourceWindow = struct {
+    has: bool = false,
+    clamped: bool = false,
+    has_root: bool = false,
+    root: u8 = 0,
+    file_id: u32 = 0,
+    active_line: u32 = 0,
+    count: u8 = 0,
+    lines: [DBG_WINDOW_LINES_MAX]SourceLine = undefined,
+};
+
+/// `whereami` / step-step context request: a tiny pointer-free POD carrying the requestable
+/// window size (lines above and below). `u16` so an oversize request (clamp test) rides to
+/// the worker, which clamps + flags `clamped` (defence-in-depth — `buildCommand` narrows too).
+pub const DbgStepReq = struct {
+    context: u16 = DBG_CONTEXT_DEFAULT,
+};
+
+/// `read_source` argument: address a file by an echoed `file_id` OR a name (resolved
+/// exact→basename on the worker), a 1-based `line`, and the window `context`.
+pub const DbgReadSrcCmd = struct {
+    has_file_id: bool = false,
+    file_id: u32 = 0,
+    line: u32 = 0,
+    context: u16 = DBG_CONTEXT_DEFAULT,
     file_len: u8 = 0,
     file: [DBG_PATH_CAP]u8 = undefined,
+};
+
+/// `dbg_set_src_bp` / `dbg_run_to_line` argument: a source `file:line` with the file
+/// name copied into a fixed inline buffer (the handler/`buildCommand` copies it). The
+/// `context` rides the run-to-line / set-confirm placement window (M-S1.5).
+pub const DbgSrcBpCmd = struct {
+    line: u32,
+    context: u16 = DBG_CONTEXT_DEFAULT,
+    file_len: u8 = 0,
+    file: [DBG_PATH_CAP]u8 = undefined,
+};
+
+/// One `list_sources` row: the compiler-recorded `path` (NOT a host path), and whether its
+/// TEXT is in the source cache (so the agent knows which files have windows).
+pub const SourceFile = struct {
+    file_id: u32 = 0,
+    cached: bool = false,
+    path_len: u8 = 0,
+    path: [DBG_PATH_CAP]u8 = undefined,
+};
+
+/// The `list_sources` result: a fixed array of source-file rows + the live count.
+pub const SourceFilesResult = struct {
+    count: u32 = 0,
+    items: [DBG_MAX_SOURCES]SourceFile = undefined,
 };
 
 /// `dbg_set_fn_bp` argument: a function name in a fixed inline buffer.
@@ -529,6 +605,8 @@ pub const PcLocationResult = struct {
     file_id: u32 = 0,
     path_len: u8 = 0,
     path: [DBG_PATH_CAP]u8 = undefined,
+    /// The inlined source window around `line` (M-S1.5); `window.has=false` ⇒ no text.
+    window: SourceWindow = .{},
 };
 
 /// The source-spec breakpoint kind (flattened from `core.BreakpointSpec`).
@@ -572,6 +650,13 @@ pub const DbgStopResult = struct {
     exit_code: u16 = 0,
     has_pc: bool = false,
     pc: PcLocationResult = .{},
+};
+
+/// R6 breakpoint SET-confirm (single result) — carries the placement window. The list row
+/// `DbgBreakpoint` stays window-free so `DbgBpListResult` does not balloon (finding #1).
+pub const DbgBpSetResult = struct {
+    bp: DbgBreakpoint = .{},
+    window: SourceWindow = .{},
 };
 
 pub const Response = union(enum) {
@@ -622,14 +707,18 @@ pub const Response = union(enum) {
     /// A branch-trace dump page. Pointer-free POD filled by the worker from the ring.
     trace_dump: TraceDumpResult,
     // ---- source-level debug core (M-S1) — flat pointer-free results ----
-    /// `whereami` — a flattened `core.PcLocation` (serialized off-worker by `writeWhere`).
+    /// `whereami` — a flattened `core.PcLocation` + inlined source window (`writeWhere`).
     dbg_where: PcLocationResult,
-    /// A source/function breakpoint set confirmation (flattened `core.ResolvedBreakpoint`).
-    dbg_bp: DbgBreakpoint,
-    /// The source-spec breakpoint list (≤ `DBG_MAX_SPECS` rows).
+    /// A source/function breakpoint SET-confirm: the breakpoint + its placement window (R6).
+    dbg_bp_set: DbgBpSetResult,
+    /// The source-spec breakpoint list (≤ `DBG_MAX_SPECS` rows; window-free, finding #1).
     dbg_bp_list: DbgBpListResult,
-    /// A source-step / run-to result (flattened `core.StopState`).
+    /// A source-step / run-to result (flattened `core.StopState`; the `pc` carries a window).
     dbg_stop: DbgStopResult,
+    /// `read_source` — a standalone windowed source view (M-S1.5).
+    dbg_source: SourceWindow,
+    /// `list_sources` — the program's source files (id, path, cached).
+    dbg_sources: SourceFilesResult,
     /// A typed error. The handler maps `code` → HTTP status.
     err: ErrCode,
 };

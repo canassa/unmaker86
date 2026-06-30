@@ -276,6 +276,143 @@ test "M-S1 core: attach -> source bp -> cont -> pcLocation -> stepLine -> stepOu
     try testing.expectEqualStrings("_main", out.pc.?.function.?);
 }
 
+// ===========================================================================
+// M-S1.5 — the PURE source-cache + window render (debug-source-inlining-plan §9).
+// Drives `cacheSource`/`sourceWindow` directly (no wire, no machine), proving the
+// render + flags + name lookup independent of the transport.
+// ===========================================================================
+
+// The exact bytes of examples/BB.C (the committed oracle): line 9 = "    r = v;",
+// line 20 = "    m = GRAPHICS;". 28 lines, LF-terminated.
+const bb_c =
+    \\struct Pixel { int x; int y; unsigned char color; };
+    \\enum Mode { TEXT, GRAPHICS, HIRES };
+    \\
+    \\int g_frames;
+    \\
+    \\int clamp(int v, int lo, int hi)
+    \\{
+    \\    int r;
+    \\    r = v;
+    \\    if (r < lo) r = lo;
+    \\    if (r > hi) r = hi;
+    \\    return r;
+    \\}
+    \\
+    \\int main(void)
+    \\{
+    \\    struct Pixel p;
+    \\    enum Mode m;
+    \\    int i;
+    \\    m = GRAPHICS;
+    \\    p.x = clamp(300, 0, 319);
+    \\    p.y = clamp(250, 0, 199);
+    \\    p.color = 15;
+    \\    for (i = 0; i < 3; i++) {
+    \\        g_frames = g_frames + 1;
+    \\    }
+    \\    return p.x + p.y + (int)m;
+    \\}
+    \\
+;
+
+fn lineNamed(win: core.SourceWindow, number: u32) ?core.SrcLine {
+    for (win.lines) |l| if (l.number == number) return l;
+    return null;
+}
+
+test "M-S1.5 core: cacheSource + sourceWindow render (BB.C oracle, flags, name lookup)" {
+    const alloc = testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    try writeHostFile(&ctx, "BB.EXE", bb_exe);
+    try m.bootProgram(2, "BB.EXE", "");
+    const psp_seg = m.dos.current_psp;
+
+    var ctrl = Controller.init(m);
+    var sd = SourceDebugger.init(alloc, &ctrl);
+    defer sd.deinit();
+    sd.attachOnLoad(bb_exe, null, psp_seg);
+
+    const file_id = sd.fileIdForName("BB.C") orelse return error.NoFile;
+    // Name lookup: exact and basename resolve the SAME id `fileId` does.
+    try testing.expectEqual(file_id, sd.fileIdForName("BB.C").?);
+
+    // Feed the on-disk BB.C bytes (the worker would read these off a configured root).
+    sd.cacheSource(file_id, 0, bb_c);
+    try testing.expect(sd.isSourceCached(file_id));
+
+    var scratch: [core.MAX_WINDOW_LINES]core.SrcLine = undefined;
+
+    // Default context (5): 11 lines 4..14, line 9 active, text "    r = v;".
+    {
+        const w = sd.sourceWindow(file_id, 9, 5, &scratch).?;
+        try testing.expectEqual(@as(usize, 11), w.lines.len);
+        try testing.expectEqual(@as(u32, 4), w.lines[0].number);
+        try testing.expectEqual(@as(u32, 14), w.lines[10].number);
+        try testing.expect(!w.clamped);
+        const active = lineNamed(w, 9).?;
+        try testing.expect(active.active);
+        try testing.expectEqualStrings("    r = v;", active.text);
+        try testing.expect(!lineNamed(w, 8).?.active);
+    }
+    // context 0 → exactly the active line.
+    {
+        const w = sd.sourceWindow(file_id, 9, 0, &scratch).?;
+        try testing.expectEqual(@as(usize, 1), w.lines.len);
+        try testing.expect(w.lines[0].active);
+        try testing.expectEqualStrings("    r = v;", w.lines[0].text);
+    }
+    // Oversize context → clamped, count == min(MAX_WINDOW_LINES, file length) = 28.
+    {
+        const w = sd.sourceWindow(file_id, 6, 1000, &scratch).?;
+        try testing.expect(w.clamped);
+        try testing.expectEqual(@as(usize, 28), w.lines.len);
+        try testing.expectEqual(@as(u32, 1), w.lines[0].number);
+        try testing.expectEqual(@as(u32, 28), w.lines[27].number);
+    }
+}
+
+test "M-S1.5 core: line truncation + CP437/CRLF/TAB transcode (no silent smear)" {
+    const alloc = testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    var ctrl = Controller.init(ctx.m);
+    var sd = SourceDebugger.init(alloc, &ctrl);
+    defer sd.deinit();
+    sd.attachOnLoad(null, null, 0); // no symbols needed for the pure cache path
+
+    // A long line (> MAX_LINE_BYTES) on line 1; a short line 2 (so line_starts is exercised).
+    {
+        var buf: [core.MAX_LINE_BYTES + 50]u8 = undefined;
+        @memset(buf[0..], 'x');
+        buf[buf.len - 1] = '\n';
+        buf[buf.len - 2] = 'b'; // line 2 = "b"
+        buf[buf.len - 3] = '\n';
+        // The cache is keyed by id, independent of the (absent) symbols.
+        sd.cacheSource(7, 0, buf[0..]);
+        var scratch: [core.MAX_WINDOW_LINES]core.SrcLine = undefined;
+        const w = sd.sourceWindow(7, 1, 0, &scratch).?;
+        try testing.expect(w.lines[0].truncated);
+        try testing.expectEqual(@as(usize, core.MAX_LINE_BYTES), w.lines[0].text.len);
+    }
+    // CP437 high byte (0xC9 → ═ U+2550) + CRLF + a leading TAB: assert valid UTF-8, CR
+    // stripped, TAB expanded to spaces (the one place "no silent smear" is at risk).
+    {
+        const raw = "\tA\xC9B\r\nnext\r\n"; // line 1 = TAB A ═ B (CRLF)
+        sd.cacheSource(8, 1, raw);
+        var scratch: [core.MAX_WINDOW_LINES]core.SrcLine = undefined;
+        const w = sd.sourceWindow(8, 1, 0, &scratch).?;
+        const text = w.lines[0].text;
+        try testing.expect(std.unicode.utf8ValidateSlice(text)); // valid UTF-8
+        try testing.expect(std.mem.indexOfScalar(u8, text, '\r') == null); // CR stripped
+        // TAB at column 0 expands to 8 spaces, then "A", the ═ glyph (U+2550 = E2 95 90), "B".
+        try testing.expectEqualStrings("        A\u{2550}B", text);
+    }
+}
+
 test "M-S1 core: source breakpoint re-resolves across a reload (new load_para)" {
     const alloc = testing.allocator;
     var ctx = try boot(alloc);
