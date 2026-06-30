@@ -1,0 +1,679 @@
+Turbo Dump  Version 3.1 Copyright (c) 1988, 1992 Borland International
+                      Display of File MI.EXE
+
+DOS File Size                                       22D0h  (  8912. )
+Load Image Size                                     1550h  (  5456. )
+Relocation Table entry count                        0011h  (    17. )
+Relocation Table address                            003Eh  (    62. )
+Size of header record      (in paragraphs)          0020h  (    32. )
+Minimum Memory Requirement (in paragraphs)          0000h  (     0. )
+Maximum Memory Requirement (in paragraphs)          FFFFh  ( 65535. )
+File load checksum                                  0000h  (     0. )
+Overlay Number                                      0000h  (     0. )
+
+Borland TLINK Version 5.00
+
+Initial Stack Segment  (SS:SP)			  014D:0080
+Program Entry Point    (CS:IP)			  0000:0000
+
+Relocation Locations (17 Entries)
+
+    0000:0001    0000:005E    0000:00A3    0000:014F    0115:02EC
+    0115:00AE    0115:00AA    0115:00A6    0115:00A2    0115:009E
+    0115:00B2    0115:00BA    0115:00B6    0115:00C8    0115:00C4
+    0115:00C0    0000:0E74
+
+Borland TLINK Symbol Table Present:
+
+Symbolic Information Version:      3.10
+Debugger Hook Address:             0000:0000
+Case Sensitive Link:               Yes
+Pascal Overlays Present:           No 
+
+Image Size                                        001750h  (  5968. )
+Name Pool Size (in bytes)                         0003CDh  (   973. )
+Number of Names                                     0074h  (   116. )
+Number of Type Entries                              002Ch  (    44. )
+Number of Member Entries                            000Fh  (    15. )
+Number of Symbols                                   0073h  (   115. )
+Number of Global Symbols                            0062h  (    98. )
+Number of Source Modules                            0001h  (     1. )
+Number of Local Symbols                             0000h  (     0. )
+Number of Scopes                                    0010h  (    16. )
+Number of Line Number Entries                       000Bh  (    11. )
+Number of Include Files                             0001h  (     1. )
+Number of Segments                                  0001h  (     1. )
+Number of Correlation Entries                       0007h  (     7. )
+Basic RTL String Segment Offset                     0000h  (     0. )
+Data Count                                          0000h  (     0. )
+Number of Class Entries                             0003h  (     3. )
+Mumber of Global Classes                            0000h  (     0. )
+Number of Parent Entries                            0002h  (     2. )
+Number of Overload Entries                          0000h  (     0. )
+Number of Scope Class Entries                       0000h  (     0. )
+Number of Module Class Entries                      0001h  (     1. )
+Number of Coverage Analysis Offsets                 0018h  (    24. )
+Number of Browser Entries                           0000h  (     0. )
+Number of Optimized Symbol Entries                  0000h  (     0. )
+Debug Flags                                         0000h  (     0. )
+
+Global Table                      98 Entries (0062)  File Base: 017A0h
+
+  Constant: 000C	  [001] __AHSHIFT            Type: Unknown
+  0000:0157 [002] __cleanup            Type: Unknown
+  0000:016A [003] __checknull          Type: Unknown
+  0000:016B [004] __terminate          Type: Unknown
+  0000:01C0 [005] __restorezero        Type: Unknown
+  0000:027A [006] _abort               Type: Unknown
+  0000:0291 [007] DGROUP@              Type: Unknown
+  0000:0293 [008] __MMODEL             Type: Unknown
+  0000:0295 [009] _atexit              Type: Unknown
+  0000:031A [00a] _exit                Type: Unknown
+  0000:0329 [00b] __exit               Type: Unknown
+  0000:033B [00c] __cexit              Type: Unknown
+  0000:0349 [00d] __c_exit             Type: Unknown
+  0000:0355 [00e] N_LXLSH@             Type: Unknown
+  0000:0358 [00f] LXLSH@               Type: Unknown
+  0000:0358 [010] F_LXLSH@             Type: Unknown
+  0000:0376 [011] N_PADD@              Type: Unknown
+  0000:0379 [012] F_PADD@              Type: Unknown
+  0000:0379 [013] PADD@                Type: Unknown
+  0000:03A5 [014] N_PSUB@              Type: Unknown
+  0000:03A8 [015] F_PSUB@              Type: Unknown
+  0000:03A8 [016] PSUB@                Type: Unknown
+  0000:03D6 [017] __IOERROR            Type: Unknown
+  0000:040F [018] __DOSERROR           Type: Unknown
+  0000:0421 [019] _isatty              Type: Unknown
+  0000:0432 [01a] _lseek               Type: Unknown
+  0000:045B [01b] N_PCMP@              Type: Unknown
+  0000:047C [01c] __setupio            Type: Unknown
+  0000:0536 [01d] ___first             Type: Unknown
+  0000:0538 [01e] ___last              Type: Unknown
+  0000:053A [01f] ___rover             Type: Unknown
+  0000:0676 [020] _free                Type: Unknown
+  0000:0676 [021] _farfree             Type: Unknown
+  0000:0780 [022] _malloc              Type: Unknown
+  0000:078A [023] _farmalloc           Type: Unknown
+  0000:08E7 [024] _realloc             Type: Unknown
+  0000:08EE [025] _farrealloc          Type: Unknown
+  0000:09DE [026] __brk                Type: Unknown
+  0000:0A1D [027] __sbrk               Type: Unknown
+  0000:0AA8 [028] _setblock            Type: Unknown
+  0000:0AC4 [029] _fflush              Type: Unknown
+  0000:0B91 [02a] _flushall            Type: Unknown
+  0000:0C55 [02b] _fseek               Type: Unknown
+  0000:0CD5 [02c] _ftell               Type: Unknown
+  0000:0DB5 [02d] _setvbuf             Type: Unknown
+  0000:0ED2 [02e] ___write             Type: Unknown
+  Constant: 1000	  [02f] __AHINCR             Type: Unknown
+  0000:1023 [030] __write              Type: Unknown
+  0000:105F [031] __xfflush            Type: Unknown
+  0109:0007 [032] _main                Type: function far C returns signed int
+  0109:0076 [033] C::fc()              Type: special function far C member Out-of-line returns signed int
+  0109:0080 [034] C::fa()              Type: special function far C member Out-of-line returns signed int
+  0109:008A [035] A::fz()              Type: special function far C member Out-of-line returns signed int
+  0109:0094 [036] C::fb()              Type: special function far C member Out-of-line returns signed int
+  0109:009E [037] C::                  Type: Unknown
+  0109:00AA [038] B::fb()              Type: special function far C member Out-of-line returns signed int
+  0109:00B4 [039] A::fa()              Type: special function far C member Out-of-line returns signed int
+  0115:0000 [03a] DATASEG@             Type: Unknown
+  0115:005B [03b] __Int0Vector         Type: Unknown
+  0115:005F [03c] __Int4Vector         Type: Unknown
+  0115:0063 [03d] __Int5Vector         Type: Unknown
+  0115:0067 [03e] __Int6Vector         Type: Unknown
+  0115:006B [03f] __C0argc             Type: Unknown
+  0115:006D [040] __C0argv             Type: Unknown
+  0115:0071 [041] __C0environ          Type: Unknown
+  0115:0075 [042] __envLng             Type: Unknown
+  0115:0077 [043] __envseg             Type: Unknown
+  0115:0079 [044] __envSize            Type: Unknown
+  0115:007B [045] __psp                Type: Unknown
+  0115:007D [046] __osversion          Type: Unknown
+  0115:007D [047] __osmajor            Type: Unknown
+  0115:007D [048] __version            Type: Unknown
+  0115:007E [049] __osminor            Type: Unknown
+  0115:007F [04a] _errno               Type: Unknown
+  0115:0081 [04b] __StartTime          Type: Unknown
+  0115:0085 [04c] ___brklvl            Type: Unknown
+  0115:0087 [04d] __heapbase           Type: Unknown
+  0115:008B [04e] __brklvl             Type: Unknown
+  0115:008F [04f] __heaptop            Type: Unknown
+  0115:0094 [050] _g_a                 Type: class 'A' 
+  0115:0098 [051] _g_b                 Type: class 'B' 
+  0115:009C [052] c::                  Type: Unknown
+  0115:00B0 [053] b::                  Type: Unknown
+  0115:00B4 [054] a::                  Type: Unknown
+  0115:00BC [055] __atexitcnt          Type: Unknown
+  0115:00BE [056] __exitbuf            Type: Unknown
+  0115:00C2 [057] __exitfopen          Type: Unknown
+  0115:00C6 [058] __exitopen           Type: Unknown
+  0115:00CA [059] __streams            Type: Unknown
+  0115:025A [05a] __nfile              Type: Unknown
+  0115:025C [05b] __openfd             Type: Unknown
+  0115:0284 [05c] __doserrno           Type: Unknown
+  0115:0286 [05d] __dosErrorToSV       Type: Unknown
+  0115:02E0 [05e] __stklen             Type: Unknown
+  0115:02E8 [05f] __ScanTodVector      Type: Unknown
+  0115:02E8 [060] __RealCvtVector      Type: Unknown
+  0115:02F4 [061] _g_c                 Type: class 'C' 
+  0115:02FE [062] __atexittbl          Type: Unknown
+
+
+Module Table                       1 Entries (0001)  File Base: 01BABh
+
+  Module: [064] MI
+    Language:  C++           Underbars: Yes    Memory Model: Large
+
+    Source Files:
+    [074] MI.CPP                 Time Stamp: 06/30/126  07:43 am
+
+    Module Type Definitions:
+      [06a] C                    tag class 'C' 
+      [069] B                    tag class 'B' 
+      [068] A                    tag class 'A' 
+
+    Correlation Records:
+      File Name: MI.CPP
+      Code Base:    0109:0007	   Code Length: 00B7 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  0052 Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  004C Bytes
+        [BP-8]	   q                    auto far pointer class 'B' 
+        [BP-4]	   p                    auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fc()
+        Scope Offset:  0076	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  3	
+        Scope Offset:  0079	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	
+        Scope Offset:  0059	   Scope Length:  001D Bytes
+
+      Parent Scope:  5	
+        Scope Offset:  005C	   Scope Length:  001A Bytes
+
+      Parent Scope:  0	Parent Function:  C::fa()
+        Scope Offset:  0080	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  7	
+        Scope Offset:  0083	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  A::fz()
+        Scope Offset:  008A	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  9	
+        Scope Offset:  008D	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fb()
+        Scope Offset:  0094	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  B	
+        Scope Offset:  0097	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  B::fb()
+        Scope Offset:  00AA	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  D	
+        Scope Offset:  00AD	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  0	Parent Function:  A::fa()
+        Scope Offset:  00B4	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  F	
+        Scope Offset:  00B7	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Line Numbers:
+         7:0007h      8:000Dh      9:0015h     10:001Dh     11:0055h
+
+      File Name: MI.CPP
+      Code Base:    0109:0007	   Code Length: 00B7 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  0052 Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  004C Bytes
+        [BP-8]	   q                    auto far pointer class 'B' 
+        [BP-4]	   p                    auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fc()
+        Scope Offset:  0076	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  3	
+        Scope Offset:  0079	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	
+        Scope Offset:  0059	   Scope Length:  001D Bytes
+
+      Parent Scope:  5	
+        Scope Offset:  005C	   Scope Length:  001A Bytes
+
+      Parent Scope:  0	Parent Function:  C::fa()
+        Scope Offset:  0080	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  7	
+        Scope Offset:  0083	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  A::fz()
+        Scope Offset:  008A	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  9	
+        Scope Offset:  008D	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fb()
+        Scope Offset:  0094	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  B	
+        Scope Offset:  0097	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  B::fb()
+        Scope Offset:  00AA	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  D	
+        Scope Offset:  00AD	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  0	Parent Function:  A::fa()
+        Scope Offset:  00B4	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  F	
+        Scope Offset:  00B7	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Line Numbers:
+         3:0076h
+
+      File Name: MI.CPP
+      Code Base:    0109:0007	   Code Length: 00B7 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  0052 Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  004C Bytes
+        [BP-8]	   q                    auto far pointer class 'B' 
+        [BP-4]	   p                    auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fc()
+        Scope Offset:  0076	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  3	
+        Scope Offset:  0079	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	
+        Scope Offset:  0059	   Scope Length:  001D Bytes
+
+      Parent Scope:  5	
+        Scope Offset:  005C	   Scope Length:  001A Bytes
+
+      Parent Scope:  0	Parent Function:  C::fa()
+        Scope Offset:  0080	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  7	
+        Scope Offset:  0083	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  A::fz()
+        Scope Offset:  008A	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  9	
+        Scope Offset:  008D	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fb()
+        Scope Offset:  0094	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  B	
+        Scope Offset:  0097	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  B::fb()
+        Scope Offset:  00AA	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  D	
+        Scope Offset:  00AD	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  0	Parent Function:  A::fa()
+        Scope Offset:  00B4	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  F	
+        Scope Offset:  00B7	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Line Numbers:
+         3:0080h
+
+      File Name: MI.CPP
+      Code Base:    0109:0007	   Code Length: 00B7 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  0052 Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  004C Bytes
+        [BP-8]	   q                    auto far pointer class 'B' 
+        [BP-4]	   p                    auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fc()
+        Scope Offset:  0076	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  3	
+        Scope Offset:  0079	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	
+        Scope Offset:  0059	   Scope Length:  001D Bytes
+
+      Parent Scope:  5	
+        Scope Offset:  005C	   Scope Length:  001A Bytes
+
+      Parent Scope:  0	Parent Function:  C::fa()
+        Scope Offset:  0080	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  7	
+        Scope Offset:  0083	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  A::fz()
+        Scope Offset:  008A	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  9	
+        Scope Offset:  008D	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fb()
+        Scope Offset:  0094	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  B	
+        Scope Offset:  0097	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  B::fb()
+        Scope Offset:  00AA	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  D	
+        Scope Offset:  00AD	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  0	Parent Function:  A::fa()
+        Scope Offset:  00B4	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  F	
+        Scope Offset:  00B7	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Line Numbers:
+         1:008Ah
+
+      File Name: MI.CPP
+      Code Base:    0109:0007	   Code Length: 00B7 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  0052 Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  004C Bytes
+        [BP-8]	   q                    auto far pointer class 'B' 
+        [BP-4]	   p                    auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fc()
+        Scope Offset:  0076	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  3	
+        Scope Offset:  0079	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	
+        Scope Offset:  0059	   Scope Length:  001D Bytes
+
+      Parent Scope:  5	
+        Scope Offset:  005C	   Scope Length:  001A Bytes
+
+      Parent Scope:  0	Parent Function:  C::fa()
+        Scope Offset:  0080	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  7	
+        Scope Offset:  0083	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  A::fz()
+        Scope Offset:  008A	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  9	
+        Scope Offset:  008D	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fb()
+        Scope Offset:  0094	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  B	
+        Scope Offset:  0097	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  B::fb()
+        Scope Offset:  00AA	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  D	
+        Scope Offset:  00AD	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  0	Parent Function:  A::fa()
+        Scope Offset:  00B4	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  F	
+        Scope Offset:  00B7	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Line Numbers:
+         3:0094h
+
+      File Name: MI.CPP
+      Code Base:    0109:0007	   Code Length: 00B7 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  0052 Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  004C Bytes
+        [BP-8]	   q                    auto far pointer class 'B' 
+        [BP-4]	   p                    auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fc()
+        Scope Offset:  0076	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  3	
+        Scope Offset:  0079	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	
+        Scope Offset:  0059	   Scope Length:  001D Bytes
+
+      Parent Scope:  5	
+        Scope Offset:  005C	   Scope Length:  001A Bytes
+
+      Parent Scope:  0	Parent Function:  C::fa()
+        Scope Offset:  0080	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  7	
+        Scope Offset:  0083	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  A::fz()
+        Scope Offset:  008A	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  9	
+        Scope Offset:  008D	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fb()
+        Scope Offset:  0094	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  B	
+        Scope Offset:  0097	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  B::fb()
+        Scope Offset:  00AA	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  D	
+        Scope Offset:  00AD	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  0	Parent Function:  A::fa()
+        Scope Offset:  00B4	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  F	
+        Scope Offset:  00B7	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Line Numbers:
+         2:00AAh
+
+      File Name: MI.CPP
+      Code Base:    0109:0007	   Code Length: 00B7 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  0052 Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  004C Bytes
+        [BP-8]	   q                    auto far pointer class 'B' 
+        [BP-4]	   p                    auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fc()
+        Scope Offset:  0076	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  3	
+        Scope Offset:  0079	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	
+        Scope Offset:  0059	   Scope Length:  001D Bytes
+
+      Parent Scope:  5	
+        Scope Offset:  005C	   Scope Length:  001A Bytes
+
+      Parent Scope:  0	Parent Function:  C::fa()
+        Scope Offset:  0080	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  7	
+        Scope Offset:  0083	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  A::fz()
+        Scope Offset:  008A	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  9	
+        Scope Offset:  008D	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  0	Parent Function:  C::fb()
+        Scope Offset:  0094	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  B	
+        Scope Offset:  0097	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'C' 
+
+      Parent Scope:  0	Parent Function:  B::fb()
+        Scope Offset:  00AA	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  D	
+        Scope Offset:  00AD	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'B' 
+
+      Parent Scope:  0	Parent Function:  A::fa()
+        Scope Offset:  00B4	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Parent Scope:  F	
+        Scope Offset:  00B7	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'A' 
+
+      Line Numbers:
+         1:00B4h
+
+
+Class Table                        3 Entries (0003)  File Base: 01EA0h
+
+  Class [069] B
+far 'this' ptr (far)
+far 'this', near vbase
+    New Offset 02
+    bx             	signed int
+    method/function B::fb()        	special function far C member Out-of-line returns signed int
+    
+  Class [068] A
+far 'this' ptr (far)
+far 'this', near vbase
+    New Offset 02
+    ax             	signed int
+    method/function A::fa()        	special function far C member Out-of-line returns signed int
+    method/function A::fz()        	special function far C member Out-of-line returns signed int
+    
+  Class [06A] C:	child of A, B
+far 'this' ptr (far)
+far 'this', near vbase
+    New Offset 08
+    cx             	signed int
+    method/function C::fa()        	special function far C member Out-of-line returns signed int
+    method/function C::fb()        	special function far C member Out-of-line returns signed int
+    method/function C::fc()        	special function far C member Out-of-line returns signed int
+    
+

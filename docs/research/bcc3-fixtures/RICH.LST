@@ -1,0 +1,249 @@
+Turbo Dump  Version 3.1 Copyright (c) 1988, 1992 Borland International
+                     Display of File RICH.EXE
+
+DOS File Size                                       1D09h  (  7433. )
+Load Image Size                                     10B0h  (  4272. )
+Relocation Table entry count                        0008h  (     8. )
+Relocation Table address                            003Eh  (    62. )
+Size of header record      (in paragraphs)          0020h  (    32. )
+Minimum Memory Requirement (in paragraphs)          0000h  (     0. )
+Maximum Memory Requirement (in paragraphs)          FFFFh  ( 65535. )
+File load checksum                                  0000h  (     0. )
+Overlay Number                                      0000h  (     0. )
+
+Borland TLINK Version 5.00
+
+Initial Stack Segment  (SS:SP)			  0103:0080
+Program Entry Point    (CS:IP)			  0000:0000
+
+Relocation Locations (8 Entries)
+
+    0000:0001    0000:015B    00CB:0025    00CB:0015    00CF:00BA
+    00CF:00B6    00CF:00B2    0000:0A77
+
+Borland TLINK Symbol Table Present:
+
+Symbolic Information Version:      3.10
+Debugger Hook Address:             0000:0000
+Case Sensitive Link:               Yes
+Pascal Overlays Present:           No 
+
+Image Size                                        0012B0h  (  4784. )
+Name Pool Size (in bytes)                         00039Fh  (   927. )
+Number of Names                                     0076h  (   118. )
+Number of Type Entries                              0024h  (    36. )
+Number of Member Entries                            000Ch  (    12. )
+Number of Symbols                                   0068h  (   104. )
+Number of Global Symbols                            0051h  (    81. )
+Number of Source Modules                            0003h  (     3. )
+Number of Local Symbols                             0000h  (     0. )
+Number of Scopes                                    0007h  (     7. )
+Number of Line Number Entries                       0016h  (    22. )
+Number of Include Files                             0003h  (     3. )
+Number of Segments                                  0003h  (     3. )
+Number of Correlation Entries                       0003h  (     3. )
+Basic RTL String Segment Offset                     0000h  (     0. )
+Data Count                                          0000h  (     0. )
+Number of Class Entries                             0000h  (     0. )
+Mumber of Global Classes                            0000h  (     0. )
+Number of Parent Entries                            0000h  (     0. )
+Number of Overload Entries                          0000h  (     0. )
+Number of Scope Class Entries                       0000h  (     0. )
+Number of Module Class Entries                      0000h  (     0. )
+Number of Coverage Analysis Offsets                 000Fh  (    15. )
+Number of Browser Entries                           0000h  (     0. )
+Number of Optimized Symbol Entries                  0000h  (     0. )
+Debug Flags                                         0000h  (     0. )
+
+Global Table                      81 Entries (0051)  File Base: 01300h
+
+  Constant: 000C	  [001] __AHSHIFT            Type: Unknown
+  0000:0163 [002] __cleanup            Type: Unknown
+  0000:0176 [003] __checknull          Type: Unknown
+  0000:019E [004] __terminate          Type: Unknown
+  0000:01F3 [005] __restorezero        Type: Unknown
+  0000:02AD [006] _abort               Type: Unknown
+  0000:02C4 [007] DGROUP@              Type: Unknown
+  0000:02C6 [008] __MMODEL             Type: Unknown
+  0000:02C8 [009] _atexit              Type: Unknown
+  0000:034D [00a] _exit                Type: Unknown
+  0000:035C [00b] __exit               Type: Unknown
+  0000:036E [00c] __cexit              Type: Unknown
+  0000:037C [00d] __c_exit             Type: Unknown
+  0000:0388 [00e] __IOERROR            Type: Unknown
+  0000:03C1 [00f] __DOSERROR           Type: Unknown
+  0000:03D3 [010] _isatty              Type: Unknown
+  0000:03E4 [011] _lseek               Type: Unknown
+  0000:040D [012] __setupio            Type: Unknown
+  0000:04B2 [013] ___brk               Type: Unknown
+  0000:04D4 [014] ___sbrk              Type: Unknown
+  0000:0505 [015] _brk                 Type: Unknown
+  0000:0511 [016] _sbrk                Type: Unknown
+  0000:0521 [017] _free                Type: Unknown
+  0000:05F0 [018] _malloc              Type: Unknown
+  0000:0749 [019] _realloc             Type: Unknown
+  0000:079C [01a] _fflush              Type: Unknown
+  0000:081D [01b] _flushall            Type: Unknown
+  0000:08B4 [01c] _fseek               Type: Unknown
+  0000:091C [01d] _ftell               Type: Unknown
+  0000:09E3 [01e] _setvbuf             Type: Unknown
+  0000:0ABB [01f] ___write             Type: Unknown
+  0000:0BC9 [020] __write              Type: Unknown
+  0000:0C03 [021] __xfflush            Type: Unknown
+  00C2:0006 [022] _compute             Type: function far C returns signed int
+  00C7:0002 [023] _process             Type: function far C returns signed long
+  00CB:0004 [024] _main                Type: function far C returns signed int
+  00CF:0000 [025] DATASEG@             Type: Unknown
+  00CF:0074 [026] __Int0Vector         Type: Unknown
+  00CF:0078 [027] __Int4Vector         Type: Unknown
+  00CF:007C [028] __Int5Vector         Type: Unknown
+  00CF:0080 [029] __Int6Vector         Type: Unknown
+  00CF:0084 [02a] __C0argc             Type: Unknown
+  00CF:0086 [02b] __C0argv             Type: Unknown
+  00CF:0088 [02c] __C0environ          Type: Unknown
+  00CF:008A [02d] __envLng             Type: Unknown
+  00CF:008C [02e] __envseg             Type: Unknown
+  00CF:008E [02f] __envSize            Type: Unknown
+  00CF:0090 [030] __psp                Type: Unknown
+  00CF:0092 [031] __osversion          Type: Unknown
+  00CF:0092 [032] __osmajor            Type: Unknown
+  00CF:0092 [033] __version            Type: Unknown
+  00CF:0093 [034] __osminor            Type: Unknown
+  00CF:0094 [035] _errno               Type: Unknown
+  00CF:0096 [036] __StartTime          Type: Unknown
+  00CF:009A [037] ___heapbase          Type: Unknown
+  00CF:009C [038] ___brklvl            Type: Unknown
+  00CF:009E [039] __heapbase           Type: Unknown
+  00CF:00A2 [03a] __brklvl             Type: Unknown
+  00CF:00A6 [03b] __heaptop            Type: Unknown
+  00CF:00AA [03c] _g_count             Type: signed int
+  00CF:00AC [03d] _g_state             Type: signed int
+  00CF:00AE [03e] __atexitcnt          Type: Unknown
+  00CF:00B0 [03f] __exitbuf            Type: Unknown
+  00CF:00B4 [040] __exitfopen          Type: Unknown
+  00CF:00B8 [041] __exitopen           Type: Unknown
+  00CF:00BC [042] __streams            Type: Unknown
+  00CF:01FC [043] __nfile              Type: Unknown
+  00CF:01FE [044] __openfd             Type: Unknown
+  00CF:0226 [045] __heaplen            Type: Unknown
+  00CF:0228 [046] __doserrno           Type: Unknown
+  00CF:022A [047] __dosErrorToSV       Type: Unknown
+  00CF:0284 [048] __stklen             Type: Unknown
+  00CF:0286 [049] __first              Type: Unknown
+  00CF:0288 [04a] __last               Type: Unknown
+  00CF:028A [04b] __rover              Type: Unknown
+  00CF:0290 [04c] __ScanTodVector      Type: Unknown
+  00CF:0290 [04d] __RealCvtVector      Type: Unknown
+  00CF:0296 [04e] _g_rect              Type: struct 'Rect' 
+  00CF:02AE [04f] _g_nodes             Type: c array[4] struct 'Node' 
+  00CF:02BE [050] __atexittbl          Type: Unknown
+  Constant: 1000	  [051] __AHINCR             Type: Unknown
+
+
+Module Table                       3 Entries (0003)  File Base: 016A8h
+
+  Module: [053] F1
+    Language:  C             Underbars: Yes    Memory Model: Medium
+
+    Source Files:
+    [066] F1.C                   Time Stamp: 06/30/126  00:16 am
+
+    Module Type Definitions:
+      [05d] byte                 typedef unsigned char
+      [05e] PointT               typedef struct 'Point' 
+          [05f] x                    signed int
+          [060] y                    signed int
+          [061] z                    signed int
+
+      [05c] Rect                 tag struct 'Rect' 
+          [062] tl                   struct 'Point' 
+          [063] br                   struct 'Point' 
+          [064] area                 signed long
+          [065] name                 c array[8] signed char
+
+      [057] Point                tag struct 'Point' 
+          [05f] x                    signed int
+          [060] y                    signed int
+          [061] z                    signed int
+
+
+    Correlation Records:
+      File Name: F1.C
+      Code Base:    00C2:0006	   Code Length: 004C bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0006	   Scope Length:  004C Bytes
+        [BP+8]	   b                    auto signed int
+        [BP+6]	   a                    auto signed int
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  0045 Bytes
+        SI	   ap                   register near pointer _DS signed int
+        [BP-12]	   pt                   auto struct 'Point' 
+        [BP-6]	   local2               auto signed long
+        [BP-2]	   local1               auto signed int
+        [BP+6]	   a                    auto signed int
+        [BP+8]	   b                    auto signed int
+
+      Parent Scope:  2	
+        Scope Offset:  0039	   Scope Length:  000F Bytes
+        [BP-14]	   inner                auto signed int
+
+      Line Numbers:
+         9:0006h     15:000Dh     16:0016h     17:001Bh     18:0028h
+        21:0039h     22:0042h     24:0048h     25:004Dh
+
+  Module: [068] F2
+    Language:  C             Underbars: Yes    Memory Model: Medium
+
+    Source Files:
+    [071] F2.C                   Time Stamp: 06/30/126  00:16 am
+
+    Module Type Definitions:
+      [069] Node                 tag struct 'Node' 
+          [06f] value                signed int
+          [070] next                 near pointer _DS struct 'Node' 
+
+
+    Correlation Records:
+      File Name: F2.C
+      Code Base:    00C7:0002	   Code Length: 0042 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0002	   Scope Length:  0042 Bytes
+        [BP+8]	   depth                auto signed int
+        [BP+6]	   n                    auto near pointer _DS struct 'Node' 
+
+      Parent Scope:  4	
+        Scope Offset:  000C	   Scope Length:  0038 Bytes
+        [BP-8]	   buf                  auto c array[4] signed char
+        CX	   i                    register signed int
+        [BP-4]	   total                auto signed long
+        SI	   n                    register near pointer _DS struct 'Node' 
+        [BP+8]	   depth                auto signed int
+
+      Line Numbers:
+         6:0002h     11:000Ch     12:0016h     13:001Ah     14:001Dh
+        15:002Eh     17:0037h     18:003Fh
+
+  Module: [073] F3
+    Language:  C             Underbars: Yes    Memory Model: Medium
+
+    Source Files:
+    [076] F3.C                   Time Stamp: 06/30/126  00:16 am
+    Correlation Records:
+      File Name: F3.C
+      Code Base:    00CB:0004	   Code Length: 0034 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0004	   Scope Length:  0034 Bytes
+
+      Parent Scope:  6	
+        Scope Offset:  000A	   Scope Length:  002E Bytes
+        [BP-6]	   t                    auto signed long
+        [BP-2]	   r                    auto signed int
+
+      Line Numbers:
+         3:0004h      7:000Ah      8:001Ch      9:002Fh     10:0034h
+
+

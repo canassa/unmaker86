@@ -1,0 +1,291 @@
+Turbo Dump  Version 3.1 Copyright (c) 1988, 1992 Borland International
+                     Display of File LCLS.EXE
+
+DOS File Size                                       2082h  (  8322. )
+Load Image Size                                     14C0h  (  5312. )
+Relocation Table entry count                        000Ah  (    10. )
+Relocation Table address                            003Eh  (    62. )
+Size of header record      (in paragraphs)          0020h  (    32. )
+Minimum Memory Requirement (in paragraphs)          0000h  (     0. )
+Maximum Memory Requirement (in paragraphs)          FFFFh  ( 65535. )
+File load checksum                                  0000h  (     0. )
+Overlay Number                                      0000h  (     0. )
+
+Borland TLINK Version 5.00
+
+Initial Stack Segment  (SS:SP)			  0144:0080
+Program Entry Point    (CS:IP)			  0000:0000
+
+Relocation Locations (10 Entries)
+
+    0000:0001    0000:005E    0000:00A3    0000:014F    010E:009A
+    010E:009E    010E:00AC    010E:00A8    010E:00A4    0000:0E74
+
+
+Borland TLINK Symbol Table Present:
+
+Symbolic Information Version:      3.10
+Debugger Hook Address:             0000:0000
+Case Sensitive Link:               Yes
+Pascal Overlays Present:           No 
+
+Image Size                                        0016C0h  (  5824. )
+Name Pool Size (in bytes)                         0003AAh  (   938. )
+Number of Names                                     0066h  (   102. )
+Number of Type Entries                              0023h  (    35. )
+Number of Member Entries                            0008h  (     8. )
+Number of Symbols                                   0062h  (    98. )
+Number of Global Symbols                            005Bh  (    91. )
+Number of Source Modules                            0001h  (     1. )
+Number of Local Symbols                             0000h  (     0. )
+Number of Scopes                                    0008h  (     8. )
+Number of Line Number Entries                       0007h  (     7. )
+Number of Include Files                             0001h  (     1. )
+Number of Segments                                  0001h  (     1. )
+Number of Correlation Entries                       0003h  (     3. )
+Basic RTL String Segment Offset                     0000h  (     0. )
+Data Count                                          0000h  (     0. )
+Number of Class Entries                             0002h  (     2. )
+Mumber of Global Classes                            0000h  (     0. )
+Number of Parent Entries                            0000h  (     0. )
+Number of Overload Entries                          0000h  (     0. )
+Number of Scope Class Entries                       0008h  (     8. )
+Number of Module Class Entries                      0001h  (     1. )
+Number of Coverage Analysis Offsets                 000Ch  (    12. )
+Number of Browser Entries                           0000h  (     0. )
+Number of Optimized Symbol Entries                  0000h  (     0. )
+Debug Flags                                         0000h  (     0. )
+
+Global Table                      91 Entries (005B)  File Base: 01710h
+
+  Constant: 000C	  [001] __AHSHIFT            Type: Unknown
+  0000:0157 [002] __cleanup            Type: Unknown
+  0000:016A [003] __checknull          Type: Unknown
+  0000:016B [004] __terminate          Type: Unknown
+  0000:01C0 [005] __restorezero        Type: Unknown
+  0000:027A [006] _abort               Type: Unknown
+  0000:0291 [007] DGROUP@              Type: Unknown
+  0000:0293 [008] __MMODEL             Type: Unknown
+  0000:0295 [009] _atexit              Type: Unknown
+  0000:031A [00a] _exit                Type: Unknown
+  0000:0329 [00b] __exit               Type: Unknown
+  0000:033B [00c] __cexit              Type: Unknown
+  0000:0349 [00d] __c_exit             Type: Unknown
+  0000:0355 [00e] N_LXLSH@             Type: Unknown
+  0000:0358 [00f] LXLSH@               Type: Unknown
+  0000:0358 [010] F_LXLSH@             Type: Unknown
+  0000:0376 [011] N_PADD@              Type: Unknown
+  0000:0379 [012] F_PADD@              Type: Unknown
+  0000:0379 [013] PADD@                Type: Unknown
+  0000:03A5 [014] N_PSUB@              Type: Unknown
+  0000:03A8 [015] F_PSUB@              Type: Unknown
+  0000:03A8 [016] PSUB@                Type: Unknown
+  0000:03D6 [017] __IOERROR            Type: Unknown
+  0000:040F [018] __DOSERROR           Type: Unknown
+  0000:0421 [019] _isatty              Type: Unknown
+  0000:0432 [01a] _lseek               Type: Unknown
+  0000:045B [01b] N_PCMP@              Type: Unknown
+  0000:047C [01c] __setupio            Type: Unknown
+  0000:0536 [01d] ___first             Type: Unknown
+  0000:0538 [01e] ___last              Type: Unknown
+  0000:053A [01f] ___rover             Type: Unknown
+  0000:0676 [020] _free                Type: Unknown
+  0000:0676 [021] _farfree             Type: Unknown
+  0000:0780 [022] _malloc              Type: Unknown
+  0000:078A [023] _farmalloc           Type: Unknown
+  0000:08E7 [024] _realloc             Type: Unknown
+  0000:08EE [025] _farrealloc          Type: Unknown
+  0000:09DE [026] __brk                Type: Unknown
+  0000:0A1D [027] __sbrk               Type: Unknown
+  0000:0AA8 [028] _setblock            Type: Unknown
+  0000:0AC4 [029] _fflush              Type: Unknown
+  0000:0B91 [02a] _flushall            Type: Unknown
+  0000:0C55 [02b] _fseek               Type: Unknown
+  0000:0CD5 [02c] _ftell               Type: Unknown
+  0000:0DB5 [02d] _setvbuf             Type: Unknown
+  0000:0ED2 [02e] ___write             Type: Unknown
+  Constant: 1000	  [02f] __AHINCR             Type: Unknown
+  0000:1023 [030] __write              Type: Unknown
+  0000:105F [031] __xfflush            Type: Unknown
+  0109:0007 [032] use()                Type: function far C returns signed int
+  0109:001B [033] _main                Type: function far C returns signed int
+  0109:0038 [034] Glob::h()            Type: special function far C member Out-of-line returns signed int
+  0109:0042 [035] 0::use()             Type: special function far C member static returns signed int
+  010E:0000 [036] DATASEG@             Type: Unknown
+  010E:005B [037] __Int0Vector         Type: Unknown
+  010E:005F [038] __Int4Vector         Type: Unknown
+  010E:0063 [039] __Int5Vector         Type: Unknown
+  010E:0067 [03a] __Int6Vector         Type: Unknown
+  010E:006B [03b] __C0argc             Type: Unknown
+  010E:006D [03c] __C0argv             Type: Unknown
+  010E:0071 [03d] __C0environ          Type: Unknown
+  010E:0075 [03e] __envLng             Type: Unknown
+  010E:0077 [03f] __envseg             Type: Unknown
+  010E:0079 [040] __envSize            Type: Unknown
+  010E:007B [041] __psp                Type: Unknown
+  010E:007D [042] __osversion          Type: Unknown
+  010E:007D [043] __osmajor            Type: Unknown
+  010E:007D [044] __version            Type: Unknown
+  010E:007E [045] __osminor            Type: Unknown
+  010E:007F [046] _errno               Type: Unknown
+  010E:0081 [047] __StartTime          Type: Unknown
+  010E:0085 [048] ___brklvl            Type: Unknown
+  010E:0087 [049] __heapbase           Type: Unknown
+  010E:008B [04a] __brklvl             Type: Unknown
+  010E:008F [04b] __heaptop            Type: Unknown
+  010E:0094 [04c] _gg                  Type: class 'Glob' 
+  010E:0098 [04d] Glob::               Type: Unknown
+  010E:009C [04e] 0::use()             Type: Unknown
+  010E:00A0 [04f] __atexitcnt          Type: Unknown
+  010E:00A2 [050] __exitbuf            Type: Unknown
+  010E:00A6 [051] __exitfopen          Type: Unknown
+  010E:00AA [052] __exitopen           Type: Unknown
+  010E:00AE [053] __streams            Type: Unknown
+  010E:023E [054] __nfile              Type: Unknown
+  010E:0240 [055] __openfd             Type: Unknown
+  010E:0268 [056] __doserrno           Type: Unknown
+  010E:026A [057] __dosErrorToSV       Type: Unknown
+  010E:02C4 [058] __stklen             Type: Unknown
+  010E:02CC [059] __ScanTodVector      Type: Unknown
+  010E:02CC [05a] __RealCvtVector      Type: Unknown
+  010E:02D2 [05b] __atexittbl          Type: Unknown
+
+
+Module Table                       1 Entries (0001)  File Base: 01A82h
+
+  Module: [05d] LCLS
+    Language:  C++           Underbars: Yes    Memory Model: Large
+
+    Source Files:
+    [066] LCLS.CPP               Time Stamp: 06/30/126  08:00 am
+
+    Module Type Definitions:
+      [061] Glob                 tag class 'Glob' 
+
+    Correlation Records:
+      File Name: LCLS.CPP
+      Code Base:    0109:0007	   Code Length: 0045 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  0014 Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  000E Bytes
+        [BP-4]	   lo                   auto class 'Local' 
+        Type: 0000	   Local                tag class 'Local' 
+
+      Parent Scope:  0	
+        Scope Offset:  001B	   Scope Length:  001D Bytes
+
+      Parent Scope:  3	
+        Scope Offset:  001E	   Scope Length:  001A Bytes
+
+      Parent Scope:  0	Parent Function:  Glob::h()
+        Scope Offset:  0038	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'Glob' 
+
+      Parent Scope:  5	
+        Scope Offset:  003B	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'Glob' 
+
+      Parent Scope:  0	Parent Function:  0::use()
+        Scope Offset:  0042	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'Local' 
+
+      Parent Scope:  7	
+        Scope Offset:  0045	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'Local' 
+
+      Line Numbers:
+         1:0007h      3:000Dh      4:0012h      5:0017h      8:001Bh
+
+      File Name: LCLS.CPP
+      Code Base:    0109:0007	   Code Length: 0045 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  0014 Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  000E Bytes
+        [BP-4]	   lo                   auto class 'Local' 
+        Type: 0000	   Local                tag class 'Local' 
+
+      Parent Scope:  0	
+        Scope Offset:  001B	   Scope Length:  001D Bytes
+
+      Parent Scope:  3	
+        Scope Offset:  001E	   Scope Length:  001A Bytes
+
+      Parent Scope:  0	Parent Function:  Glob::h()
+        Scope Offset:  0038	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'Glob' 
+
+      Parent Scope:  5	
+        Scope Offset:  003B	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'Glob' 
+
+      Parent Scope:  0	Parent Function:  0::use()
+        Scope Offset:  0042	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'Local' 
+
+      Parent Scope:  7	
+        Scope Offset:  0045	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'Local' 
+
+      Line Numbers:
+         6:0038h
+
+      File Name: LCLS.CPP
+      Code Base:    0109:0007	   Code Length: 0045 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  0014 Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  000E Bytes
+        [BP-4]	   lo                   auto class 'Local' 
+        Type: 0000	   Local                tag class 'Local' 
+
+      Parent Scope:  0	
+        Scope Offset:  001B	   Scope Length:  001D Bytes
+
+      Parent Scope:  3	
+        Scope Offset:  001E	   Scope Length:  001A Bytes
+
+      Parent Scope:  0	Parent Function:  Glob::h()
+        Scope Offset:  0038	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'Glob' 
+
+      Parent Scope:  5	
+        Scope Offset:  003B	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'Glob' 
+
+      Parent Scope:  0	Parent Function:  0::use()
+        Scope Offset:  0042	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'Local' 
+
+      Parent Scope:  7	
+        Scope Offset:  0045	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'Local' 
+
+      Line Numbers:
+         2:0042h
+
+
+Class Table                        2 Entries (0002)  File Base: 01C7Ch
+
+  Class [05E] Local
+far 'this' ptr (far)
+far 'this', near vbase
+    New Offset 02
+    lx             	signed int
+    method/function 0::use()       	special function far C member static returns signed int
+    
+  Class [061] Glob
+far 'this' ptr (far)
+far 'this', near vbase
+    New Offset 02
+    gx             	signed int
+    method/function Glob::h()      	special function far C member Out-of-line returns signed int
+    
+

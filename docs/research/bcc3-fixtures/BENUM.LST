@@ -1,0 +1,175 @@
+Turbo Dump  Version 3.1 Copyright (c) 1988, 1992 Borland International
+                     Display of File BENUM.EXE
+
+DOS File Size                                       18EDh  (  6381. )
+Load Image Size                                      F40h  (  3904. )
+Relocation Table entry count                        0001h  (     1. )
+Relocation Table address                            003Eh  (    62. )
+Size of header record      (in paragraphs)          0020h  (    32. )
+Minimum Memory Requirement (in paragraphs)          0000h  (     0. )
+Maximum Memory Requirement (in paragraphs)          FFFFh  ( 65535. )
+File load checksum                                  0000h  (     0. )
+Overlay Number                                      0000h  (     0. )
+
+Borland TLINK Version 5.00
+
+Initial Stack Segment  (SS:SP)			  00EC:0080
+Program Entry Point    (CS:IP)			  0000:0000
+
+Relocation Locations (1 Entry)
+
+    0000:0001
+
+Borland TLINK Symbol Table Present:
+
+Symbolic Information Version:      3.10
+Debugger Hook Address:             0000:0000
+Case Sensitive Link:               Yes
+Pascal Overlays Present:           No 
+
+Image Size                                        001140h  (  4416. )
+Name Pool Size (in bytes)                         000324h  (   804. )
+Number of Names                                     005Eh  (    94. )
+Number of Type Entries                              001Ch  (    28. )
+Number of Member Entries                            000Ch  (    12. )
+Number of Symbols                                   004Fh  (    79. )
+Number of Global Symbols                            004Dh  (    77. )
+Number of Source Modules                            0001h  (     1. )
+Number of Local Symbols                             0000h  (     0. )
+Number of Scopes                                    0002h  (     2. )
+Number of Line Number Entries                       0001h  (     1. )
+Number of Include Files                             0001h  (     1. )
+Number of Segments                                  0001h  (     1. )
+Number of Correlation Entries                       0001h  (     1. )
+Basic RTL String Segment Offset                     0000h  (     0. )
+Data Count                                          0000h  (     0. )
+Number of Class Entries                             0000h  (     0. )
+Mumber of Global Classes                            0000h  (     0. )
+Number of Parent Entries                            0000h  (     0. )
+Number of Overload Entries                          0000h  (     0. )
+Number of Scope Class Entries                       0000h  (     0. )
+Number of Module Class Entries                      0000h  (     0. )
+Number of Coverage Analysis Offsets                 0003h  (     3. )
+Number of Browser Entries                           0000h  (     0. )
+Number of Optimized Symbol Entries                  0000h  (     0. )
+Debug Flags                                         0000h  (     0. )
+
+Global Table                      77 Entries (004D)  File Base: 01190h
+
+  Constant: 000C	  [001] __AHSHIFT            Type: Unknown
+  0000:015F [002] __cleanup            Type: Unknown
+  0000:0172 [003] __checknull          Type: Unknown
+  0000:019A [004] __terminate          Type: Unknown
+  0000:01EF [005] __restorezero        Type: Unknown
+  0000:02A9 [006] _abort               Type: Unknown
+  0000:02BE [007] DGROUP@              Type: Unknown
+  0000:02C0 [008] __MMODEL             Type: Unknown
+  0000:02C2 [009] _main                Type: function near C returns signed int
+  0000:02D0 [00a] _atexit              Type: Unknown
+  0000:0342 [00b] _exit                Type: Unknown
+  0000:0351 [00c] __exit               Type: Unknown
+  0000:0363 [00d] __cexit              Type: Unknown
+  0000:0371 [00e] __c_exit             Type: Unknown
+  0000:037D [00f] __IOERROR            Type: Unknown
+  0000:03B6 [010] __DOSERROR           Type: Unknown
+  0000:03C8 [011] _isatty              Type: Unknown
+  0000:03D9 [012] _lseek               Type: Unknown
+  0000:0402 [013] __setupio            Type: Unknown
+  0000:049F [014] ___brk               Type: Unknown
+  0000:04C1 [015] ___sbrk              Type: Unknown
+  0000:04F2 [016] _brk                 Type: Unknown
+  0000:04FE [017] _sbrk                Type: Unknown
+  0000:050E [018] _free                Type: Unknown
+  0000:05DD [019] _malloc              Type: Unknown
+  0000:0734 [01a] _realloc             Type: Unknown
+  0000:0785 [01b] _fflush              Type: Unknown
+  0000:0802 [01c] _flushall            Type: Unknown
+  0000:0897 [01d] _fseek               Type: Unknown
+  0000:08FB [01e] _ftell               Type: Unknown
+  0000:09BC [01f] _setvbuf             Type: Unknown
+  0000:0A88 [020] ___write             Type: Unknown
+  0000:0B8E [021] __write              Type: Unknown
+  0000:0BC8 [022] __xfflush            Type: Unknown
+  00BF:0000 [023] DATASEG@             Type: Unknown
+  00BF:0074 [024] __Int0Vector         Type: Unknown
+  00BF:0078 [025] __Int4Vector         Type: Unknown
+  00BF:007C [026] __Int5Vector         Type: Unknown
+  00BF:0080 [027] __Int6Vector         Type: Unknown
+  00BF:0084 [028] __C0argc             Type: Unknown
+  00BF:0086 [029] __C0argv             Type: Unknown
+  00BF:0088 [02a] __C0environ          Type: Unknown
+  00BF:008A [02b] __envLng             Type: Unknown
+  00BF:008C [02c] __envseg             Type: Unknown
+  00BF:008E [02d] __envSize            Type: Unknown
+  00BF:0090 [02e] __psp                Type: Unknown
+  00BF:0092 [02f] __osversion          Type: Unknown
+  00BF:0092 [030] __osmajor            Type: Unknown
+  00BF:0092 [031] __version            Type: Unknown
+  00BF:0093 [032] __osminor            Type: Unknown
+  00BF:0094 [033] _errno               Type: Unknown
+  00BF:0096 [034] __StartTime          Type: Unknown
+  00BF:009A [035] ___heapbase          Type: Unknown
+  00BF:009C [036] ___brklvl            Type: Unknown
+  00BF:009E [037] __heapbase           Type: Unknown
+  00BF:00A2 [038] __brklvl             Type: Unknown
+  00BF:00A6 [039] __heaptop            Type: Unknown
+  00BF:00AA [03a] _g_big               Type: enum 'Big' 
+  00BF:00AC [03b] _g_small             Type: enum 'Small' 
+  00BF:00AE [03c] __atexitcnt          Type: Unknown
+  00BF:00B0 [03d] __exitbuf            Type: Unknown
+  00BF:00B2 [03e] __exitfopen          Type: Unknown
+  00BF:00B4 [03f] __exitopen           Type: Unknown
+  00BF:00B6 [040] __streams            Type: Unknown
+  00BF:01F6 [041] __nfile              Type: Unknown
+  00BF:01F8 [042] __openfd             Type: Unknown
+  00BF:0220 [043] __heaplen            Type: Unknown
+  00BF:0222 [044] __doserrno           Type: Unknown
+  00BF:0224 [045] __dosErrorToSV       Type: Unknown
+  00BF:027E [046] __stklen             Type: Unknown
+  00BF:0280 [047] __first              Type: Unknown
+  00BF:0282 [048] __last               Type: Unknown
+  00BF:0284 [049] __rover              Type: Unknown
+  00BF:028A [04a] __ScanTodVector      Type: Unknown
+  00BF:028A [04b] __RealCvtVector      Type: Unknown
+  00BF:0290 [04c] __atexittbl          Type: Unknown
+  Constant: 1000	  [04d] __AHINCR             Type: Unknown
+
+
+Module Table                       1 Entries (0001)  File Base: 01457h
+
+  Module: [04f] BENUM
+    Language:  C             Underbars: Yes    Memory Model: Small
+
+    Source Files:
+    [05e] BENUM.C                Time Stamp: 06/30/126  07:43 am
+
+    Module Type Definitions:
+      [050] Small                tag enum 'Small' 
+          [052] SA                     Value = 0h
+          [053] SB                     Value = 1h
+          [054] SC                     Value = 2h
+      [051] Big                  tag enum 'Big' 
+          [055] Z0                     Value = 0h
+          [056] Z1                     Value = 1h
+          [057] Z2                     Value = 2h
+          [058] Z3                     Value = Ah
+          [059] Z4                     Value = Bh
+          [05a] Z5                     Value = 64h
+          [05b] Z6                     Value = 65h
+          [05c] Z7                     Value = FFFBh
+          [05d] Z8                     Value = FFFCh
+
+    Correlation Records:
+      File Name: BENUM.C
+      Code Base:    0000:02C2	   Code Length: 000E bytes
+
+      Parent Scope:  0	
+        Scope Offset:  02C2	   Scope Length:  000E Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  02C5	   Scope Length:  000B Bytes
+
+      Line Numbers:
+         5:02C2h
+
+

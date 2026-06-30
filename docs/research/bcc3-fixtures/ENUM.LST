@@ -1,0 +1,206 @@
+Turbo Dump  Version 3.1 Copyright (c) 1988, 1992 Borland International
+                     Display of File ENUM.EXE
+
+DOS File Size                                       2020h  (  8224. )
+Load Image Size                                     14C0h  (  5312. )
+Relocation Table entry count                        0009h  (     9. )
+Relocation Table address                            003Eh  (    62. )
+Size of header record      (in paragraphs)          0020h  (    32. )
+Minimum Memory Requirement (in paragraphs)          0000h  (     0. )
+Maximum Memory Requirement (in paragraphs)          FFFFh  ( 65535. )
+File load checksum                                  0000h  (     0. )
+Overlay Number                                      0000h  (     0. )
+
+Borland TLINK Version 5.00
+
+Initial Stack Segment  (SS:SP)			  0144:0080
+Program Entry Point    (CS:IP)			  0000:0000
+
+Relocation Locations (9 Entries)
+
+    0000:0001    0000:005E    0000:00A3    0000:014F    0109:001B
+    010D:00BE    010D:00BA    010D:00B6    0000:0E74
+
+Borland TLINK Symbol Table Present:
+
+Symbolic Information Version:      3.10
+Debugger Hook Address:             0000:0000
+Case Sensitive Link:               Yes
+Pascal Overlays Present:           No 
+
+Image Size                                        0016C0h  (  5824. )
+Name Pool Size (in bytes)                         0003B5h  (   949. )
+Number of Names                                     0070h  (   112. )
+Number of Type Entries                              0021h  (    33. )
+Number of Member Entries                            000Ch  (    12. )
+Number of Symbols                                   0067h  (   103. )
+Number of Global Symbols                            005Fh  (    95. )
+Number of Source Modules                            0001h  (     1. )
+Number of Local Symbols                             0000h  (     0. )
+Number of Scopes                                    0004h  (     4. )
+Number of Line Number Entries                       0002h  (     2. )
+Number of Include Files                             0001h  (     1. )
+Number of Segments                                  0001h  (     1. )
+Number of Correlation Entries                       0001h  (     1. )
+Basic RTL String Segment Offset                     0000h  (     0. )
+Data Count                                          0000h  (     0. )
+Number of Class Entries                             0000h  (     0. )
+Mumber of Global Classes                            0000h  (     0. )
+Number of Parent Entries                            0000h  (     0. )
+Number of Overload Entries                          0000h  (     0. )
+Number of Scope Class Entries                       0000h  (     0. )
+Number of Module Class Entries                      0000h  (     0. )
+Number of Coverage Analysis Offsets                 0006h  (     6. )
+Number of Browser Entries                           0000h  (     0. )
+Number of Optimized Symbol Entries                  0000h  (     0. )
+Debug Flags                                         0000h  (     0. )
+
+Global Table                      95 Entries (005F)  File Base: 01710h
+
+  Constant: 000C	  [001] __AHSHIFT            Type: Unknown
+  0000:0157 [002] __cleanup            Type: Unknown
+  0000:016A [003] __checknull          Type: Unknown
+  0000:016B [004] __terminate          Type: Unknown
+  0000:01C0 [005] __restorezero        Type: Unknown
+  0000:027A [006] _abort               Type: Unknown
+  0000:0291 [007] DGROUP@              Type: Unknown
+  0000:0293 [008] __MMODEL             Type: Unknown
+  0000:0295 [009] _atexit              Type: Unknown
+  0000:031A [00a] _exit                Type: Unknown
+  0000:0329 [00b] __exit               Type: Unknown
+  0000:033B [00c] __cexit              Type: Unknown
+  0000:0349 [00d] __c_exit             Type: Unknown
+  0000:0355 [00e] N_LXLSH@             Type: Unknown
+  0000:0358 [00f] LXLSH@               Type: Unknown
+  0000:0358 [010] F_LXLSH@             Type: Unknown
+  0000:0376 [011] N_PADD@              Type: Unknown
+  0000:0379 [012] F_PADD@              Type: Unknown
+  0000:0379 [013] PADD@                Type: Unknown
+  0000:03A5 [014] N_PSUB@              Type: Unknown
+  0000:03A8 [015] F_PSUB@              Type: Unknown
+  0000:03A8 [016] PSUB@                Type: Unknown
+  0000:03D6 [017] __IOERROR            Type: Unknown
+  0000:040F [018] __DOSERROR           Type: Unknown
+  0000:0421 [019] _isatty              Type: Unknown
+  0000:0432 [01a] _lseek               Type: Unknown
+  0000:045B [01b] N_PCMP@              Type: Unknown
+  0000:047C [01c] __setupio            Type: Unknown
+  0000:0536 [01d] ___first             Type: Unknown
+  0000:0538 [01e] ___last              Type: Unknown
+  0000:053A [01f] ___rover             Type: Unknown
+  0000:0676 [020] _free                Type: Unknown
+  0000:0676 [021] _farfree             Type: Unknown
+  0000:0780 [022] _malloc              Type: Unknown
+  0000:078A [023] _farmalloc           Type: Unknown
+  0000:08E7 [024] _realloc             Type: Unknown
+  0000:08EE [025] _farrealloc          Type: Unknown
+  0000:09DE [026] __brk                Type: Unknown
+  0000:0A1D [027] __sbrk               Type: Unknown
+  0000:0AA8 [028] _setblock            Type: Unknown
+  0000:0AC4 [029] _fflush              Type: Unknown
+  0000:0B91 [02a] _flushall            Type: Unknown
+  0000:0C55 [02b] _fseek               Type: Unknown
+  0000:0CD5 [02c] _ftell               Type: Unknown
+  0000:0DB5 [02d] _setvbuf             Type: Unknown
+  0000:0ED2 [02e] ___write             Type: Unknown
+  Constant: 1000	  [02f] __AHINCR             Type: Unknown
+  0000:1023 [030] __write              Type: Unknown
+  0000:105F [031] __xfflush            Type: Unknown
+  0109:0007 [032] _dummy               Type: function far C returns signed int
+  0109:0014 [033] _main                Type: function far C returns signed int
+  010D:0000 [034] DATASEG@             Type: Unknown
+  010D:005B [035] __Int0Vector         Type: Unknown
+  010D:005F [036] __Int4Vector         Type: Unknown
+  010D:0063 [037] __Int5Vector         Type: Unknown
+  010D:0067 [038] __Int6Vector         Type: Unknown
+  010D:006B [039] __C0argc             Type: Unknown
+  010D:006D [03a] __C0argv             Type: Unknown
+  010D:0071 [03b] __C0environ          Type: Unknown
+  010D:0075 [03c] __envLng             Type: Unknown
+  010D:0077 [03d] __envseg             Type: Unknown
+  010D:0079 [03e] __envSize            Type: Unknown
+  010D:007B [03f] __psp                Type: Unknown
+  010D:007D [040] __osversion          Type: Unknown
+  010D:007D [041] __osmajor            Type: Unknown
+  010D:007D [042] __version            Type: Unknown
+  010D:007E [043] __osminor            Type: Unknown
+  010D:007F [044] _errno               Type: Unknown
+  010D:0081 [045] __StartTime          Type: Unknown
+  010D:0085 [046] ___brklvl            Type: Unknown
+  010D:0087 [047] __heapbase           Type: Unknown
+  010D:008B [048] __brklvl             Type: Unknown
+  010D:008F [049] __heaptop            Type: Unknown
+  010D:0094 [04a] _g_color             Type: enum 'Color' 
+  010D:0096 [04b] _g_d                 Type: double
+  010D:009E [04c] _g_f                 Type: float
+  010D:00A2 [04d] _g_ul                Type: unsigned long
+  010D:00A6 [04e] _g_fp                Type: far pointer signed char
+  010D:00AA [04f] _g_hp                Type: far pointer huge signed char
+  010D:00AE [050] _g_func              Type: far pointer function far C returns signed int
+  010D:00B2 [051] __atexitcnt          Type: Unknown
+  010D:00B4 [052] __exitbuf            Type: Unknown
+  010D:00B8 [053] __exitfopen          Type: Unknown
+  010D:00BC [054] __exitopen           Type: Unknown
+  010D:00C0 [055] __streams            Type: Unknown
+  010D:0250 [056] __nfile              Type: Unknown
+  010D:0252 [057] __openfd             Type: Unknown
+  010D:027A [058] __doserrno           Type: Unknown
+  010D:027C [059] __dosErrorToSV       Type: Unknown
+  010D:02D6 [05a] __stklen             Type: Unknown
+  010D:02DE [05b] __ScanTodVector      Type: Unknown
+  010D:02DE [05c] __RealCvtVector      Type: Unknown
+  010D:02E4 [05d] _g_bits              Type: struct 'Bits' 
+  010D:02E6 [05e] _g_var               Type: union 'Variant' 
+  010D:02EE [05f] __atexittbl          Type: Unknown
+
+
+Module Table                       1 Entries (0001)  File Base: 01AAFh
+
+  Module: [061] ENUM
+    Language:  C             Underbars: Yes    Memory Model: Large
+
+    Source Files:
+    [070] ENUM.C                 Time Stamp: 06/30/126  07:01 am
+
+    Module Type Definitions:
+      [067] FuncPtr              typedef far pointer function far C returns signed int
+      [064] Bits                 tag struct 'Bits' 
+          [063] a                    unsigned int: 3h Bits
+          [062] b                    unsigned int: 5h Bits
+          [068] s                    signed int: 4h Bits
+
+      [065] Variant              tag union 'Variant' 
+          [069] i                    signed int
+          [06a] l                    signed long
+          [06b] d                    double
+          [06c] c                    signed char
+
+      [066] Color                tag enum 'Color' 
+          [06d] RED                    Value = 0h
+          [06e] GREEN                  Value = 5h
+          [06f] BLUE                   Value = 6h
+
+    Correlation Records:
+      File Name: ENUM.C
+      Code Base:    0109:0007	   Code Length: 002E bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  000D Bytes
+        [BP+8]	   b                    auto signed int
+        [BP+6]	   a                    auto signed int
+
+      Parent Scope:  1	
+        Scope Offset:  000A	   Scope Length:  000A Bytes
+        [BP+6]	   a                    auto signed int
+        [BP+8]	   b                    auto signed int
+
+      Parent Scope:  0	
+        Scope Offset:  0014	   Scope Length:  0021 Bytes
+
+      Parent Scope:  3	
+        Scope Offset:  0017	   Scope Length:  001E Bytes
+
+      Line Numbers:
+        14:0007h     15:0014h
+
+

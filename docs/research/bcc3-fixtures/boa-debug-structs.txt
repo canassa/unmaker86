@@ -1,0 +1,1022 @@
+                                             Symbol table format
+
+
+               TLINK's debugging output is written at the end of
+               the load image in the .EXE file. An image that
+               does not include extra information beyond the
+               image size has no debug information. If extra
+               data is written beyond the load image, check the
+               first word for the number 0x52fb.
+
+               The debug information begins with a header
+               describing the sizes of the remaining tables.
+               This header is defined as follows:
+
+                 struct  debug_header
+                 {
+                   unsigned short  magic_number;   /* To be sure
+                 who we are */
+                   unsigned short  version_id;     /* In case we
+                 change things */
+                   unsigned long   names;          /* Names pool
+                 size in bytes */
+                   unsigned long   names_count;    /* Number of
+                 names in pool */
+                   unsigned long   types_count;    /* Number of
+                 type entries */
+                   unsigned long   members_count;  /* Structure
+                 members table */
+                   unsigned long   symbols_count;  /* Number of
+                 symbols */
+                   unsigned long   globals_count;  /* Number of
+                 global symbols */
+                   unsigned long   modules_count;  /* Number of
+                 modules (units)*/
+                   unsigned long   locals_count;   /* optional;
+                 can be filler*/
+                   unsigned long   scopes_count;   /* Number of
+                 scopes in table*/
+
+
+
+
+               Chapter 3 Page 51
+
+
+
+
+
+
+
+
+
+
+                   unsigned long   lines_count;    /* Number of
+                 line nos */
+                   unsigned long   source_count;   /* Number of
+                 include files */
+                   unsigned long   segment_count;  /* number of
+                 segment records*/
+                   unsigned long   correlation_count;/* number
+                 of segment/file */
+                                                   /*
+                 correlations */
+                   unsigned long   image_size;     /* The number
+                 of bytes in */
+                                                   /* the .EXE
+                 file if the */
+                                                   /*
+                 uninitialized part of */
+                                                   /* the data,
+                 plus this */
+                                                   /* debug info
+                 were removed. */
+                   void    far *debugger_hook;     /* A far ptr
+                 into debugged */
+                                                   /* program,
+                 meaning depends */
+                                                   /* on program
+                 flags. For pascal */
+                                                   /* overlays,
+                 is ptr to start of */
+                                                   /* data area
+                 that contains info */
+                                                   /* contains
+                 about the overlays. */
+                   unsigned char   program_flags;  /* A byte of
+                 flags */
+                                                   /* 0x01 =
+                 Case sensitive link */
+                                                   /* 0x00 =
+                 Case insensitive link */
+                                                   /* 0x02 =
+                 pascal overlay program*/
+                   unsigned stringsegoffset;       /* No longer
+                 used */
+                   unsigned short data_count;      /* size in
+                 bytes of data pool   */
+                   unsigned char filler;           /* to force
+                 alignment */
+                   unsigned short extension_size;  /* 0, or 16,
+                 for now */
+                 };
+
+                 struct header_extension
+                 {
+
+
+
+               Chapter 3 Page 52
+
+
+
+
+
+
+
+
+
+
+                   unsigned long class_entries;         /*
+                 number of classes */
+                   unsigned long parent_entries;        /*
+                 number of parents */
+                   unsigned long global_classes;        /*
+                 number of global classes */
+                                                        /* - NOT
+                 USED */
+                   unsigned long scope_class_entries;   /*
+                 number of scope classes */
+                   unsigned long module_class_entries;  /*
+                 number of module classes /
+                   unsigned long CoverageOffsetCount;   /*
+                 number of coverage offsets*/
+                   unsigned long NamePoolOffset;        /*
+                 offset to start of name *
+                                                        /* pool.
+                 This is relative */
+                                                        /* to
+                 the symbols base */
+                   unsigned long BrowserEntries;     /* number
+                 of browser info recs */
+                   unsigned long OptSymEntries;      /* number
+                 of opt symbol recs */
+                   unsigned int DebugFlags;          /* various
+                 flags  */
+                   unsigned long refInfoSize;        /* size in
+                 bytes of ref */
+                                                     /* info
+                 section */
+                   char    filler [14];              /* padding
+                 */
+                 };
+
+                 typedef struct      /* Trailer at end of NEW
+                 EXE with debug info */
+                 {
+                   unsigned short Signature;       /* 'NB'
+                 */
+                   unsigned short Version;         /* MS debug
+                 info version number */
+                   unsigned long Size;             /* Codeview
+                 header offset =     */
+                                                   /* (EOF -
+                 Size)                 */
+                 } TMSDbgTrailer;
+
+               The layout appears in the .EXE files as follows:
+
+               EXE header
+               fixups
+               EXE image
+
+
+
+               Chapter 3 Page 53
+
+
+
+
+
+
+
+
+
+
+               debug header
+               Symbol Table
+               Module Table
+               Source File Table
+               Scopes Table
+               Line Number Table
+               Segments Table
+               Correlation Table
+               Type Table
+               Members Table
+               Class Table
+               Parent Table
+               Scope Class Table
+               Module Class Table
+               Coverage Map Table
+               Coverage Offsets Table
+               Browser Definitions Table
+               Optimized Symbols Table
+               Module Optimization Flags Table
+               Reference Information Table
+               Names Table
+
+               For new .EXE files, there will be an 8-byte
+               Codeview header immediately before the debug
+               header, and an 8-byte Codeview trailer
+               immediately after the names table. TD symbols
+               tables can be told apart from Microsoft-generated
+               tables by the value 0xFFFFFFFF in the last 4
+               bytes of the Codeview header.
+
+               All symbols, global or not, appear in the symbols
+               area. The globals appear first, with module and
+               local symbols following. The globals field
+               specifies how many of the symbols are globals.
+
+               Identifiers are stored as indexes into the names
+               pool. The index is to the relative identifier
+               number (starting at 1). This way 64K distinct
+               identifiers of arbitrary length can be stored.
+               Names are stored uniquely, so that comparing
+               indexes is as good as comparing strings. An
+               identifier is stored in the pool as an ASCIIZ
+               string (null-terminated string).
+
+
+               Symbols
+
+                 struct symbol_record
+                 {
+                   unsigned long   symbol_name;
+                   unsigned long   symbol_type;
+                   unsigned short  symbol_offset;
+
+
+
+               Chapter 3 Page 54
+
+
+
+
+
+
+
+
+
+
+                   unsigned short  symbol_segment;
+                   unsigned short  symbol_class : 3;
+                   unsigned short  has_valid_BP : 1;
+                   unsigned short  return_address_word_offset :
+                 3;
+                 };
+
+               The symbol table consists of a series of symbol
+               definitions, sorted into ascending address order,
+               with constant symbols (symbol_class == 5) at the
+               end of each section (global or module local).
+
+               Note also that globals are all static, absolute,
+               or typedefs.
+
+               No register globals are generated by Borland compilers at this time.
+
+		symbol_name is the index of the symbol name.
+
+               symbol_type is the index of the symbol type.
+
+               symbol_offset is interpreted according to the
+               symbol_class field.
+
+               symbol_segment is the segment part of the symbol
+               address for static symbols.
+                
+               For new .EXE files, the top two bits of
+               symbol_segment are used to provide information
+               about symbols in DLLs as follows: If
+               SR_SS_DllEntry bit is non-zero, then
+               SR_SS_OrdinalFlag determines whether or not the
+               SR_SS_Ordinal field of symbol_segment is an
+               ordinal value or not.
+
+               For DLLs, symbol_offset is the name index of the
+               module and symbol_name is name index of the DLL's
+               entry point.
+
+               symbol_class is one of the following:
+               _________________________________________________
+
+                 Value    Symbol class
+		__________________________
+
+                 0x0      Static, offset and segment give the
+                          address.
+
+                 0x1      Absolute symbol. The segment and
+                          offset is the absolute address of the
+                          symbol.
+
+                 0x2      Auto, offset is treated as signed,
+                          relative to BP.
+
+
+
+               Chapter 3 Page 55
+
+
+
+
+
+
+
+
+
+
+                 0x3      Pascal var parameter. The offset is BP
+                          relative and is the location of the
+                          far pointer to the parameter.
+
+                 0x4      Register. Offset is a register ID as
+                          follows:
+
+                     0x00  AX       0x0A  DL      0x14  FS      0x20  ST(0)
+
+                     0x01  CX       0x0B  BL      0x15  GS      0x21  ST(1)
+
+                     0x02  DX       0x0C  AH      0x18  EA      0x22  ST(2)X
+
+                     0x03  BX       0x0D  CH      0x19  EC      0x23  ST(3)X
+
+                     0x04  SP       0x0E  DH      0x1A  ED      0x24  ST(4)X
+
+                     0x05  BP       0x0F  BH      0x1B  EB      0x25  ST(5)X
+
+                     0x06  SI       0x10  ES      0x1C  ES      0x26  ST(6)P
+
+                     0x07  DI       0x11  CS      0x1D  EB      0x27  ST(7)P
+
+                     0x08  AL       0x12  SS      0x1E  ESI
+
+                     0x09  CL       0x13  DS      0x1F  EDI
+
+                 0x5      Constant. Up to 4-byte constant stored
+                          in offset/segment.
+
+                 0x6      Typedef. The offset field is ignored.
+
+                 0x7      Structure/Union/Enum Tag. The offset
+                          is a type index.
+			______________________
+
+                 #define SC_STATIC   0x0
+                 #define SC_ABSOLUTE 0x1
+                 #define SC_AUTO     0x2
+                 #define SC_PASVAR   0x3
+                 #define SC_REGISTER 0x4
+
+                 #define SC_CONST    0x5
+                 #define SC_TYPEDEF  0x6
+                 #define SC_TAG      0x7
+
+                 #define SR_SS_DllEntry     0x8000  /* symbol is
+                 a dll entry   */
+                 #define SR_SS_OrdinalFlag  0x4000  /* segment
+                 is ordinal value */
+                 #define SR_SS_Ordinal      0x3fff  /* mask to
+                 obtain ordinal value */
+
+
+
+
+               Chapter 3 Page 56
+
+
+
+
+
+
+
+
+
+
+               The has_valid_BP field is defined for functions
+               only. If the bit is zero, the function does not
+               set up a BP stack frame, if the value is one then
+               a valid BP is set up.
+
+               The return_address_word_offset field contains the
+               offset in words from BP where the return address
+               can be found if the has_valid_BP field is not
+               zero. The size of the return address is
+               determined from the function type.
+
+
+               Modules
+
+               A module (or unit) consists of a set of objects,
+               source files, and correlation records.
+
+                 struct  module_header
+                 {
+                   unsigned long   module_name;
+                   unsigned char   language;
+                   unsigned short  memory_model : 3;
+                   unsigned short  underbars_on : 1;
+                   unsigned long   symbols_index;
+                   unsigned short  symbols_count;
+                   unsigned short  source_files_index;
+                   unsigned short  source_files_count;
+                   unsigned short  correlation_index;
+                   unsigned short  correlation_count;
+                 };
+
+                 #define MM_TINY         0x0
+                 #define MM_SMALL        0x1
+                 #define MM_MEDIUM       0x2
+                 #define MM_COMPACT      0x3
+                 #define MM_LARGE        0x4
+                 #define MM_HUGE         0x5
+                 #define MM_SMALL386     0x6
+                 #define MM_MEDIUM386    0x7
+                 #define MM_COMPACT386   0x8
+                 #define MM_LARGE386     0x9
+
+               module_name is the index of the module's name.
+               This name is the source file name given to the
+               compiler, including the extension.
+
+               symbols_index is the index of the first symbol in
+               the symbol table for the module.
+
+               symbols_count is the number of symbols defined
+               local to the module.
+
+
+
+
+               Chapter 3 Page 57
+
+
+
+
+
+
+
+
+
+
+               source_files_index is the index of the first
+               source file record for the module.
+
+               source_files_count is the number of source files
+               in the module.
+
+               correlation_index is the index of the correlation
+               record for the module.
+
+               correlation_count is the number of correlation
+               entries in the module.
+
+               language indicates the source language for the
+               module.
+               _________________________________________________
+
+                 Value Language
+		_________________________________
+
+                 0     Unknown
+                 1     C
+                 2     Pascal
+                 3     Basic (not used)
+
+                 4     assembly language
+                 5     C++
+		______________________________________
+
+               memory_model determines default pointer sizes in
+               type conversions.
+
+               underbars_on is non-zero if underbars should be
+               prepended for cdecl-style symbols in any search
+               context in this module.
+
+
+               Source files
+
+                 struct  source_file
+                 {
+                   unsigned long   source_file_name;
+                   unsigned long   time_stamp;
+                 };
+
+               Each source file with line numbers in the
+               executable code will have a source file record in
+               the list module source files. There will always
+               be at least one source file record per module
+               (assuming there is any executable code in the
+               module). Each include file containing code will
+               generate a single source-file record per
+               inclusion.
+
+
+
+
+
+               Chapter 3 Page 58
+
+
+
+
+
+
+
+
+
+
+               The line numbers for a segment within a source
+               file will appear as a block in the line number
+               table.
+
+               The source files in a module will appear in the
+               order of their appearance in the compilation
+               process. Thus the main source file appears first,
+               followed by each of the include files. Note that
+               if an include file doesn't have executable code
+               (and therefore no source line numbers), it
+               shouldn't be included here. Thus, for most source
+               files with no code in include files, there will
+               be only one file entry per module. Of course, if
+               no executable code appears in a module, there is
+               no need for a source file record.
+
+               The source file name will include any
+               subdirectory information. Thus, if Turbo Debugger
+               is run in the source directory (or with the
+               source directory given in the appropriate TD
+               option), it should be able to find all the
+               source, even if it originated from some other
+               source or had some peculiar file-name extension.
+               For include files, the actual path name used to
+               open the file is used. This way the debugger
+               doesn't duplicate the compiler's include
+               directory search logic.
+
+               The date/time stamp determines if the source file
+               has changed since the time of the link.
+
+
+               Line numbers
+
+                 struct  line_number
+                 {
+                   unsigned short  line_number_value;
+                   unsigned short  line_number_offset;
+                 };
+
+               line_number_value is the module line number.
+
+               line_number_offset is the offset of the line
+               number relative to the segment value stored in
+               the segment record referred to in the active
+               correlation record.
+
+               Only unique offsets have line numbers stored.
+               When a statement spans several lines, there can
+               be two line records with the same offset, but
+               different line numbers.
+
+
+
+
+               Chapter 3 Page 59
+
+
+
+
+
+
+
+
+
+
+               The line number records are address sorted; they
+               are not necessarily line-number ordered.
+
+
+               Scopes
+
+                 struct  scope
+                 {
+                   unsigned long   autos_index;
+                   unsigned short  autos_count;
+                   unsigned short  parent_scope;
+                   unsigned long   function_symbol;
+                   unsigned short  scope_offset;
+                   unsigned short  scope_length;
+                 };
+
+               autos_index and autos_count define the symbol
+               table area containing this scope's symbols. The
+               auto_start is the index into the symbols table of
+               the first variable local to the scope.
+
+               parent_scope is the index of the scope within the
+               current module of the immediate enclosing scope.
+
+               scope_offset and scope_length defines the ranges
+               of code addresses the scope is valid for. The
+               segment is that stored in the segment record
+               referred to in the active correlation record.
+
+               To handle nested units in pascal, there is a set
+               of scopes at the beginning of the scopes table
+               with a function_symbol of 0xffff. There is a
+               one-to-one correspondence between these and the
+               module (unit) records. These are the "unit
+               scopes." The symbols that the record points to
+               are the interfaced symbols of the unit.
+
+               The "uses scope" record has a function_parent of
+               0xfffe to establish the correct linking between
+               the unit scope records. It does not contain
+               information about the scope's symbols. Instead,
+               autos_index is an index to the unit scope record
+               that refers to the interfaced symbols. To look up
+               a name, the scopes are traced using the
+               scope_parent records, but the symbols are
+               accessed by referring to the corresponding unit
+               scope record.
+
+
+               Segments
+
+                 typedef struct /* segment info */
+
+
+
+               Chapter 3 Page 60
+
+
+
+
+
+
+
+
+
+
+                 {
+                   unsigned short  mod_index;
+                   unsigned short  code_segment;
+                   unsigned short  code_offset;
+                   unsigned short  code_length;
+                   unsigned short  scopes_index;
+                   unsigned short  scopes_count;
+                   unsigned short  correlation_index;
+                   unsigned short  correlation_count;
+                 } segrec;
+
+               A segment record gives a code segment, offset,
+               and length, and relates it to a particular
+               module. It also gives an index into the scopes
+               table for the scopes defined in the segment. The
+               correlation table index and count allow the
+               segment to be related to one or more source files
+               and possibly to non-continuous groups of lines
+               inside the files.
+
+               The segment records are address-ordered by
+               segment and then by offset within the segment.
+
+               mod_index is the index of the module record for
+               the corresponding module.
+
+               code_segment is the base address of the segment
+               in the image.
+
+               code_offset is the offset from the base address
+               of the segment in the image.
+
+               code_length is the length of the segment.
+
+               scopes_index is the index of the scope record of
+               the starting scope for this segment.
+
+               scopes_count is the count of scopes for this
+               segment.
+
+               correlation_index is the index of the correlation
+               record for the starting correlation for this
+               segment.
+
+               correlation_count is the number of correlation
+               records for this segment.
+
+
+               Segment/source file correlations
+
+               These records link a range of line numbers in a
+               file to a particular segment record.
+
+
+
+               Chapter 3 Page 61
+
+
+
+
+
+
+
+
+
+
+                 typedef struct
+                 {
+                   unsigned short segment_index;
+                   unsigned short file_index;
+                   unsigned long  lines_index;
+                   unsigned short lines_count;
+                 } correlation;
+
+               segment_index is the index of the segment record
+               for this correlation.
+
+               file_index is the index of the source file record
+               for this correlation.
+
+               lines_index is the index of the first line number
+               record for this correlation.
+
+               lines_count is the number of line number records
+               for this correlation.
+
+
+               Types
+
+                 TID_FLOAT     0x0D   IEEE 32-bit real.
+                 TID_TPREAL    0x0E   Turbo Pascal 6-byte real.
+                 TID_DOUBLE    0x0F   IEEE 64-bit real.
+                 TID_LDOUBLE   0x10   IEEE 80-bit real.
+                 TID_BCD4      0x11   4 byte BCD.
+                 TID_BCD8      0x12   8 byte BCD.
+                 TID_BCD10     0x13   10 byte BCD.
+                 TID_BCDCOB    0x14   COBOL BCD.
+                 TID_NEAR      0x15   Near pointer.
+                 TID_FAR       0x16   Far pointer.
+                 TID_SEG       0x17   Segment pointer.
+                 TID_NEAR386   0x18   386 32-bit offset pointer.
+                 TID_FAR386    0x19   386 48-bit far pointer.
+                 TID_CARRAY    0x1A   C array - 0 based.
+                 TID_VLARRAY   0x1B   Very Large 0 based array.
+                 TID_PARRAY    0x1C   Pascal array.
+                 TID_ADESC     0x1D   Basic array descriptor.
+                 TID_STRUCT    0x1E   Structure.
+                 TID_UNION     0x1F   Union.
+                 TID_VLSTRUCT  0x20   Very Large Structure.
+                 TID_VLUNION   0x21   Very Large Union.
+                 TID_ENUM      0x22   Enumerated range.
+                 TID_FUNCTION  0x23   Function or procedure.
+                 TID_LABEL     0x24   Goto label.
+                 TID_SET       0x25   Pascal set.
+                 TID_TFILE     0x26   Pascal text file.
+                 TID_BFILE     0x27   Pascal binary file.
+                 TID_BOOL      0x28   Pascal boolean.
+                 TID_PENUM     0x29   Pascal enumerated range
+                                      (no arithmetic).
+                 TID_PWORD     0x2A   Pword
+                 TID_TBYTE     0x2B   Tbyte
+                 TID_SPECIALFUNC
+                               0x2D   Member/Duplicate function
+                 TID_CLASS     0x2E   C++ Class
+                 TID_HANDLEPTR 0x30   Handle based ptr
+                 TID_MEMBERPTR 0x33   Type pointed to by a class
+                                      member pointer.
+                 TID_NREF      0x34   Near reference
+                 TID_FREF      0x35   Far reference
+                 TID_NEWMEMPTR 0x38   New stype member ptr
+		______
+
+               The format of the remainder of the type record
+               depends on the TID byte as shown in the following
+               table:
+
+
+
+
+
+               Chapter 2 Page 31
+
+
+
+
+
+
+
+
+
+
+              Simple types
+
+               TID_VOID     TID_FLOAT    TID_BCD8     TID_TFILE
+               TID_LSTR     TID_TPREAL   TID_BCD10    TID_BOOL
+               TID_DSTR     TID_DOUBLE   TID_ADESC    TID_SCHAR
+               TID_SQUAD    TID_LDOUBLE  TID_STRUCT   TID_PWORD
+               TID_UQUAD    TID_BCD4     TID_UNION    TID_TBYTE
+
+
+              Pascal string type
+                TID_PSTR
+
+               byte           The maximum size of the string.
+
+
+              Labels
+                 TID_LABEL
+
+               byte           Zero if near, one if far.
+
+
+              Integral range types
+
+               TID_SCHAR    TID_SLONG    TID_UINT     TID_PCHAR
+               TID_SINT     TID_UCHAR    TID_ULONG
+
+               The integral range types are a hierarchy of
+               related types that form a tree. The root of the
+               tree is the general type, which is stored
+               explicitly as a range. The parent type is zero
+               and the lower and upper bounds are the entire
+               range of values storable in the size of memory
+               indicated by the TID. The bound values are
+               interpreted as signed or unsigned according to
+               the TID. The Pascal character TID (TID_PCHAR) is
+               stored as an unsigned character-sized range,
+               except arithmetic isn't allowed on objects of
+               Pascal character type.
+
+               For all types, a 4-byte upper and lower bound
+               value allows standard treatment of range
+               checking.
+
+               The sub-fields are stored as shown in the
+               following list:
+
+               * index    The parent type index
+
+               * double word
+                          The lower bound of the range
+
+
+
+
+               Chapter 2 Page 32
+
+
+
+
+
+
+
+
+
+
+               * double word
+                          The upper bound of the range
+
+
+              Cobol-style BCD
+
+                TID_BCDCOB
+
+               byte           The position of the decimal point.
+                              The number of total digits is
+                              determined from the size, using 2
+                              digits per byte, except for the
+                              last byte, which has one digit and
+                              a sign. The decimal position is
+                              the number of digits to the right
+                              of the decimal point.
+
+              Pointer types
+
+               TID_NEAR     TID_SEG      TID_FAR386   TID_FREF
+               TID_FAR      TID_NEAR386  TID_NREF
+
+               All pointer types have an index field for the
+               pointed-to type. All have an additional byte
+               field following the pointed-to type field that
+               consists of extra information as follows:
+
+
+               TID_NEAR and TID_NEAR386
+
+               The segment base of the pointer:
+               _________________________________________________
+
+                 Value Segment register
+		_________________________
+
+                 0x0   segment register unspecified.
+                 0x1   ES relative
+                 0x2   CS relative
+                 0x3   SS relative
+                 0x4   DS relative
+                 0x5   FS relative
+                 0x6   GS relative
+		______________________________
+
+
+               TID_FAR and TID_FAR386
+
+               0x0       far pointer arithmetic (no segment
+                         adjustments).
+               0x1       huge pointer arithmetic (segment
+                         adjustments to avoid offset wrap-
+                         around).
+
+
+
+
+               Chapter 2 Page 33
+
+
+
+
+
+
+
+
+
+
+               TID_SEG
+
+               0x0 ignored
+
+
+               TID_NREF
+
+               0x0 ignored
+
+
+               TID_FREF
+
+               0x0 ignored
+
+
+              Array types
+
+               TID_CARRAY
+
+               index     The index of the element type. The
+                         dimension of the array is determined by
+                         dividing the size of the overall array
+                         by the size of each element. No padding
+                         is assumed between array elements.
+
+
+               TID_VLARRAY
+
+               word      The upper 16 bits of the array size.
+                         This word is placed so that the normal
+                         type size field and this one can be
+                         considered a double word size.
+
+               index     The index of the element type. The
+                         dimension of the array is determined as
+                         it is for normal C arrays.
+
+
+               TID_PARRAY
+
+               index     The element type.
+
+               index     The type of the dimension. The number
+                         of elements in the array and their
+                         indices are determined by the dimension
+                         type, which is normally some sort of
+                         integral or enum range.
+
+
+
+
+
+
+
+
+               Chapter 2 Page 34
+
+
+
+
+
+
+
+
+
+
+              Very large structure types
+		 
+	       TID_VLSTRUCT and TID_VLUNION
+               word      The upper 16 bits of the size of the
+                         struct or union. This word is placed so
+                         that the upper 16 bits and the normal
+                         type size can be considered a double
+                         word size.
+
+
+              Enumerated types
+
+               TID_ENUM and TID_PENUM
+
+               index     The index of the parent type.
+
+               word      The lower bound of the range
+                         (considered a signed integer range).
+
+               word      The upper bound of the range
