@@ -56,6 +56,17 @@ pub const FramebufferKind = @import("devices").vga_render.Kind;
 pub const RENDER_INDEX_CAP = @import("devices").vga_render.MAX_INDEX_LEN;
 pub const RENDER_RGBA_CAP = @import("devices").vga_render.MAX_RGBA_LEN;
 
+// ---- symbol layer (Tier 1): host-side, load-time Borland TDS overlay ----
+// Pure function of the EXE bytes; image-relative parse + indices + the load_para
+// runtime map. Never snapshotted (re-attached on load like LoadRecipe).
+pub const symbols = @import("symbols/symbols.zig");
+pub const Tds = symbols.Tds;
+pub const SymbolIndex = symbols.SymbolIndex;
+pub const AddressMap = symbols.AddressMap;
+/// The owning symbol-overlay façade the debug core holds (TDS|map|none under one
+/// lifetime). Entry point: `Symbols.open(gpa, exe_bytes, opt_map_bytes)`.
+pub const Symbols = symbols.Symbols;
+
 test {
     _ = breakpoints;
     _ = controller;
@@ -66,4 +77,5 @@ test {
     _ = @import("watchpoint_test.zig");
     _ = @import("determinism_test.zig");
     _ = @import("branch_trap_test.zig");
+    _ = symbols;
 }

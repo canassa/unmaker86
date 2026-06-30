@@ -13,6 +13,18 @@ test "no host time / RNG / thread / env / float / hashmap / atomic in src/debug 
         @embedFile("debug.zig"),
         @embedFile("breakpoints.zig"),
         @embedFile("controller.zig"),
+        // The host-side, load-time TDS symbol overlay (Tier 1). Pure function of the
+        // EXE bytes; must stay free of host time/RNG/threads/HashMap/atomics/floats so
+        // it produces byte-identical indices for identical input (CLAUDE.md §1).
+        @embedFile("symbols/format.zig"),
+        @embedFile("symbols/tds.zig"),
+        @embedFile("symbols/index.zig"),
+        @embedFile("symbols/types.zig"),
+        @embedFile("symbols/map.zig"),
+        @embedFile("symbols/mapfile.zig"),
+        // The module root + owning façade — keep it on the gate so it can't silently
+        // grow a host dependency (B).
+        @embedFile("symbols/symbols.zig"),
     };
     const forbidden = [_][]const u8{
         "std.time",
@@ -59,6 +71,21 @@ test "POD + StopReason types contain no pointer-typed fields (#14 reflection)" {
     try expectNoPointerFields(debug.StopReason);
     try expectNoPointerFields(debug.CpuSnapshot);
     try expectNoPointerFields(debug.StepOverResult);
+    // The symbol-layer lookup-result PODs hold only integers (sym/segment/offset/
+    // line/file ids) — never a borrowed name pointer that could leak a host address
+    // into a snapshot or the M2 JSON (plan §8.3).
+    try expectNoPointerFields(debug.symbols.SymRef);
+    try expectNoPointerFields(debug.symbols.FuncRef);
+    try expectNoPointerFields(debug.symbols.LineHit);
+    try expectNoPointerFields(debug.symbols.ImageAddr);
+    // Tier-2 result PODs: the type-walk / member-layout / enumerator / scope-local
+    // views hold only integers + enums (names as 1-based name_index'es), so no host
+    // address can leak into a snapshot or the M2 JSON (plan §8.3 reflection gate).
+    try expectNoPointerFields(debug.symbols.TypeInfo);
+    try expectNoPointerFields(debug.symbols.MemberInfo);
+    try expectNoPointerFields(debug.symbols.EnumeratorInfo);
+    try expectNoPointerFields(debug.symbols.Local);
+    try expectNoPointerFields(debug.symbols.Storage);
 }
 
 /// Recursively assert a type (and its struct/union/optional/array fields) has no
