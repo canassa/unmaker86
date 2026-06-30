@@ -1,8 +1,8 @@
 //! Phase 4 server route/JSON tests (§D #4 + route/parse/serialize round-trips),
 //! driven IN-PROCESS over in-memory reader/writer streams — NO real socket. The
 //! server's queue + worker thread run for real, so this exercises the full
-//! request → Command → submit → worker → Response → JSON path. (The single
-//! real-socket test lives in server_integration_test.zig, an opt-in step.)
+//! request → Command → submit → worker → Response → JSON path. (The real-socket
+//! tests live out-of-process in the black-box suite, `tests/blackbox/`.)
 
 const std = @import("std");
 const server_mod = @import("server.zig");

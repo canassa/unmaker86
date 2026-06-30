@@ -523,9 +523,10 @@ pub fn build(b: *std.Build) void {
     // The api test root imports the api module's own submodules (via the module
     // root's `test {}` aggregator) plus debug/cpu (the production deps) and the
     // machine-building set (machine/bus/devices/timing) so an in-process test can
-    // build a real machine + Controller and drive the queue/worker. The single
-    // real-socket integration test gets its OWN step (test-api-integration), NOT
-    // folded into `test`, so the default gate stays deterministic and CI-stable.
+    // build a real machine + Controller and drive the queue/worker. The real-socket
+    // integration tests now live OUT-OF-PROCESS in the black-box suite
+    // (`test-blackbox`, `tests/blackbox/stream_test.zig`), so the default `test` gate
+    // stays deterministic and CI-stable.
     const api_imports = [_]Imp{
         .{ .name = "api", .mod = api_mod },
         .{ .name = "debug", .mod = debug_mod },
@@ -573,11 +574,6 @@ pub fn build(b: *std.Build) void {
     const host_test_step = b.step("test-host", "Run the host-layer (run-pacer) tests");
     host_test_step.dependOn(&host_tests.step);
 
-    // The single real-socket integration test (opt-in; not in the default `test`).
-    const api_integration = MachineTest.add(b, target, optimize, "src/api/server_integration_test.zig", &api_imports);
-    const api_integration_step = b.step("test-api-integration", "Run the real-socket API integration test (opt-in)");
-    api_integration_step.dependOn(&api_integration.step);
-
     // ---- Black-box API tests (test-blackbox) ----
     // A TRUE black box: each test SPAWNS the built `./zig-out/bin/zdos --serve 0`
     // child and drives it over a real localhost socket via `std.http.Client`. It
@@ -585,8 +581,9 @@ pub fn build(b: *std.Build) void {
     // `CpuSnapshot`/`BreakpointKind` types it parses into) so a wire-format change
     // fails to COMPILE here — but it touches NO emulator internals at runtime.
     // Because it uses real sockets + child processes it gets its OWN step, NOT folded
-    // into the default `test` aggregate (mirrors `test-api-integration`), so the
-    // default gate stays hermetic. It depends on the installed exe (it execs the
+    // into the default `test` aggregate, so the default gate stays hermetic. This is
+    // also where the live-stream WebSocket tests live (`stream_test.zig`, driven the
+    // REAL way via the pacer). It depends on the installed exe (it execs the
     // binary), so `zig build test-blackbox` builds + installs the binary first.
     const blackbox_imports = [_]Imp{
         .{ .name = "api", .mod = api_mod },

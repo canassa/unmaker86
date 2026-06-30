@@ -116,26 +116,47 @@ fn totalNonBg(frame: Session.Frame) usize {
 }
 
 /// One injected-cursor probe: at `inject_cycle` set the absolute position to (px,py)
-/// (in pixels; converted to driver-virtual units), then scan `SCAN_OFFSETS` later
-/// cycles and return the MAX sprite-count seen at (px,py). The cursor BLINKS (the
-/// single-page fixture erases then redraws each frame), so a single capture can land
-/// on an erase-frame; scanning a fixed window guarantees catching a draw-frame. The
-/// schedule is fixed (no host clock), so the result is deterministic.
+/// (in pixels; converted to driver-virtual units), then scan `SCAN_OFFSETS` cycles
+/// AFTER the inject SETTLES and return the MAX sprite-count seen at (px,py).
+///
+/// CALLBACK DWELL (load-bearing for the timing model). The guest registered an INT 33h
+/// AX=0Ch event handler (mask 0x1F), so an absolute-position inject that MOVES the
+/// cursor FIRES that handler and runs a fixed, deterministic dwell — advancing the
+/// machine ~1.43M cycles past `inject_cycle` (the inject HTTP reply is
+/// `{"stop":{"dwell_complete":{...}}}`). The cursor stays LATCHED at the injected
+/// position afterward. So the scan must be based on the ACTUAL post-inject cycle
+/// (`status().cycles`), NOT `inject_cycle` (which is now in the past → run-to-cycle
+/// no-ops). Re-injecting the position the cursor already sits at (the centre probe)
+/// does NOT move it, so it fires no dwell and the base stays at `inject_cycle`.
 const Probe = struct {
     px: i16,
     py: i16,
     inject_cycle: u64,
 };
 
-/// 8 fixed offsets spanning ~140k cycles (≥3 blink periods) after each inject.
-const SCAN_OFFSETS = [_]u64{ 10_000, 30_000, 50_000, 70_000, 90_000, 110_000, 130_000, 150_000 };
+/// Dense scan offsets: every 1000 cycles across 0..15000 (> one full ~14k cursor
+/// blink/burst period) relative to the POST-INJECT base. The cursor erases+redraws
+/// each tick, so a single capture can land on an erase-frame; and the burst's
+/// ≥`HIT_THRESHOLD`-pixel draw window is only ~3k cycles wide and recurs every ~14k,
+/// so a COARSE offset set aliases (e.g. 20k spacing can miss every draw-frame at one
+/// phase). A dense sweep over a full period makes the windowed MAX reliably catch a
+/// draw-frame regardless of the post-inject phase. The schedule is fixed (no host
+/// clock), so the result is deterministic.
+const SCAN_OFFSETS = blk: {
+    var offs: [16]u64 = undefined;
+    for (&offs, 0..) |*o, i| o.* = @as(u64, i) * 1000;
+    break :blk offs;
+};
 
-/// The probe schedule: centre, then two distinct off-centre positions, each in its
-/// own non-overlapping cycle window (so the prior cursor is gone before the next).
+/// The probe schedule: centre, then two distinct off-centre positions. Each off-centre
+/// inject runs the ~1.43M-cycle callback dwell, so the probes are spaced ~1.6M apart
+/// (each `inject_cycle` > the prior probe's last scanned cycle ≈ prev_base + 1.43M +
+/// max SCAN_OFFSET) AND the last probe's scan (≈10.3M + 1.43M + 15k ≈ 11.75M) finishes
+/// well before `TOTAL_CYCLES` (12,096,343) — the program's deterministic termination.
 const PROBES = [_]Probe{
     .{ .px = 160, .py = 100, .inject_cycle = 7_000_000 },
-    .{ .px = 60, .py = 30, .inject_cycle = 7_300_000 },
-    .{ .px = 250, .py = 150, .inject_cycle = 7_600_000 },
+    .{ .px = 60, .py = 30, .inject_cycle = 8_700_000 },
+    .{ .px = 250, .py = 150, .inject_cycle = 10_300_000 },
 };
 
 /// A cursor cluster of at least this many non-bg pixels at the target box counts as
@@ -236,15 +257,43 @@ fn captureAt(s: *Session, cycle: u64) !Session.Frame {
     return f;
 }
 
+/// Where (best-effort) cursor evidence PNGs are written.
+const PngSink = struct {
+    io: Io,
+    dir: std.Io.Dir,
+};
+
+/// Grab `GET /api/framebuffer?format=png` of the frame the machine is CURRENTLY parked
+/// at (the caller has just confirmed it is a draw-frame via `captureAt`) and write it
+/// to `<SHOTS_DIR>/cursor_px<px>_<py>.png`. Best-effort: no second inject, no machine
+/// advance, so it never perturbs the probe schedule.
+fn savePng(s: *Session, sink: PngSink, p: Probe) !void {
+    const png = try s.requestRaw(.GET, "/api/framebuffer?format=png", null);
+    if (png.status != .ok) return;
+    var name_buf: [128]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&name_buf, SHOTS_DIR ++ "/cursor_px{d}_{d}.png", .{ p.px, p.py });
+    try sink.dir.writeFile(sink.io, .{ .sub_path = rel, .data = png.body });
+}
+
 /// Run the inject-and-scan probe; returns the max sprite-count seen at the target.
-fn probeMaxHit(s: *Session, p: Probe) !usize {
+/// When `png` is non-null, saves a PNG of the FIRST draw-frame found during the scan
+/// (captured in place, since the machine is parked at that exact cycle — no re-inject).
+fn probeMaxHit(s: *Session, p: Probe, png: ?PngSink) !usize {
     _ = try s.runToCycle(p.inject_cycle);
     _ = try s.injectMouse(pxToDrv(p.px), pxToDrv(p.py), null, null, null);
+    // The inject may have run the fixed AX=0Ch callback dwell (~1.43M cycles); base the
+    // scan on the ACTUAL post-inject cycle, not `inject_cycle` (now in the past).
+    const base = (try s.status()).cycles;
     var best: usize = 0;
+    var saved = false;
     for (SCAN_OFFSETS) |off| {
-        const f = try captureAt(s, p.inject_cycle + off);
+        const f = try captureAt(s, base + off);
         const c = spriteCountAt(f, p.px, p.py);
         if (c > best) best = c;
+        if (!saved and c >= HIT_THRESHOLD) {
+            saved = true;
+            if (png) |sink| savePng(s, sink, p) catch {};
+        }
     }
     return best;
 }
@@ -292,7 +341,11 @@ test "MOUSE: AH=0Ch callback drives the real BaK cursor to injected positions (P
         try std.testing.expect(spriteCountAt(base, 160, 100) >= HIT_THRESHOLD);
 
         for (PROBES, 0..) |p, i| {
-            const best = try probeMaxHit(&s, p);
+            // Save an evidence PNG of the cursor for the off-centre probes (captured
+            // inline at the draw-frame the scan finds — no second inject that would
+            // perturb the schedule).
+            const sink: ?PngSink = if (i > 0) .{ .io = io, .dir = work_dir } else null;
+            const best = try probeMaxHit(&s, p, sink);
             if (best < HIT_THRESHOLD) {
                 std.debug.print(
                     "FAIL: injected px({d},{d}) (drv {d},{d}) — max cursor cluster at target = {d} (< {d})\n",
@@ -300,21 +353,6 @@ test "MOUSE: AH=0Ch callback drives the real BaK cursor to injected positions (P
                 );
             }
             try std.testing.expect(best >= HIT_THRESHOLD);
-
-            // Save an evidence PNG of the strongest draw-frame for the off-centre probes.
-            if (i > 0) {
-                // Re-run to the best-known draw offset (+50k aligns the draw-phase here)
-                // and grab the PNG of the cursor sitting at the injected position.
-                _ = try s.runToCycle(p.inject_cycle + 200_000);
-                _ = try s.injectMouse(pxToDrv(p.px), pxToDrv(p.py), null, null, null);
-                _ = try s.runToCycle(p.inject_cycle + 250_000);
-                const png = try s.requestRaw(.GET, "/api/framebuffer?format=png", null);
-                if (png.status == .ok) {
-                    var name_buf: [128]u8 = undefined;
-                    const rel = try std.fmt.bufPrint(&name_buf, SHOTS_DIR ++ "/cursor_px{d}_{d}.png", .{ p.px, p.py });
-                    work_dir.writeFile(io, .{ .sub_path = rel, .data = png.body }) catch {};
-                }
-            }
         }
     }
 
@@ -324,25 +362,41 @@ test "MOUSE: AH=0Ch callback drives the real BaK cursor to injected positions (P
     // the callback perturbed emulation timing/state, these would differ.)
     {
         const probe = PROBES[2]; // the lower-right off-centre position
-        // +30k is a DRAW-frame for this probe (the single-page fixture blinks the
-        // cursor every ~20k cycles; offsets [1]/[3]/[5]/[7] are draw, [0]/[2]/… erase),
-        // so the captured frame both round-trips byte-identically AND shows the cursor.
-        const cap_cycle = probe.inject_cycle + SCAN_OFFSETS[1];
 
+        // Session A: inject, then find the first scan offset that is a DRAW-frame (the
+        // cursor blinks; the post-inject base + that offset is the absolute draw cycle).
         var a = try Session.spawnArgs(alloc, io, exe_path, &.{"headless"});
         defer a.deinit();
         _ = try a.runToCycle(probe.inject_cycle);
         _ = try a.injectMouse(pxToDrv(probe.px), pxToDrv(probe.py), null, null, null);
-        const fa = try captureAt(&a, cap_cycle);
-        // Copy out of the session arena (a's next request would reset it; b is separate).
-        const a_bytes = try alloc.dupe(u8, fa.data);
+        const base = (try a.status()).cycles;
+
+        var draw_cycle: u64 = 0;
+        var found = false;
+        var a_bytes: []u8 = &.{};
+        for (SCAN_OFFSETS) |off| {
+            const fa = try captureAt(&a, base + off);
+            if (spriteCountAt(fa, probe.px, probe.py) >= HIT_THRESHOLD) {
+                draw_cycle = base + off;
+                // Copy out of the session arena (a's next request would reset it).
+                a_bytes = try alloc.dupe(u8, fa.data);
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
         defer alloc.free(a_bytes);
 
+        // Session B runs the IDENTICAL script. The callback dwell is deterministic, so
+        // B reaches the SAME post-inject base; capturing at the SAME absolute draw cycle
+        // must yield a byte-for-byte equal frame (proves the API/callback did not perturb
+        // emulation timing or state).
         var b = try Session.spawnArgs(alloc, io, exe_path, &.{"headless"});
         defer b.deinit();
         _ = try b.runToCycle(probe.inject_cycle);
         _ = try b.injectMouse(pxToDrv(probe.px), pxToDrv(probe.py), null, null, null);
-        const fb = try captureAt(&b, cap_cycle);
+        try std.testing.expectEqual(base, (try b.status()).cycles);
+        const fb = try captureAt(&b, draw_cycle);
 
         try std.testing.expectEqualSlices(u8, a_bytes, fb.data);
         // And the cursor really is at the injected position in that frame.

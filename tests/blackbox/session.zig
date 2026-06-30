@@ -319,6 +319,13 @@ pub const Session = struct {
     pub const Mem = struct { phys: u32, len: u32, data: []const u8 };
     pub const Ivt = struct { vector: u8, ip: u16, cs: u16 };
     pub const Ok = struct { ok: bool };
+    /// A `POST /api/input/*` response. An inject-ONLY event (a raw scancode edge, a
+    /// scripted mouse position) returns `{"ok":true}`; an injection that ADVANCES the
+    /// machine — a `{"char"}` keystroke TAP (default ~100 ms dwell) or a mouse CLICK
+    /// that fires the INT 33h / AX=0Ch callback — returns the run/stop result
+    /// `{"stop":{...}}` instead. Both fields are optional so the one helper parses
+    /// either shape (the caller usually ignores the result).
+    pub const InjectResp = struct { ok: bool = false, stop: ?WireStop = null };
     /// `GET /api/console` — the guest's accumulated CON output as a `{len, data}`
     /// object where `data` is lowercase hex (so arbitrary CON bytes survive JSON).
     pub const Console = struct { len: u32, data: []const u8 };
@@ -373,24 +380,28 @@ pub const Session = struct {
     /// = key-down (raw set-1 code), false = key-up (break = code|0x80); `ext` = the
     /// 0xE0 extended prefix. Pushes the byte at the 8042 + raises IRQ1; the guest
     /// INT 09h ISR cooks it into the BDA ring on the next run.
-    pub fn injectKey(self: *Session, scancode: u8, make: bool, ext: bool) !Ok {
-        return self.post("/api/input/key", wire.KeyReq{ .scancode = scancode, .make = make, .ext = ext }, Ok);
+    pub fn injectKey(self: *Session, scancode: u8, make: bool, ext: bool) !InjectResp {
+        return self.post("/api/input/key", wire.KeyReq{ .scancode = scancode, .make = make, .ext = ext }, InjectResp);
     }
 
     /// Inject a full keystroke by CHARACTER (the `{"char"}` convenience): the server
     /// resolves the char to its set-1 scancode (+ a Shift bracket when needed) over
-    /// the REAL scancode table and injects make+break as one deterministic command.
-    pub fn injectKeyChar(self: *Session, ch: u8) !Ok {
+    /// the REAL scancode table. A `char` keystroke is a TAP that holds the key for a
+    /// default ~100 ms dwell, so it ADVANCES the machine and returns a run/stop result
+    /// (see `InjectResp`).
+    pub fn injectKeyChar(self: *Session, ch: u8) !InjectResp {
         const s = [_]u8{ch};
-        return self.post("/api/input/key", wire.KeyReq{ .char = &s }, Ok);
+        return self.post("/api/input/key", wire.KeyReq{ .char = &s }, InjectResp);
     }
 
     /// Inject a mouse event into the INT 33h driver (input-injection.md §5.2). Any
     /// subset of absolute position (x/y), relative motion (dx/dy), and the button
     /// mask; a null field is left unset. Absolute and relative are mutually exclusive
-    /// per axis at the server (mixing x+dx / y+dy is a 400).
-    pub fn injectMouse(self: *Session, x: ?i16, y: ?i16, dx: ?i16, dy: ?i16, buttons: ?u16) !Ok {
-        return self.post("/api/input/mouse", wire.MouseReq{ .x = x, .y = y, .dx = dx, .dy = dy, .buttons = buttons }, Ok);
+    /// per axis at the server (mixing x+dx / y+dy is a 400). A button CLICK fires the
+    /// AX=0Ch callback and advances the machine (run/stop result); a position-only
+    /// event is inject-only (`{"ok":true}`) — `InjectResp` parses either.
+    pub fn injectMouse(self: *Session, x: ?i16, y: ?i16, dx: ?i16, dy: ?i16, buttons: ?u16) !InjectResp {
+        return self.post("/api/input/mouse", wire.MouseReq{ .x = x, .y = y, .dx = dx, .dy = dy, .buttons = buttons }, InjectResp);
     }
 
     /// `GET /api/console` → the raw `{len, data(hex)}` object (side-effect-free read

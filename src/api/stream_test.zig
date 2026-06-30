@@ -4,9 +4,9 @@
 //! producer's cycle-neutrality (driving the real worker/queue but NO net listener).
 //!
 //! The real-socket half (WS handshake/101, frame round-trip on the wire, the N+1 → 503
-//! cap, 2 concurrent clients, clean shutdown with a live connection) lives in
-//! `server_integration_test.zig` (the opt-in `test-api-integration` step), so the
-//! default `test` gate stays hermetic + CI-stable (the existing convention).
+//! cap, 2 concurrent clients, clean shutdown with a live connection) lives OUT-OF-
+//! PROCESS in the black-box suite (`tests/blackbox/stream_test.zig`, `test-blackbox`),
+//! so the default `test` gate stays hermetic + CI-stable (the existing convention).
 
 const std = @import("std");
 const sf = @import("shared_frame.zig");

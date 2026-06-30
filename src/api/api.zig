@@ -21,8 +21,13 @@ const worker = @import("worker.zig");
 const server = @import("server.zig");
 const run_control = @import("run_control.zig");
 const live_mouse = @import("live_mouse.zig");
-const stream = @import("stream.zig");
-const shared_frame = @import("shared_frame.zig");
+// `stream` + `shared_frame` are re-exported (pub) so OUT-OF-MODULE consumers (the
+// black-box WS harness, `tests/blackbox/`) can reference the wire-frame contract
+// (`shared_frame.MAGIC`/`VERSION`/`HEADER_LEN`/`FLAG_HAS_PALETTE`/`MAX_PAYLOAD`) and the
+// connection cap (`stream.MAX_CONNS`) at COMPILE TIME — same rationale as `api.wire`: a
+// frame/stream-contract change FAILS TO COMPILE the test, not silently drifts.
+pub const stream = @import("stream.zig");
+pub const shared_frame = @import("shared_frame.zig");
 const mcp = @import("mcp.zig");
 const mcp_tools = @import("mcp_tools.zig");
 const session_mod = @import("session.zig");

@@ -21,12 +21,14 @@ test {
     _ = @import("keyecho_test.zig");
     _ = @import("ttm_test.zig");
     _ = @import("mouse_test.zig");
+    _ = @import("debug_test.zig");
+    _ = @import("stream_test.zig");
 }
 
 const FIXTURE = "examples/HELLO.EXE";
 
 // Golden constants for HELLO.EXE, captured from the running API and asserted exactly.
-const ENTRY_LINEAR: u32 = 33200; // cs_base(33200) + eip(0) at process entry
+const ENTRY_LINEAR: u32 = 6688; // cs_base(6688 = seg 0x1A2 << 4) + eip(0) at process entry
 const ENTRY_BYTES_HEX = "0e1fb409ba0e00cd21b8004ccd214865"; // 16 bytes at ENTRY_LINEAR
 const CYCLE_BP_STOP: u64 = 224; // a cycle bp armed at 50 stops at the next boundary, cycle 224
 const STEP1_CYCLE: u64 = 4; // one instruction from entry retires at cycle 4
@@ -173,7 +175,7 @@ test "6: register mutate round-trip (PATCH reg, GET cpu, assert changed)" {
     try std.testing.expectEqual(@as(u32, 0x1234), after.eax);
 }
 
-test "7: error paths — 404 no_such_breakpoint, 501 disasm, 501 io breakpoint" {
+test "7: 404 no_such_breakpoint; disasm + io-breakpoints are implemented" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     var s = try spawn(threaded.io());
@@ -184,15 +186,17 @@ test "7: error paths — 404 no_such_breakpoint, 501 disasm, 501 io breakpoint" 
     try std.testing.expectEqual(std.http.Status.not_found, e404.status);
     try std.testing.expect(std.mem.indexOf(u8, e404.body, "\"no_such_breakpoint\"") != null);
 
-    // GET /api/disasm is a declared-but-deferred endpoint → 501.
-    const e_dis = try s.rawStatus(.GET, "/api/disasm", null);
-    try std.testing.expectEqual(std.http.Status.not_implemented, e_dis.status);
+    // GET /api/disasm is now implemented: with no params it disassembles a window at
+    // CS:IP → 200 with the rendered instruction list.
+    const dis = try s.rawStatus(.GET, "/api/disasm", null);
+    try std.testing.expectEqual(std.http.Status.ok, dis.status);
+    try std.testing.expect(std.mem.indexOf(u8, dis.body, "\"instructions\":") != null);
 
-    // An io-kind breakpoint is declared in the core but unimplemented → 501.
+    // io-kind breakpoints are now live: POST → 200 with the assigned id.
     const io_bp = "{\"kind\":{\"io\":{\"port\":0,\"access\":\"write\"}},\"one_shot\":false}";
     const e_io = try s.rawStatus(.POST, "/api/breakpoints", io_bp);
-    try std.testing.expectEqual(std.http.Status.not_implemented, e_io.status);
-    try std.testing.expect(std.mem.indexOf(u8, e_io.body, "\"not_implemented\"") != null);
+    try std.testing.expectEqual(std.http.Status.ok, e_io.status);
+    try std.testing.expect(std.mem.indexOf(u8, e_io.body, "\"id\":") != null);
 }
 
 test "8: reset -> load -> run reproduces a fresh run byte-identically (Part-1 regression)" {

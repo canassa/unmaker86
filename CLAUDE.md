@@ -29,7 +29,8 @@ Run from the repo root (Zig 0.16 is on PATH via direnv; `zig version` must print
 ```sh
 zig build                 # compile -> zig-out/bin/zdos (Debug; ~5x slower interpreter)
 zig build -Doptimize=ReleaseFast   # ALWAYS use this for any server/guest you'll actually run — Debug is too slow for real-time guest play (e.g. games slow-motion)
-zig build test            # run the test suite (keep it green)
+zig build test            # run the default (hermetic) test suite (keep it green)
+zig build test-blackbox   # spawn the real server binary + drive it over real sockets (NOT in `test`)
 zig fmt src/              # format in place
 zig fmt --check src/      # verify formatting
 
@@ -40,4 +41,15 @@ zig build run -- --serve PORT <PROGRAM>         # load, pause at entry, serve th
 
 # Or use the built binary directly:
 zig-out/bin/zdos --serve 8099 <PROGRAM>
+```
+
+## Before committing
+
+ALWAYS run **both** suites and have them green before any commit — `test-blackbox` is its own
+step (it spawns the real `zdos` binary over real sockets) and is NOT folded into `zig build test`,
+so the default gate alone will not catch a black-box regression:
+
+```sh
+zig build test            # hermetic unit/integration suite
+zig build test-blackbox   # real-binary, real-socket black-box suite
 ```
