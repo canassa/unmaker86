@@ -67,6 +67,13 @@ pub const AddressMap = symbols.AddressMap;
 /// lifetime). Entry point: `Symbols.open(gpa, exe_bytes, opt_map_bytes)`.
 pub const Symbols = symbols.Symbols;
 
+// ---- protocol-neutral source-level debug core (M-S1) ----
+// Pure + synchronous source semantics (breakpoint resolution / pcLocation / source-line
+// stepping) over the symbol overlay + Controller. On the determinism grep-gate; no
+// src/api import, no atomics, no host clock. The worker owns the preempt loop.
+pub const core = @import("core/core.zig");
+pub const SourceDebugger = core.SourceDebugger;
+
 test {
     _ = breakpoints;
     _ = controller;
@@ -78,4 +85,5 @@ test {
     _ = @import("determinism_test.zig");
     _ = @import("branch_trap_test.zig");
     _ = symbols;
+    _ = core;
 }

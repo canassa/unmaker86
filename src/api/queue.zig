@@ -208,8 +208,57 @@ pub const Command = union(enum) {
     branch_trap_arm: TrapArgs,
     /// Disarm the trap (reset the predicate) + drop any latch.
     branch_trap_clear: void,
+    // ---- source-level debug core (M-S1, debug-core-plan.md §3.3) -------
+    // Each routes to the `?*SourceDebugger` the worker holds, inside `drainOne`, on
+    // the single machine-owning thread (no second path to the machine). All M-S1
+    // results are FLAT pointer-free PODs (the DisasmResult flatten pattern, §3.1a) —
+    // no worker-side JSON body seam (that is M-S2).
+    /// `whereami` — resolve the live CS:IP to function + source line (PcLocation).
+    /// A pure inspection (cycle-neutral); valid only at a clean stop boundary.
+    dbg_where: void,
+    /// Set a SOURCE breakpoint (`file:line`); the file path rides inline (fixed cap).
+    dbg_set_src_bp: DbgSrcBpCmd,
+    /// Set a FUNCTION breakpoint (post-prologue entry); the name rides inline.
+    dbg_set_fn_bp: DbgFnBpCmd,
+    /// Drop a source-spec breakpoint by its SourceDebugger handle (spec-slot id).
+    dbg_clear_bp: struct { id: u32 },
+    /// Enumerate the source-spec breakpoints (≤ DBG_MAX_SPECS rows).
+    dbg_list_bp: void,
+    /// Source-line step (`next` — step OVER calls), driven preemptibly by the worker.
+    dbg_step_line: void,
+    /// Source step INTO a callee's first line.
+    dbg_step_in: void,
+    /// Run to the caller's return (stepOut).
+    dbg_step_out: void,
+    /// Run to a `file:line` one-shot target (runToLine).
+    dbg_run_to_line: DbgSrcBpCmd,
+
     /// The worker-shutdown sentinel: the worker loop exits when it dequeues this.
     shutdown_worker: void,
+};
+
+// ---- source-level debug core (M-S1) — command/result inline caps -----------
+// A DOS source path is ≤255 chars and a C/Borland symbol name fits comfortably; both
+// are FIXED inline buffers so the new Command/Response variants stay pointer-free PODs
+// (the DisasmResult flatten pattern, debug-core-plan.md §3.1a). A longer name/path is
+// truncated at the worker copy (display-only; never a borrowed slice on the queue).
+pub const DBG_PATH_CAP = 128;
+pub const DBG_NAME_CAP = 128;
+/// Mirrors `core.MAX_SPECS` — the SourceDebugger spec table size.
+pub const DBG_MAX_SPECS = 64;
+
+/// `dbg_set_src_bp` / `dbg_run_to_line` argument: a source `file:line` with the file
+/// name copied into a fixed inline buffer (the handler/`buildCommand` copies it).
+pub const DbgSrcBpCmd = struct {
+    line: u32,
+    file_len: u8 = 0,
+    file: [DBG_PATH_CAP]u8 = undefined,
+};
+
+/// `dbg_set_fn_bp` argument: a function name in a fixed inline buffer.
+pub const DbgFnBpCmd = struct {
+    name_len: u8 = 0,
+    name: [DBG_NAME_CAP]u8 = undefined,
 };
 
 /// Per-response branch-trace dump cap (docs/branch-trace-plan.md §6) — bounds the
@@ -316,6 +365,17 @@ pub const ErrCode = enum {
     /// No snapshot slot with the requested `seq` (restore/delete of an unknown or
     /// already-freed handle).
     no_such_snapshot,
+    // ---- source-level debug core (M-S1) ----
+    /// A source-level inspection / step was issued while the machine was running (the
+    /// live BP/SP/registers are only meaningful at a clean instruction boundary).
+    not_stopped,
+    /// A source / function op needs the TDS symbol overlay, which is absent (a stripped
+    /// image, or no `.MAP` sidecar). Address-level breakpoints still work.
+    no_symbols,
+    /// A `file:line` / function name resolved to no code address (run_to_line target).
+    unresolved,
+    /// The fixed source-spec breakpoint table (`DBG_MAX_SPECS`) is full.
+    spec_table_full,
 };
 
 /// The per-session snapshot-slot cap (snapshot-restore-plan §3 / Decision D1; LOCKED).
@@ -449,6 +509,71 @@ pub const RegionsResult = struct {
     items: [MAX_REGIONS]Region = undefined,
 };
 
+// ---- source-level debug core (M-S1) — FLAT pointer-free result PODs ---------
+// These flatten the slice-bearing neutral DTOs (`core.PcLocation`/`ResolvedBreakpoint`/
+// `StopState`) into FIXED inline buffers + integers, so they pass
+// `expectNoPointerFields(q.Response)` and the listener serializes them off-worker from
+// owned-by-value bytes (no read-after-resume race; debug-core-plan.md §1/§3.1a).
+
+/// A flattened `core.PcLocation`: the resolved seg:off:linear plus the (optional)
+/// function name and source location, each copied into a fixed inline buffer.
+pub const PcLocationResult = struct {
+    seg: u16 = 0,
+    off: u16 = 0,
+    linear: u32 = 0,
+    has_function: bool = false,
+    func_len: u8 = 0,
+    func: [DBG_NAME_CAP]u8 = undefined,
+    has_source: bool = false,
+    line: u32 = 0,
+    file_id: u32 = 0,
+    path_len: u8 = 0,
+    path: [DBG_PATH_CAP]u8 = undefined,
+};
+
+/// The source-spec breakpoint kind (flattened from `core.BreakpointSpec`).
+pub const DbgBpKind = enum { addr, function, source };
+
+/// A flattened `core.ResolvedBreakpoint`: the spec (kind + inline name/line) + the
+/// resolved address + source location. Used both as a set confirmation and as a
+/// `DbgBpListResult` row.
+pub const DbgBreakpoint = struct {
+    id: u32 = 0,
+    kind: DbgBpKind = .addr,
+    verified: bool = false,
+    spec_line: u32 = 0, // the source-spec line (0 for addr/function)
+    name_len: u8 = 0,
+    name: [DBG_NAME_CAP]u8 = undefined, // spec text: source file path or function name
+    seg: u16 = 0,
+    off: u16 = 0,
+    linear: u32 = 0,
+    has_source: bool = false,
+    src_line: u32 = 0,
+    file_id: u32 = 0,
+    path_len: u8 = 0,
+    path: [DBG_PATH_CAP]u8 = undefined,
+};
+
+pub const DbgBpListResult = struct {
+    count: u32 = 0,
+    items: [DBG_MAX_SPECS]DbgBreakpoint = undefined,
+};
+
+/// A flattened `core.StopState` (the source-step / run-to result). The optional
+/// `PcLocation` is embedded as a flattened `PcLocationResult`.
+pub const DbgStopResult = struct {
+    running: bool = false,
+    has_kind: bool = false,
+    kind: debug.core.StopKind = .step,
+    cycle: u64 = 0,
+    has_bp_id: bool = false,
+    bp_id: u32 = 0,
+    has_exit_code: bool = false,
+    exit_code: u16 = 0,
+    has_pc: bool = false,
+    pc: PcLocationResult = .{},
+};
+
 pub const Response = union(enum) {
     /// `{"ok":true}` — reset/load/enable/remove/clear (clear carries a count).
     ok: void,
@@ -496,6 +621,15 @@ pub const Response = union(enum) {
     trace_status: TraceStatus,
     /// A branch-trace dump page. Pointer-free POD filled by the worker from the ring.
     trace_dump: TraceDumpResult,
+    // ---- source-level debug core (M-S1) — flat pointer-free results ----
+    /// `whereami` — a flattened `core.PcLocation` (serialized off-worker by `writeWhere`).
+    dbg_where: PcLocationResult,
+    /// A source/function breakpoint set confirmation (flattened `core.ResolvedBreakpoint`).
+    dbg_bp: DbgBreakpoint,
+    /// The source-spec breakpoint list (≤ `DBG_MAX_SPECS` rows).
+    dbg_bp_list: DbgBpListResult,
+    /// A source-step / run-to result (flattened `core.StopState`).
+    dbg_stop: DbgStopResult,
     /// A typed error. The handler maps `code` → HTTP status.
     err: ErrCode,
 };

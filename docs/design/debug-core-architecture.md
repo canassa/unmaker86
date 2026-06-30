@@ -1,7 +1,26 @@
 # Protocol-Neutral Debug Core — Architecture & Design
 
-**Status:** design (no code). Targets source-level debugging of Borland-C++-3.1-compiled
+**Status:** design. Targets source-level debugging of Borland-C++-3.1-compiled
 DOS guests (a decompiled *Betrayal at Krondor* relink) under zdos.
+
+> **🔄 RECONCILED 2026-06-30 (symbol layer now built).** This document was drafted
+> *before* the Borland TDS symbol layer existed. The layer (`src/debug/symbols/`, 153
+> tests) and a **live-machine integration proof** (`src/debug/symbols_integration_test.zig`)
+> now exist. Sections that referenced "the symbol layer" abstractly have been reconciled
+> against the **real API** — `Symbols` / `AddressMap` / `TypeGraph` / `SymbolIndex` and the
+> result PODs (`FuncRef`/`LineHit`/`Local`/`Storage`/…). Reconciliation edits are tagged
+> **`[R]`** inline. The execution-control grounding (§2, §5, §7) was already accurate and
+> is preserved. The concrete, step-by-step build is in the sibling
+> **`docs/design/debug-core-plan.md`** (the analog of `tds-parser-plan.md`).
+>
+> **Confirmed by the integration proof** (fold these into every "load_para" claim below):
+> attach is `Symbols.attach(psp_seg)` with `psp_seg = m.dos.current_psp`; the runtime base
+> paragraph is `psp_seg + 0x10`; the live-PC key is `seg_base[CS] +% EIP`
+> (`breakpoints.currentLinear`); a `BB.C:9` source line resolved through `runtimeAddrForLine`
+> → a real `Controller` `execution_address` breakpoint → run → stop landed **exactly** at the
+> predicted live CS:IP, and `functionForRuntimeAddr`/`lineForRuntimeAddr`/`scopeForRuntimeAddr`
+> → `localsForScope` reverse-resolved it, with a BP-relative local's live value read off the
+> bus. **No symbol-layer additions were needed for the proof.**
 
 **Prime directive (inherited, non-negotiable — CLAUDE.md §1):** determinism. Same binary +
 same inputs ⇒ byte-identical machine state at any cycle N, every run. The debug core lives
@@ -183,6 +202,14 @@ preemption, and (d) a background-run + push precedent (pacer + stream). The new 
 **two additions** on top: a **symbol layer** (TDS) and a **source-semantics + event layer**,
 plus an **event bus** in `src/api`. No new engine surface.
 
+**[R]** The first addition — the **symbol layer** — is now **built and tested**
+(`src/debug/symbols/`, façade `Symbols`, re-exported from `src/debug/debug.zig:62-68`). What
+remains is the **source-semantics + event layer** (this document / the plan). The symbol layer
+exposes exactly what §4/§7 need and required **no additions to serve the integration proof** — with
+**one** exception the proof never exercised: `stepOut`'s near/far decision needs a new
+`SymbolIndex.typeRefForFunction(FuncRef) -> ?u16` accessor (`FuncRef` carries no `type_index`; see
+§7.1 and `debug-core-plan.md §3.2/§10`). That is the single symbol-API addition the core requires.
+
 ---
 
 ## 3. A. Layering & boundaries
@@ -236,23 +263,36 @@ caches — is **host-side configuration re-attached on load**, exactly analogous
 
 ### 3.3 Determinism / snapshot interaction (the load_para subtlety)
 
-The TDS→runtime relocation is `runtime = load_para + seg_base + tds_offset`
-(research §8). `load_para` is the DOS load paragraph — **a property of the deterministic load,
+The TDS→runtime relocation is `runtime_linear = (psp_seg + 0x10 + tds_segment) * 16 + tds_offset`
+(research §14). `load_para` is the DOS load paragraph — **a property of the deterministic load,
 recoverable from the machine** (the MCB/PSP allocation that zdos tracks), *not* something the
 core invents. The symbol layer therefore re-derives `load_para` **from the machine** at attach
-time (or after each `load`), exactly as the existing config is re-applied. Concretely:
+time (or after each `load`), exactly as the existing config is re-applied.
 
-- On `load` / `reset+load` (`worker.zig : loadResp`), the resolved runtime address of any TDS
-  symbol changes only because `load_para` changed — a deterministic function of the load. The
-  core re-resolves its address indices; the **breakpoint *specs* persist** (file:line,
-  function name), their **resolved linear addresses are recomputed**. This mirrors how
-  breakpoints "PERSIST across a restore (LOCKED, like reset)" while their bus watches are
-  rebuilt (`rearmWatches` doc, `controller.zig:757`).
-- On `restore` (`worker.zig : restoreResp`): the machine reverts to a prior cycle, the bus
-  watch tables revert with it, and `rearmWatches` re-syncs. **`load_para` is unchanged across a
-  restore** (same load), so the symbol indices need no rebuild; only `last_stop` and the live
-  frame/variable caches (which are valid only while stopped) are invalidated. The design adds a
-  symmetric `core.onMachineReverted()` hook called from `restoreResp` next to `rearmWatches`.
+**[R] Concrete API (built + proven).** The whole relocation lives in **one** function,
+`AddressMap.toRuntimeLinear` (`src/debug/symbols/map.zig:36`), reached via
+`Symbols.attach(psp_seg) -> AddressMap` (`symbols.zig:144`), where `base_para = psp_seg + 0x10`
+(`map.zig:31`). `psp_seg` is read straight off the machine: `m.dos.current_psp`
+(`dos/dos.zig:126`), set by the loader at `loader.zig:206` (`load_seg = psp_seg + 16`,
+`loader.zig:195`). The integration test (`symbols_integration_test.zig`) **proved** this
+matches the loader's actual placement byte-for-byte for the small-model `BB.EXE`:
+`((psp_seg + 0x10) << 4) + 0x02CB == runtimeAddrForLine(BB.C, 9)` and the run stopped at that
+exact live CS:IP. Concretely:
+
+- On `load` / `reset+load` (`worker.zig : loadResp`, `:655` → `ctrl.m.boot`), the resolved
+  runtime address of any TDS symbol changes only because `load_para` changed — a deterministic
+  function of the load. **[R]** The image-relative `Symbols`/`SymbolIndex`/`TypeGraph` are a pure
+  function of the EXE bytes and **do not change**; only the cheap `AddressMap` (which is just
+  `{*index, base_para}`) is re-`attach`ed with the new `psp_seg`. The **breakpoint *specs*
+  persist** (file:line, function name); their **resolved linear addresses are recomputed** via
+  the fresh `AddressMap`. This mirrors how breakpoints "PERSIST across a restore (LOCKED, like
+  reset)" while their bus watches are rebuilt (`rearmWatches` doc, `controller.zig:757`).
+- On `restore` (`worker.zig : restoreResp`, `:692`): the machine reverts to a prior cycle, the
+  bus watch tables revert with it, and `rearmWatches` re-syncs (`worker.zig:696`). **`load_para`
+  is unchanged across a restore** (same load), so even the `AddressMap` need not rebuild; only
+  `last_stop` and the live frame/variable caches (valid only while stopped) are invalidated. The
+  design adds a symmetric `core.onMachineReverted()` hook called from `restoreResp` next to
+  `rearmWatches`.
 
 No core state ever enters `Machine.Snapshot`; the snapshot/restore byte-identity guarantee is
 untouched.
@@ -264,6 +304,27 @@ untouched.
 Native Zig types. **No DAP/MCP type appears here.** Reuses existing PODs where they already fit
 (`debug.CpuSnapshot`, `debug.DisasmResult`). DAP maps ~1:1 onto these; MCP maps a friendlier
 subset of the *same* operations.
+
+**[R] These DTOs carry `[]const u8`, are worker-internal render targets, and never cross
+`q.Response` as slices.** The neutral types below (`SourceLoc.path`, `PcLocation.function`,
+`Variable.name`/`type_name`/`value_text`, …) hold resolved slices into the symbol arena and into
+rendered scratch, so they **cannot** pass `expectNoPointerFields` (the symbol-POD gate,
+`src/debug/determinism_test.zig`, which rejects *any* slice); they are **excluded from that gate**
+and covered by the **grep gate only** (no host time/RNG/thread/atomic/float). **[R] The earlier
+claim that they are "consumed within one Stopped epoch by a frontend" was WRONG and is corrected:**
+a `q.Response` is serialized on the **listener** thread *after* `submit()` returns
+(`queue.zig:555`/`:593`; the worker then immediately resumes its `while(true)` run loop,
+`worker.zig:753-760`) — so by the
+time a `writeX` serializer runs (e.g. `writeDisasm`, `server.zig:2997`) the worker may already have
+advanced guest RAM (`run`/`step`) or freed+rebuilt the symbol arena (`load`/`reset` →
+`attachOnLoad` → `old.deinit()`). A borrowed slice on a `q.Response` would be a **read-after-resume
+race** *and* **non-deterministic output** — which is exactly why `expectNoPointerFields(q.Response)`
+(`src/api/determinism_test.zig:155`) **stays unchanged**. The slice-bearing DTOs are therefore
+produced **AND serialized worker-side, while still Stopped**; what crosses `q.Response` is only a
+**flat pointer-free POD** (flat results) or a **length-tagged owned-body descriptor** (nested
+results — the framebuffer-seam generalization). The integer-only **symbol PODs** (`FuncRef`/
+`SymRef`/`LineHit`/`TypeInfo`/`Local`/…) stay on the symbol-POD gate. See `debug-core-plan.md
+§1`/§3.1a.
 
 ### 4.1 Identity & location types
 
@@ -324,6 +385,20 @@ A `source`/`function` spec **resolves to a `Controller` `execution_address{linea
 (`addBreakpoint`, `controller.zig:634`). The core keeps the spec→id mapping so it can
 *re-resolve* after a `load` (new `load_para`) without the frontend re-sending.
 
+**[R] Concrete resolution path (real API):**
+
+| `BreakpointSpec` | resolves via |
+|---|---|
+| `source{file,line}` | `SymbolIndex.fileId(file)` → `AddressMap.runtimeAddrForLine(file_id, line)` (`map.zig:57`) → `linear`; null ⇒ `verified=false` |
+| `function{name}` | `SymbolIndex.nameToSymbol(name)` → `addrToFunction(seg,off)` → `AddressMap.entryAddrForFunction(f)` (post-prologue, `map.zig:77`) |
+| `addr{linear}` | used as-is |
+
+The `ResolvedBreakpoint.id` is the `u32` returned by `Controller.addBreakpoint` (stable slot
+id). `runtimeAddrForLine` already returns the *lowest* code offset for a line, and
+`entryAddrForFunction` already snaps past the prologue via `entryOffsetForFunction`
+(`index.zig:312`) — so §7.6's "stop post-prologue so locals are valid" is satisfied by the
+symbol layer with **no extra logic in the core**.
+
 ### 4.3 Frames, scopes, variables
 
 ```zig
@@ -353,6 +428,33 @@ pub const Variable = struct {
 };
 ```
 
+**[R] How a `Variable` is produced (the integration proof, generalized).** The proof walked
+`scopeForRuntimeAddr(am, pc)` (`symbols.zig:152`) → `TypeGraph.localsForScope(scope)`
+(`types.zig:469`), and for the full visible set climbs `TypeGraph.parentOf` (`types.zig:476`).
+Each `Local` (`types.zig:156`) carries `{name_index, type_ref, storage}`. Rendering:
+
+- **`type_name`** ← `TypeGraph.typeName(local.type_ref, writer)` (`types.zig:423`) — renders
+  `"int"`, `"struct Point *"`, `"char [8]"`, etc.; aggregates/pointers expand via `members`
+  (`types.zig:396`) / `typeInfo` (`types.zig:338`) behind `children_ref`.
+- **`value_text` / `addr`** ← read per `local.storage` (`Storage`, `types.zig:146`):
+  - `.auto = i16` → BP-relative: `addr.linear = ss_base +% (BP + off)`, read via
+    `Controller.peekMem(.ss, …)`. *(Proven: `v.storage == .{.auto = 4}` → `SS:[BP+4] == 300`.)*
+  - `.register = u8` → read the live register from `Controller.cpuSnapshot` (BX=3, CX=1,
+    DX=2, … per `format.Reg`). *(Proven for `lo`/`hi`/`r`.)*
+  - `.static = {segment, offset}` → image-relative global: relocate via
+    `AddressMap.toRuntimeLinear(segment, offset)`, read with `peekMemPhys`.
+  - `.constant`/`.absolute`/`.other` → rendered from the symbol value directly (no bus read).
+
+  `writable` is false for `.constant`/`.absolute`; a `.auto`/`.register`/`.static` write is a
+  deliberate new input (`Controller.writeMem` / `setReg*`).
+
+  **[R] Float locals render as raw hex bytes ONLY.** The Borland primitive set has
+  `float`/`double`/`ldouble`/`tpreal` (`types.zig:342`), but zdos has **no x87** (memory note
+  *no-FPU-constraint*) and `src/debug` is on a grep gate that **forbids `f32`/`f64`**
+  (`determinism_test.zig:37-40`). So a float's `value_text` is its storage bytes as a fixed-width
+  hex string — never a host `std.fmt` float conversion (a gate violation and a host-rounding
+  nondeterminism). The `type_name` ("float"/"double") still renders. See `debug-core-plan.md §4`.
+
 ### 4.4 Stop reason & stop state (pollable)
 
 ```zig
@@ -374,6 +476,16 @@ pub const StopState = struct {
 Return-immediately run-control returns a small `Ack`; the *result* (the stop) arrives as a
 `Stopped` event (§5). Query/inspect operations are synchronous (they run on the worker via the
 existing queue and return a value).
+
+**[R] Transport of query results across the queue.** A query result does **not** cross `q.Response`
+as these slice-bearing DTOs (§4 head note: the listener serializes *after* the worker resumed).
+**Flat, bounded** results (`pcLocation`, breakpoint confirmations, `registers`) are flattened into
+a **pointer-free POD** (the `debug.DisasmResult` pattern, serialized off-worker by a `writeX`).
+**Nested / variable-length** results (`stackTrace`, `scopes`, `variables`, `evaluate`,
+`setVariable`) are **serialized to JSON on the worker** into a session-owned bounded buffer, with
+only a `{ body_len }` descriptor on the `q.Response` — generalizing the framebuffer seam
+(`server.zig` `submitAndRespondFramebuffer`). This is what keeps the slice borrows from outliving
+the Stopped epoch. Full design: `debug-core-plan.md §3.1a`.
 
 ```zig
 pub const Ack = struct { accepted: bool, reason: ?[]const u8 = null }; // false ⇒ e.g. already running
@@ -506,8 +618,19 @@ generalized into a **debug-run owner**:
    `RunControl.preemptRequested()` so a `pause`/`reset` from any frontend lands promptly.
 3. When a burst returns a non-`cycle_budget_exhausted` `StopReason`, the driver:
    - records it (`Controller.last_stop`, `RunControl.recordStop`),
-   - calls `RunControl.endDebugger()` to release the owner (state → Stopped),
+   - calls the **async end transition** to release the owner (state → Stopped),
    - **publishes a `Stopped` event** to the event bus, which fans out to every attached frontend.
+
+**[R] `beginDebugger`/`endDebugger` as-built do NOT compose for a background run.** Today's pair
+(`run_control.zig:230/:241`) is for the *blocking* per-command path: (a) `owner = .debugger` is
+ambiguous — a background run reusing it is indistinguishable from an in-flight blocking command;
+(b) a non-returning background run can leave `owner = .debugger` stuck, wedging `RunControl.start`
+(409 forever); and critically (c) `endDebugger(.paced)` **re-arms the pacer**
+(`armed.store(true)`), so ending a background run that just stopped at a breakpoint would resume a
+free-run **past** that breakpoint. M-S4 therefore adds an explicit async-run ownership state
+(`.debugger_async` + `beginDebuggerAsync`/`endDebuggerAsync`): the driver owns the begin/end
+pairing (no frontend can strand the owner), and the async end on a real stop goes to Stopped
+(`owner = .idle`) **without** re-arming the pacer. Full design: `debug-core-plan.md §6.2.1`.
 
 The DAP frontend turns that into a DAP `stopped` event; the web UI updates; the MCP poller sees
 it on its next `status` call.
@@ -572,6 +695,24 @@ arbitrates and **broadcasts every event to all** frontends.
 | A `detach`es while running | Its subscription is dropped; the run continues for the others. If A was the *last* frontend, the core may keep running headless (policy: do **not** kill the guest on detach — matches DAP "attach" detach semantics). |
 | Stale variable reference (DAP `variablesReference`) after a step | Refs are valid only in the current Stopped epoch; the core stamps each ref with a `stop_epoch` and rejects stale ones with a clean error. |
 
+**[R] Async hazards the M-S4 design must close (detailed in `debug-core-plan.md §6.3/§7`):**
+
+- **Event-bus overflow policy.** The bounded ring is **drop-oldest, never block the producer**; a
+  lagging frontend's cursor is advanced and a `dropped` marker set, telling it to re-sync via
+  `stopState()` (the level is always re-readable, so a dropped edge is never a correctness loss).
+- **Preempt-counter leak on async `pause`.** `beginPreempt`/`endPreempt` is a *counter*
+  (`run_control.zig:270/:277`); an async `pause` that surfaces via a `Stopped` event (not a
+  blocking response) must still pair its `endPreempt` on the driver side, or the counter leaks and
+  every future burst yields immediately (permanent no-progress). The M-S4 test asserts the count
+  is back to 0 after the pause lands.
+- **Last-detach must not wedge the owner.** Because the **driver** (not the frontend) owns the
+  `beginDebuggerAsync`/`endDebuggerAsync` pairing, dropping the last frontend mid-run continues
+  headless and still ends cleanly (`owner = .idle`); detach never touches run ownership.
+
+**[R] Inspection ops are gated on the Stopped state.** `stackTrace`/`scopes`/`variables`/
+`setVariable`/`registers`/`pcLocation` read live BP/SP/regs valid only at a clean boundary (§5.1);
+the core rejects them with a clean error when not Stopped, rather than peeking a mid-burst machine.
+
 **Note (shared FS):** per the memory note *session FS isolation = caller's job* and `session.zig`
 header, two sessions share the host mount dir by design; that is orthogonal to multi-frontend
 (which is multiple clients of **one** session/machine).
@@ -592,8 +733,28 @@ exactly one PC and one BP chain to reason about.
 - `Controller.stepOver()` — steps over a direct CALL/INT or a whole REP (SP-guarded return),
   falling back to step-into with a reported flag (`controller.zig:1035`).
 - `Controller.runToAddress(linear)` — one-shot bp + run.
-- Symbol layer: `lineForAddr(linear) -> ?SourceLoc`, `functionForAddr(linear) -> ?Fn`,
-  `addrForLine(file,line) -> ?linear`, `entryAddr(fn) -> linear` (post-prologue).
+- **[R] Symbol layer (real API on `AddressMap` + `SymbolIndex`)** — the invented names below
+  map 1:1 onto these:
+  - `lineForAddr(linear)` → **`AddressMap.lineForRuntimeAddr(linear) -> ?LineHit`** (`map.zig:63`)
+  - `functionForAddr(linear)` → **`AddressMap.functionForRuntimeAddr(linear) -> ?FuncRef`** (`map.zig:69`)
+  - `addrForLine(file,line)` → **`SymbolIndex.fileId(file)` + `AddressMap.runtimeAddrForLine(file_id,line) -> ?u32`** (`map.zig:57`)
+  - `entryAddr(fn)` (post-prologue) → **`AddressMap.entryAddrForFunction(FuncRef) -> u32`** (`map.zig:77`)
+  - the line returned by `lineForRuntimeAddr` is a `LineHit{line, file_id, code_offset}`; the
+    `SourceLoc.path` is `SymbolIndex.sourceFile(file_id)` (`index.zig:347`).
+  - **[R] `stepOut` far/near (the one missing accessor)** → **`SymbolIndex.typeRefForFunction(
+    FuncRef) -> ?u16`** is **NOT YET in the code** and must be added. `functionForRuntimeAddr` gives
+    a `FuncRef`, but `FuncRef` (`index.zig:36`) carries **no `type_index`** (only `SymRef` does),
+    so the function's return type — needed for the near/far return decision (§7.4) — is
+    unreachable today. The new accessor resolves `tds.symbols[sym_index-1].type` to a type-ref,
+    which `TypeGraph.typeInfo(t).function.far` (`types.zig:374`) then reads. See `debug-core-plan.md
+    §3.2`/§5.4. This is the **single** symbol-layer addition the whole core needs.
+
+**[R] The run/preempt loop is WORKER-side; the pure core owns only the line predicate.** The step
+loops below (§7.2–7.5) are written as `loop:` for clarity, but `src/debug/core` is on the
+no-atomics determinism gate, so it may **not** poll `RunControl.preemptRequested()`. As in
+`worker.zig:runCapPreemptible`/`runToTargetPreemptible`, the pure core runs a *bounded burst* and
+returns `.stopped`/`.budget_exhausted`; the **worker** owns the preempt-polling loop around it,
+with a FIXED compile-time per-step cycle budget (never host-derived). See `debug-core-plan.md §5`.
 
 ### 7.2 `stepLine` / `next` (step over, stop at next source line)
 
@@ -632,7 +793,10 @@ loop:
 ```
 
 Guard: a callee with **no** debug info (C0 startup, library) must not trap the user — detect "no
-source for this addr" and degrade to `stepLine` (run back out), reported, never silent.
+source for this addr" and degrade to `stepLine` (run back out), reported, never silent. **[R]** The
+fallback must reuse the **original `start_sp`** captured *before* the first `stepInstruction` (not
+re-sampled inside the deeper callee), so `stepLine`'s same-or-shallower-frame test runs out to the
+caller's next line instead of losing the frame (see `debug-core-plan.md §5.3`).
 
 ### 7.4 `stepOut` (run to the caller frame's return)
 
@@ -647,7 +811,10 @@ Controller.runUntilEvent(...) ; on the guarded hit → emit Stopped(step)
 ```
 
 `returnAddrOfFrame` reads the stack via the side-effect-free `peekStack`/`peekMem`. Far vs near
-is taken from the function's TDS calling-convention (research §7).
+is taken from the function's TDS calling-convention (research §7). **[R]** Concretely:
+`SymbolIndex.typeRefForFunction(fn)` (the NEW accessor, §7.1) → `TypeGraph.typeInfo(t).function.far`
+— *not* the `FuncRef` directly, which has no `type_index`. A `.map`-backed image (no TDS type) ⇒
+assume near (small-model default), reported.
 
 ### 7.5 `runToLine`
 
@@ -772,18 +939,21 @@ and (optionally) an MCP long-poll to it.
 Respect the existing `src/debug` (pure, synchronous, no-atomics determinism gate) vs `src/api`
 (threaded, atomics-legal) split:
 
-- **Symbol layer:** `src/debug/symbols/` (new) — pure TDS parse + indices + `load_para` map.
-  Imports only `std` (+ reads bytes the loader/machine provide). No atomics; snapshot-neutral.
-- **Source semantics:** `src/debug/source.zig` (new) — the source-line stepping algorithm,
-  breakpoint resolution, unwinding, variable rendering. Sits **above** `Controller`, imports the
-  symbol layer + `Controller`. Pure and synchronous, like the rest of `src/debug`.
+- **Symbol layer:** `src/debug/symbols/` — **[R] BUILT** (façade `Symbols`, re-exported at
+  `debug.zig:62-68`; 153 tests; on the determinism grep-gate, `determinism_test.zig:12-28`).
+  Pure TDS parse + indices + `load_para` map. Imports only `std`. No atomics; snapshot-neutral.
+- **Source semantics:** `src/debug/core/` (new — **[R]** the plan settles on a `core/`
+  subdirectory rather than a single `source.zig`, see `debug-core-plan.md §2`). The source-line
+  stepping algorithm, breakpoint resolution, unwinding, variable rendering. Sits **above**
+  `Controller`, imports `Symbols` + `Controller`. Pure and synchronous, like the rest of
+  `src/debug`. **No DAP/MCP type crosses into `src/debug`.**
 - **Async / event / session machinery:** extend `src/api` — `src/api/event_bus.zig` (new,
   clockless broadcast), the debug-run owner in `run_control.zig`, the DAP codec `src/api/dap.zig`,
   and the source-tool rows in `mcp_tools.zig`. The neutral `DebugCore` *facade* (§4) is the
-  public seam these consume; its pure methods delegate to `src/debug/source.zig`, its async
+  public seam these consume; its pure methods delegate to `src/debug/core/` (**[R]**), its async
   methods to the `src/api` worker/event machinery.
 
-This keeps the **protocol-neutral core type definitions** in one place (`src/debug/source.zig`
+This keeps the **protocol-neutral core type definitions** in one place (`src/debug/core/` (**[R]**)
 public API), with frontends in `src/api` translating to/from them — and no DAP/MCP type ever
 crossing into `src/debug`.
 
@@ -835,11 +1005,13 @@ entirely.
 6. **Stale `variablesReference` epochs.** DAP refs are valid only while stopped; the core stamps a
    `stop_epoch` and rejects stale refs. Confirm DAP clients tolerate the clean error (they
    should — they re-fetch on each stop).
-7. **Line-table edge cases not yet pinned in research.** §0 of the research confirms the
-   `{line, offset}` entry layout, but the **source-file record (6 bytes)** and **correlation
-   record (8 bytes)** field semantics are only "partially resolved." Address↔line for the *main*
-   module is solid; multi-file / multi-segment correlation needs a confirming multi-file build
-   before Tier 1 can claim full file coverage.
+7. **[R] Line-table edge cases — RESOLVED.** When this was drafted the source-file (6B) and
+   correlation (8B) records were "partially resolved." They are now fully decoded and *built*:
+   `SymbolIndex.build` binds line records to a code segment via correlations (`index.zig:86-105`),
+   and multi-module/multi-segment is proven by the `RICH` fixture (3 modules / 3 far segments,
+   `index.zig` + `map.zig` tests). `fileId`/`sourceFile`/`addrToLine`/`lineToAddr` are real. No
+   `multi_file_unverified` gate remains. (BaK is a multi-`.obj` build — exercise it in Tier 1
+   testing, but the mechanism is general.)
 8. **`Output` event fidelity.** `Controller.console()` is a non-clearing capture of guest CON; an
    `Output` event must emit only the *delta* since the last emit (host-side high-water mark), and
    distinguish stdout vs stderr (DOS handle 1 vs 2) if the DOS layer tracks it.
@@ -909,9 +1081,16 @@ The implementer builds primarily on these (all paths absolute under the repo roo
 - `src/api/session.zig : Session` (`:201`) — the per-session bundle + concurrency contract;
   `LoadRecipe` (the host-side, re-attached-on-load config the symbol layer is modeled after).
 - `src/api/mcp.zig` / `src/api/mcp_tools.zig` — the existing pull-based frontend the source tools
-  extend.
+  extend (35 tools today; new rows append to `tools` + a `buildCommand` arm).
 - `src/host/run_pacer.zig` + `src/api/stream.zig` — the background-run + server-push precedent the
   event model generalizes.
+- **[R] `src/debug/symbols/` (BUILT)** — `symbols.zig` (`Symbols.open`/`attach`/
+  `scopeForRuntimeAddr`), `index.zig` (`SymbolIndex`), `map.zig` (`AddressMap` — the sole
+  `load_para` consumer), `types.zig` (`TypeGraph` + `Storage`/`Local`). The source-semantics
+  layer composes these; see `docs/design/debug-core-plan.md` for the per-operation mapping.
+- **[R] `src/debug/symbols_integration_test.zig` (BUILT)** — the end-to-end proof
+  (boot+load `BB.EXE` → attach → source bp → stop → function/line/scope/locals + live value).
+  The Tier-1 test harness extends this.
 - `docs/research/borland-bcc3-debug-format.md` — the symbol layer's spec (§0 empirical
   confirmation; §6 line/correlation; §7 types; §8 address/segment model + `load_para`).
 ```

@@ -64,7 +64,7 @@ const Seg = cpu_mod.Seg;
 const HTTP_HEADER_MAX = 16 * 1024; // also the head-parse buffer; undersize → 413/oversize-head
 const WRITE_BUF = 8 * 1024;
 const MAX_BODY = 64 * 1024; // > MAX_MEM_CHUNK*2 hex + JSON overhead; reject larger with 413
-const RESPONSE_BUF = 32 * 1024; // serialized JSON body
+const RESPONSE_BUF = 48 * 1024; // serialized JSON body (tools/list grew to ~37.6 KiB with the M-S1 debug tools)
 
 /// Worst-case size of a per-`Conn` CAPTURE buffer (Finding 2): the largest raw frame
 /// payload a capture path copies out from under `session.lock` before the unbounded
@@ -383,7 +383,8 @@ pub const Server = struct {
         // the Server is at its final address.)
         if (self.session) |*s| {
             s.wireStream(self.io);
-            const w: worker_mod.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl, .mount_dir = s.mount_dir, .io = self.io, .render = s.render, .live_mouse = s.live_mouse, .snapshots = s.snapshots, .run_ctl = s.run_control };
+            var w: worker_mod.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl, .mount_dir = s.mount_dir, .io = self.io, .render = s.render, .live_mouse = s.live_mouse, .snapshots = s.snapshots, .run_ctl = s.run_control, .sd = s.source_debugger, .initial_file_len = s.recipe.file_len };
+            @memcpy(w.initial_file[0..s.recipe.file_len], s.recipe.file[0..s.recipe.file_len]);
             s.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
         }
 
@@ -2813,9 +2814,103 @@ pub const Conn = struct {
             .snapshot_deleted => |d| try w.print("{{\"handle\":\"snap-{d}\",\"deleted\":true,\"count\":{d}}}", .{ d.seq, d.count }),
             .trace_status => |s| try self.writeValue(w, s),
             .trace_dump => |d| try self.writeTraceDump(w, d),
+            // ---- source-level debug core (M-S1) — flat PODs → JSON ----
+            .dbg_where => |loc| try self.writeWhere(w, loc),
+            .dbg_bp => |bp| try self.writeDbgBreakpoint(w, bp),
+            .dbg_bp_list => |l| try self.writeDbgBpList(w, l),
+            .dbg_stop => |st| try self.writeDbgStop(w, st),
             // Pre-handled by every caller (see the doc comment). Reaching here is a bug.
             .err, .framebuffer => unreachable,
         }
+    }
+
+    // ---- source-level debug core (M-S1) serializers ------------------------
+    // Flatten PODs (fixed inline name/path buffers + length) → proper JSON strings/
+    // optionals. std.json over the raw struct would render the [N]u8 buffers as arrays,
+    // so each name/path is written via `encodeJsonString` over its `buf[0..len]` slice.
+
+    /// `{"seg":S,"off":O,"linear":L}` — a flattened image/runtime address.
+    fn writeAddrTriple(self: *Conn, w: *std.Io.Writer, seg: u16, off: u16, linear: u32) std.Io.Writer.Error!void {
+        _ = self;
+        try w.print("{{\"seg\":{d},\"off\":{d},\"linear\":{d}}}", .{ seg, off, linear });
+    }
+
+    /// The inner PcLocation body: `"addr":{..},"function":"name"|null,"source":{..}|null`
+    /// (no surrounding braces) — shared by `writeWhere` and the step result's `pc`.
+    fn writePcLocBody(self: *Conn, w: *std.Io.Writer, loc: q.PcLocationResult) std.Io.Writer.Error!void {
+        try w.writeAll("\"addr\":");
+        try self.writeAddrTriple(w, loc.seg, loc.off, loc.linear);
+        try w.writeAll(",\"function\":");
+        if (loc.has_function) {
+            try std.json.Stringify.encodeJsonString(loc.func[0..loc.func_len], .{}, w);
+        } else try w.writeAll("null");
+        try w.writeAll(",\"source\":");
+        if (loc.has_source) {
+            try w.print("{{\"file_id\":{d},\"path\":", .{loc.file_id});
+            try std.json.Stringify.encodeJsonString(loc.path[0..loc.path_len], .{}, w);
+            try w.print(",\"line\":{d}}}", .{loc.line});
+        } else try w.writeAll("null");
+    }
+
+    fn writeWhere(self: *Conn, w: *std.Io.Writer, loc: q.PcLocationResult) std.Io.Writer.Error!void {
+        try w.writeAll("{");
+        try self.writePcLocBody(w, loc);
+        try w.writeAll("}");
+    }
+
+    fn writeDbgBreakpoint(self: *Conn, w: *std.Io.Writer, bp: q.DbgBreakpoint) std.Io.Writer.Error!void {
+        try w.print("{{\"id\":{d},\"kind\":\"{s}\",\"verified\":{},\"spec\":", .{ bp.id, @tagName(bp.kind), bp.verified });
+        // spec: source → {file,line}; function → {name}; addr → {linear}
+        switch (bp.kind) {
+            .source => {
+                try w.writeAll("{\"file\":");
+                try std.json.Stringify.encodeJsonString(bp.name[0..bp.name_len], .{}, w);
+                try w.print(",\"line\":{d}}}", .{bp.spec_line});
+            },
+            .function => {
+                try w.writeAll("{\"name\":");
+                try std.json.Stringify.encodeJsonString(bp.name[0..bp.name_len], .{}, w);
+                try w.writeAll("}");
+            },
+            .addr => try w.print("{{\"linear\":{d}}}", .{bp.linear}),
+        }
+        try w.writeAll(",\"resolved\":");
+        if (bp.verified) {
+            try self.writeAddrTriple(w, bp.seg, bp.off, bp.linear);
+        } else try w.writeAll("null");
+        try w.writeAll(",\"source\":");
+        if (bp.has_source) {
+            try w.print("{{\"file_id\":{d},\"path\":", .{bp.file_id});
+            try std.json.Stringify.encodeJsonString(bp.path[0..bp.path_len], .{}, w);
+            try w.print(",\"line\":{d}}}", .{bp.src_line});
+        } else try w.writeAll("null");
+        try w.writeAll("}");
+    }
+
+    fn writeDbgBpList(self: *Conn, w: *std.Io.Writer, l: q.DbgBpListResult) std.Io.Writer.Error!void {
+        try w.writeAll("{\"breakpoints\":[");
+        for (l.items[0..l.count], 0..) |bp, i| {
+            if (i != 0) try w.writeAll(",");
+            try self.writeDbgBreakpoint(w, bp);
+        }
+        try w.writeAll("]}");
+    }
+
+    fn writeDbgStop(self: *Conn, w: *std.Io.Writer, st: q.DbgStopResult) std.Io.Writer.Error!void {
+        try w.writeAll("{\"kind\":");
+        if (st.has_kind) {
+            try w.print("\"{s}\"", .{@tagName(st.kind)});
+        } else try w.writeAll("null");
+        try w.print(",\"running\":{},\"cycle\":{d}", .{ st.running, st.cycle });
+        if (st.has_bp_id) try w.print(",\"bp_id\":{d}", .{st.bp_id});
+        if (st.has_exit_code) try w.print(",\"exit_code\":{d}", .{st.exit_code});
+        try w.writeAll(",\"pc\":");
+        if (st.has_pc) {
+            try w.writeAll("{");
+            try self.writePcLocBody(w, st.pc);
+            try w.writeAll("}");
+        } else try w.writeAll("null");
+        try w.writeAll("}");
     }
 
     /// Serialize the grouped device snapshot. The whole POD is JSON-Stringify-able
@@ -3051,6 +3146,15 @@ pub const Conn = struct {
             // idiom); reclaim with delete_snapshot, then retry.
             .snapshot_limit_reached => .{ .status = .service_unavailable, .code = "snapshot_limit_reached", .msg = "all snapshot slots are in use; delete one first" },
             .no_such_snapshot => .{ .status = .not_found, .code = "no_such_snapshot", .msg = "no snapshot with that handle" },
+            // ---- source-level debug core (M-S1) ----
+            // The machine is mid-run: 409 Conflict (inspect only at a clean stop boundary).
+            .not_stopped => .{ .status = .conflict, .code = "not_stopped", .msg = "machine is running; valid only when stopped" },
+            // The image carries no usable TDS symbols — the source resource is absent (404).
+            .no_symbols => .{ .status = .not_found, .code = "no_symbols", .msg = "no source-level symbols for the loaded image" },
+            // The file:line / function name maps to no code address (404).
+            .unresolved => .{ .status = .not_found, .code = "unresolved", .msg = "file:line or function name resolved to no code address" },
+            // All source-spec breakpoint slots are in use — 503 (the breakpoint_table_full idiom).
+            .spec_table_full => .{ .status = .service_unavailable, .code = "spec_table_full", .msg = "all source breakpoint slots are in use" },
         };
     }
 

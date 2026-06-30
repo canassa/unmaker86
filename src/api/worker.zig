@@ -41,6 +41,8 @@ const PREEMPT_BURST_CYCLES: u64 = 1 << 20;
 const PREEMPT_STEP_BATCH: u64 = 1 << 16;
 
 const Controller = debug.Controller;
+const SourceDebugger = debug.SourceDebugger;
+const core = debug.core;
 const Seg = cpu_mod.Seg;
 const Command = q.Command;
 const Response = q.Response;
@@ -110,7 +112,7 @@ fn inSlab(ctrl: *const Controller, start: u32, len: u32) bool {
 /// Dispatch exactly one command to one `Controller` method. Pure mapping; the only
 /// state it touches is via `ctrl` (the worker owns it) and `ctx.scratch` (the
 /// mem_write bytes, copied in by the handler before submit).
-pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render: ?*RenderBuffers, live: ?*LiveMouseState, snapshots: ?*SnapshotStore, run_ctl: ?*RunControl) Response {
+pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render: ?*RenderBuffers, live: ?*LiveMouseState, snapshots: ?*SnapshotStore, run_ctl: ?*RunControl, sd: ?*SourceDebugger) Response {
     return switch (ctx.cmd) {
         // ---- run / step ----------------------------------------------------
         // Every run is PREEMPTIBLE: advanced in bounded bursts so a long/unbounded/wedged
@@ -226,7 +228,7 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
             ctrl.reset() catch return .{ .err = .load_failed };
             break :blk .ok;
         },
-        .load => |c| loadResp(ctrl, c, mount),
+        .load => |c| loadResp(ctrl, sd, c, mount),
         .mem_regions => regionsResp(ctrl),
         .disasm => |c| disasmResp(ctrl, c.origin, c.count),
         .devices_get => .{ .devices = ctrl.devicesSnapshot() },
@@ -237,7 +239,7 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
         // Run ON THE WORKER (the machine owner); reach the per-session store via the
         // worker's `?*SnapshotStore` (like `render`/`live_mouse`), never via the queue.
         .snapshot => snapshotResp(ctrl, snapshots),
-        .restore => |c| restoreResp(ctrl, snapshots, c.seq),
+        .restore => |c| restoreResp(ctrl, sd, snapshots, c.seq),
         .list_snapshots => listSnapshotsResp(snapshots),
         .delete_snapshot => |c| deleteSnapshotResp(snapshots, c.seq),
 
@@ -258,6 +260,20 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
             .kind_trap_mask = a.kind_trap_mask,
         })) },
         .branch_trap_clear => .{ .trace_status = wireTraceStatus(ctrl.clearBranchTrap()) },
+
+        // ---- source-level debug core (M-S1) --------------------------------
+        // Delegate to the `?*SourceDebugger` the worker holds. A null `sd` (an in-
+        // process test harness that never wired one) fails loud with `not_implemented`
+        // rather than faking a debug result.
+        .dbg_where => dbgWhere(sd),
+        .dbg_set_src_bp => |c| dbgSetSrcBp(sd, c),
+        .dbg_set_fn_bp => |c| dbgSetFnBp(sd, c),
+        .dbg_clear_bp => |c| dbgClearBp(sd, c.id),
+        .dbg_list_bp => dbgListBp(sd),
+        .dbg_step_line => dbgStep(ctrl, sd, run_ctl, .line, null, 0),
+        .dbg_step_in => dbgStep(ctrl, sd, run_ctl, .in, null, 0),
+        .dbg_step_out => dbgStep(ctrl, sd, run_ctl, .out, null, 0),
+        .dbg_run_to_line => |c| dbgStep(ctrl, sd, run_ctl, .to_line, c.file[0..c.file_len], c.line),
 
         .shutdown_worker => .ok,
     };
@@ -652,12 +668,18 @@ fn regionsResp(ctrl: *Controller) Response {
 /// `dos.init` (`drives = @splat(null)`); `bootProgram` alone would then fail to find
 /// the file because drive C: is no longer mounted. `boot` re-establishes the mount
 /// (host `dir` + `io` from the server-held `MountSource`) before loading.
-fn loadResp(ctrl: *Controller, c: q.LoadCmd, mount: MountSource) Response {
+fn loadResp(ctrl: *Controller, sd: ?*SourceDebugger, c: q.LoadCmd, mount: MountSource) Response {
     // The mount source MUST be present to re-establish the drive (no fake mount).
     const dir = mount.dir orelse return .{ .err = .load_failed };
     const io = mount.io orelse return .{ .err = .load_failed };
     ctrl.m.boot(c.drive, dir, io, c.file[0..c.file_len], c.cmdtail[0..c.cmdtail_len]) catch
         return .{ .err = .load_failed };
+    // Re-attach the host-side symbol overlay for THIS fresh load (debug-core-plan.md
+    // §2.1). Host-side, LOAD-TIME ONLY (never the per-cycle path), so determinism-safe:
+    // it reads the EXE/.MAP back off the same mount the boot used and re-resolves every
+    // retained breakpoint spec against the new load_para. An unreadable image ⇒ no
+    // symbols (graceful), never a panic.
+    if (sd) |s| attachSymbols(s, dir, io, c.file[0..c.file_len], ctrl.m.dos.current_psp);
     // A fresh load invalidates any prior stop; mirror reset's clear so status is
     // coherent. (boot does not own last_stop; clearing it is the server's job —
     // done here on the worker, the sole owner of controller state.)
@@ -689,11 +711,15 @@ fn snapshotResp(ctrl: *Controller, snapshots: ?*SnapshotStore) Response {
 /// `cpu.st.cycles` to the snapshot's; we then re-sync the bus watches with the live
 /// breakpoint set (clear-then-rebuild) and clear `last_stop` for a coherent status —
 /// breakpoints PERSIST (LOCKED, like `reset`/`load`).
-fn restoreResp(ctrl: *Controller, snapshots: ?*SnapshotStore, seq: u64) Response {
+fn restoreResp(ctrl: *Controller, sd: ?*SourceDebugger, snapshots: ?*SnapshotStore, seq: u64) Response {
     const store = snapshots orelse return .{ .err = .load_failed };
     if (!store.applyTo(ctrl.m, seq)) return .{ .err = .no_such_snapshot };
     // Re-arm the snapshot-reverted bus watches from the live breakpoint set (§1.2 #2/D2).
     ctrl.rearmWatches();
+    // A revert keeps the same load (load_para unchanged), so neither the Symbols nor the
+    // AddressMap rebuilds — only the live frame/step caches are invalidated (debug-core-
+    // plan.md §2.2). No reparse, no guest effect.
+    if (sd) |s| s.onMachineReverted();
     // A rewind invalidates any prior stop; mirror reset/load's clear so status is coherent.
     ctrl.last_stop = null;
     // Auto-clear the branch trace (docs/branch-trace-plan.md §3/§7): a restore starts a
@@ -714,6 +740,220 @@ fn deleteSnapshotResp(snapshots: ?*SnapshotStore, seq: u64) Response {
     const store = snapshots orelse return .{ .err = .load_failed };
     const remaining = store.delete(seq) orelse return .{ .err = .no_such_snapshot };
     return .{ .snapshot_deleted = .{ .seq = seq, .count = remaining } };
+}
+
+// ===========================================================================
+// Source-level debug core (M-S1). The worker owns the `?*SourceDebugger`; every op
+// runs here, on the single machine-owning thread, exactly like every other inspect/
+// run command (debug-core-plan.md §1: "no second path to the machine"). The pure core
+// stays free of atomics/`src/api`; the WORKER drives the preempt-poll step loop and
+// flattens the slice-bearing neutral DTOs into the pointer-free `q.Response` PODs.
+// ===========================================================================
+
+/// The largest debug IMAGE (EXE/.MAP) the load-time symbol read will pull off the host
+/// mount. A guest program + its embedded TDS is comfortably under this; a larger file ⇒
+/// no symbols (graceful), never an unbounded host allocation. Load-path only.
+const MAX_DEBUG_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read a whole host file off the mount `dir` into a fresh `gpa` buffer (caller frees).
+/// Host-side, LOAD-TIME ONLY (never the per-cycle path) — it introduces no cycle-time
+/// host dependency, so it is determinism-safe (CLAUDE.md §1 governs EMULATED time). Any
+/// open/size/read failure ⇒ null (the caller degrades to "no symbols"), never a panic.
+fn readHostFile(gpa: std.mem.Allocator, dir: Io.Dir, io: Io, name: []const u8) ?[]u8 {
+    var f = dir.openFile(io, name, .{}) catch return null;
+    defer f.close(io);
+    const len = f.length(io) catch return null;
+    if (len == 0 or len > MAX_DEBUG_IMAGE_BYTES) return null;
+    const buf = gpa.alloc(u8, @intCast(len)) catch return null;
+    var r = f.reader(io, &.{});
+    r.interface.readSliceAll(buf) catch {
+        gpa.free(buf);
+        return null;
+    };
+    return buf;
+}
+
+/// Swap an 8.3 file's extension for `ext` (e.g. `"BB.EXE"` → `"BB.MAP"`) into `out`,
+/// returning the slice (or null if it would not fit). A name with no dot gets `ext`
+/// appended. Load-path only; pure string work.
+fn sameStem(out: []u8, file: []const u8, ext: []const u8) ?[]const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, file, '.') orelse file.len;
+    const stem = file[0..dot];
+    if (stem.len + ext.len > out.len) return null;
+    @memcpy(out[0..stem.len], stem);
+    @memcpy(out[stem.len..][0..ext.len], ext);
+    return out[0 .. stem.len + ext.len];
+}
+
+/// Re-attach the symbol overlay for a fresh load: read the EXE (+ optional `.MAP`
+/// sidecar) back off the same mount, then call `SourceDebugger.attachOnLoad`. The temp
+/// read buffers are freed once `Symbols.open` has parsed them (it copies what it
+/// retains). Load-path only (debug-core-plan.md §2.1).
+fn attachSymbols(sd: *SourceDebugger, dir: Io.Dir, io: Io, file: []const u8, psp_seg: u16) void {
+    const gpa = sd.gpa;
+    const exe = readHostFile(gpa, dir, io, file);
+    defer if (exe) |b| gpa.free(b);
+    var map_name_buf: [16]u8 = undefined;
+    const map_bytes = if (sameStem(&map_name_buf, file, ".MAP")) |mn|
+        readHostFile(gpa, dir, io, mn)
+    else
+        null;
+    defer if (map_bytes) |b| gpa.free(b);
+    sd.attachOnLoad(exe, map_bytes, psp_seg);
+}
+
+/// Map a `core.Error` to the transport-neutral `q.ErrCode`.
+fn dbgErr(e: core.Error) Response {
+    return .{ .err = switch (e) {
+        error.NotStopped => .not_stopped,
+        error.NoSymbols => .no_symbols,
+        error.Unresolved => .unresolved,
+        error.SpecTableFull => .spec_table_full,
+        error.BreakpointTableFull => .breakpoint_table_full,
+        error.NoSuchBreakpoint => .no_such_breakpoint,
+    } };
+}
+
+/// Copy `s` into `dst` (truncating to the fixed cap), returning the copied length.
+fn copyInline(dst: []u8, s: []const u8) u8 {
+    const n = @min(s.len, dst.len);
+    @memcpy(dst[0..n], s[0..n]);
+    return @intCast(n);
+}
+
+/// Flatten a `core.PcLocation` into the pointer-free wire POD.
+fn flattenPc(loc: core.PcLocation) q.PcLocationResult {
+    var r = q.PcLocationResult{ .seg = loc.addr.seg, .off = loc.addr.off, .linear = loc.addr.linear };
+    if (loc.function) |f| {
+        r.has_function = true;
+        r.func_len = copyInline(&r.func, f);
+    }
+    if (loc.source) |s| {
+        r.has_source = true;
+        r.line = s.line;
+        r.file_id = s.file_id;
+        r.path_len = copyInline(&r.path, s.path);
+    }
+    return r;
+}
+
+/// Flatten a `core.ResolvedBreakpoint` into the pointer-free wire POD (set confirm /
+/// list row).
+fn flattenBp(rb: core.ResolvedBreakpoint) q.DbgBreakpoint {
+    var r = q.DbgBreakpoint{ .id = rb.id, .verified = rb.verified };
+    switch (rb.spec) {
+        .addr => r.kind = .addr,
+        .function => |f| {
+            r.kind = .function;
+            r.name_len = copyInline(&r.name, f.name);
+        },
+        .source => |sp| {
+            r.kind = .source;
+            r.spec_line = sp.line;
+            r.name_len = copyInline(&r.name, sp.file);
+        },
+    }
+    if (rb.resolved) |a| {
+        r.seg = a.seg;
+        r.off = a.off;
+        r.linear = a.linear;
+    }
+    if (rb.source) |s| {
+        r.has_source = true;
+        r.src_line = s.line;
+        r.file_id = s.file_id;
+        r.path_len = copyInline(&r.path, s.path);
+    }
+    return r;
+}
+
+/// Flatten a `core.StopState` (source-step / run-to result) into the wire POD.
+fn flattenStop(ss: core.StopState) q.DbgStopResult {
+    var r = q.DbgStopResult{ .running = ss.running, .cycle = ss.cycle };
+    if (ss.kind) |k| {
+        r.has_kind = true;
+        r.kind = k;
+    }
+    if (ss.bp_id) |id| {
+        r.has_bp_id = true;
+        r.bp_id = id;
+    }
+    if (ss.exit_code) |c| {
+        r.has_exit_code = true;
+        r.exit_code = c;
+    }
+    if (ss.pc) |pc| {
+        r.has_pc = true;
+        r.pc = flattenPc(pc);
+    }
+    return r;
+}
+
+fn dbgWhere(sd: ?*SourceDebugger) Response {
+    const s = sd orelse return .{ .err = .not_implemented };
+    const loc = s.pcLocation() catch |e| return dbgErr(e);
+    return .{ .dbg_where = flattenPc(loc) };
+}
+
+fn dbgSetSrcBp(sd: ?*SourceDebugger, c: q.DbgSrcBpCmd) Response {
+    const s = sd orelse return .{ .err = .not_implemented };
+    const rb = s.setBreakpoint(.{ .source = .{ .file = c.file[0..c.file_len], .line = c.line } }) catch |e| return dbgErr(e);
+    return .{ .dbg_bp = flattenBp(rb) };
+}
+
+fn dbgSetFnBp(sd: ?*SourceDebugger, c: q.DbgFnBpCmd) Response {
+    const s = sd orelse return .{ .err = .not_implemented };
+    const rb = s.setBreakpoint(.{ .function = .{ .name = c.name[0..c.name_len] } }) catch |e| return dbgErr(e);
+    return .{ .dbg_bp = flattenBp(rb) };
+}
+
+fn dbgClearBp(sd: ?*SourceDebugger, id: u32) Response {
+    const s = sd orelse return .{ .err = .not_implemented };
+    s.clearBreakpoint(id) catch |e| return dbgErr(e);
+    return .ok;
+}
+
+fn dbgListBp(sd: ?*SourceDebugger) Response {
+    const s = sd orelse return .{ .err = .not_implemented };
+    var specs: [q.DBG_MAX_SPECS]core.ResolvedBreakpoint = undefined;
+    const list = s.listBreakpoints(&specs);
+    var res: q.DbgBpListResult = .{};
+    for (list) |rb| {
+        res.items[res.count] = flattenBp(rb);
+        res.count += 1;
+    }
+    return .{ .dbg_bp_list = res };
+}
+
+/// The WORKER-side preempt-poll source-step DRIVER (debug-core-plan.md §5, Finding 1).
+/// Mirrors `runToTargetPreemptible`: `beginStep` then loop the pure BOUNDED
+/// `stepBurst(STEP_BURST_CYCLES)`, polling the clockless preempt flag BETWEEN bursts so
+/// a `pause`/`reset`/new-breakpoint from another frontend lands at a burst boundary as a
+/// `.pause` stop — under the fixed anti-wedge `STEP_WEDGE_CAP_CYCLES` ceiling. The pure
+/// core never polls an atomic / imports `src/api`; the budget + cap are FIXED compile-
+/// time cycle constants (defined in the core), never host-derived.
+fn dbgStep(ctrl: *Controller, sd: ?*SourceDebugger, run_ctl: ?*RunControl, kind: core.StepKind, file: ?[]const u8, line: u32) Response {
+    const s = sd orelse return .{ .err = .not_implemented };
+    s.beginStep(kind, file, line) catch |e| return dbgErr(e);
+    var spent: u64 = 0;
+    while (true) {
+        if (preempting(run_ctl)) {
+            s.endStep();
+            const reason = ctrl.recordExternalStop(.{ .stopped_by_request = .{ .at_cycle = ctrl.currentCycle() } });
+            return .{ .dbg_stop = flattenStop(s.projectStop(reason)) };
+        }
+        switch (s.stepBurst(core.STEP_BURST_CYCLES)) {
+            .stopped => |ss| return .{ .dbg_stop = flattenStop(ss) },
+            .budget_exhausted => {
+                spent +|= core.STEP_BURST_CYCLES;
+                if (spent >= core.STEP_WEDGE_CAP_CYCLES) {
+                    s.endStep();
+                    const reason = ctrl.recordExternalStop(.{ .step_complete = .{ .at_cycle = ctrl.currentCycle() } });
+                    return .{ .dbg_stop = flattenStop(s.projectStop(reason)) };
+                }
+            },
+        }
+    }
 }
 
 // ===========================================================================
@@ -744,9 +984,30 @@ pub const Worker = struct {
     /// completes byte-identically). Set by the server / registry at the worker-spawn sites,
     /// exactly like `render`/`live_mouse`/`snapshots`.
     run_ctl: ?*RunControl = null,
+    /// The session's source-level debug core (debug-core-plan.md §1). Null in a test
+    /// harness that never wired one (the `dbg_*` commands then fail loud). Set by the
+    /// server / registry at the worker-spawn sites, exactly like `render`/`run_ctl`.
+    sd: ?*SourceDebugger = null,
+    /// The initially-loaded program (from the session recipe), for the STARTUP symbol
+    /// attach (investigation point #3): the default `--serve` session boots via
+    /// `bootProgram` BEFORE any debug command, so without this initial `attachOnLoad`
+    /// `whereami` would see no symbols until an explicit `load`. Copied from the recipe
+    /// at the construction site (worker.zig must not import session.zig — a cycle).
+    initial_file: [13]u8 = undefined,
+    initial_file_len: u8 = 0,
 
     pub fn run(self: Worker) void {
         const mount: MountSource = .{ .dir = self.mount_dir, .io = self.io };
+        // Startup symbol attach for the program the machine already booted (investigation
+        // point #3): read the EXE/.MAP off the mount and build the overlay for the live
+        // load, on THIS (the machine-owning) thread, before servicing any command — so a
+        // freshly-served program answers `whereami` without an explicit `load` first.
+        if (self.sd) |sd| {
+            if (self.initial_file_len != 0) {
+                if (mount.dir) |dir| if (mount.io) |io|
+                    attachSymbols(sd, dir, io, self.initial_file[0..self.initial_file_len], self.ctrl.m.dos.current_psp);
+            }
+        }
         // Publish the initial settled status so a never-commanded machine reports correct
         // cycles/mult to `GET /api/machines` (which reads these atomics off-worker).
         self.publishStatus();
@@ -756,7 +1017,7 @@ pub const Worker = struct {
                 self.queue.complete(ctx, .ok);
                 return;
             }
-            const resp = drainOne(self.ctrl, ctx, mount, self.render, self.live_mouse, self.snapshots, self.run_ctl);
+            const resp = drainOne(self.ctrl, ctx, mount, self.render, self.live_mouse, self.snapshots, self.run_ctl, self.sd);
             self.queue.complete(ctx, resp);
             // Stamp the published cycle/mult AFTER each command so `/api/machines` can report
             // this machine's status WITHOUT submitting to (and being blocked by) this worker —

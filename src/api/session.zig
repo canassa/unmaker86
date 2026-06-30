@@ -308,6 +308,14 @@ pub const Session = struct {
     /// store struct itself is destroyed (else the lazy slabs leak).
     snapshots: *snapshot_store_mod.SnapshotStore,
 
+    /// The source-level debug core (M-S1, debug-core-plan.md §1). The host-side Borland
+    /// TDS symbol overlay + the breakpoint spec table over the live `Controller`, re-
+    /// attached on every load (the `LoadRecipe` precedent). Heap-allocated ONCE so the
+    /// worker holds a stable `?*SourceDebugger` (reached like `render`); its symbol
+    /// overlay (`syms`/`map`) has the shorter lifetime of the loaded program, rebuilt by
+    /// `attachOnLoad`. Allocated from the Session `gpa` in `init`, freed in `deinit`.
+    source_debugger: ?*debug.SourceDebugger = null,
+
     /// Allocate the per-session heap blocks and stand up the queue. Captures NO
     /// self-address (the stream hub is `.init`-wired later, in `Server.wireStream`,
     /// once the Session is at its final address). The errdefer chain frees every
@@ -335,6 +343,15 @@ pub const Session = struct {
         // are lazy (allocated on first `snapshot`) and freed in `deinit`.
         const snaps = try gpa.create(snapshot_store_mod.SnapshotStore);
         snaps.* = snapshot_store_mod.SnapshotStore.init(gpa);
+        errdefer {
+            snaps.deinit();
+            gpa.destroy(snaps);
+        }
+        // The source-level debug core (M-S1). Owns the symbol overlay; bound to the
+        // Controller's FINAL address (passed in here, already at rest) — the worker
+        // dereferences it on the machine-owning thread.
+        const sd = try gpa.create(debug.SourceDebugger);
+        sd.* = debug.SourceDebugger.init(gpa, ctrl);
         return .{
             .id = id,
             .ctrl = ctrl,
@@ -347,6 +364,7 @@ pub const Session = struct {
             .shared_frame = frame,
             .stream_hub = hub,
             .snapshots = snaps,
+            .source_debugger = sd,
         };
     }
 
@@ -373,5 +391,10 @@ pub const Session = struct {
         // each allocated slab.
         self.snapshots.deinit();
         gpa.destroy(self.snapshots);
+        // Free the symbol overlay (the loaded-program lifetime) BEFORE the core struct.
+        if (self.source_debugger) |sd| {
+            sd.deinit();
+            gpa.destroy(sd);
+        }
     }
 };

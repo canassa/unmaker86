@@ -235,7 +235,7 @@ pub const SessionRegistry = struct {
         session.wireStream(self.io);
 
         // Spawn this session's worker (the sole owner of its machine).
-        const w: worker_mod.Worker = .{
+        var w: worker_mod.Worker = .{
             .queue = &session.queue,
             .ctrl = session.ctrl,
             .mount_dir = session.mount_dir,
@@ -244,7 +244,10 @@ pub const SessionRegistry = struct {
             .live_mouse = session.live_mouse,
             .snapshots = session.snapshots,
             .run_ctl = session.run_control,
+            .sd = session.source_debugger,
+            .initial_file_len = session.recipe.file_len,
         };
+        @memcpy(w.initial_file[0..session.recipe.file_len], session.recipe.file[0..session.recipe.file_len]);
         session.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
         errdefer {
             var sc: q.RequestCtx = .{ .cmd = .shutdown_worker };

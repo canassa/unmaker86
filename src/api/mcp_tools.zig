@@ -353,6 +353,60 @@ pub const tools = [_]Tool{
         \\{"type":"object","properties":{"snapshot":{"type":"string","minLength":1,"description":"the snap-<n> handle to delete"}},"required":["snapshot"],"additionalProperties":false}
         ,
     },
+    // --- source-level debug core (M-S1, debug-core-plan.md §3.3) ---
+    .{
+        .name = "whereami",
+        .description = "Resolve the live CS:IP to its function + source file:line via the loaded program's TDS debug info (attached on load). Valid only when the machine is stopped. Returns {addr:{seg,off,linear}, function|null, source:{file_id,path,line}|null}; null fields mean the PC isn't covered by symbols (a stripped image or library code).",
+        .input_schema = SCHEMA_EMPTY,
+    },
+    .{
+        .name = "set_source_breakpoint",
+        .description = "Set a breakpoint at a source file:line, resolved through the TDS line table to a runtime address. Returns the breakpoint {id, kind, verified, spec, resolved, source}: verified=false means file:line mapped to no code (kept and re-resolved on reload). Clear it with clear_source_breakpoint.",
+        .input_schema =
+        \\{"type":"object","properties":{"file":{"type":"string","minLength":1,"description":"source file name as the compiler recorded it (e.g. BB.C)"},"line":{"type":"integer","minimum":1,"description":"1-based source line"}},"required":["file","line"],"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "set_function_breakpoint",
+        .description = "Set a breakpoint at a function's post-prologue entry, resolved through the symbol table. Returns the breakpoint {id, kind, verified, spec, resolved, source}. verified=false means the name was not found (kept and re-resolved on reload).",
+        .input_schema =
+        \\{"type":"object","properties":{"name":{"type":"string","minLength":1,"description":"function symbol name (Borland C decorates with a leading underscore, e.g. _main)"}},"required":["name"],"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "list_source_breakpoints",
+        .description = "List the source/function breakpoints set via set_source_breakpoint/set_function_breakpoint (id, kind, verified, spec, resolved address, source). Does not include raw add_breakpoint entries.",
+        .input_schema = SCHEMA_EMPTY,
+    },
+    .{
+        .name = "clear_source_breakpoint",
+        .description = "Remove a source/function breakpoint by its id (the handle from set_source_breakpoint/set_function_breakpoint).",
+        .input_schema =
+        \\{"type":"object","properties":{"id":{"type":"integer","minimum":0,"description":"the breakpoint id"}},"required":["id"],"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "step_line",
+        .description = "Source-line step OVER calls (the debugger 'next'): advance to the next source line in the same or a shallower frame; a CALL is run to completion. ADVANCES the machine and returns the stop {kind, cycle, pc:{addr,function,source}}.",
+        .input_schema = SCHEMA_EMPTY,
+    },
+    .{
+        .name = "step_in",
+        .description = "Source-line step INTO calls (the debugger 'step'): stop at the next source line, descending into a symbolized callee's first line. An unsymbolized callee (C runtime/library) is run back out. ADVANCES the machine and returns the stop {kind, cycle, pc}.",
+        .input_schema = SCHEMA_EMPTY,
+    },
+    .{
+        .name = "step_out",
+        .description = "Run to the current function's caller return (the debugger 'finish'): near/far return chosen from the function's TDS type. ADVANCES the machine and returns the stop {kind, cycle, pc} in the caller. Unreliable without BP frame pointers (optimized builds).",
+        .input_schema = SCHEMA_EMPTY,
+    },
+    .{
+        .name = "run_to_line",
+        .description = "Run the guest until it reaches a source file:line (a one-shot target breakpoint). ADVANCES the machine and returns the stop {kind, cycle, pc}. Errors (unresolved) if the line maps to no code.",
+        .input_schema =
+        \\{"type":"object","properties":{"file":{"type":"string","minLength":1,"description":"source file name (e.g. BB.C)"},"line":{"type":"integer","minimum":1,"description":"1-based source line"}},"required":["file","line"],"additionalProperties":false}
+        ,
+    },
     // --- machine lifecycle (machine-AGNOSTIC; server-special, like `load`) ---
     .{
         // Server-special (handled in `server.zig:handleMcpToolCall`, not via `buildCommand`):
@@ -753,6 +807,30 @@ pub fn parseSnapHandle(s: []const u8) ?u64 {
 }
 const ScreenReq = struct { attrs: bool = false };
 
+// Source-level debug (M-S1) argument structs. `file`/`name` are arena slices copied
+// into the fixed-inline command PODs by `fillSrcBp`/`fillFnBp` (no borrowed slice on
+// the queue).
+const SrcLineReq = struct { file: []const u8, line: u32 };
+const FnNameReq = struct { name: []const u8 };
+
+/// Copy a `file:line` into the pointer-free `DbgSrcBpCmd` (truncating an over-long path).
+fn fillSrcBp(file: []const u8, line: u32) q.DbgSrcBpCmd {
+    var c = q.DbgSrcBpCmd{ .line = line };
+    const n = @min(file.len, c.file.len);
+    @memcpy(c.file[0..n], file[0..n]);
+    c.file_len = @intCast(n);
+    return c;
+}
+
+/// Copy a function name into the pointer-free `DbgFnBpCmd`.
+fn fillFnBp(name: []const u8) q.DbgFnBpCmd {
+    var c = q.DbgFnBpCmd{};
+    const n = @min(name.len, c.name.len);
+    @memcpy(c.name[0..n], name[0..n]);
+    c.name_len = @intCast(n);
+    return c;
+}
+
 // Branch-trace argument structs (docs/branch-trace-plan.md §6). `kinds` is an optional
 // array of BranchKind tag names → a `kind_mask`/`kind_trap_mask`. `pub` so the HTTP
 // `/api/branch-trace/*` handlers in server.zig parse the SAME structs the MCP path does
@@ -1018,6 +1096,32 @@ pub fn buildCommand(
         const r = parse(SnapReq, arena, args) orelse return invalid("delete_snapshot expects {snapshot:\"snap-<n>\"}");
         const seq = parseSnapHandle(r.snapshot) orelse return invalid("snapshot handle must be snap-<n>");
         return cmd(.{ .delete_snapshot = .{ .seq = seq } }, false);
+    }
+
+    // --- source-level debug core (M-S1, debug-core-plan.md §3.3) ---
+    // Inspection ops (whereami / list / set / clear) are pure-ish queue commands like
+    // add_breakpoint (needs_debugger=false). The STEP ops run the guest, so they take
+    // the debugger owner (needs_debugger=true) exactly like run/step.
+    if (is(name, "whereami")) return cmd(.dbg_where, false);
+    if (is(name, "set_source_breakpoint")) {
+        const r = parse(SrcLineReq, arena, args) orelse return invalid("set_source_breakpoint expects {file:string, line:integer>=1}");
+        return cmd(.{ .dbg_set_src_bp = fillSrcBp(r.file, r.line) }, false);
+    }
+    if (is(name, "set_function_breakpoint")) {
+        const r = parse(FnNameReq, arena, args) orelse return invalid("set_function_breakpoint expects {name:string}");
+        return cmd(.{ .dbg_set_fn_bp = fillFnBp(r.name) }, false);
+    }
+    if (is(name, "list_source_breakpoints")) return cmd(.dbg_list_bp, false);
+    if (is(name, "clear_source_breakpoint")) {
+        const r = parse(IdReq, arena, args) orelse return invalid("clear_source_breakpoint expects {id:integer}");
+        return cmd(.{ .dbg_clear_bp = .{ .id = r.id } }, false);
+    }
+    if (is(name, "step_line")) return cmd(.dbg_step_line, true);
+    if (is(name, "step_in")) return cmd(.dbg_step_in, true);
+    if (is(name, "step_out")) return cmd(.dbg_step_out, true);
+    if (is(name, "run_to_line")) {
+        const r = parse(SrcLineReq, arena, args) orelse return invalid("run_to_line expects {file:string, line:integer>=1}");
+        return cmd(.{ .dbg_run_to_line = fillSrcBp(r.file, r.line) }, true);
     }
 
     // `load` (recipe overlay/persist) and `screenshot` (session render buffers + image

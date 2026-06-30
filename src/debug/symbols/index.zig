@@ -384,6 +384,18 @@ pub const SymbolIndex = struct {
         if (s.name_index == 0) return null;
         return tds.name(s.name_index);
     }
+
+    /// The 1-based type-ref of the function symbol behind `f` (its
+    /// `Tds.symbols[sym_index-1].type`), for the `stepOut` far/near-return decision
+    /// (`TypeGraph.typeInfo(t).function.far`). The live-PC path yields a `FuncRef`, which
+    /// (unlike `SymRef`) carries no `type_index`, so the function's return type cannot be
+    /// reached without this accessor. Null for a `.map`-backed index (no `Tds` / no symbol
+    /// type) or an out-of-range `sym_index`. Pure, integer-only — stays on both gates.
+    pub fn typeRefForFunction(self: *const SymbolIndex, f: FuncRef) ?u16 {
+        const tds = self.tds orelse return null;
+        if (f.sym_index == 0 or f.sym_index > tds.symbols.len) return null;
+        return tds.symbols[f.sym_index - 1].type;
+    }
 };
 
 /// The code extent end for the segment record whose `code_segment` paragraph is
@@ -618,6 +630,26 @@ test "SymbolIndex(TEST): fileId + sourceFileCount (#4)" {
     // The id round-trips back through sourceFile.
     try testing.expectEqualStrings("TEST.C", idx.sourceFile(idx.fileId("TEST.C").?).?);
     try testing.expect(idx.fileId("NOPE.C") == null);
+}
+
+test "SymbolIndex(TEST): typeRefForFunction reaches a function's return type" {
+    var tds = try tdsmod.parseExe(testing.allocator, test_exe);
+    defer tds.deinit();
+    var idx = try SymbolIndex.build(testing.allocator, &tds);
+    defer idx.deinit();
+
+    // The FuncRef path has no type_index; the accessor recovers it from the symbol table.
+    const add = idx.addrToFunction(0, 706).?;
+    const t = idx.typeRefForFunction(add).?;
+    try testing.expectEqual(tds.symbols[add.sym_index - 1].type, t);
+    try testing.expect(t != 0);
+
+    // A `.map`-backed index has no Tds, so there is no symbol type to resolve.
+    const publics = [_]Public{.{ .segment = 0, .offset = 0x10, .name = "_main" }};
+    var midx = try SymbolIndex.fromMap(testing.allocator, &publics);
+    defer midx.deinit();
+    const mf = midx.addrToFunction(0, 0x10).?;
+    try testing.expect(midx.typeRefForFunction(mf) == null);
 }
 
 test {

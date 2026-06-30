@@ -25,6 +25,12 @@ test "no host time / RNG / thread / env / float / hashmap / atomic in src/debug 
         // The module root + owning façade — keep it on the gate so it can't silently
         // grow a host dependency (B).
         @embedFile("symbols/symbols.zig"),
+        // The protocol-neutral source-level debug core (M-S1). Pure + synchronous
+        // semantics over the symbol overlay + Controller; on the grep gate so it can
+        // never poll an atomic / import src/api / touch a host clock (debug-core-plan.md
+        // §1: the worker owns the preempt loop, the pure core only the line predicate).
+        @embedFile("core/core.zig"),
+        @embedFile("core/debugger.zig"),
     };
     const forbidden = [_][]const u8{
         "std.time",

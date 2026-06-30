@@ -216,3 +216,123 @@ test "LIVE relocation: psp_seg-based AddressMap matches the loader's actual BB.E
     try testing.expectEqualStrings("_clamp", syms.index.functionName(am.functionForRuntimeAddr(clamp_linear).?).?);
     try testing.expectEqualStrings("_main", syms.index.functionName(am.functionForRuntimeAddr(main_linear).?).?);
 }
+
+// ===========================================================================
+// M-S1 MVP — the SAME chain, now driven entirely through the protocol-neutral
+// `SourceDebugger` core: attach-on-load → source breakpoint → run-to-it →
+// pcLocation (function + line) → source-line step → stepOut. (debug-core-plan.md §9.)
+// ===========================================================================
+
+const SourceDebugger = debug.SourceDebugger;
+const core = debug.core;
+
+test "M-S1 core: attach -> source bp -> cont -> pcLocation -> stepLine -> stepOut (BB.EXE)" {
+    const alloc = testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    try writeHostFile(&ctx, "BB.EXE", bb_exe);
+    try m.bootProgram(2, "BB.EXE", "");
+    const psp_seg = m.dos.current_psp;
+
+    var ctrl = Controller.init(m);
+    var sd = SourceDebugger.init(alloc, &ctrl);
+    defer sd.deinit();
+
+    // 1. Attach-on-load: build + relocate the overlay for THIS concrete load.
+    sd.attachOnLoad(bb_exe, null, psp_seg);
+
+    // 2. Source breakpoint `BB.C:9` resolves through the core to the proof's invariant
+    //    linear ((psp+0x10)<<4)+0x02CB — verified, with the spec retained.
+    const rb = try sd.setBreakpoint(.{ .source = .{ .file = "BB.C", .line = CLAMP_LINE } });
+    try testing.expect(rb.verified);
+    try testing.expectEqual(((@as(u32, psp_seg) + 0x10) << 4) + 0x02CB, rb.resolved.?.linear);
+    try testing.expectEqual(@as(u32, CLAMP_LINE), rb.source.?.line);
+
+    // 3. Blocking `cont` (run to the next event), projected through the core's ONE
+    //    StopReason→StopKind seam. The guest reaches clamp via C0 startup + main().
+    const stop = sd.projectStop(ctrl.runUntilEvent(50_000_000));
+    try testing.expectEqual(core.StopKind.breakpoint, stop.kind.?);
+    try testing.expectEqual(rb.id, stop.bp_id.?);
+
+    // 4. pcLocation reverse-resolves the live CS:IP to function + source line.
+    const where = try sd.pcLocation();
+    try testing.expectEqualStrings("_clamp", where.function.?);
+    try testing.expectEqual(@as(u32, CLAMP_LINE), where.source.?.line);
+    try testing.expectEqualStrings("BB.C", where.source.?.path);
+
+    // 5. One source-line step: stays in _clamp (same frame) and advances off line 9.
+    const after_step = try sd.stepLine();
+    try testing.expectEqual(core.StopKind.step, after_step.kind.?);
+    try testing.expect(after_step.pc.?.source.?.line != CLAMP_LINE);
+    try testing.expectEqualStrings("_clamp", after_step.pc.?.function.?);
+
+    // 6. stepOut runs to the caller's return — back in _main (small-model near return).
+    //    Clear the clamp breakpoint first so a forward run cannot re-trip it.
+    try sd.clearBreakpoint(rb.id);
+    const out = try sd.stepOut();
+    try testing.expectEqual(core.StopKind.step, out.kind.?);
+    try testing.expectEqualStrings("_main", out.pc.?.function.?);
+}
+
+test "M-S1 core: source breakpoint re-resolves across a reload (new load_para)" {
+    const alloc = testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    try writeHostFile(&ctx, "BB.EXE", bb_exe);
+    try m.bootProgram(2, "BB.EXE", "");
+    const psp_seg = m.dos.current_psp;
+
+    var ctrl = Controller.init(m);
+    var sd = SourceDebugger.init(alloc, &ctrl);
+    defer sd.deinit();
+
+    sd.attachOnLoad(bb_exe, null, psp_seg);
+    const rb = try sd.setBreakpoint(.{ .source = .{ .file = "BB.C", .line = CLAMP_LINE } });
+    try testing.expect(rb.verified);
+    const first = rb.resolved.?.linear;
+
+    // A reload at a DIFFERENT psp (load_para) shifts every runtime address by 16 bytes
+    // per paragraph; the RETAINED spec re-resolves to the new linear without re-sending.
+    sd.attachOnLoad(bb_exe, null, psp_seg + 1);
+    var out: [4]core.ResolvedBreakpoint = undefined;
+    const list = sd.listBreakpoints(&out);
+    try testing.expectEqual(@as(usize, 1), list.len);
+    try testing.expect(list[0].verified);
+    try testing.expectEqual(first + 0x10, list[0].resolved.?.linear);
+}
+
+test "M-S1 core: graceful no-symbols (stripped image) — addr bp works, source does not" {
+    const alloc = testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+
+    try writeHostFile(&ctx, "BB.EXE", bb_exe);
+    try m.bootProgram(2, "BB.EXE", "");
+
+    var ctrl = Controller.init(m);
+    var sd = SourceDebugger.init(alloc, &ctrl);
+    defer sd.deinit();
+
+    // No EXE bytes ⇒ a graceful empty overlay (`source == .none`): every symbol lookup
+    // returns null, source/function breakpoints are unverified, address bp still works.
+    sd.attachOnLoad(null, null, m.dos.current_psp);
+
+    const src = try sd.setBreakpoint(.{ .source = .{ .file = "BB.C", .line = CLAMP_LINE } });
+    try testing.expect(!src.verified);
+
+    const fnbp = try sd.setBreakpoint(.{ .function = .{ .name = "_clamp" } });
+    try testing.expect(!fnbp.verified);
+
+    const where = try sd.pcLocation();
+    try testing.expect(where.function == null);
+    try testing.expect(where.source == null);
+
+    const addr = try sd.setBreakpoint(.{ .addr = .{ .linear = 0x12340 } });
+    try testing.expect(addr.verified);
+    try testing.expectEqual(@as(u32, 0x12340), addr.resolved.?.linear);
+}

@@ -81,7 +81,7 @@ fn workerThread(args: WorkerArgs) void {
             args.queue.complete(ctx, .ok);
             return;
         }
-        const resp = api.drainOne(args.ctrl, ctx, .{}, null, null, null, null);
+        const resp = api.drainOne(args.ctrl, ctx, .{}, null, null, null, null, null);
         args.queue.complete(ctx, resp);
     }
 }
