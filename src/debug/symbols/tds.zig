@@ -274,6 +274,7 @@ const all_fixtures = [_]struct { name: []const u8, bytes: []const u8 }{
     .{ .name = "BENUM", .bytes = @embedFile("testdata/BENUM.EXE") },
     .{ .name = "INC", .bytes = @embedFile("testdata/INC.EXE") },
     .{ .name = "BBCPP", .bytes = @embedFile("testdata/BBCPP.EXE") },
+    .{ .name = "ACC", .bytes = @embedFile("testdata/ACC.EXE") },
 };
 
 test "parseExe: TEST.EXE trailer + header counts" {
@@ -396,7 +397,7 @@ test "parseExe: RICH.EXE is multi-module (3 modules / 3 segments / 3 correlation
     try testing.expectEqual(@as(u16, 5), tds.correlations[2].line_count);
 }
 
-test "parseExe: the block walk lands exactly on the name pool for all 13 fixtures" {
+test "parseExe: the block walk lands exactly on the name pool for all fixtures" {
     // This is the catch-all guard: if any record size / table count is wrong, the
     // cumulative walk misses names_pool_start and parseTds returns error.Truncated.
     for (all_fixtures) |fx| {
@@ -548,6 +549,54 @@ test "parseExe: LCLS.EXE local class populates the Scope-Class table" {
     // The {1,1} record is the function scope that defines one local class.
     try testing.expectEqual(@as(u16, 1), tds.scope_classes[1].class_index);
     try testing.expectEqual(@as(u16, 1), tds.scope_classes[1].class_count);
+}
+
+const acc_exe = @embedFile("testdata/ACC.EXE");
+
+/// Find a 1-based class index by tag name in the Class table.
+fn classByName(tds: *const Tds, want: []const u8) ?usize {
+    for (tds.classes, 0..) |c, i| {
+        if (std.mem.eql(u8, tds.name(c.name_index), want)) return i;
+    }
+    return null;
+}
+
+test "parseExe: ACC.EXE base ACCESS is NOT recorded — pub/priv/prot decode identically" {
+    // The empirical resolution of the Fix-2 contradiction: ACC derives the SAME base
+    // `Base` three ways — `Pub : public Base`, `Pri : private Base`, `Prot : protected
+    // Base`. If any record bit encoded access, the three would differ. They do NOT: the
+    // Class `info` byte is a constant 0x0C for ALL classes (incl. `Base` itself), and each
+    // derived class's single Parent record is byte-identical {class=Base, virtual=0}. So
+    // the old `info.bit1 = public` reading is FALSE and access is unrecoverable (§15.1/§17).
+    var tds = try parseExe(testing.allocator, acc_exe);
+    defer tds.deinit();
+
+    const pub_i = classByName(&tds, "Pub") orelse return error.NoPub;
+    const pri_i = classByName(&tds, "Pri") orelse return error.NoPri;
+    const prot_i = classByName(&tds, "Prot") orelse return error.NoProt;
+    const base_i = classByName(&tds, "Base") orelse return error.NoBase;
+
+    // Every class — base and all three derivations — carries the identical info byte 0x0C.
+    // (bit1, the alleged "public" bit, is 0 even on the public-base class.)
+    for ([_]usize{ pub_i, pri_i, prot_i, base_i }) |ci| {
+        try testing.expectEqual(@as(u8, 0x0C), tds.classes[ci].info);
+        try testing.expectEqual(@as(u8, 0), tds.classes[ci].info & 0x02); // bit1 never set
+    }
+
+    // Each derived class has exactly one parent, and all three Parent records are byte-
+    // identical: same base class index, virtual-flag clear. No access bit distinguishes them.
+    const pub_p = tds.parents[tds.classes[pub_i].parent_index - 1];
+    const pri_p = tds.parents[tds.classes[pri_i].parent_index - 1];
+    const prot_p = tds.parents[tds.classes[prot_i].parent_index - 1];
+    try testing.expectEqual(@as(u16, 1), tds.classes[pub_i].parent_count);
+    try testing.expectEqual(@as(u16, 1), tds.classes[pri_i].parent_count);
+    try testing.expectEqual(@as(u16, 1), tds.classes[prot_i].parent_count);
+    try testing.expectEqual(pub_p.class_index, pri_p.class_index);
+    try testing.expectEqual(pub_p.class_index, prot_p.class_index);
+    try testing.expectEqual(@as(u16, 0), pub_p.class_index & 0x8000);
+    // …and all three point at `Base`.
+    const base_class_index: u16 = @intCast(base_i + 1);
+    try testing.expectEqual(base_class_index, pub_p.class_index & 0x7FFF);
 }
 
 test {

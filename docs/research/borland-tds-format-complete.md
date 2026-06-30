@@ -589,13 +589,21 @@ members** the byte additionally uses Borland's method-attribute encoding (also O
 | `0x00` | non-static, non-bitfield data member |
 | `0x01`–`0x3F` | bitfield, value = width in bits |
 | `0x40` | **offset-reset record** (`offset_rec`) — next `u16` is the new running struct offset (Pascal variants / alignment) |
-| `0x41` / `0x42` / `0x43` | destructor / constructor / conversion method (mutually exclusive) |
-| `0x44` | virtual method (OR with 0x48) |
-| `0x48` | (non-virtual) method / member function |
-| `0x4C` | **virtual method** (`0x48 ∣ 0x44`) — CLS `@Base@who$qv`, `@Derived@who$qv` [C] |
-| `0x50` / `0x60` | static member function / static data member (`member.type` → the member's symbol) |
+| `0x48` | (non-virtual) **method** / member function — `ACC @Acc@method$qi` [C] |
+| `0x49` | **destructor** (`0x48 ∣ 0x01`) — `ACC @Acc@$bdtr$qv` [C] |
+| `0x4A` | **constructor** (`0x48 ∣ 0x02`) — `ACC @Acc@$bctr$qv` [C] |
+| `0x4B` | **conversion** method (`0x48 ∣ 0x03`) — not emitted by the corpus [B] |
+| `0x4C` | **virtual method** (`0x48 ∣ 0x04`) — CLS `@Base@who$qv`, `@Derived@who$qv` [C] |
+| `0x50` | static member function — not emitted by the corpus [B] |
+| `0x60` | static data member (`member.type` → the member's symbol) — `ACC @Acc@s_count` [C] |
 | `0x80` | last member of the list (sign bit) / last enumerator (`end_of_list`) |
 | `0xC0` | list terminator (`end_of_structure ∣ offset_rec`) — the trailing record closing a struct/union |
+
+**Correction (`ACC`):** an earlier draft mapped ctor/dtor/conversion to `0x41`/`0x42`/`0x43`. The real
+bytes show a **function** record carries bit `0x08` (so all are `0x48`-based), and the low 3 bits then
+select the kind: `0x4C` virtual, `0x4A` ctor, `0x49` dtor, `0x4B` conversion, plain `0x48` method.
+`0x60`/`0x50` are static data/method. (No per-member **access** bit exists — `pub_data` and
+`priv_data` both read `flags=0x00`; access is unrecoverable, §17.)
 
 [C] Bitfields: `struct Bits{unsigned a:3; unsigned b:5; int s:4;}` →
 `m1{flags=3,"a",10(uint)} m2{flags=5,"b",10} m3{flags=4,"s",4(int)} m4{0xC0}`. The bit *width*
@@ -657,8 +665,16 @@ inheritance, and method signatures; verified against `CLS`/`MI`/`LCLS` and the n
 +4  u16  member_index   1-based index into the Member table of this class's first member
 +6  u16  name_index     name-pool index of the class tag (e.g. "Base")
 +8  u16  virtual_ptr    byte offset of the vtable pointer within the object (0 ⇒ vptr at offset 0)
-+0xA u8  info           bit0 = virtual base, bit1 = public, bits2‑7 = vtable method-slot offset
++0xA u8  info           bit0 = virtual base; rest = object descriptor (NOT access — see below)
 ```
+
+**`info` does NOT encode base/member access.** The earlier "bit1 = public" reading is **WRONG**:
+the new **`ACC`** fixture derives one base `Base` three ways — `Pub : public Base`,
+`Pri : private Base`, `Prot : protected Base` — and every Class record (incl. `Base` itself) reads
+the *identical* `info = 0x0C`; the three derived classes' Parent records are byte-identical too. No
+bit anywhere distinguishes `public`/`private`/`protected`. `info`'s upper bits are the constant
+`far 'this' ptr / near vbase` object descriptor TDUMP prints, not an access specifier. Access is
+therefore **unrecoverable** from BCC 3.1's TDS (§17). [CONFIRMED by `ACC`.]
 
 CLS: `cls1 Base   {parent_index=1, parent_count=0, member_index=1, name=96, vptr=0, info=0x0C}`,
 `cls2 Derived {parent_index=1, parent_count=1, member_index=5, name=97, vptr=0, info=0x0C}`.
@@ -676,6 +692,14 @@ methods like `@Base@who$qv` with `flags=0x4C`, §13).
 CLS = `{1}` (Derived's parent is class 1 = Base). MI = `{2, 1}` (class C's two parents, referenced
 by `cls3.parent_index=1, parent_count=2`). No virtual bases in the corpus, so the 0x8000 virtual-base
 flag is **[B]**.
+
+**Base-subobject offsets (computed, not stored):** a Parent record names the base but not where its
+subobject sits in the derived object. The offset is the running sum of the sizes of the *preceding
+non-virtual* bases in declaration order (the first base is at 0). CONFIRMED by **MI** `C : public A,
+public B`: A (4 bytes) at offset 0, B (4 bytes) at offset 4, so C's own `cx` lands at 8. Single
+(leading) inheritance ⇒ base at 0 (CLS/BBCPP/ACC). The decoder exposes this as `BaseInfo.byte_offset`
+(`src/debug/symbols/types.zig`). A *virtual* base's true offset is not this running sum (it is laid
+out separately) — but no fixture has a virtual base, so that case is **[B]**.
 
 ### 15.3 Scope-Class table — `scope_class_entries × 4 bytes`  [C]
 
@@ -1098,18 +1122,27 @@ All six previously-open `[U]` items are closed:
 type layer renders a `TID_CLASS` as `class Foo` with its **data members** (name / type / byte offset,
 honouring the `0x40` offset-reset record whose new running offset lives in the member **name** field —
 e.g. CLS `New Offset 02`), its **direct base classes** (declaration order, with the `0x8000`
-virtual-base flag), and its **method signatures** (members with flags `0x41`–`0x60`, classified
-data/method/virtual/static/ctor/dtor/conversion). The TID_CLASS→Class-table link is `member_type`
-(§12.3, corrected). Verified by the new C++ fixture **`BBCPP`** (`Entity` base + `Monster : public
-Entity` derived + `enum Shape`).
+virtual-base flag and the computed `byte_offset` of each base subobject, §15.2), and its **method
+signatures** (function records with flags `0x48`-based — `0x48` method / `0x49` dtor / `0x4A` ctor /
+`0x4C` virtual — plus `0x60` static data, classified into `MemberKind`). The TID_CLASS→Class-table
+link is `member_type` (§12.3, corrected). Verified by the C++ fixtures **`BBCPP`** (`Entity` base +
+`Monster : public Entity` + `enum Shape`) and **`ACC`** (access keywords + every member kind + MI
+offsets).
 
 **Honest limit on C++ method/vtable recovery in BCC 3.1:** what is recoverable per method is only its
 **typed signature** (the mangled name + the SPECIALFUNC return-type record). The callable body, vtable
 slot assignment, overload sets, and RTTI live in the **Browser / Overload / Optimized-Symbol /
 Reference-Info** tables, which **BCC 3.1 emits a count of 0 for on every fixture** (§15.5) — so vtable
 layout and method bodies are *not* recoverable. Likewise, **no per-member or per-base access specifier**
-(`public`/`private`/`protected`) is present anywhere in BCC 3.1's 16-bit member (5B) or Parent (2B)
-records — TDUMP itself renders none — so access is **not** reported (only the virtual-base flag is).
+(`public`/`private`/`protected`) is present anywhere in BCC 3.1's 16-bit Class (11B), member (5B), or
+Parent (2B) records — TDUMP itself renders none — so access is **not** reported (only the virtual-base
+flag is). This is now **empirically CONFIRMED** by the **`ACC`** fixture, which derives one base three
+ways (`Pub : public`, `Pri : private`, `Prot : protected`) plus a class with a public and a private
+data member: the Class `info` byte is a constant `0x0C` for *all* of them, the three Parent records are
+byte-identical, and `pub_data`/`priv_data` both read `flags=0x00`. (The earlier "Class `info` bit1 =
+public" reading was wrong, §15.1.) What **is** newly confirmed by `ACC`: the C++ member-kind flag bytes
+— `0x48` method, `0x49` dtor, `0x4A` ctor, `0x60` static data — and the multiple-inheritance
+**base-subobject offsets** (`BaseInfo.byte_offset`, §15.2).
 
 **Fully mapped & CONFIRMED structures:** base header, extended header, symbol, module, source-file,
 line, scope, segment, correlation, type (+ ordinal/enum aux record), member, class, parent,
@@ -1135,4 +1168,7 @@ Fixtures checked in this pass: **`MI`, `LCLS`, `MMC`, `MMH`, `MMT`, `PTR`, `BENU
 `.LST`s and sources), alongside the pre-existing `TEST`, `RICH`, `ENUM`, `CLS`. Decoder scripts
 `decode2.py`/`decode3.py`/`decode4.py`/`names.py` reproduce every claim above. The Tier-3 C++ pass
 adds **`BBCPP`** (`BBCPP.CPP`/`.EXE`/`.LST`) — a base class with data members + a virtual method, a
-single-inheritance derived class, and an `enum` — as the black-box oracle for class decoding.
+single-inheritance derived class, and an `enum` — as the black-box oracle for class decoding. The
+Tier-3 review pass adds **`ACC`** (`ACC.CPP`/`.EXE`/`.LST`) — one base derived `public`/`private`/
+`protected`, plus a class with a non-virtual method, ctor, dtor, static data member, and a public +
+private data member — proving access is unrecorded and confirming the member-kind flag bytes.

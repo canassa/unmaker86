@@ -234,6 +234,7 @@ test "black-box BBCPP.EXE: a derived class reports its base + its own added memb
     const bs = tg.bases(m.type_ref);
     try testing.expectEqual(@as(usize, 1), bs.len);
     try testing.expect(!bs[0].is_virtual);
+    try testing.expectEqual(@as(u16, 0), bs[0].byte_offset); // leading single base @ offset 0
     try testing.expectEqualStrings("class Entity", typeStr(tg, bs[0].type_ref, &buf));
 
     // Monster adds `damage` at offset 6 (Entity subobject is 6 bytes), then overrides kind().

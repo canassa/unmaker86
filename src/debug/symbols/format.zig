@@ -292,7 +292,14 @@ pub const ClassRecord = packed struct { // 11 bytes
     member_index: u16, // 1-based into Member table (class's first member)
     name_index: u16, // class tag name-pool index
     virtual_ptr: u16, // vtable-pointer offset within the object
-    info: u8, // bit0 virtual-base, bit1 public, bits2..7 vtable slot
+    // `info`: NOT a base/member access specifier. Empirically (ACC fixture: a public,
+    // a private AND a protected derivation of the SAME base) it reads a constant `0x0C`
+    // for EVERY class — base, public-derived, private-derived, protected-derived alike —
+    // so no bit here encodes `public`/`private`/`protected`. (The earlier "bit1 = public"
+    // reading was wrong; bit1 is 0 even on a public-base class.) bit0 = virtual-base;
+    // the rest is the `far 'this' ptr / near vbase` object descriptor TDUMP prints.
+    // Access is unrecoverable from BCC 3.1's TDS — see `BaseInfo` / spec §15.1 / §17.
+    info: u8,
     comptime {
         std.debug.assert(@bitSizeOf(@This()) == 8 * 11);
     }

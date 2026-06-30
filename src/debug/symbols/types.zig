@@ -64,7 +64,10 @@ pub const TypeInfo = union(enum) {
         size: u16,
         is_union: bool,
         is_class: bool,
-        first_member: u16, // 1-based member-table index (0 for a C++ class: §12.3)
+        // 1-based Member-table index of the first member. For a struct/union this is the
+        // type record's `member_type`; for a C++ class it is the Class-table entry's
+        // `member_index` (§15.1) — nonzero, resolved at build time into `class_first_member`.
+        first_member: u16,
         member_count: u16,
     },
     enumeration: struct {
@@ -87,15 +90,21 @@ pub const TypeInfo = union(enum) {
 /// emits **zero** of — so a method is recoverable as a typed *signature* (name + type), not
 /// as callable/vtable detail. (No public/private/protected per-member access specifier is
 /// present in BCC 3.1's 16-bit TDS at all — see `bases` / the limitation note in §17.)
+/// Flag→kind mapping, CONFIRMED against the ACC fixture (`@Acc@$bctr$qv`=0x4A ctor,
+/// `@Acc@$bdtr$qv`=0x49 dtor, `@Acc@method$qi`=0x48 method, `@Acc@s_count`=0x60 static
+/// data) and CLS/MI/LCLS/BBCPP (virtual methods=0x4C). A method record always has bit
+/// 0x40 (C++ attribute) set; bit 0x08 marks a *function*, whose low 3 bits then select
+/// the special kind (0x04 virtual, 0x02 ctor, 0x01 dtor, 0x03 conversion); bit 0x20 marks
+/// static data, bit 0x10 static method.
 pub const MemberKind = enum {
-    data, // non-static data member (or any plain C struct/union member)
-    method, // non-virtual member function (flags 0x48)
-    virtual_method, // virtual member function (flags 0x44 / 0x4C)
-    static_data, // static data member (flags 0x60; member.type → its symbol)
-    static_method, // static member function (flags 0x50)
-    constructor, // flags 0x42
-    destructor, // flags 0x41
-    conversion, // flags 0x43 (operator-conversion)
+    data, // non-static data member (or any plain C struct/union member); flags 0x00
+    method, // non-virtual member function (flags 0x48) [CONFIRMED ACC]
+    virtual_method, // virtual member function (flags 0x4C) [CONFIRMED CLS/MI/LCLS/BBCPP]
+    static_data, // static data member (flags 0x60; member.type → backing symbol) [CONFIRMED ACC]
+    static_method, // static member function (flags 0x50) [B] — BCC 3.1 emits none in the corpus
+    constructor, // flags 0x4A [CONFIRMED ACC]
+    destructor, // flags 0x49 [CONFIRMED ACC]
+    conversion, // flags 0x4B (operator-conversion) [B] — not produced by the corpus
 };
 
 /// One struct/union/class member with its computed byte offset (§13). `bit_width == 0`
@@ -113,11 +122,18 @@ pub const MemberInfo = struct {
 /// the base's `TID_CLASS` type record (render with `typeName`, walk with `members`),
 /// `class_index` its 1-based Class-table index. NB: BCC 3.1's 16-bit TDS carries **no**
 /// base-access specifier (`public`/`private`/`protected`) — only the virtual-base flag —
-/// so access is not reported (it cannot be recovered; see §17).
+/// so access is not reported (it cannot be recovered; CONFIRMED by the ACC fixture, where
+/// a public, a private and a protected derivation of one base decode byte-identically; §17).
 pub const BaseInfo = struct {
     type_ref: u16, // base's TID_CLASS type record (0 if unresolvable)
     class_index: u16, // 1-based Class-table index of the base
     is_virtual: bool, // the Parent record's 0x8000 virtual-base flag
+    /// Byte offset of this base subobject within the derived object: the running sum of
+    /// the sizes of all *preceding non-virtual* bases in declaration order (the first base
+    /// is at 0). CONFIRMED against MI (`C : A, B` → A@0, B@sizeof(A)=4, C's own `cx`@8).
+    /// For a *virtual* base this running sum is not the true subobject offset (a vbase is
+    /// laid out separately) — but no fixture exercises virtual bases, so that case is [B].
+    byte_offset: u16,
 };
 
 /// One enumerator `{ name, signed value }` (§12.3a). Pointer-free.
@@ -534,6 +550,46 @@ fn ptrKind(id: TypeId, class: u8) PtrKind {
     };
 }
 
+/// The running state of a data-member layout walk: the next free byte and the open
+/// bitfield container (if any). Shared by `buildAggregate` (struct/union) and `buildClass`
+/// (C++ class) via `layoutDataMember`, so a future bitfield fix lives in exactly one place.
+const LayoutState = struct {
+    byte_off: u16 = 0, // next free byte (the running offset)
+    bf_bits: u32 = 0, // bits used so far in the current bitfield container
+    bf_container: u16 = 0, // byte size of the current bitfield container (0 = none open)
+};
+
+/// Place ONE data member of `type_ref` (bitfield `width` in bits; 0 = plain) and return its
+/// byte offset, advancing `st` (§13). A bitfield run shares one container (the member type's
+/// size); a new container opens when the field would overflow the current one or changes
+/// size. A union member is always at offset 0 and never advances the running offset. The
+/// `+|=` adds saturate because member sizes are attacker-controlled (a crafted type table
+/// can sum past 0xFFFF) — clamp rather than overflow-panic (BUG-2).
+fn layoutDataMember(tds: *const Tds, st: *LayoutState, type_ref: u16, width: u8, is_union: bool) u16 {
+    if (is_union) return 0;
+    if (width != 0) {
+        const csize = typeSizeOf(tds, type_ref);
+        if (st.bf_bits == 0) {
+            st.bf_container = csize;
+        } else if (st.bf_bits + width > @as(u32, st.bf_container) * 8 or csize != st.bf_container) {
+            st.byte_off +|= st.bf_container; // close the full container, open a new one
+            st.bf_bits = 0;
+            st.bf_container = csize;
+        }
+        const off = st.byte_off;
+        st.bf_bits += width;
+        return off;
+    }
+    if (st.bf_bits > 0) { // flush a pending bitfield container
+        st.byte_off +|= st.bf_container;
+        st.bf_bits = 0;
+        st.bf_container = 0;
+    }
+    const off = st.byte_off;
+    st.byte_off +|= typeSizeOf(tds, type_ref);
+    return off;
+}
+
 /// Walk a struct/union member list from `t.member_type` until the `0xC0` terminator,
 /// accumulating byte offsets (§13). A bitfield run shares its container (the member
 /// type's size); a `0x40` offset-reset record sets the running offset (Pascal variants).
@@ -544,48 +600,19 @@ fn buildAggregate(
     t: format.Type,
     is_union: bool,
 ) error{OutOfMemory}!void {
-    var byte_off: u16 = 0;
-    var bf_bits: u32 = 0; // bits used so far in the current bitfield container
-    var bf_container: u16 = 0; // byte size of the current bitfield container
+    var st: LayoutState = .{};
     var mi: usize = t.member_type; // 1-based first member
     var guard: usize = 0;
     while (mi != 0 and mi <= tds.members.len and guard <= tds.members.len) : (guard += 1) {
         const m = tds.members[mi - 1];
         if ((m.flags & 0xC0) == 0xC0) break; // 0xC0 = list terminator
         if ((m.flags & 0xC0) == 0x40) { // offset-reset record (no field emitted)
-            byte_off = m.type;
-            bf_bits = 0;
-            bf_container = 0;
+            st = .{ .byte_off = m.type };
             mi += 1;
             continue;
         }
         const width: u8 = m.flags & 0x3F; // 0 = not a bitfield
-        var this_off: u16 = 0;
-        if (!is_union) {
-            if (width != 0) {
-                const csize = typeSizeOf(tds, m.type);
-                if (bf_bits == 0) {
-                    bf_container = csize;
-                } else if (bf_bits + width > @as(u32, bf_container) * 8 or csize != bf_container) {
-                    byte_off +|= bf_container; // close the full container, open a new one
-                    bf_bits = 0;
-                    bf_container = csize;
-                }
-                this_off = byte_off;
-                bf_bits += width;
-            } else {
-                if (bf_bits > 0) { // flush a pending bitfield container
-                    byte_off +|= bf_container;
-                    bf_bits = 0;
-                    bf_container = 0;
-                }
-                this_off = byte_off;
-                // Saturating: member sizes are attacker-controlled (a crafted type
-                // table can make them sum past 0xFFFF). `byte_offset` is u16 anyway —
-                // saturate rather than overflow-panic (BUG-2).
-                byte_off +|= typeSizeOf(tds, m.type);
-            }
-        }
+        const this_off = layoutDataMember(tds, &st, m.type, width, is_union);
         try out.append(a, .{
             .name_index = m.name,
             .type_ref = m.type,
@@ -605,20 +632,22 @@ fn classEntry(tds: *const Tds, class_index: u16) ?format.ClassRecord {
 
 /// Classify a C++ class member from its `flags` byte (the method-attribute byte, §13/§15).
 /// Only reached for records with bit6 (0x40) set and a non-zero low nibble (a pure 0x40 is
-/// an offset-reset, handled in `buildClass`; 0xC0 is the terminator). The low 6 bits select:
-/// 0x20 static-data, 0x10 static-method, 0x04 virtual, 0x08 method, 1/2/3 dtor/ctor/conv.
+/// an offset-reset, handled in `buildClass`; 0xC0 is the terminator). Mapping CONFIRMED by
+/// the ACC fixture: 0x60 static-data, 0x48 method, 0x49 dtor, 0x4A ctor; 0x4C virtual from
+/// CLS/MI/LCLS/BBCPP. A function record carries bit 0x08; its low 3 bits then select the
+/// special kind (0x04 virtual / 0x02 ctor / 0x01 dtor / 0x03 conversion, else plain method).
 fn classifyClassMember(flags: u8) MemberKind {
     const low: u8 = flags & 0x3F;
-    if (low & 0x20 != 0) return .static_data; // 0x60
-    if (low & 0x10 != 0) return .static_method; // 0x50
-    if (low & 0x04 != 0) return .virtual_method; // 0x44 / 0x4C
-    if (low & 0x08 != 0) return .method; // 0x48
-    return switch (low) {
-        1 => .destructor, // 0x41
-        2 => .constructor, // 0x42
-        3 => .conversion, // 0x43
-        else => .method,
+    if (low & 0x20 != 0) return .static_data; // 0x60  [CONFIRMED ACC: @Acc@s_count]
+    if (low & 0x10 != 0) return .static_method; // 0x50  [B] — corpus emits none
+    if (low & 0x08 != 0) return switch (low & 0x07) {
+        0x04 => .virtual_method, // 0x4C  [CONFIRMED]
+        0x02 => .constructor, // 0x4A  [CONFIRMED ACC]
+        0x01 => .destructor, // 0x49  [CONFIRMED ACC]
+        0x03 => .conversion, // 0x4B  [B] — not in the corpus
+        else => .method, // 0x48  [CONFIRMED ACC]
     };
+    return .method;
 }
 
 /// Walk a C++ class's member list (§15.1/§15) from its Class-table `member_index` until the
@@ -636,9 +665,7 @@ fn buildClass(
     a: std.mem.Allocator,
     member_index: u16,
 ) error{OutOfMemory}!void {
-    var byte_off: u16 = 0;
-    var bf_bits: u32 = 0; // bits used so far in the current bitfield container
-    var bf_container: u16 = 0; // byte size of the current bitfield container
+    var st: LayoutState = .{};
     var mi: usize = member_index; // 1-based first member
     var guard: usize = 0;
     while (mi != 0 and mi <= tds.members.len and guard <= tds.members.len) : (guard += 1) {
@@ -647,9 +674,7 @@ fn buildClass(
         if ((m.flags & 0x40) != 0) {
             if ((m.flags & 0x3F) == 0) {
                 // Pure offset-reset (0x40): the new running offset is in the NAME field.
-                byte_off = m.name;
-                bf_bits = 0;
-                bf_container = 0;
+                st = .{ .byte_off = m.name };
             } else {
                 // A method / static record — a typed signature, no data layout (§15.5: its
                 // body/vtable slot would live in the Browser/Overload tables BCC 3.1 omits).
@@ -664,29 +689,10 @@ fn buildClass(
             mi += 1;
             continue;
         }
-        // bit6 clear ⇒ a data member (plain or bitfield), laid out like a struct.
+        // bit6 clear ⇒ a data member (plain or bitfield), laid out like a struct (a class is
+        // never a union, so is_union=false). Shares `layoutDataMember` with buildAggregate.
         const width: u8 = m.flags & 0x3F; // 0 = not a bitfield
-        var this_off: u16 = byte_off;
-        if (width != 0) {
-            const csize = typeSizeOf(tds, m.type);
-            if (bf_bits == 0) {
-                bf_container = csize;
-            } else if (bf_bits + width > @as(u32, bf_container) * 8 or csize != bf_container) {
-                byte_off +|= bf_container; // close the full container, open a new one
-                bf_bits = 0;
-                bf_container = csize;
-            }
-            this_off = byte_off;
-            bf_bits += width;
-        } else {
-            if (bf_bits > 0) { // flush a pending bitfield container
-                byte_off +|= bf_container;
-                bf_bits = 0;
-                bf_container = 0;
-            }
-            this_off = byte_off;
-            byte_off +|= typeSizeOf(tds, m.type); // saturating (attacker-controlled sizes)
-        }
+        const this_off = layoutDataMember(tds, &st, m.type, width, false);
         try out.append(a, .{
             .name_index = m.name,
             .type_ref = m.type,
@@ -701,7 +707,11 @@ fn buildClass(
 /// Resolve a class's direct base list from the Parent table (§15.2): the `parent_count`
 /// records starting at the 1-based `parent_index`. Each Parent record names a base by
 /// 1-based Class-table index (`class_to_type` maps it back to a renderable type record);
-/// bit15 (0x8000) is the virtual-base flag. Bounds-checked against a lying class table.
+/// bit15 (0x8000) is the virtual-base flag. Each base subobject's `byte_offset` is the
+/// running sum of the sizes of the *preceding non-virtual* bases (the first base is at 0):
+/// CONFIRMED against MI (`C : A, B` → A@0, B@sizeof(A); C's own member then follows both).
+/// A base's size is its renderable `TID_CLASS` record's size. Bounds-checked against a
+/// lying class table.
 fn buildBases(
     tds: *const Tds,
     out: *std.ArrayList(BaseInfo),
@@ -711,16 +721,23 @@ fn buildBases(
 ) error{OutOfMemory}!void {
     if (cls.parent_count == 0 or cls.parent_index == 0) return;
     const first: usize = cls.parent_index - 1; // 1-based
+    var running: u16 = 0; // sum of preceding non-virtual base sizes
     var k: usize = 0;
     while (k < cls.parent_count and first + k < tds.parents.len) : (k += 1) {
         const p = tds.parents[first + k];
         const ci: u16 = p.class_index & 0x7FFF;
+        const is_virtual: bool = (p.class_index & 0x8000) != 0;
         const tref: u16 = if (ci < class_to_type.len) class_to_type[ci] else 0;
         try out.append(a, .{
             .type_ref = tref,
             .class_index = ci,
-            .is_virtual = (p.class_index & 0x8000) != 0,
+            .is_virtual = is_virtual,
+            .byte_offset = running,
         });
+        // Only non-virtual bases occupy the leading layout; a virtual base is placed
+        // separately (no fixture exercises it — see BaseInfo). Saturating: base sizes are
+        // attacker-controlled (a crafted Class table can sum past 0xFFFF).
+        if (!is_virtual) running +|= typeSizeOf(tds, tref);
     }
 }
 
@@ -1147,6 +1164,8 @@ test "CLS: class Base / Derived render with data members + single inheritance (�
     try testing.expectEqual(@as(u16, 25), db[0].type_ref);
     try testing.expectEqual(@as(u16, 1), db[0].class_index);
     try testing.expect(!db[0].is_virtual);
+    // Single (leading) base ⇒ subobject at offset 0 (Fix 1).
+    try testing.expectEqual(@as(u16, 0), db[0].byte_offset);
     try testing.expectEqualStrings("class Base", renderToBuf(&tg, db[0].type_ref, &buf));
 
     // Derived adds `dy` @offset 4 (vptr + base bx + this dy), plus its own virtual who.
@@ -1175,6 +1194,13 @@ test "MI: class C reports BOTH base classes A, B in declaration order (§15.2)" 
     try testing.expectEqualStrings("class B", renderToBuf(&tg, cb[1].type_ref, &buf));
     try testing.expectEqual(@as(u16, 25), cb[1].type_ref);
     for (cb) |b| try testing.expect(!b.is_virtual);
+    // Fix 1: the base subobjects' byte offsets. A (the leading base) is at 0; B follows
+    // it at sizeof(A) (each base is 4 bytes here), so C's own `cx` lands at 8 (asserted
+    // below). This is the MI multiple-inheritance proof — without the offset, B's
+    // inherited fields would be placed at A's address.
+    try testing.expectEqual(@as(u16, 0), cb[0].byte_offset);
+    try testing.expectEqual(tg.typeSize(cb[0].type_ref), cb[1].byte_offset); // B @ sizeof(A)
+    try testing.expectEqual(@as(u16, 4), cb[1].byte_offset);
 
     // C's own member `cx` lands at offset 8 (A subobject 4 + B subobject 4), then 3 methods.
     const cm = tg.members(29);
@@ -1253,6 +1279,160 @@ test "C++ class decode is robust against a lying class/member table (no panic)" 
     // member_type=99 is out of range → no class entry → empty members + bases.
     try testing.expectEqual(@as(usize, 0), tg.members(1).len);
     try testing.expectEqual(@as(usize, 0), tg.bases(1).len);
+}
+
+const acc_exe = @embedFile("testdata/ACC.EXE");
+
+/// 1-based type record index of a TID_CLASS with tag `want`, or null.
+fn classTypeByName(tds: *const Tds, want: []const u8) ?u16 {
+    for (tds.types, 0..) |t, i| {
+        if (@as(TypeId, @enumFromInt(t.id)) != .class) continue;
+        if (std.mem.eql(u8, tds.name(t.name), want)) return @intCast(i + 1);
+    }
+    return null;
+}
+
+test "ACC: member KINDS (data/static/ctor/dtor/method) match the real flag bytes (§15)" {
+    // Fix 3c: ACC's `class Acc` exercises every kind BCC 3.1 actually emits — confirming
+    // the flag→kind map against the bytes (`@Acc@s_count`=0x60 static, `@Acc@$bctr$qv`=0x4A
+    // ctor, `@Acc@$bdtr$qv`=0x49 dtor, `@Acc@method$qi`=0x48 method). The old classifier
+    // mislabeled the 0x4A ctor and 0x49 dtor as plain `.method`.
+    var tds = try tdsmod.parseExe(testing.allocator, acc_exe);
+    defer tds.deinit();
+    var tg = try TypeGraph.build(testing.allocator, &tds);
+    defer tg.deinit();
+
+    const acc = classTypeByName(&tds, "Acc") orelse return error.NoAcc;
+    const ms = tg.members(acc);
+
+    // Look up each member's kind by name (list order is layout order, not source order).
+    const want = [_]struct { name: []const u8, kind: MemberKind }{
+        .{ .name = "pub_data", .kind = .data },
+        .{ .name = "priv_data", .kind = .data },
+        .{ .name = "@Acc@s_count", .kind = .static_data },
+        .{ .name = "@Acc@$bctr$qv", .kind = .constructor },
+        .{ .name = "@Acc@$bdtr$qv", .kind = .destructor },
+        .{ .name = "@Acc@method$qi", .kind = .method },
+    };
+    for (want) |w| {
+        const m = memberNamed(&tds, ms, w.name) orelse return error.MissingMember;
+        try testing.expectEqual(w.kind, m.kind);
+    }
+
+    // Acc has no vtable (no virtual methods) ⇒ no offset-reset record: the two data
+    // members pack from offset 0 (pub_data@0, priv_data@2); statics/methods carry no offset.
+    try testing.expectEqual(@as(u16, 0), memberNamed(&tds, ms, "pub_data").?.byte_offset);
+    try testing.expectEqual(@as(u16, 2), memberNamed(&tds, ms, "priv_data").?.byte_offset);
+}
+
+/// Find a member by name within an already-resolved member slice (test helper).
+fn memberNamed(tds: *const Tds, ms: []const MemberInfo, want: []const u8) ?MemberInfo {
+    for (ms) |m| {
+        if (std.mem.eql(u8, tds.name(m.name_index), want)) return m;
+    }
+    return null;
+}
+
+test "ACC: per-member ACCESS is not recorded — public vs private member decode the same" {
+    // Fix 2 (member side): `pub_data` (public) and `priv_data` (private) are both plain data
+    // members with byte offsets and NO access marker — the kind/bit_width are identical and
+    // neither carries a public/private tag (only their declared offset distinguishes them).
+    var tds = try tdsmod.parseExe(testing.allocator, acc_exe);
+    defer tds.deinit();
+    var tg = try TypeGraph.build(testing.allocator, &tds);
+    defer tg.deinit();
+
+    const acc = classTypeByName(&tds, "Acc") orelse return error.NoAcc;
+    var pub_m: ?MemberInfo = null;
+    var priv_m: ?MemberInfo = null;
+    for (tg.members(acc)) |m| {
+        if (std.mem.eql(u8, tds.name(m.name_index), "pub_data")) pub_m = m;
+        if (std.mem.eql(u8, tds.name(m.name_index), "priv_data")) priv_m = m;
+    }
+    try testing.expectEqual(pub_m.?.kind, priv_m.?.kind); // both .data — no access distinction
+    try testing.expectEqual(pub_m.?.bit_width, priv_m.?.bit_width);
+    try testing.expectEqual(pub_m.?.type_ref, priv_m.?.type_ref); // both `int`
+}
+
+test "ACC: public/private/protected single-inheritance bases all sit at offset 0 (§15.2)" {
+    // Fix 1 (single-inheritance case) + Fix 2 (base side): Pub/Pri/Prot each derive `Base`
+    // exactly one way; the base subobject is at offset 0 for all three, and the BaseInfo is
+    // identical regardless of the (public/private/protected) access keyword — access is gone.
+    var tds = try tdsmod.parseExe(testing.allocator, acc_exe);
+    defer tds.deinit();
+    var tg = try TypeGraph.build(testing.allocator, &tds);
+    defer tg.deinit();
+
+    const base_ref = classTypeByName(&tds, "Base") orelse return error.NoBase;
+    inline for (.{ "Pub", "Pri", "Prot" }) |cls_name| {
+        const cref = classTypeByName(&tds, cls_name) orelse return error.NoClass;
+        const bs = tg.bases(cref);
+        try testing.expectEqual(@as(usize, 1), bs.len);
+        try testing.expectEqual(base_ref, bs[0].type_ref); // all derive the SAME `Base`
+        try testing.expectEqual(@as(u16, 0), bs[0].byte_offset); // leading base @ 0
+        try testing.expect(!bs[0].is_virtual);
+    }
+}
+
+test "C++ class decode terminates on a malicious parent cycle / self-referential index (no hang)" {
+    // Fix 3d: a hand-crafted Class/Parent table where class A's base is B and B's base is A
+    // (a parent cycle), and each class's member_index points back into a self-referential
+    // member list. The bounded walks (no recursion through bases; per-walk guard ≤ table len)
+    // must yield finite members/bases and a finite render — never a panic, OOB, or hang.
+    var tds: Tds = undefined;
+    tds.arena = .init(testing.allocator);
+    defer tds.deinit();
+    const a = tds.arena.allocator();
+
+    // Two TID_CLASS type records, A (#1) and B (#2); member_type = 1-based Class index.
+    const types = try a.alloc(format.Type, 2);
+    types[0] = .{ .id = @intFromEnum(TypeId.class), .name = 0, .size = 4, .class = 0, .member_type = 1 };
+    types[1] = .{ .id = @intFromEnum(TypeId.class), .name = 0, .size = 4, .class = 0, .member_type = 2 };
+
+    // A's member list starts at m1, B's at m2; both terminate (so the walk is finite even
+    // though the data offsets/types are nonsense).
+    const members = try a.alloc(format.Member, 2);
+    members[0] = .{ .flags = 0x00, .name = 0, .type = 1 }; // a data member of class A (self-type)
+    members[1] = .{ .flags = 0xC0, .name = 0, .type = 0 }; // terminator (shared)
+
+    // Class A: base = B; Class B: base = A → A↔B parent cycle.
+    const classes = try a.alloc(format.ClassRecord, 2);
+    classes[0] = .{ .parent_index = 1, .parent_count = 1, .member_index = 1, .name_index = 0, .virtual_ptr = 0, .info = 0 };
+    classes[1] = .{ .parent_index = 2, .parent_count = 1, .member_index = 2, .name_index = 0, .virtual_ptr = 0, .info = 0 };
+    const parents = try a.alloc(format.ParentRecord, 2);
+    parents[0] = .{ .class_index = 2 }; // A's base = class 2 (B)
+    parents[1] = .{ .class_index = 1 }; // B's base = class 1 (A)
+
+    tds.header = std.mem.zeroes(format.Header);
+    tds.ext = std.mem.zeroes(format.ExtHeader);
+    tds.symbols = &.{};
+    tds.modules = &.{};
+    tds.sources = &.{};
+    tds.lines = &.{};
+    tds.scopes = &.{};
+    tds.segments = &.{};
+    tds.correlations = &.{};
+    tds.types = types;
+    tds.members = members;
+    tds.classes = classes;
+    tds.parents = parents;
+    tds.scope_classes = &.{};
+    tds.module_classes = &.{};
+    tds.name_pool = &.{};
+    tds.name_starts = &.{};
+
+    var tg = try TypeGraph.build(testing.allocator, &tds);
+    defer tg.deinit();
+
+    // Each class lists its (cyclic) direct base without recursing → finite, no hang.
+    try testing.expectEqual(@as(usize, 1), tg.bases(1).len);
+    try testing.expectEqual(@as(usize, 1), tg.bases(2).len);
+    try testing.expectEqual(@as(u16, 2), tg.bases(1)[0].type_ref); // A's base resolves to B
+    try testing.expectEqual(@as(u16, 1), tg.bases(2)[0].type_ref); // B's base resolves to A
+    // Rendering A reaches B by name only (no expansion) ⇒ terminates.
+    var buf: [64]u8 = undefined;
+    _ = renderToBuf(&tg, 1, &buf);
+    _ = renderToBuf(&tg, 2, &buf);
 }
 
 test "TypeGraph: build is deterministic (byte-identical arrays on re-build)" {

@@ -1,0 +1,271 @@
+Turbo Dump  Version 3.1 Copyright (c) 1988, 1992 Borland International
+                      Display of File ACC.EXE
+
+DOS File Size                                       234Ah  (  9034. )
+Load Image Size                                     15F0h  (  5616. )
+Relocation Table entry count                        000Ch  (    12. )
+Relocation Table address                            003Eh  (    62. )
+Size of header record      (in paragraphs)          0020h  (    32. )
+Minimum Memory Requirement (in paragraphs)          0000h  (     0. )
+Maximum Memory Requirement (in paragraphs)          FFFFh  ( 65535. )
+File load checksum                                  0000h  (     0. )
+Overlay Number                                      0000h  (     0. )
+
+Borland TLINK Version 5.00
+
+Initial Stack Segment  (SS:SP)			  0157:0080
+Program Entry Point    (CS:IP)			  0000:0000
+
+Relocation Locations (12 Entries)
+
+    0000:0001    0000:005E    0000:00A3    0000:014F    0111:005D
+    0111:0017    0120:02C6    0120:02D2    0120:00A2    0120:009E
+    0120:009A    0000:0EF2
+
+Borland TLINK Symbol Table Present:
+
+Symbolic Information Version:      3.10
+Debugger Hook Address:             0000:0000
+Case Sensitive Link:               Yes
+Pascal Overlays Present:           No 
+
+Image Size                                        0017F0h  (  6128. )
+Name Pool Size (in bytes)                         000423h  (  1059. )
+Number of Names                                     0074h  (   116. )
+Number of Type Entries                              0027h  (    39. )
+Number of Member Entries                            0012h  (    18. )
+Number of Symbols                                   0072h  (   114. )
+Number of Global Symbols                            0062h  (    98. )
+Number of Source Modules                            0001h  (     1. )
+Number of Local Symbols                             0000h  (     0. )
+Number of Scopes                                    000Ch  (    12. )
+Number of Line Number Entries                       0007h  (     7. )
+Number of Include Files                             0001h  (     1. )
+Number of Segments                                  0001h  (     1. )
+Number of Correlation Entries                       0001h  (     1. )
+Basic RTL String Segment Offset                     0000h  (     0. )
+Data Count                                          0000h  (     0. )
+Number of Class Entries                             0005h  (     5. )
+Mumber of Global Classes                            0000h  (     0. )
+Number of Parent Entries                            0003h  (     3. )
+Number of Overload Entries                          0000h  (     0. )
+Number of Scope Class Entries                       0000h  (     0. )
+Number of Module Class Entries                      0001h  (     1. )
+Number of Coverage Analysis Offsets                 0017h  (    23. )
+Number of Browser Entries                           0000h  (     0. )
+Number of Optimized Symbol Entries                  0000h  (     0. )
+Debug Flags                                         0000h  (     0. )
+
+Global Table                      98 Entries (0062)  File Base: 01840h
+
+  Constant: 000C	  [001] __AHSHIFT            Type: Unknown
+  0000:0157 [002] __cleanup            Type: Unknown
+  0000:016A [003] __checknull          Type: Unknown
+  0000:016B [004] __terminate          Type: Unknown
+  0000:01C0 [005] __restorezero        Type: Unknown
+  0000:027A [006] _abort               Type: Unknown
+  0000:0291 [007] DGROUP@              Type: Unknown
+  0000:0293 [008] __MMODEL             Type: Unknown
+  0000:0295 [009] _atexit              Type: Unknown
+  0000:02C2 [00a] operator delete(void far*)
+		  Type: function far C returns void
+  0000:032C [00b] _exit                Type: Unknown
+  0000:033B [00c] __exit               Type: Unknown
+  0000:034D [00d] __cexit              Type: Unknown
+  0000:035B [00e] __c_exit             Type: Unknown
+  0000:0367 [00f] N_LXLSH@             Type: Unknown
+  0000:036A [010] LXLSH@               Type: Unknown
+  0000:036A [011] F_LXLSH@             Type: Unknown
+  0000:0388 [012] N_PADD@              Type: Unknown
+  0000:038B [013] F_PADD@              Type: Unknown
+  0000:038B [014] PADD@                Type: Unknown
+  0000:03B7 [015] N_PSUB@              Type: Unknown
+  0000:03BA [016] F_PSUB@              Type: Unknown
+  0000:03BA [017] PSUB@                Type: Unknown
+  0000:03E8 [018] __IOERROR            Type: Unknown
+  0000:0421 [019] __DOSERROR           Type: Unknown
+  0000:0433 [01a] _isatty              Type: Unknown
+  0000:0444 [01b] _lseek               Type: Unknown
+  0000:046D [01c] set_new_handler(void(far*)())
+		  Type: Unknown
+  0000:0497 [01d] operator new(unsigned int)
+		  Type: function far C returns far pointer void
+  0000:04D9 [01e] N_PCMP@              Type: Unknown
+  0000:04FA [01f] __setupio            Type: Unknown
+  0000:05B4 [020] ___first             Type: Unknown
+  0000:05B6 [021] ___last              Type: Unknown
+  0000:05B8 [022] ___rover             Type: Unknown
+  0000:06F4 [023] _free                Type: Unknown
+  0000:06F4 [024] _farfree             Type: Unknown
+  0000:07FE [025] _malloc              Type: Unknown
+  0000:0808 [026] _farmalloc           Type: Unknown
+  0000:0965 [027] _realloc             Type: Unknown
+  0000:096C [028] _farrealloc          Type: Unknown
+  0000:0A5C [029] __brk                Type: Unknown
+  0000:0A9B [02a] __sbrk               Type: Unknown
+  0000:0B26 [02b] _setblock            Type: Unknown
+  0000:0B42 [02c] _fflush              Type: Unknown
+  0000:0C0F [02d] _flushall            Type: Unknown
+  0000:0CD3 [02e] _fseek               Type: Unknown
+  0000:0D53 [02f] _ftell               Type: Unknown
+  0000:0E33 [030] _setvbuf             Type: Unknown
+  0000:0F50 [031] ___write             Type: Unknown
+  Constant: 1000	  [032] __AHINCR             Type: Unknown
+  0000:10A1 [033] __write              Type: Unknown
+  0000:10DD [034] __xfflush            Type: Unknown
+  0111:0005 [035] Acc::Acc()           Type: special function far C member returns far pointer class 'Acc' 
+  0111:003F [036] Acc::~Acc()          Type: special function far C member returns void
+  0111:0064 [037] Acc::method(int)     Type: special function far C member returns signed int
+  0111:007F [038] _main                Type: function far C returns signed int
+  0120:0000 [039] DATASEG@             Type: Unknown
+  0120:005B [03a] __Int0Vector         Type: Unknown
+  0120:005F [03b] __Int4Vector         Type: Unknown
+  0120:0063 [03c] __Int5Vector         Type: Unknown
+  0120:0067 [03d] __Int6Vector         Type: Unknown
+  0120:006B [03e] __C0argc             Type: Unknown
+  0120:006D [03f] __C0argv             Type: Unknown
+  0120:0071 [040] __C0environ          Type: Unknown
+  0120:0075 [041] __envLng             Type: Unknown
+  0120:0077 [042] __envseg             Type: Unknown
+  0120:0079 [043] __envSize            Type: Unknown
+  0120:007B [044] __psp                Type: Unknown
+  0120:007D [045] __osversion          Type: Unknown
+  0120:007D [046] __osmajor            Type: Unknown
+  0120:007D [047] __version            Type: Unknown
+  0120:007E [048] __osminor            Type: Unknown
+  0120:007F [049] _errno               Type: Unknown
+  0120:0081 [04a] __StartTime          Type: Unknown
+  0120:0085 [04b] ___brklvl            Type: Unknown
+  0120:0087 [04c] __heapbase           Type: Unknown
+  0120:008B [04d] __brklvl             Type: Unknown
+  0120:008F [04e] __heaptop            Type: Unknown
+  0120:0094 [04f] Acc::s_count         Type: signed int
+  0120:0096 [050] __atexitcnt          Type: Unknown
+  0120:0098 [051] __exitbuf            Type: Unknown
+  0120:009C [052] __exitfopen          Type: Unknown
+  0120:00A0 [053] __exitopen           Type: Unknown
+  0120:00A4 [054] __streams            Type: Unknown
+  0120:0234 [055] __nfile              Type: Unknown
+  0120:0236 [056] __openfd             Type: Unknown
+  0120:025E [057] __doserrno           Type: Unknown
+  0120:0260 [058] __dosErrorToSV       Type: Unknown
+  0120:02BA [059] __stklen             Type: Unknown
+  0120:02C2 [05a] __ScanTodVector      Type: Unknown
+  0120:02C2 [05b] __RealCvtVector      Type: Unknown
+  0120:02D4 [05c] _g_base              Type: class 'Base' 
+  0120:02D6 [05d] _g_pub               Type: class 'Pub' 
+  0120:02DA [05e] _g_pri               Type: class 'Pri' 
+  0120:02DE [05f] _g_prot              Type: class 'Prot' 
+  0120:02E2 [060] _g_acc               Type: class 'Acc' 
+  0120:02E6 [061] __atexittbl          Type: Unknown
+  0120:0366 [062] __new_handler        Type: Unknown
+
+
+Module Table                       1 Entries (0001)  File Base: 01C42h
+
+  Module: [064] ACC
+    Language:  C++           Underbars: Yes    Memory Model: Large
+
+    Source Files:
+    [074] ACC.CPP                Time Stamp: 06/30/126  02:48 pm
+
+    Module Type Definitions:
+      [068] Acc                  tag class 'Acc' 
+      [06a] Prot                 tag class 'Prot' 
+      [06b] Pri                  tag class 'Pri' 
+      [06c] Pub                  tag class 'Pub' 
+      [069] Base                 tag class 'Base' 
+
+    Correlation Records:
+      File Name: ACC.CPP
+      Code Base:    0111:0005	   Code Length: 00E4 bytes
+
+      Parent Scope:  0	Parent Function:  Acc::Acc()
+        Scope Offset:  0005	   Scope Length:  003A Bytes
+        [BP+6]	   this                 auto far pointer class 'Acc' 
+
+      Parent Scope:  1	
+        Scope Offset:  0008	   Scope Length:  0037 Bytes
+        [BP+6]	   this                 auto far pointer class 'Acc' 
+
+      Parent Scope:  0	Parent Function:  Acc::~Acc()
+        Scope Offset:  003F	   Scope Length:  0025 Bytes
+        [BP+10]	   delete               auto signed int
+        [BP+6]	   this                 auto far pointer class 'Acc' 
+
+      Parent Scope:  3	
+        Scope Offset:  0046	   Scope Length:  001E Bytes
+        [BP+6]	   this                 auto far pointer class 'Acc' 
+        SI	   delete               register signed int
+
+      Parent Scope:  0	Parent Function:  Acc::method(int)
+        Scope Offset:  0064	   Scope Length:  001B Bytes
+        [BP+10]	   a                    auto signed int
+        [BP+6]	   this                 auto far pointer class 'Acc' 
+
+      Parent Scope:  5	
+        Scope Offset:  0068	   Scope Length:  0017 Bytes
+        [BP+6]	   this                 auto far pointer class 'Acc' 
+        [BP+10]	   a                    auto signed int
+
+      Parent Scope:  0	
+        Scope Offset:  007F	   Scope Length:  0045 Bytes
+
+      Parent Scope:  7	
+        Scope Offset:  0085	   Scope Length:  003F Bytes
+        [BP-4]	   a                    auto class 'Acc' 
+
+      Parent Scope:  0	
+        Scope Offset:  00C4	   Scope Length:  0010 Bytes
+
+      Parent Scope:  9	
+        Scope Offset:  00C7	   Scope Length:  000D Bytes
+
+      Parent Scope:  0	
+        Scope Offset:  00D4	   Scope Length:  0015 Bytes
+
+      Parent Scope:  B	
+        Scope Offset:  00D7	   Scope Length:  0012 Bytes
+
+      Line Numbers:
+        38:0005h     39:003Fh     40:0064h     48:007Fh     50:0085h
+        51:0090h     52:00C0h
+
+
+Class Table                        5 Entries (0005)  File Base: 01EAEh
+
+  Class [068] Acc
+far 'this' ptr (far)
+far 'this', near vbase
+    pub_data       	signed int
+    Static Acc::s_count   	signed int
+
+    Constructor method/function Acc::Acc()     	special function far C member returns far pointer class 'Acc' 
+    Destructor method/function Acc::~Acc()    	special function far C member returns void
+    method/function Acc::method(int)	special function far C member returns signed int
+    priv_data      	signed int
+    
+  Class [06A] Prot:	child of Base
+far 'this' ptr (far)
+far 'this', near vbase
+    New Offset 02
+    rx             	signed int
+    
+  Class [069] Base
+far 'this' ptr (far)
+far 'this', near vbase
+    b              	signed int
+    
+  Class [06B] Pri:	child of Base
+far 'this' ptr (far)
+far 'this', near vbase
+    New Offset 02
+    qx             	signed int
+    
+  Class [06C] Pub:	child of Base
+far 'this' ptr (far)
+far 'this', near vbase
+    New Offset 02
+    px             	signed int
+    
+
