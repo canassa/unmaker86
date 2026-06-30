@@ -502,7 +502,7 @@ RICH/ENUM far cdecl → 0x04. Bit 2 (`0x04`) = far modifier; the low bits select
 | id | `member_type` means |
 |----|---------------------|
 | STRUCT/UNION (0x1E/0x1F) | 1-based **member-table index** of the first member |
-| CLASS (0x2E) | a far-pointer/aux type index (the class's member list is reached via the **Class table** `member_index`, §15.1) |
+| CLASS (0x2E) | the class's **1-based Class-table index** (§15.1) — its member list is then reached via that Class-table entry's `member_index`. *(Correction: this is NOT a type index; in CLS/MI/LCLS/BBCPP `member_type` reads `{1,2,3}` mapping 1:1 onto the Class table — a type index there would be `void`. CONFIRMED by the Tier-3 decoder, which resolves a TID_CLASS record to its Class entry via this field.)* |
 | ENUM (0x22) | **0** — the enumerator-list link lives in the following aux record, see §12.3a |
 | NEARP/FARP (0x15/0x16) | **pointee** type index |
 | ARRAY (0x1A) | **element** type index; element_count = `size / sizeof(element)` |
@@ -643,6 +643,11 @@ the 16-bit BC++ 3.1 output decoded here they are `unsigned short` — confirmed 
 
 A C++ class is represented in **two** places: a **type record** `id=0x2E` (TID_CLASS, §12.1) that is
 named and sized, and a **Class-table entry** (below) that carries the inheritance/member/vtable info.
+The two are linked by the TID_CLASS record's **`member_type` field = the 1-based Class-table index**
+(§12.3): resolve `types[ref].member_type → classes[member_type-1]`, then walk `classes[…].member_index`
+for the members and `classes[…].parent_index/parent_count` for the bases. *(DECODED & retained by the
+Tier-3 parser — `src/debug/symbols/{tds,types}.zig` — which renders `class Foo` with its data members,
+inheritance, and method signatures; verified against `CLS`/`MI`/`LCLS` and the new `BBCPP` fixture.)*
 
 ### 15.1 Class table — `class_entries × 11 bytes`  [C]
 
@@ -1086,7 +1091,25 @@ All six previously-open `[U]` items are closed:
 | 3 | pointer `class` `_CS`/`_ES`; func `class` `pascal`/`interrupt` | **[C]** ES=1,CS=2,SS=3,DS=4; func cdecl=0,pascal=1,far=4,interrupt=7 | `PTR.C` |
 | 4 | enum → enumerator linkage | **[C]** aux record after the ENUM type record, byte +4 = first enumerator | `BENUM.C` (3 enums) |
 | 5 | include-files records & coverage grouping | **[C]** includes = the source-file table (§6); coverage = Coverage-Map (per-segment start) + Coverage-Offset; module-opt-flags trailing | `INC.C`; full zero-residual walk |
-| 6 | C++ Class/Parent/Scope-Class/Module-Class/Coverage/Browser/Overload/OptSym/RefInfo/Module-Opt layouts | **[C]** Class(11B), Parent(2B), Scope-Class(4B), Module-Class(4B), Coverage-Map(2B), Coverage-Offset(2B), Module-Opt(4B); Browser(6B)/OptSym(9B)/Overload/RefInfo **[B]** (BCC3.1 emits 0) | `CLS`/`MI`/`LCLS` |
+| 6 | C++ Class/Parent/Scope-Class/Module-Class/Coverage/Browser/Overload/OptSym/RefInfo/Module-Opt layouts | **[C]** Class(11B), Parent(2B), Scope-Class(4B), Module-Class(4B), Coverage-Map(2B), Coverage-Offset(2B), Module-Opt(4B); Browser(6B)/OptSym(9B)/Overload/RefInfo **[B]** (BCC3.1 emits 0) | `CLS`/`MI`/`LCLS`/`BBCPP` |
+
+**Tier-3 status (DECODED, not merely sized):** the **Class** and **Parent** tables (and the
+**Scope-Class** / **Module-Class** tables) are no longer skipped — the parser RETAINS them and the
+type layer renders a `TID_CLASS` as `class Foo` with its **data members** (name / type / byte offset,
+honouring the `0x40` offset-reset record whose new running offset lives in the member **name** field —
+e.g. CLS `New Offset 02`), its **direct base classes** (declaration order, with the `0x8000`
+virtual-base flag), and its **method signatures** (members with flags `0x41`–`0x60`, classified
+data/method/virtual/static/ctor/dtor/conversion). The TID_CLASS→Class-table link is `member_type`
+(§12.3, corrected). Verified by the new C++ fixture **`BBCPP`** (`Entity` base + `Monster : public
+Entity` derived + `enum Shape`).
+
+**Honest limit on C++ method/vtable recovery in BCC 3.1:** what is recoverable per method is only its
+**typed signature** (the mangled name + the SPECIALFUNC return-type record). The callable body, vtable
+slot assignment, overload sets, and RTTI live in the **Browser / Overload / Optimized-Symbol /
+Reference-Info** tables, which **BCC 3.1 emits a count of 0 for on every fixture** (§15.5) — so vtable
+layout and method bodies are *not* recoverable. Likewise, **no per-member or per-base access specifier**
+(`public`/`private`/`protected`) is present anywhere in BCC 3.1's 16-bit member (5B) or Parent (2B)
+records — TDUMP itself renders none — so access is **not** reported (only the virtual-base flag is).
 
 **Fully mapped & CONFIRMED structures:** base header, extended header, symbol, module, source-file,
 line, scope, segment, correlation, type (+ ordinal/enum aux record), member, class, parent,
@@ -1110,4 +1133,6 @@ comptime size asserts for **every** table and enum above.
 
 Fixtures checked in this pass: **`MI`, `LCLS`, `MMC`, `MMH`, `MMT`, `PTR`, `BENUM`, `INC`** (+ their
 `.LST`s and sources), alongside the pre-existing `TEST`, `RICH`, `ENUM`, `CLS`. Decoder scripts
-`decode2.py`/`decode3.py`/`decode4.py`/`names.py` reproduce every claim above.
+`decode2.py`/`decode3.py`/`decode4.py`/`names.py` reproduce every claim above. The Tier-3 C++ pass
+adds **`BBCPP`** (`BBCPP.CPP`/`.EXE`/`.LST`) — a base class with data members + a virtual method, a
+single-inheritance derived class, and an `enum` — as the black-box oracle for class decoding.

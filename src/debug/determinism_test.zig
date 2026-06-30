@@ -83,6 +83,7 @@ test "POD + StopReason types contain no pointer-typed fields (#14 reflection)" {
     // address can leak into a snapshot or the M2 JSON (plan §8.3 reflection gate).
     try expectNoPointerFields(debug.symbols.TypeInfo);
     try expectNoPointerFields(debug.symbols.MemberInfo);
+    try expectNoPointerFields(debug.symbols.BaseInfo);
     try expectNoPointerFields(debug.symbols.EnumeratorInfo);
     try expectNoPointerFields(debug.symbols.Local);
     try expectNoPointerFields(debug.symbols.Storage);

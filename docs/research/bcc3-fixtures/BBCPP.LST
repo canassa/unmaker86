@@ -1,0 +1,283 @@
+Turbo Dump  Version 3.1 Copyright (c) 1988, 1992 Borland International
+                     Display of File BBCPP.EXE
+
+DOS File Size                                       20D0h  (  8400. )
+Load Image Size                                     14D0h  (  5328. )
+Relocation Table entry count                        000Ah  (    10. )
+Relocation Table address                            003Eh  (    62. )
+Size of header record      (in paragraphs)          0020h  (    32. )
+Minimum Memory Requirement (in paragraphs)          0000h  (     0. )
+Maximum Memory Requirement (in paragraphs)          FFFFh  ( 65535. )
+File load checksum                                  0000h  (     0. )
+Overlay Number                                      0000h  (     0. )
+
+Borland TLINK Version 5.00
+
+Initial Stack Segment  (SS:SP)			  0145:0080
+Program Entry Point    (CS:IP)			  0000:0000
+
+Relocation Locations (10 Entries)
+
+    0000:0001    0000:005E    0000:00A3    0000:014F    010F:00A4
+    010F:00A8    010F:00B6    010F:00B2    010F:00AE    0000:0E74
+
+
+Borland TLINK Symbol Table Present:
+
+Symbolic Information Version:      3.10
+Debugger Hook Address:             0000:0000
+Case Sensitive Link:               Yes
+Pascal Overlays Present:           No 
+
+Image Size                                        0016D0h  (  5840. )
+Name Pool Size (in bytes)                         0003E9h  (  1001. )
+Number of Names                                     006Dh  (   109. )
+Number of Type Entries                              0024h  (    36. )
+Number of Member Entries                            000Ch  (    12. )
+Number of Symbols                                   0065h  (   101. )
+Number of Global Symbols                            005Bh  (    91. )
+Number of Source Modules                            0001h  (     1. )
+Number of Local Symbols                             0000h  (     0. )
+Number of Scopes                                    0006h  (     6. )
+Number of Line Number Entries                       0008h  (     8. )
+Number of Include Files                             0001h  (     1. )
+Number of Segments                                  0001h  (     1. )
+Number of Correlation Entries                       0003h  (     3. )
+Basic RTL String Segment Offset                     0000h  (     0. )
+Data Count                                          0000h  (     0. )
+Number of Class Entries                             0002h  (     2. )
+Mumber of Global Classes                            0000h  (     0. )
+Number of Parent Entries                            0001h  (     1. )
+Number of Overload Entries                          0000h  (     0. )
+Number of Scope Class Entries                       0000h  (     0. )
+Number of Module Class Entries                      0001h  (     1. )
+Number of Coverage Analysis Offsets                 0009h  (     9. )
+Number of Browser Entries                           0000h  (     0. )
+Number of Optimized Symbol Entries                  0000h  (     0. )
+Debug Flags                                         0000h  (     0. )
+
+Global Table                      91 Entries (005B)  File Base: 01720h
+
+  Constant: 000C	  [001] __AHSHIFT            Type: Unknown
+  0000:0157 [002] __cleanup            Type: Unknown
+  0000:016A [003] __checknull          Type: Unknown
+  0000:016B [004] __terminate          Type: Unknown
+  0000:01C0 [005] __restorezero        Type: Unknown
+  0000:027A [006] _abort               Type: Unknown
+  0000:0291 [007] DGROUP@              Type: Unknown
+  0000:0293 [008] __MMODEL             Type: Unknown
+  0000:0295 [009] _atexit              Type: Unknown
+  0000:031A [00a] _exit                Type: Unknown
+  0000:0329 [00b] __exit               Type: Unknown
+  0000:033B [00c] __cexit              Type: Unknown
+  0000:0349 [00d] __c_exit             Type: Unknown
+  0000:0355 [00e] N_LXLSH@             Type: Unknown
+  0000:0358 [00f] LXLSH@               Type: Unknown
+  0000:0358 [010] F_LXLSH@             Type: Unknown
+  0000:0376 [011] N_PADD@              Type: Unknown
+  0000:0379 [012] F_PADD@              Type: Unknown
+  0000:0379 [013] PADD@                Type: Unknown
+  0000:03A5 [014] N_PSUB@              Type: Unknown
+  0000:03A8 [015] F_PSUB@              Type: Unknown
+  0000:03A8 [016] PSUB@                Type: Unknown
+  0000:03D6 [017] __IOERROR            Type: Unknown
+  0000:040F [018] __DOSERROR           Type: Unknown
+  0000:0421 [019] _isatty              Type: Unknown
+  0000:0432 [01a] _lseek               Type: Unknown
+  0000:045B [01b] N_PCMP@              Type: Unknown
+  0000:047C [01c] __setupio            Type: Unknown
+  0000:0536 [01d] ___first             Type: Unknown
+  0000:0538 [01e] ___last              Type: Unknown
+  0000:053A [01f] ___rover             Type: Unknown
+  0000:0676 [020] _free                Type: Unknown
+  0000:0676 [021] _farfree             Type: Unknown
+  0000:0780 [022] _malloc              Type: Unknown
+  0000:078A [023] _farmalloc           Type: Unknown
+  0000:08E7 [024] _realloc             Type: Unknown
+  0000:08EE [025] _farrealloc          Type: Unknown
+  0000:09DE [026] __brk                Type: Unknown
+  0000:0A1D [027] __sbrk               Type: Unknown
+  0000:0AA8 [028] _setblock            Type: Unknown
+  0000:0AC4 [029] _fflush              Type: Unknown
+  0000:0B91 [02a] _flushall            Type: Unknown
+  0000:0C55 [02b] _fseek               Type: Unknown
+  0000:0CD5 [02c] _ftell               Type: Unknown
+  0000:0DB5 [02d] _setvbuf             Type: Unknown
+  0000:0ED2 [02e] ___write             Type: Unknown
+  Constant: 1000	  [02f] __AHINCR             Type: Unknown
+  0000:1023 [030] __write              Type: Unknown
+  0000:105F [031] __xfflush            Type: Unknown
+  0109:0007 [032] _main                Type: function far C returns signed int
+  0109:0048 [033] Entity::kind()       Type: special function far C member Out-of-line returns signed int
+  0109:0051 [034] Monster::kind()      Type: special function far C member Out-of-line returns signed int
+  010F:0000 [035] DATASEG@             Type: Unknown
+  010F:005B [036] __Int0Vector         Type: Unknown
+  010F:005F [037] __Int4Vector         Type: Unknown
+  010F:0063 [038] __Int5Vector         Type: Unknown
+  010F:0067 [039] __Int6Vector         Type: Unknown
+  010F:006B [03a] __C0argc             Type: Unknown
+  010F:006D [03b] __C0argv             Type: Unknown
+  010F:0071 [03c] __C0environ          Type: Unknown
+  010F:0075 [03d] __envLng             Type: Unknown
+  010F:0077 [03e] __envseg             Type: Unknown
+  010F:0079 [03f] __envSize            Type: Unknown
+  010F:007B [040] __psp                Type: Unknown
+  010F:007D [041] __osversion          Type: Unknown
+  010F:007D [042] __osmajor            Type: Unknown
+  010F:007D [043] __version            Type: Unknown
+  010F:007E [044] __osminor            Type: Unknown
+  010F:007F [045] _errno               Type: Unknown
+  010F:0081 [046] __StartTime          Type: Unknown
+  010F:0085 [047] ___brklvl            Type: Unknown
+  010F:0087 [048] __heapbase           Type: Unknown
+  010F:008B [049] __brklvl             Type: Unknown
+  010F:008F [04a] __heaptop            Type: Unknown
+  010F:0094 [04b] _g_entity            Type: class 'Entity' 
+  010F:009A [04c] _g_monster           Type: class 'Monster' 
+  010F:00A2 [04d] Monster::            Type: Unknown
+  010F:00A6 [04e] Entity::             Type: Unknown
+  010F:00AA [04f] __atexitcnt          Type: Unknown
+  010F:00AC [050] __exitbuf            Type: Unknown
+  010F:00B0 [051] __exitfopen          Type: Unknown
+  010F:00B4 [052] __exitopen           Type: Unknown
+  010F:00B8 [053] __streams            Type: Unknown
+  010F:0248 [054] __nfile              Type: Unknown
+  010F:024A [055] __openfd             Type: Unknown
+  010F:0272 [056] __doserrno           Type: Unknown
+  010F:0274 [057] __dosErrorToSV       Type: Unknown
+  010F:02CE [058] __stklen             Type: Unknown
+  010F:02D6 [059] __ScanTodVector      Type: Unknown
+  010F:02D6 [05a] __RealCvtVector      Type: Unknown
+  010F:02DC [05b] __atexittbl          Type: Unknown
+
+
+Module Table                       1 Entries (0001)  File Base: 01AADh
+
+  Module: [05d] BBCPP
+    Language:  C++           Underbars: Yes    Memory Model: Large
+
+    Source Files:
+    [06d] BBCPP.CPP              Time Stamp: 06/30/126  12:03 pm
+
+    Module Type Definitions:
+      [064] Monster              tag class 'Monster' 
+      [063] Entity               tag class 'Entity' 
+      [05e] Shape                tag enum 'Shape' 
+          [065] CIRCLE                 Value = 0h
+          [066] SQUARE                 Value = 1h
+          [067] TRIANGLE               Value = 2h
+
+    Correlation Records:
+      File Name: BBCPP.CPP
+      Code Base:    0109:0007	   Code Length: 0054 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  0041 Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  003B Bytes
+        [BP-16]	   s                    auto enum 'Shape' 
+        [BP-14]	   m                    auto class 'Monster' 
+        [BP-6]	   e                    auto class 'Entity' 
+
+      Parent Scope:  0	Parent Function:  Entity::kind()
+        Scope Offset:  0048	   Scope Length:  0009 Bytes
+        [BP+6]	   this                 auto far pointer class 'Entity' 
+
+      Parent Scope:  3	
+        Scope Offset:  004B	   Scope Length:  0006 Bytes
+        [BP+6]	   this                 auto far pointer class 'Entity' 
+
+      Parent Scope:  0	Parent Function:  Monster::kind()
+        Scope Offset:  0051	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'Monster' 
+
+      Parent Scope:  5	
+        Scope Offset:  0054	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'Monster' 
+
+      Line Numbers:
+        25:0007h     27:000Dh     28:0012h     29:001Ch     30:0021h
+        31:0044h
+
+      File Name: BBCPP.CPP
+      Code Base:    0109:0007	   Code Length: 0054 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  0041 Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  003B Bytes
+        [BP-16]	   s                    auto enum 'Shape' 
+        [BP-14]	   m                    auto class 'Monster' 
+        [BP-6]	   e                    auto class 'Entity' 
+
+      Parent Scope:  0	Parent Function:  Entity::kind()
+        Scope Offset:  0048	   Scope Length:  0009 Bytes
+        [BP+6]	   this                 auto far pointer class 'Entity' 
+
+      Parent Scope:  3	
+        Scope Offset:  004B	   Scope Length:  0006 Bytes
+        [BP+6]	   this                 auto far pointer class 'Entity' 
+
+      Parent Scope:  0	Parent Function:  Monster::kind()
+        Scope Offset:  0051	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'Monster' 
+
+      Parent Scope:  5	
+        Scope Offset:  0054	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'Monster' 
+
+      Line Numbers:
+        13:0048h
+
+      File Name: BBCPP.CPP
+      Code Base:    0109:0007	   Code Length: 0054 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0007	   Scope Length:  0041 Bytes
+
+      Parent Scope:  1	
+        Scope Offset:  000D	   Scope Length:  003B Bytes
+        [BP-16]	   s                    auto enum 'Shape' 
+        [BP-14]	   m                    auto class 'Monster' 
+        [BP-6]	   e                    auto class 'Entity' 
+
+      Parent Scope:  0	Parent Function:  Entity::kind()
+        Scope Offset:  0048	   Scope Length:  0009 Bytes
+        [BP+6]	   this                 auto far pointer class 'Entity' 
+
+      Parent Scope:  3	
+        Scope Offset:  004B	   Scope Length:  0006 Bytes
+        [BP+6]	   this                 auto far pointer class 'Entity' 
+
+      Parent Scope:  0	Parent Function:  Monster::kind()
+        Scope Offset:  0051	   Scope Length:  000A Bytes
+        [BP+6]	   this                 auto far pointer class 'Monster' 
+
+      Parent Scope:  5	
+        Scope Offset:  0054	   Scope Length:  0007 Bytes
+        [BP+6]	   this                 auto far pointer class 'Monster' 
+
+      Line Numbers:
+        19:0051h
+
+
+Class Table                        2 Entries (0002)  File Base: 01CAFh
+
+  Class [064] Monster:	child of Entity
+far 'this' ptr (far)
+far 'this', near vbase
+    New Offset 06
+    damage         	signed int
+    method/function Monster::kind()	special function far C member Out-of-line returns signed int
+    
+  Class [063] Entity
+far 'this' ptr (far)
+far 'this', near vbase
+    New Offset 02
+    id             	signed int
+    hp             	signed int
+    method/function Entity::kind() 	special function far C member Out-of-line returns signed int
+    
+

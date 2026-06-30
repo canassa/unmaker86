@@ -80,13 +80,44 @@ pub const TypeInfo = union(enum) {
     typedef: struct { name_index: u16, aliased: u16 },
 };
 
-/// One struct/union data member with its computed byte offset (§13). `bit_width == 0`
-/// means "not a bitfield". Pointer-free (name via `Tds.name(name_index)`).
+/// What a class/struct member record encodes — decoded from the member `flags` byte's
+/// C++ method-attribute bits (§13/§15). Plain C struct/union members are always `.data`.
+/// BCC 3.1 emits methods as records *inside* the class member list (flags `0x41`–`0x60`);
+/// their full bodies/vtable slots would live in the Browser/Overload tables, which BCC 3.1
+/// emits **zero** of — so a method is recoverable as a typed *signature* (name + type), not
+/// as callable/vtable detail. (No public/private/protected per-member access specifier is
+/// present in BCC 3.1's 16-bit TDS at all — see `bases` / the limitation note in §17.)
+pub const MemberKind = enum {
+    data, // non-static data member (or any plain C struct/union member)
+    method, // non-virtual member function (flags 0x48)
+    virtual_method, // virtual member function (flags 0x44 / 0x4C)
+    static_data, // static data member (flags 0x60; member.type → its symbol)
+    static_method, // static member function (flags 0x50)
+    constructor, // flags 0x42
+    destructor, // flags 0x41
+    conversion, // flags 0x43 (operator-conversion)
+};
+
+/// One struct/union/class member with its computed byte offset (§13). `bit_width == 0`
+/// means "not a bitfield"; `byte_offset` is meaningful only for `.data` members (methods
+/// and statics carry 0). Pointer-free (name via `Tds.name(name_index)`).
 pub const MemberInfo = struct {
     name_index: u16,
     type_ref: u16,
     byte_offset: u16,
     bit_width: u8, // 0 = not a bitfield; else width in bits
+    kind: MemberKind = .data, // C++ member-attribute decode; `.data` for plain C
+};
+
+/// One direct base class of a C++ class (§15.2 Parent table). Pointer-free: `type_ref` is
+/// the base's `TID_CLASS` type record (render with `typeName`, walk with `members`),
+/// `class_index` its 1-based Class-table index. NB: BCC 3.1's 16-bit TDS carries **no**
+/// base-access specifier (`public`/`private`/`protected`) — only the virtual-base flag —
+/// so access is not reported (it cannot be recovered; see §17).
+pub const BaseInfo = struct {
+    type_ref: u16, // base's TID_CLASS type record (0 if unresolvable)
+    class_index: u16, // 1-based Class-table index of the base
+    is_virtual: bool, // the Parent record's 0x8000 virtual-base flag
 };
 
 /// One enumerator `{ name, signed value }` (§12.3a). Pointer-free.
@@ -123,8 +154,14 @@ pub const TypeGraph = struct {
     arena: std.heap.ArenaAllocator,
     tds: *const Tds,
 
-    member_layouts: []MemberInfo, // all aggregates' members, concatenated
+    member_layouts: []MemberInfo, // all aggregates' (struct/union/class) members, concatenated
     member_ranges: []Range, // indexed by (type_ref - 1); {0,0} for non-aggregates
+    /// For a `TID_CLASS` type: the class's 1-based Member-table index (its `member_index`
+    /// from the Class table, §15.1); 0 for every non-class type. This is the raw on-disk
+    /// `first_member` a class reaches its member list through (vs a struct's `member_type`).
+    class_first_member: []u16, // indexed by (type_ref - 1)
+    bases_flat: []BaseInfo, // all classes' base lists, concatenated (§15.2)
+    base_ranges: []Range, // indexed by (type_ref - 1); {0,0} for non-classes / root classes
     enumerators_flat: []EnumeratorInfo, // all enums' enumerators, concatenated
     enum_ranges: []Range, // indexed by (type_ref - 1); {0,0} for non-enums
     locals_flat: []Local, // all scopes' locals, concatenated
@@ -146,14 +183,34 @@ pub const TypeGraph = struct {
         const ntypes = tds.types.len;
         const member_ranges = try a.alloc(Range, ntypes);
         const enum_ranges = try a.alloc(Range, ntypes);
+        const class_first_member = try a.alloc(u16, ntypes);
+        const base_ranges = try a.alloc(Range, ntypes);
         @memset(member_ranges, .{ .start = 0, .count = 0 });
         @memset(enum_ranges, .{ .start = 0, .count = 0 });
+        @memset(class_first_member, 0);
+        @memset(base_ranges, .{ .start = 0, .count = 0 });
 
-        // ---- struct/union member layouts (§13): walk each aggregate's member list,
-        //      accumulating byte offsets in declaration order (bitfields share a
-        //      container; unions place every member at offset 0). ----
+        // ---- reverse map: 1-based Class-table index → 1-based type_ref (§15.1). A
+        //      TID_CLASS type record's `member_type` IS its Class-table index (empirically
+        //      {1,2,3} in CLS/MI/LCLS — a type index there would be `void`), so this lets a
+        //      Parent record (which names a base by Class-table index) resolve back to the
+        //      base's renderable type record. Bounds-checked against a lying member_type. ----
+        const class_to_type = try a.alloc(u16, tds.classes.len + 1);
+        @memset(class_to_type, 0);
+        for (tds.types, 0..) |t, i| {
+            if (@as(TypeId, @enumFromInt(t.id)) != .class) continue;
+            const ci = t.member_type;
+            if (ci != 0 and ci <= tds.classes.len and class_to_type[ci] == 0)
+                class_to_type[ci] = @intCast(i + 1);
+        }
+
+        // ---- struct/union member layouts (§13) + C++ class member layouts (§15.1):
+        //      walk each aggregate's member list, accumulating byte offsets in declaration
+        //      order (bitfields share a container; unions place every member at offset 0; a
+        //      class reaches its list via the Class table and uses the C++ attribute byte). ----
         var member_list: std.ArrayList(MemberInfo) = .empty;
         var enums: std.ArrayList(EnumeratorInfo) = .empty;
+        var base_list: std.ArrayList(BaseInfo) = .empty;
         for (tds.types, 0..) |t, i| {
             const id: TypeId = @enumFromInt(t.id);
             switch (id) {
@@ -161,6 +218,18 @@ pub const TypeGraph = struct {
                     const start: u32 = @intCast(member_list.items.len);
                     try buildAggregate(tds, &member_list, a, t, id == .@"union");
                     member_ranges[i] = .{ .start = start, .count = @intCast(member_list.items.len - start) };
+                },
+                .class => {
+                    // member_type = the class's 1-based Class-table index (§15.1).
+                    const cls = classEntry(tds, t.member_type) orelse continue;
+                    class_first_member[i] = cls.member_index;
+                    const mstart: u32 = @intCast(member_list.items.len);
+                    try buildClass(tds, &member_list, a, cls.member_index);
+                    member_ranges[i] = .{ .start = mstart, .count = @intCast(member_list.items.len - mstart) };
+                    // base classes via the Parent table (§15.2).
+                    const bstart: u32 = @intCast(base_list.items.len);
+                    try buildBases(tds, &base_list, a, cls, class_to_type);
+                    base_ranges[i] = .{ .start = bstart, .count = @intCast(base_list.items.len - bstart) };
                 },
                 .@"enum" => {
                     const start: u32 = @intCast(enums.items.len);
@@ -172,6 +241,7 @@ pub const TypeGraph = struct {
         }
         const member_layouts = try member_list.toOwnedSlice(a);
         const enumerators_flat = try enums.toOwnedSlice(a);
+        const bases_flat = try base_list.toOwnedSlice(a);
 
         // ---- scope tree + per-scope locals (§4/§8) ----
         const nscopes = tds.scopes.len;
@@ -220,6 +290,9 @@ pub const TypeGraph = struct {
             .tds = tds,
             .member_layouts = member_layouts,
             .member_ranges = member_ranges,
+            .class_first_member = class_first_member,
+            .bases_flat = bases_flat,
+            .base_ranges = base_ranges,
             .enumerators_flat = enumerators_flat,
             .enum_ranges = enum_ranges,
             .locals_flat = locals_flat,
@@ -263,14 +336,19 @@ pub const TypeGraph = struct {
                 const count: u32 = if (elem_size == 0) 0 else @as(u32, rec.size) / elem_size;
                 break :blk .{ .array = .{ .element = rec.member_type, .count = count, .size = rec.size } };
             },
-            .@"struct", .@"union", .class => .{ .aggregate = .{
-                .name_index = rec.name,
-                .size = rec.size,
-                .is_union = id == .@"union",
-                .is_class = id == .class,
-                .first_member = if (id == .class) 0 else rec.member_type,
-                .member_count = @intCast(self.member_ranges[type_ref - 1].count),
-            } },
+            .@"struct", .@"union", .class => .{
+                .aggregate = .{
+                    .name_index = rec.name,
+                    .size = rec.size,
+                    .is_union = id == .@"union",
+                    .is_class = id == .class,
+                    // A struct/union links its first member via `member_type`; a C++ class
+                    // reaches its member list through the Class table's `member_index` (§15.1),
+                    // resolved at build time into `class_first_member`.
+                    .first_member = if (id == .class) self.class_first_member[type_ref - 1] else rec.member_type,
+                    .member_count = @intCast(self.member_ranges[type_ref - 1].count),
+                },
+            },
             .@"enum" => .{ .enumeration = .{
                 .name_index = rec.name,
                 .size = rec.size,
@@ -303,6 +381,16 @@ pub const TypeGraph = struct {
         if (type_ref == 0 or type_ref > self.member_ranges.len) return &.{};
         const r = self.member_ranges[type_ref - 1];
         return self.member_layouts[r.start..][0..r.count];
+    }
+
+    /// The direct base classes of `type_ref` in declaration order; empty if it is not a
+    /// C++ class or is a root class (§15.2). Each `BaseInfo.type_ref` is the base's own
+    /// `TID_CLASS` record (render with `typeName`, walk with `members`). The slice is
+    /// borrowed from the graph.
+    pub fn bases(self: *const TypeGraph, type_ref: u16) []const BaseInfo {
+        if (type_ref == 0 or type_ref > self.base_ranges.len) return &.{};
+        const r = self.base_ranges[type_ref - 1];
+        return self.bases_flat[r.start..][0..r.count];
     }
 
     /// The enumerators of `type_ref`; empty if it is not an enum (§12.3a).
@@ -508,6 +596,134 @@ fn buildAggregate(
     }
 }
 
+/// The Class-table entry for a 1-based class index (a `TID_CLASS` type record's
+/// `member_type`, §15.1); null for index 0 / out-of-range (a lying type table).
+fn classEntry(tds: *const Tds, class_index: u16) ?format.ClassRecord {
+    if (class_index == 0 or class_index > tds.classes.len) return null;
+    return tds.classes[class_index - 1];
+}
+
+/// Classify a C++ class member from its `flags` byte (the method-attribute byte, §13/§15).
+/// Only reached for records with bit6 (0x40) set and a non-zero low nibble (a pure 0x40 is
+/// an offset-reset, handled in `buildClass`; 0xC0 is the terminator). The low 6 bits select:
+/// 0x20 static-data, 0x10 static-method, 0x04 virtual, 0x08 method, 1/2/3 dtor/ctor/conv.
+fn classifyClassMember(flags: u8) MemberKind {
+    const low: u8 = flags & 0x3F;
+    if (low & 0x20 != 0) return .static_data; // 0x60
+    if (low & 0x10 != 0) return .static_method; // 0x50
+    if (low & 0x04 != 0) return .virtual_method; // 0x44 / 0x4C
+    if (low & 0x08 != 0) return .method; // 0x48
+    return switch (low) {
+        1 => .destructor, // 0x41
+        2 => .constructor, // 0x42
+        3 => .conversion, // 0x43
+        else => .method,
+    };
+}
+
+/// Walk a C++ class's member list (§15.1/§15) from its Class-table `member_index` until the
+/// `0xC0` terminator, emitting both data members (with accumulated byte offsets) and method
+/// records (typed signatures; no data offset). Differs from `buildAggregate` in three ways
+/// the C++ encoding requires: (1) a `0x40` offset-reset record carries the new running
+/// offset in its **name** field (empirically: CLS `New Offset 02` ⇐ name=2; it sits before
+/// the first data member to skip the vtable pointer); (2) method records (flags `0x41`–`0x60`,
+/// i.e. bit6 set with a non-zero low nibble) are emitted with their `MemberKind` and do not
+/// advance the data offset; (3) the list is reached via the Class table, not `member_type`.
+/// Bounds/overflow are saturating like `buildAggregate` (a lying class table must not panic).
+fn buildClass(
+    tds: *const Tds,
+    out: *std.ArrayList(MemberInfo),
+    a: std.mem.Allocator,
+    member_index: u16,
+) error{OutOfMemory}!void {
+    var byte_off: u16 = 0;
+    var bf_bits: u32 = 0; // bits used so far in the current bitfield container
+    var bf_container: u16 = 0; // byte size of the current bitfield container
+    var mi: usize = member_index; // 1-based first member
+    var guard: usize = 0;
+    while (mi != 0 and mi <= tds.members.len and guard <= tds.members.len) : (guard += 1) {
+        const m = tds.members[mi - 1];
+        if ((m.flags & 0xC0) == 0xC0) break; // 0xC0 = list terminator
+        if ((m.flags & 0x40) != 0) {
+            if ((m.flags & 0x3F) == 0) {
+                // Pure offset-reset (0x40): the new running offset is in the NAME field.
+                byte_off = m.name;
+                bf_bits = 0;
+                bf_container = 0;
+            } else {
+                // A method / static record — a typed signature, no data layout (§15.5: its
+                // body/vtable slot would live in the Browser/Overload tables BCC 3.1 omits).
+                try out.append(a, .{
+                    .name_index = m.name,
+                    .type_ref = m.type,
+                    .byte_offset = 0,
+                    .bit_width = 0,
+                    .kind = classifyClassMember(m.flags),
+                });
+            }
+            mi += 1;
+            continue;
+        }
+        // bit6 clear ⇒ a data member (plain or bitfield), laid out like a struct.
+        const width: u8 = m.flags & 0x3F; // 0 = not a bitfield
+        var this_off: u16 = byte_off;
+        if (width != 0) {
+            const csize = typeSizeOf(tds, m.type);
+            if (bf_bits == 0) {
+                bf_container = csize;
+            } else if (bf_bits + width > @as(u32, bf_container) * 8 or csize != bf_container) {
+                byte_off +|= bf_container; // close the full container, open a new one
+                bf_bits = 0;
+                bf_container = csize;
+            }
+            this_off = byte_off;
+            bf_bits += width;
+        } else {
+            if (bf_bits > 0) { // flush a pending bitfield container
+                byte_off +|= bf_container;
+                bf_bits = 0;
+                bf_container = 0;
+            }
+            this_off = byte_off;
+            byte_off +|= typeSizeOf(tds, m.type); // saturating (attacker-controlled sizes)
+        }
+        try out.append(a, .{
+            .name_index = m.name,
+            .type_ref = m.type,
+            .byte_offset = this_off,
+            .bit_width = width,
+            .kind = .data,
+        });
+        mi += 1;
+    }
+}
+
+/// Resolve a class's direct base list from the Parent table (§15.2): the `parent_count`
+/// records starting at the 1-based `parent_index`. Each Parent record names a base by
+/// 1-based Class-table index (`class_to_type` maps it back to a renderable type record);
+/// bit15 (0x8000) is the virtual-base flag. Bounds-checked against a lying class table.
+fn buildBases(
+    tds: *const Tds,
+    out: *std.ArrayList(BaseInfo),
+    a: std.mem.Allocator,
+    cls: format.ClassRecord,
+    class_to_type: []const u16,
+) error{OutOfMemory}!void {
+    if (cls.parent_count == 0 or cls.parent_index == 0) return;
+    const first: usize = cls.parent_index - 1; // 1-based
+    var k: usize = 0;
+    while (k < cls.parent_count and first + k < tds.parents.len) : (k += 1) {
+        const p = tds.parents[first + k];
+        const ci: u16 = p.class_index & 0x7FFF;
+        const tref: u16 = if (ci < class_to_type.len) class_to_type[ci] else 0;
+        try out.append(a, .{
+            .type_ref = tref,
+            .class_index = ci,
+            .is_virtual = (p.class_index & 0x8000) != 0,
+        });
+    }
+}
+
 /// Walk an enum's enumerators (§12.3a). The type record at 0-based `enum_idx0` is the
 /// `ENUM`; the record immediately after it is the aux ordinal-range record whose 5th
 /// byte (the high byte of `size`) is the 1-based index of the first enumerator. The list
@@ -565,6 +781,9 @@ const rich_exe = @embedFile("testdata/RICH.EXE");
 const enum_exe = @embedFile("testdata/ENUM.EXE");
 const benum_exe = @embedFile("testdata/BENUM.EXE");
 const ptr_exe = @embedFile("testdata/PTR.EXE");
+const cls_exe = @embedFile("testdata/CLS.EXE");
+const mi_exe = @embedFile("testdata/MI.EXE");
+const lcls_exe = @embedFile("testdata/LCLS.EXE");
 
 /// Render a type to a stack buffer and return the written slice (for assertions).
 fn renderToBuf(tg: *const TypeGraph, type_ref: u16, buf: []u8) []const u8 {
@@ -889,6 +1108,153 @@ test "RICH F1: scopeForAddr finds the innermost enclosing scope" {
     try testing.expect(found_cx);
 }
 
+test "CLS: class Base / Derived render with data members + single inheritance (§15)" {
+    var tds = try tdsmod.parseExe(testing.allocator, cls_exe);
+    defer tds.deinit();
+    var tg = try TypeGraph.build(testing.allocator, &tds);
+    defer tg.deinit();
+    var buf: [64]u8 = undefined;
+
+    // Base = type record #25 (id=TID_CLASS 0x2E): renders "class Base", no bases.
+    try testing.expectEqualStrings("class Base", renderToBuf(&tg, 25, &buf));
+    switch (tg.typeInfo(25).?) {
+        .aggregate => |ag| {
+            try testing.expect(ag.is_class);
+            try testing.expect(!ag.is_union);
+            try testing.expectEqualStrings("Base", tds.name(ag.name_index));
+            try testing.expectEqual(@as(u16, 4), ag.size); // vptr(2) + bx(2)
+            try testing.expectEqual(@as(u16, 1), ag.first_member); // Class-table member_index
+        },
+        else => return error.WrongVariant,
+    }
+    try testing.expectEqual(@as(usize, 0), tg.bases(25).len);
+
+    // Base members: data `bx` @offset 2 (after the vtable pointer), then virtual `who`.
+    const bm = tg.members(25);
+    try testing.expectEqual(@as(usize, 2), bm.len);
+    try testing.expectEqualStrings("bx", tds.name(bm[0].name_index));
+    try testing.expectEqual(@as(u16, 2), bm[0].byte_offset);
+    try testing.expectEqual(MemberKind.data, bm[0].kind);
+    try testing.expectEqualStrings("int", renderToBuf(&tg, bm[0].type_ref, &buf));
+    try testing.expectEqualStrings("@Base@who$qv", tds.name(bm[1].name_index));
+    try testing.expectEqual(MemberKind.virtual_method, bm[1].kind);
+    try testing.expectEqual(@as(u16, 0), bm[1].byte_offset); // methods carry no data offset
+
+    // Derived = #27: "class Derived", base = Base (#25), non-virtual.
+    try testing.expectEqualStrings("class Derived", renderToBuf(&tg, 27, &buf));
+    const db = tg.bases(27);
+    try testing.expectEqual(@as(usize, 1), db.len);
+    try testing.expectEqual(@as(u16, 25), db[0].type_ref);
+    try testing.expectEqual(@as(u16, 1), db[0].class_index);
+    try testing.expect(!db[0].is_virtual);
+    try testing.expectEqualStrings("class Base", renderToBuf(&tg, db[0].type_ref, &buf));
+
+    // Derived adds `dy` @offset 4 (vptr + base bx + this dy), plus its own virtual who.
+    const dm = tg.members(27);
+    try testing.expectEqual(@as(usize, 2), dm.len);
+    try testing.expectEqualStrings("dy", tds.name(dm[0].name_index));
+    try testing.expectEqual(@as(u16, 4), dm[0].byte_offset);
+    try testing.expectEqual(MemberKind.data, dm[0].kind);
+    try testing.expectEqual(MemberKind.virtual_method, dm[1].kind);
+}
+
+test "MI: class C reports BOTH base classes A, B in declaration order (§15.2)" {
+    var tds = try tdsmod.parseExe(testing.allocator, mi_exe);
+    defer tds.deinit();
+    var tg = try TypeGraph.build(testing.allocator, &tds);
+    defer tg.deinit();
+    var buf: [64]u8 = undefined;
+
+    // Type records: #25=B, #27=A, #29=C (see decode oracle). C : public A, public B.
+    try testing.expectEqualStrings("class C", renderToBuf(&tg, 29, &buf));
+    const cb = tg.bases(29);
+    try testing.expectEqual(@as(usize, 2), cb.len);
+    // declaration order is A then B (Parent table {2,1} → class 2=A, class 1=B).
+    try testing.expectEqualStrings("class A", renderToBuf(&tg, cb[0].type_ref, &buf));
+    try testing.expectEqual(@as(u16, 27), cb[0].type_ref);
+    try testing.expectEqualStrings("class B", renderToBuf(&tg, cb[1].type_ref, &buf));
+    try testing.expectEqual(@as(u16, 25), cb[1].type_ref);
+    for (cb) |b| try testing.expect(!b.is_virtual);
+
+    // C's own member `cx` lands at offset 8 (A subobject 4 + B subobject 4), then 3 methods.
+    const cm = tg.members(29);
+    try testing.expectEqualStrings("cx", tds.name(cm[0].name_index));
+    try testing.expectEqual(@as(u16, 8), cm[0].byte_offset);
+    try testing.expectEqual(MemberKind.data, cm[0].kind);
+    var methods: usize = 0;
+    for (cm) |m| if (m.kind == .virtual_method) {
+        methods += 1;
+    };
+    try testing.expectEqual(@as(usize, 3), methods); // fa, fb, fc all virtual in C
+
+    // The single-inheritance roots A and B carry no bases.
+    try testing.expectEqual(@as(usize, 0), tg.bases(27).len);
+    try testing.expectEqual(@as(usize, 0), tg.bases(25).len);
+}
+
+test "LCLS: a local class and a global class both decode their members" {
+    var tds = try tdsmod.parseExe(testing.allocator, lcls_exe);
+    defer tds.deinit();
+    var tg = try TypeGraph.build(testing.allocator, &tds);
+    defer tg.deinit();
+    var buf: [64]u8 = undefined;
+
+    // #24 = the function-local `class Local`, #28 = file-scope `class Glob`.
+    try testing.expectEqualStrings("class Local", renderToBuf(&tg, 24, &buf));
+    const lm = tg.members(24);
+    try testing.expectEqualStrings("lx", tds.name(lm[0].name_index));
+    try testing.expectEqual(@as(u16, 2), lm[0].byte_offset);
+    try testing.expectEqual(MemberKind.data, lm[0].kind);
+    try testing.expectEqual(MemberKind.virtual_method, lm[1].kind); // Local::g
+
+    try testing.expectEqualStrings("class Glob", renderToBuf(&tg, 28, &buf));
+    const gm = tg.members(28);
+    try testing.expectEqualStrings("gx", tds.name(gm[0].name_index));
+    try testing.expectEqual(@as(u16, 2), gm[0].byte_offset);
+    // Neither class inherits.
+    try testing.expectEqual(@as(usize, 0), tg.bases(24).len);
+    try testing.expectEqual(@as(usize, 0), tg.bases(28).len);
+}
+
+test "C++ class decode is robust against a lying class/member table (no panic)" {
+    // A type record claims to be a TID_CLASS whose member_type points past the (empty)
+    // class table, and a parent_index/count that would overrun the parent table. The
+    // bounds-checked resolution must yield empty members/bases, never a panic.
+    var tds: Tds = undefined;
+    tds.arena = .init(testing.allocator);
+    defer tds.deinit();
+    const a = tds.arena.allocator();
+
+    const types = try a.alloc(format.Type, 1);
+    types[0] = .{ .id = @intFromEnum(TypeId.class), .name = 0, .size = 0, .class = 0, .member_type = 99 };
+    const classes = try a.alloc(format.ClassRecord, 1);
+    classes[0] = .{ .parent_index = 50, .parent_count = 40, .member_index = 9, .name_index = 0, .virtual_ptr = 0, .info = 0 };
+
+    tds.header = std.mem.zeroes(format.Header);
+    tds.ext = std.mem.zeroes(format.ExtHeader);
+    tds.symbols = &.{};
+    tds.modules = &.{};
+    tds.sources = &.{};
+    tds.lines = &.{};
+    tds.scopes = &.{};
+    tds.segments = &.{};
+    tds.correlations = &.{};
+    tds.types = types;
+    tds.members = &.{};
+    tds.classes = classes;
+    tds.parents = &.{};
+    tds.scope_classes = &.{};
+    tds.module_classes = &.{};
+    tds.name_pool = &.{};
+    tds.name_starts = &.{};
+
+    var tg = try TypeGraph.build(testing.allocator, &tds);
+    defer tg.deinit();
+    // member_type=99 is out of range → no class entry → empty members + bases.
+    try testing.expectEqual(@as(usize, 0), tg.members(1).len);
+    try testing.expectEqual(@as(usize, 0), tg.bases(1).len);
+}
+
 test "TypeGraph: build is deterministic (byte-identical arrays on re-build)" {
     var tds = try tdsmod.parseExe(testing.allocator, rich_exe);
     defer tds.deinit();
@@ -897,6 +1263,8 @@ test "TypeGraph: build is deterministic (byte-identical arrays on re-build)" {
     var b = try TypeGraph.build(testing.allocator, &tds);
     defer b.deinit();
     try testing.expectEqualSlices(MemberInfo, a.member_layouts, b.member_layouts);
+    try testing.expectEqualSlices(BaseInfo, a.bases_flat, b.bases_flat);
+    try testing.expectEqualSlices(u16, a.class_first_member, b.class_first_member);
     try testing.expectEqualSlices(EnumeratorInfo, a.enumerators_flat, b.enumerators_flat);
     try testing.expectEqualSlices(Local, a.locals_flat, b.locals_flat);
     try testing.expectEqualSlices(u16, a.scope_seg, b.scope_seg);
@@ -934,6 +1302,10 @@ test "BUG-2: aggregate member sizes summing past 0xFFFF saturate (no overflow pa
     tds.correlations = &.{};
     tds.types = types;
     tds.members = members;
+    tds.classes = &.{};
+    tds.parents = &.{};
+    tds.scope_classes = &.{};
+    tds.module_classes = &.{};
     tds.name_pool = &.{};
     tds.name_starts = &.{};
 

@@ -45,6 +45,20 @@ pub const Tds = struct {
     types: []format.Type,
     members: []format.Member,
 
+    // ---- C++ extension tables (Tier-3; all zero-length for plain C, spec §15) ----
+    /// The Class table (§15.1): one record per C++ class, carrying the inheritance /
+    /// member / vtable linkage. A `TID_CLASS` type record reaches its entry here via its
+    /// `member_type` field = the 1-based Class-table index (see `types.zig`).
+    classes: []format.ClassRecord,
+    /// The Parent table (§15.2): a flat pool of base-class references; a class's bases are
+    /// the `parent_count` records starting at its 1-based `parent_index`.
+    parents: []format.ParentRecord,
+    /// The Scope-Class table (§15.3): one record per scope, present only when a local
+    /// class exists. Retained for completeness; not needed to render a class's members.
+    scope_classes: []format.ScopeClassRecord,
+    /// The Module-Class table (§15.4): one record per module that defines classes.
+    module_classes: []format.ModuleClassRecord,
+
     /// Owned copy of the EOF name pool (1-based, NUL-terminated strings).
     name_pool: []u8,
     /// `name_starts[i]` = byte offset of the (i+1)-th string in `name_pool`.
@@ -109,12 +123,17 @@ pub fn parseTds(gpa: std.mem.Allocator, tds_bytes: []const u8) ParseError!Tds {
     const types = try cur.readTable(a, format.Type, header.types_count);
     const members = try cur.readTable(a, format.Member, header.members_count);
 
-    // ---- C++ extension tables (all zero-length for plain C; spec §15) ----
-    try cur.skip(format.stride(format.ClassRecord) * ext.class_entries);
-    try cur.skip(format.stride(format.ParentRecord) * ext.parent_entries);
-    try cur.skip(format.stride(format.ClassRange) * ext.scope_class_entries);
-    try cur.skip(format.stride(format.ClassRange) * ext.module_class_entries);
+    // ---- C++ extension tables (Tier-3; all zero-length for plain C; spec §15) ----
+    // These are now RETAINED (not skipped) so a C++ class type can render its data
+    // members + inheritance. Reading them with `readTable` keeps the cumulative block
+    // walk identical (same on-disk strides), so the name-pool landing guard below still
+    // validates every count.
+    const classes = try cur.readTable(a, format.ClassRecord, ext.class_entries);
+    const parents = try cur.readTable(a, format.ParentRecord, ext.parent_entries);
+    const scope_classes = try cur.readTable(a, format.ScopeClassRecord, ext.scope_class_entries);
+    const module_classes = try cur.readTable(a, format.ModuleClassRecord, ext.module_class_entries);
     // The 4-byte C++ coverage-prefix word is present iff class_entries > 0 (spec §15.6).
+    // Parser-irrelevant (the name pool is located via the EOF anchor) — still skipped.
     if (ext.class_entries > 0) try cur.skip(4);
 
     // ---- trailing tables (present on every fixture; spec §11) ----
@@ -159,6 +178,10 @@ pub fn parseTds(gpa: std.mem.Allocator, tds_bytes: []const u8) ParseError!Tds {
         .correlations = correlations,
         .types = types,
         .members = members,
+        .classes = classes,
+        .parents = parents,
+        .scope_classes = scope_classes,
+        .module_classes = module_classes,
         .name_pool = name_pool,
         .name_starts = name_starts,
     };
@@ -250,6 +273,7 @@ const all_fixtures = [_]struct { name: []const u8, bytes: []const u8 }{
     .{ .name = "PTR", .bytes = @embedFile("testdata/PTR.EXE") },
     .{ .name = "BENUM", .bytes = @embedFile("testdata/BENUM.EXE") },
     .{ .name = "INC", .bytes = @embedFile("testdata/INC.EXE") },
+    .{ .name = "BBCPP", .bytes = @embedFile("testdata/BBCPP.EXE") },
 };
 
 test "parseExe: TEST.EXE trailer + header counts" {
@@ -372,7 +396,7 @@ test "parseExe: RICH.EXE is multi-module (3 modules / 3 segments / 3 correlation
     try testing.expectEqual(@as(u16, 5), tds.correlations[2].line_count);
 }
 
-test "parseExe: the block walk lands exactly on the name pool for all 12 fixtures" {
+test "parseExe: the block walk lands exactly on the name pool for all 13 fixtures" {
     // This is the catch-all guard: if any record size / table count is wrong, the
     // cumulative walk misses names_pool_start and parseTds returns error.Truncated.
     for (all_fixtures) |fx| {
@@ -454,6 +478,76 @@ test "parseExe: malformed inputs degrade to a clean error (never a crash)" {
         std.mem.writeInt(u32, buf[base + 4 ..][0..4], 0x0010_0000, .little);
         try testing.expectError(error.Truncated, parseExe(testing.allocator, buf));
     }
+}
+
+const cls_exe = @embedFile("testdata/CLS.EXE");
+const mi_exe = @embedFile("testdata/MI.EXE");
+const lcls_exe = @embedFile("testdata/LCLS.EXE");
+
+test "parseExe: CLS.EXE retains the C++ Class / Parent tables (spec §15)" {
+    var tds = try parseExe(testing.allocator, cls_exe);
+    defer tds.deinit();
+
+    // CLS: 2 classes (Base, Derived), 1 parent (Derived → Base), 0 scope-classes, 1 module-class.
+    try testing.expectEqual(@as(usize, 2), tds.classes.len);
+    try testing.expectEqual(@as(usize, 1), tds.parents.len);
+    try testing.expectEqual(@as(usize, 0), tds.scope_classes.len);
+    try testing.expectEqual(@as(usize, 1), tds.module_classes.len);
+
+    // cls1 Base {parent_index=1, parent_count=0, member_index=1, name=96}.
+    const base = tds.classes[0];
+    try testing.expectEqual(@as(u16, 0), base.parent_count);
+    try testing.expectEqual(@as(u16, 1), base.member_index);
+    try testing.expectEqualStrings("Base", tds.name(base.name_index));
+
+    // cls2 Derived {parent_index=1, parent_count=1, member_index=5, name=97}.
+    const der = tds.classes[1];
+    try testing.expectEqual(@as(u16, 1), der.parent_index);
+    try testing.expectEqual(@as(u16, 1), der.parent_count);
+    try testing.expectEqual(@as(u16, 5), der.member_index);
+    try testing.expectEqualStrings("Derived", tds.name(der.name_index));
+
+    // Derived's single parent → class index 1 (Base), not a virtual base.
+    try testing.expectEqual(@as(u16, 1), tds.parents[0].class_index & 0x7FFF);
+    try testing.expectEqual(@as(u16, 0), tds.parents[0].class_index & 0x8000);
+}
+
+test "parseExe: MI.EXE multiple-inheritance Parent table (C → A, B)" {
+    var tds = try parseExe(testing.allocator, mi_exe);
+    defer tds.deinit();
+
+    // MI: 3 classes (B, A, C in table order), 2 parents (C's bases A and B).
+    try testing.expectEqual(@as(usize, 3), tds.classes.len);
+    try testing.expectEqual(@as(usize, 2), tds.parents.len);
+
+    // cls3 C {parent_index=1, parent_count=2} — the multiple-inheritance proof.
+    const c = tds.classes[2];
+    try testing.expectEqualStrings("C", tds.name(c.name_index));
+    try testing.expectEqual(@as(u16, 1), c.parent_index);
+    try testing.expectEqual(@as(u16, 2), c.parent_count);
+
+    // Parent table {2, 1}: C's bases are class 2 (A) then class 1 (B) — declaration order.
+    try testing.expectEqual(@as(u16, 2), tds.parents[0].class_index);
+    try testing.expectEqual(@as(u16, 1), tds.parents[1].class_index);
+    try testing.expectEqualStrings("A", tds.name(tds.classes[1].name_index));
+    try testing.expectEqualStrings("B", tds.name(tds.classes[0].name_index));
+}
+
+test "parseExe: LCLS.EXE local class populates the Scope-Class table" {
+    var tds = try parseExe(testing.allocator, lcls_exe);
+    defer tds.deinit();
+
+    // LCLS: 2 classes (Local, Glob), 0 parents, scope_class_entries == scopes_count == 8.
+    try testing.expectEqual(@as(usize, 2), tds.classes.len);
+    try testing.expectEqual(@as(usize, 0), tds.parents.len);
+    try testing.expectEqual(@as(usize, 8), tds.scope_classes.len);
+    try testing.expectEqual(@as(usize, tds.scopes.len), tds.scope_classes.len);
+
+    try testing.expectEqualStrings("Local", tds.name(tds.classes[0].name_index));
+    try testing.expectEqualStrings("Glob", tds.name(tds.classes[1].name_index));
+    // The {1,1} record is the function scope that defines one local class.
+    try testing.expectEqual(@as(u16, 1), tds.scope_classes[1].class_index);
+    try testing.expectEqual(@as(u16, 1), tds.scope_classes[1].class_count);
 }
 
 test {

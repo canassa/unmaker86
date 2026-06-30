@@ -22,9 +22,11 @@ const symbols = @import("symbols.zig");
 const Symbols = symbols.Symbols;
 const TypeGraph = symbols.TypeGraph;
 const Storage = symbols.Storage;
+const MemberKind = symbols.MemberKind;
 const Tds = @import("tds.zig").Tds;
 
 const bb_exe = @embedFile("testdata/BB.EXE");
+const bbcpp_exe = @embedFile("testdata/BBCPP.EXE");
 
 fn typeStr(tg: *const TypeGraph, ref: u16, buf: []u8) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
@@ -156,4 +158,110 @@ test "black-box BB.EXE: main's locals carry the right storage + types" {
     try testing.expectEqualStrings("enum Mode", typeStr(tg, m.type_ref, &buf));
     try testing.expectEqual(Storage{ .auto = -6 }, p.storage);
     try testing.expectEqualStrings("struct Pixel", typeStr(tg, p.type_ref, &buf));
+}
+
+// ─────────────────────── Tier-3: C++ classes (BBCPP.EXE) ───────────────────────
+//
+// BBCPP.CPP (bcc -v -ml, large model C++) — oracle: docs/research/bcc3-fixtures/BBCPP.LST:
+//   enum Shape { CIRCLE, SQUARE, TRIANGLE };
+//   class Entity { public: int id; int hp; virtual int kind(); };          // size 6
+//   class Monster : public Entity { public: int damage; int kind(); };     // size 8
+//   int main() { Entity e; Monster m; enum Shape s = TRIANGLE; ... }
+// The TDUMP Class Table records: Entity {New Offset 02; id; hp; method kind()},
+// Monster {child of Entity; New Offset 06; damage; method kind()}; main's locals
+// e@[BP-6], m@[BP-14], s@[BP-16].
+
+/// Locate main's innermost scope through the public API: line 30 (the `return`) is in
+/// main's body; lineToAddr → scopeForAddr lands on the scope holding e/m/s.
+fn mainScope(syms: *const Symbols) !usize {
+    const a = syms.index.lineToAddr(0, 30) orelse return error.NoLine;
+    return (&syms.typegraph.?).scopeForAddr(a.segment, a.offset) orelse error.NoScope;
+}
+
+test "black-box BBCPP.EXE: opens as a full TDS C++ source" {
+    var syms = try Symbols.open(testing.allocator, bbcpp_exe, null);
+    defer syms.deinit();
+    try testing.expectEqual(Symbols.Source.tds, syms.source);
+    try testing.expect(syms.typegraph != null);
+    try testing.expectEqual(@as(?u32, 0), syms.index.fileId("BBCPP.CPP"));
+}
+
+test "black-box BBCPP.EXE: a base class renders 'class Entity' with its data members" {
+    var syms = try Symbols.open(testing.allocator, bbcpp_exe, null);
+    defer syms.deinit();
+    const tg = &syms.typegraph.?;
+    const t = syms.tds.?;
+    var buf: [64]u8 = undefined;
+
+    // Reach Entity through main's local `e` (a class-typed local — PUBLIC API only).
+    const scope = try mainScope(&syms);
+    const e = localNamed(tg, t, scope, "e") orelse return error.NoE;
+    try testing.expectEqual(Storage{ .auto = -6 }, e.storage); // [BP-6] per BBCPP.LST
+    try testing.expectEqualStrings("class Entity", typeStr(tg, e.type_ref, &buf));
+
+    // Data members id@2, hp@4 (offset 0..1 is the vtable pointer; New Offset 02), then the
+    // virtual method kind(). Offsets/types from the source + the .LST Class Table.
+    const ms = tg.members(e.type_ref);
+    try testing.expectEqualStrings("id", t.name(ms[0].name_index));
+    try testing.expectEqual(@as(u16, 2), ms[0].byte_offset);
+    try testing.expectEqual(MemberKind.data, ms[0].kind);
+    try testing.expectEqualStrings("int", typeStr(tg, ms[0].type_ref, &buf));
+    try testing.expectEqualStrings("hp", t.name(ms[1].name_index));
+    try testing.expectEqual(@as(u16, 4), ms[1].byte_offset);
+    try testing.expectEqual(MemberKind.data, ms[1].kind);
+    // the virtual method is present as a typed signature (BCC3.1 limit: no vtable detail).
+    try testing.expectEqual(MemberKind.virtual_method, ms[2].kind);
+    try testing.expectEqualStrings("@Entity@kind$qv", t.name(ms[2].name_index));
+
+    // Entity is a root class — no bases.
+    try testing.expectEqual(@as(usize, 0), tg.bases(e.type_ref).len);
+}
+
+test "black-box BBCPP.EXE: a derived class reports its base + its own added member" {
+    var syms = try Symbols.open(testing.allocator, bbcpp_exe, null);
+    defer syms.deinit();
+    const tg = &syms.typegraph.?;
+    const t = syms.tds.?;
+    var buf: [64]u8 = undefined;
+
+    const scope = try mainScope(&syms);
+    const m = localNamed(tg, t, scope, "m") orelse return error.NoM;
+    try testing.expectEqual(Storage{ .auto = -14 }, m.storage); // [BP-14]
+    try testing.expectEqualStrings("class Monster", typeStr(tg, m.type_ref, &buf));
+
+    // Single inheritance: Monster's one base is Entity (non-virtual). BCC3.1 carries no
+    // public/private access byte, so we assert identity + the (false) virtual-base flag.
+    const bs = tg.bases(m.type_ref);
+    try testing.expectEqual(@as(usize, 1), bs.len);
+    try testing.expect(!bs[0].is_virtual);
+    try testing.expectEqualStrings("class Entity", typeStr(tg, bs[0].type_ref, &buf));
+
+    // Monster adds `damage` at offset 6 (Entity subobject is 6 bytes), then overrides kind().
+    const ms = tg.members(m.type_ref);
+    try testing.expectEqualStrings("damage", t.name(ms[0].name_index));
+    try testing.expectEqual(@as(u16, 6), ms[0].byte_offset);
+    try testing.expectEqual(MemberKind.data, ms[0].kind);
+    try testing.expectEqual(MemberKind.virtual_method, ms[1].kind);
+}
+
+test "black-box BBCPP.EXE: enum Shape resolves through main's local s" {
+    var syms = try Symbols.open(testing.allocator, bbcpp_exe, null);
+    defer syms.deinit();
+    const tg = &syms.typegraph.?;
+    const t = syms.tds.?;
+    var buf: [64]u8 = undefined;
+
+    const scope = try mainScope(&syms);
+    const s = localNamed(tg, t, scope, "s") orelse return error.NoS;
+    try testing.expectEqual(Storage{ .auto = -16 }, s.storage); // [BP-16]
+    try testing.expectEqualStrings("enum Shape", typeStr(tg, s.type_ref, &buf));
+
+    const es = tg.enumerators(s.type_ref);
+    try testing.expectEqual(@as(usize, 3), es.len);
+    try testing.expectEqualStrings("CIRCLE", t.name(es[0].name_index));
+    try testing.expectEqual(@as(i32, 0), es[0].value);
+    try testing.expectEqualStrings("SQUARE", t.name(es[1].name_index));
+    try testing.expectEqual(@as(i32, 1), es[1].value);
+    try testing.expectEqualStrings("TRIANGLE", t.name(es[2].name_index));
+    try testing.expectEqual(@as(i32, 2), es[2].value);
 }
