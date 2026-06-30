@@ -29,9 +29,12 @@ test "no host time / RNG / thread / env reads anywhere in src/bus (grep-enforced
     };
     const forbidden = [_][]const u8{
         "std.time",
-        "std.Random", "std.rand",
+        "std.Random",
+        "std.rand",
         "std.Thread",
-        "std.posix.getenv", "std.process.getEnv", "std.os.getenv",
+        "std.posix.getenv",
+        "std.process.getEnv",
+        "std.os.getenv",
     };
     for (sources) |src| {
         for (forbidden) |needle| {

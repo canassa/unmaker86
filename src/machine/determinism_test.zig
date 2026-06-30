@@ -19,11 +19,15 @@ test "no host time / RNG / thread / env / float anywhere in src/machine (grep)" 
     };
     const forbidden = [_][]const u8{
         "std.time",
-        "std.Random", "std.rand",
+        "std.Random",
+        "std.rand",
         "std.Thread",
-        "std.posix.getenv", "std.process.getEnv", "std.os.getenv",
+        "std.posix.getenv",
+        "std.process.getEnv",
+        "std.os.getenv",
         // No floats in the scheduling/timing path (M-D2): reject f32/f64 keys.
-        "f32", "f64",
+        "f32",
+        "f64",
     };
     for (sources) |src| {
         for (forbidden) |needle| {
