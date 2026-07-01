@@ -391,6 +391,13 @@ fn dispatch(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render: ?*R
         // `inspect` (M2-d, §4): a bounded path-addressed peek. `context` (M2-d, §5/R3): the
         // combined one-call-per-stop body (frame + window + backtrace + top-frame locals).
         .dbg_inspect => |c| dbgInspect(sd, dbg_json, c),
+        // `evaluate` (M3-a, §A): a READ-ONLY C-expression evaluator (peek-only, zero cycles).
+        .dbg_evaluate => |c| dbgEvaluate(sd, dbg_json, c),
+        // `set_variable` (M3-b, §B): a DELIBERATE, deterministic MUTATION arm — resolve the
+        // lvalue + encode the value in the pure core, then commit the poke here (the same guarded
+        // path memWritePhys/applyRegSet use). NOT in `isResumeCmd` → no CS:IP advance, no cycles,
+        // no `stop_epoch` bump (B.5).
+        .dbg_set_variable => |c| dbgSetVariable(sd, dbg_json, c),
         .dbg_context => |c| dbgContext(sd, dbg_json, c),
 
         .shutdown_worker => .ok,
@@ -625,6 +632,113 @@ fn writeInspect(s: *SourceDebugger, path: []const u8, v: core.Variable, w: *std.
     try w.writeByte('}');
 }
 
+// ─────────────────────────── evaluate (M3-a, §A) ───────────────────────────
+
+/// `evaluate{frame,expr}` (§A): a READ-ONLY C-expression evaluator. Parses + evaluates `expr`
+/// against the frame's locals/globals + type graph (`core.expr.evaluate`) — PURE, peek-only,
+/// zero cycles, NO guest execution. HONEST typed errors, never a guessed value:
+/// `unsupported_expression` (out-of-subset / float arith / call), `unresolved` (unknown name/
+/// member), `not_lvalue` (`&` of a non-lvalue), `type_error` (bad operand types / OOB index),
+/// `divide_by_zero`. A `<null>` deref / `unreadable` address is a SUCCESSFUL body (honest avail).
+fn dbgEvaluate(sd: ?*SourceDebugger, dbg_json: ?*DebugJsonBuffer, c: q.DbgEvaluateReq) Response {
+    const r = switch (dbgReady(sd, dbg_json)) {
+        .err => |e| return e,
+        .ok => |ok| ok,
+    };
+    var fbuf: [core.MAX_FRAMES]core.Frame = undefined;
+    const frame = frameOrBad(r.s, c.frame, fbuf[0..]) orelse return .{ .err = .bad_frame };
+
+    const expr = c.expr[0..@min(@as(usize, c.expr_len), c.expr.len)];
+    var scratch: [512]u8 = undefined;
+    const v = core.expr.evaluate(r.s, frame, expr, scratch[0..]) catch |e| return .{ .err = evalErr(e) };
+
+    var w = std.Io.Writer.fixed(r.buf.body[0..]);
+    (writeEvaluate(r.s, expr, v, &w)) catch return .{ .err = .response_too_large };
+    return sealJson(r.buf, &w);
+}
+
+fn writeEvaluate(s: *SourceDebugger, expr: []const u8, v: core.Variable, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeAll("{\"expr\":");
+    try std.json.Stringify.encodeJsonString(expr, .{}, w);
+    try w.writeAll(",\"result\":");
+    try writeVariable(s, v, w);
+    try w.writeByte('}');
+}
+
+// ─────────────────────────── set_variable (M3-b, §B) — a DELIBERATE MUTATION ───────────────────────────
+
+/// `set_variable{frame,lvalue,value}` (§B): a DELIBERATE, deterministic poke (the debugger
+/// sibling of write_memory/set_register). The PURE core (`core.expr.resolveWrite`) resolves the
+/// lvalue + type-directed encodes the value into a neutral `{destination, bytes}` plan (D1);
+/// THIS handler commits it through the SAME guarded path memWritePhys/applyRegSet use
+/// (`inSlab` + `writeMemPhys`/`setReg16`/`setReg8`). It does NOT advance CS:IP, charges ZERO
+/// cycles, and does NOT bump `stop_epoch` (B.5). Honest typed errors, never a partial / neighbor-
+/// clobbering / silently-wrapped write: `not_lvalue`, `type_error`, `unresolved`,
+/// `address_out_of_range` (out-of-slab), `unsupported_expression` (float target). After the
+/// write it RE-RENDERS the lvalue (re-resolve + render) so the agent confirms the new value.
+fn dbgSetVariable(sd: ?*SourceDebugger, dbg_json: ?*DebugJsonBuffer, c: q.DbgSetVarReq) Response {
+    const r = switch (dbgReady(sd, dbg_json)) {
+        .err => |e| return e,
+        .ok => |ok| ok,
+    };
+    var fbuf: [core.MAX_FRAMES]core.Frame = undefined;
+    const frame = frameOrBad(r.s, c.frame, fbuf[0..]) orelse return .{ .err = .bad_frame };
+
+    const lvalue = c.lvalue[0..@min(@as(usize, c.lvalue_len), c.lvalue.len)];
+    const value = c.value[0..@min(@as(usize, c.value_len), c.value.len)];
+
+    // 1. PURE: resolve the lvalue + encode the value (the write EFFECT stays off the core).
+    const plan = core.expr.resolveWrite(r.s, frame, lvalue, value) catch |e| return .{ .err = evalErr(e) };
+
+    // 2. COMMIT the poke — the SAME guarded path the mem-write / reg-patch handlers use. S6: the
+    //    memory write ALWAYS routes through `inSlab(computed_linear)` + `writeMemPhys`, so an
+    //    out-of-slab target is an honest `address_out_of_range`, never a wild host write.
+    switch (plan.dest) {
+        .mem => |m| {
+            if (!inSlab(r.s.ctrl, m.linear, m.len)) return .{ .err = .address_out_of_range };
+            r.s.ctrl.writeMemPhys(m.linear, plan.bytes[0..m.len]);
+        },
+        .reg => |rg| {
+            // format.Reg 0-7 (ax..di) → setReg16; 8-15 (al..bh) → setReg8(r-8) — the exact
+            // applyRegSet mapping. The width guard (S3) already ran in the core.
+            if (rg.num < 8) {
+                const v16 = std.mem.readInt(u16, plan.bytes[0..2], .little);
+                r.s.ctrl.setReg16(@enumFromInt(rg.num), v16);
+            } else {
+                r.s.ctrl.setReg8(@enumFromInt(rg.num - 8), plan.bytes[0]);
+            }
+        },
+    }
+
+    // 3. RE-RENDER the lvalue (re-resolve + render through the SAME evaluator) so the agent
+    //    confirms the write landed with the new value.
+    var scratch: [512]u8 = undefined;
+    const v = core.expr.evaluate(r.s, frame, lvalue, scratch[0..]) catch |e| return .{ .err = evalErr(e) };
+
+    var w = std.Io.Writer.fixed(r.buf.body[0..]);
+    (writeSetVar(r.s, lvalue, v, &w)) catch return .{ .err = .response_too_large };
+    return sealJson(r.buf, &w);
+}
+
+/// Map the pure-core `EvalError` vocabulary to the wire `ErrCode` (shared by evaluate + set_variable).
+fn evalErr(e: core.expr.EvalError) q.ErrCode {
+    return switch (e) {
+        error.Unsupported => .unsupported_expression,
+        error.Unresolved => .unresolved,
+        error.NotLvalue => .not_lvalue,
+        error.TypeError => .type_error,
+        error.DivByZero => .divide_by_zero,
+    };
+}
+
+fn writeSetVar(s: *SourceDebugger, lvalue: []const u8, v: core.Variable, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeAll("{\"lvalue\":");
+    try std.json.Stringify.encodeJsonString(lvalue, .{}, w);
+    try w.writeAll(",\"result\":");
+    try writeVariable(s, v, w);
+    try w.writeByte('}');
+}
+
 // ─────────────────────────── context / R3 (M2-d, §5) ───────────────────────────
 
 /// `context{frame,window,max_frames}` (§5/R3): the combined one-call-per-stop body — the
@@ -713,7 +827,14 @@ fn writeVariable(s: *SourceDebugger, v: core.Variable, w: *std.Io.Writer) std.Io
     try w.writeAll("{\"name\":");
     try writeGuestJsonString(w, v.name);
     try w.writeAll(",\"type\":");
-    try writeTypeName(s, v.type_ref, w);
+    // G1: a SYNTHESIZED result (M-S3 `evaluate` literal/arith/`sizeof`/`&`) carries its type
+    // as `type_text` (no `type_ref`); prefer it. A graph-typed result (empty `type_text`)
+    // streams `typeName(type_ref)` exactly as M-S2 — so those bodies stay byte-identical.
+    if (v.type_text.len != 0) {
+        try writeGuestJsonString(w, v.type_text);
+    } else {
+        try writeTypeName(s, v.type_ref, w);
+    }
     try w.print(",\"avail\":\"{s}\"", .{@tagName(v.avail)});
     if (v.avail == .ok) {
         try w.writeAll(",\"value\":");
@@ -721,6 +842,9 @@ fn writeVariable(s: *SourceDebugger, v: core.Variable, w: *std.Io.Writer) std.Io
     }
     if (v.addr) |a| try w.print(",\"addr\":{{\"seg\":{d},\"off\":{d},\"linear\":{d}}}", .{ a.seg, a.off, a.linear });
     if (v.bit_width != 0) try w.print(",\"bit_width\":{d}", .{v.bit_width});
+    // An lvalue result advertises `writable` (M-S3 `set_variable` targets it); omitted (false)
+    // for the M-S2 read paths so their bodies are unchanged.
+    if (v.writable) try w.writeAll(",\"writable\":true");
     try w.print(",\"variables_ref\":{d}}}", .{v.variables_ref});
 }
 

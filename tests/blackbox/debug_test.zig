@@ -163,6 +163,10 @@ const Scopes = struct { scopes: []const ScopeRow = &.{} };
 
 // ── M-S2 inspect / context shapes (mirror worker.zig writeInspect / writeContext) ──
 const Inspect = struct { path: []const u8 = "", result: Variable = .{} };
+/// M-S3 `evaluate` result shape (mirrors worker.zig:writeEvaluate).
+const Evaluate = struct { expr: []const u8 = "", result: Variable = .{} };
+/// M-S3 `set_variable` result shape (mirrors worker.zig:writeSetVar) — the RE-RENDERED lvalue.
+const SetVar = struct { lvalue: []const u8 = "", result: Variable = .{} };
 const CtxFrame = struct { index: u32 = 0, function: ?[]const u8 = null, file: ?[]const u8 = null, line: u32 = 0, addr: FrameAddr = .{} };
 const CtxWindow = struct { has: bool = false, file_id: u32 = 0, active_line: u32 = 0, clamped: bool = false, lines: []const Line = &.{} };
 const Context = struct {
@@ -1031,5 +1035,474 @@ test "M-S2 context (BB.EXE): one call = frame + window + backtrace + locals; det
         const r = try s.requestRaw(.GET, "/api/dbg/context", null);
         try testing.expectEqual(std.http.Status.ok, r.status);
         try testing.expectEqualStrings(det_body[0..det_len], r.body);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M-S3 `evaluate` — the READ-ONLY C-expression evaluator (debug-m3-plan.md §A/§E).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `evaluate` a stopped-frame expression and assert it errored with `code` (the honest typed
+/// signal, never a guessed value). The error text is the JSON-RPC/tool error body.
+fn evalErr(s: *Session, expr: []const u8, code: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    const args = try std.fmt.bufPrint(&buf, "{{\"expr\":{f}}}", .{std.json.fmt(expr, .{})});
+    const m = try mcpCall(s, "evaluate", args);
+    if (!m.is_error) {
+        std.debug.print("evaluate '{s}': expected error {s}, got OK: {s}\n", .{ expr, code, m.text });
+        return error.ExpectedEvalError;
+    }
+    if (std.mem.indexOf(u8, m.text, code) == null) {
+        std.debug.print("evaluate '{s}': expected {s}, got: {s}\n", .{ expr, code, m.text });
+        return error.WrongEvalError;
+    }
+}
+
+/// `evaluate` an expression and return the parsed `Evaluate` (asserting it did NOT error).
+fn evalOk(s: *Session, expr: []const u8) !Evaluate {
+    return evalOkF(s, expr, 0);
+}
+fn evalOkF(s: *Session, expr: []const u8, frame: u16) !Evaluate {
+    var buf: [512]u8 = undefined;
+    const args = try std.fmt.bufPrint(&buf, "{{\"expr\":{f},\"frame\":{d}}}", .{ std.json.fmt(expr, .{}), frame });
+    return mcpOk(s, Evaluate, "evaluate", args);
+}
+
+test "M-S3 evaluate (BB.EXE clamp): C-semantics matrix + arithmetic on locals; peek-only + determinism" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var det_body: [4096]u8 = undefined;
+    var det_len: usize = 0;
+    {
+        var s = try spawn(threaded.io());
+        defer s.deinit();
+        _ = try mcpOk(&s, Bp, "set_source_breakpoint", "{\"file\":\"BB.C\",\"line\":9}");
+        const stop = try s.run(null);
+        try testing.expect(stop.stop.breakpoint != null);
+
+        // Cycle-neutral: a whole battery of `evaluate`s charges ZERO cycles (peek-only, §F).
+        const cyc_before = (try s.status()).cycles;
+
+        // --- arithmetic on real locals (clamp: v=300 auto, lo=BX=0, hi=CX=319). ---
+        try testing.expectEqualStrings("300 (0x12C)", (try evalOk(&s, "v + lo")).result.value);
+        try testing.expectEqualStrings("318 (0x13E)", (try evalOk(&s, "hi - 1")).result.value);
+        try testing.expectEqualStrings("601 (0x259)", (try evalOk(&s, "v * 2 + 1")).result.value);
+        try testing.expectEqualStrings("1 (0x1)", (try evalOk(&s, "v > lo")).result.value);
+
+        // --- the C-semantics DISTINGUISHING matrix (each a value the naive impl gets wrong). ---
+        // C1 unsigned hex literal: 0xFFFF is `unsigned int`, so 0xFFFF > 0 == 1 (not -1 > 0 == 0).
+        try testing.expectEqualStrings("1 (0x1)", (try evalOk(&s, "0xFFFF > 0")).result.value);
+        // C1 decimal `long` literal: 40000 promotes to long ⇒ 40000+40000 == 80000, no 16-bit wrap.
+        {
+            const r = try evalOk(&s, "40000 + 40000");
+            try testing.expect(std.mem.startsWith(u8, r.result.value, "80000 "));
+            try testing.expectEqualStrings("long", r.result.type);
+        }
+        // C6 logical shift of an unsigned literal: 0x8000 >> 1 == 16384 (not sign-propagated).
+        try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "0x8000 >> 1")).result.value, "16384 "));
+        // C3 signed / and % truncate toward zero (@divTrunc/@rem), not floor.
+        try testing.expectEqualStrings("-3 (0xFFFD)", (try evalOk(&s, "-7 / 2")).result.value);
+        try testing.expectEqualStrings("-1 (0xFFFF)", (try evalOk(&s, "-7 % 3")).result.value);
+        // C5 cast conversion order: (int)-1 sign-extends, then reinterpret unsigned ⇒ 0xFFFFFFFF.
+        {
+            const r = try evalOk(&s, "(unsigned long)(int)-1");
+            try testing.expect(std.mem.indexOf(u8, r.result.value, "4294967295") != null);
+            try testing.expect(std.mem.indexOf(u8, r.result.value, "0xFFFFFFFF") != null);
+            try testing.expectEqualStrings("unsigned long", r.result.type);
+        }
+        // C6 shift count ≥ width(promoted-left) ⇒ type_error (never a Zig panic).
+        try evalErr(&s, "1 << 20", "type_error");
+        // sizeof a known type (unevaluated) ⇒ unsigned int size_t.
+        {
+            const r = try evalOk(&s, "sizeof(int)");
+            try testing.expect(std.mem.startsWith(u8, r.result.value, "2 "));
+            try testing.expectEqualStrings("unsigned int", r.result.type);
+        }
+        // Short-circuit: 0 && (1/0) == 0, and the dead branch is NOT evaluated (no divide_by_zero).
+        try testing.expectEqualStrings("0 (0x0)", (try evalOk(&s, "0 && (1/0)")).result.value);
+        // Ternary evaluates only the taken branch.
+        try testing.expectEqualStrings("300 (0x12C)", (try evalOk(&s, "v > 0 ? v : 1/0")).result.value);
+
+        try testing.expectEqual(cyc_before, (try s.status()).cycles); // NOT one cycle charged
+
+        // Capture the raw evaluate body for the byte-identity determinism compare.
+        const r = try s.requestRaw(.GET, "/api/dbg/evaluate?expr=v%20%2B%20lo", null);
+        try testing.expectEqual(std.http.Status.ok, r.status);
+        @memcpy(det_body[0..r.body.len], r.body);
+        det_len = r.body.len;
+    }
+
+    // Determinism: a SECOND fresh session emits a BYTE-IDENTICAL evaluate body.
+    {
+        var s = try spawn(threaded.io());
+        defer s.deinit();
+        _ = try mcpOk(&s, Bp, "set_source_breakpoint", "{\"file\":\"BB.C\",\"line\":9}");
+        _ = try s.run(null);
+        const r = try s.requestRaw(.GET, "/api/dbg/evaluate?expr=v%20%2B%20lo", null);
+        try testing.expectEqual(std.http.Status.ok, r.status);
+        try testing.expectEqualStrings(det_body[0..det_len], r.body);
+    }
+}
+
+test "M-S3 evaluate (BB.EXE main): negative-enum operand (C7) + tag cast" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var s = try spawn(threaded.io());
+    defer s.deinit();
+
+    _ = try mcpOk(&s, Bp, "set_source_breakpoint", "{\"file\":\"BB.C\",\"line\":9}");
+    _ = try s.run(null);
+
+    // Frame 1 = main: `m` is `enum Mode` == GRAPHICS (1). An enum OPERAND promotes to signed int
+    // (C7: sign-extend by typeSize, NOT via isSigned which is false for enums).
+    try testing.expectEqualStrings("1 (0x1)", (try evalOkF(&s, "m + 0", 1)).result.value);
+
+    // C7 distinguisher: poke m's 2 bytes to 0xFFFF; a signed enum operand reads -1, NOT 65535.
+    // (The negative-enumerator case — no negative enumerator exists in enum Mode, so we force the
+    // negative bit pattern; -1 vs 65535 is exactly the sign-extend-vs-zero-extend distinction.)
+    var m_linear: u32 = 0;
+    {
+        const r = try evalOkF(&s, "m", 1);
+        m_linear = r.result.addr.?.linear;
+    }
+    {
+        var poke: [96]u8 = undefined;
+        const body = try std.fmt.bufPrint(&poke, "{{\"phys\":{d},\"data\":\"FFFF\"}}", .{m_linear});
+        const wr = try s.requestRaw(.PUT, "/api/mem", body);
+        try testing.expectEqual(std.http.Status.ok, wr.status);
+    }
+    try testing.expectEqualStrings("-1 (0xFFFF)", (try evalOkF(&s, "m + 0", 1)).result.value);
+
+    // A tag-cast target (needs typeRefForTag): sizeof(struct Pixel) is the struct size, and a
+    // `(struct Pixel *)`-cast member access resolves to `int` (value garbage at this stop — p not
+    // yet assigned — but the type + resolution mechanism is the assertion).
+    try testing.expect(std.mem.startsWith(u8, (try evalOkF(&s, "sizeof(struct Pixel)", 1)).result.value, "5 "));
+    try testing.expectEqualStrings("int", (try evalOkF(&s, "((struct Pixel *)&p)->x", 1)).result.type);
+}
+
+test "M-S3 evaluate (BB2.EXE main): pointer/array/deref/member/sizeof/short-circuit + honest errors" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var s = try Session.spawn(testing.allocator, threaded.io(), "examples/BB2.EXE");
+    defer s.deinit();
+
+    // Break at BB2.C:54 (frame 0 = main; arr={10,20,30,40}, p=&arr[0], np=0, bits{a=5,b=17,c=200}).
+    _ = try mcpOk(&s, Bp, "set_source_breakpoint", "{\"file\":\"BB2.C\",\"line\":54}");
+    const stop = try s.run(null);
+    try testing.expect(stop.stop.breakpoint != null);
+
+    // --- array element by a runtime sub-expression + a LOCAL index. ---
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "arr[0]")).result.value, "10 "));
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "arr[2]")).result.value, "30 "));
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "arr[1 + 1]")).result.value, "30 "));
+
+    // --- deref + pointer arithmetic (scaled by pointee size). ---
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "*p")).result.value, "10 "));
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "p[1]")).result.value, "20 "));
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "*(p + 1)")).result.value, "20 "));
+
+    // --- p + 1 advances by sizeof(int) == 2 bytes (assert the offset delta). ---
+    {
+        const p0 = try evalOk(&s, "p");
+        const p1 = try evalOk(&s, "p + 1");
+        // both render as near-pointer hex "0x....": parse the 16-bit offset out of the value text.
+        const off0 = try std.fmt.parseInt(u16, p0.result.value[2..], 16); // strip "0x"
+        const off1 = try std.fmt.parseInt(u16, p1.result.value[2..], 16);
+        try testing.expectEqual(@as(u16, 2), off1 -% off0);
+    }
+
+    // --- &arr[2] == &arr[0] + 2*sizeof(int); it carries an expandable pointee ref. ---
+    {
+        const r = try evalOk(&s, "&arr[2]");
+        try testing.expectEqualStrings("int *", r.result.type);
+        try testing.expect(r.result.variables_ref != 0);
+    }
+
+    // --- member chains + comparisons. ---
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "bits.a")).result.value, "5 "));
+    try testing.expectEqualStrings("22 (0x16)", (try evalOk(&s, "bits.a + bits.b")).result.value); // 5+17
+
+    // --- null pointer: `np == 0` is TRUE (offset test, not the DS:0000 linear); `*np` is <null>. ---
+    try testing.expectEqualStrings("1 (0x1)", (try evalOk(&s, "np == 0")).result.value);
+    try testing.expectEqualStrings("<null>", (try evalOk(&s, "*np")).result.value);
+    // Short-circuit through a null pointer: `np && np[0]` must NOT deref null → 0, no type_error.
+    try testing.expectEqualStrings("0 (0x0)", (try evalOk(&s, "np && np[0]")).result.value);
+
+    // --- sizeof (UNEVALUATED): sizeof arr == 8 bytes; sizeof *p does NOT deref. ---
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "sizeof arr")).result.value, "8 "));
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "sizeof *p")).result.value, "2 "));
+
+    // --- the EXCLUSIONS as honest typed errors (never a partial eval / guessed value). ---
+    try evalErr(&s, "fact(5)", "unsupported_expression"); // a function CALL (would run the guest)
+    try evalErr(&s, "sum = 1", "unsupported_expression"); // assignment (a side effect)
+    try evalErr(&s, "++sum", "unsupported_expression"); // pre-increment (maximal-munch token)
+    try evalErr(&s, "sum--", "unsupported_expression"); // post-decrement (no partial `sum`)
+    try evalErr(&s, "sum, i", "unsupported_expression"); // comma operator
+    try evalErr(&s, "zzz", "unresolved"); // unknown identifier
+    try evalErr(&s, "&300", "not_lvalue"); // & of a non-lvalue
+    try evalErr(&s, "1 / 0", "divide_by_zero"); // division by zero
+    try evalErr(&s, "arr[999]", "type_error"); // out-of-bounds index (never a wild read)
+    try evalErr(&s, "*sum", "type_error"); // deref of a non-pointer
+    try evalErr(&s, "sum.x", "type_error"); // member of a non-aggregate
+}
+
+test "M-S3 evaluate adversarial parser (BB2.EXE): every malformed input a clean typed error, no crash" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var s = try Session.spawn(testing.allocator, threaded.io(), "examples/BB2.EXE");
+    defer s.deinit();
+
+    _ = try mcpOk(&s, Bp, "set_source_breakpoint", "{\"file\":\"BB2.C\",\"line\":54}");
+    _ = try s.run(null);
+
+    // Each of these MUST return a clean typed error (no crash / hang / panic / unreachable).
+    try evalErr(&s, "1 +", "unsupported_expression"); // trailing operator (incomplete)
+    try evalErr(&s, ")(", "unsupported_expression"); // garbage punctuation
+    try evalErr(&s, "arr..bits", "unsupported_expression"); // `..` is no production
+    try evalErr(&s, "(", "unsupported_expression"); // unterminated paren
+    try evalErr(&s, "arr[", "unsupported_expression"); // unterminated index
+    try evalErr(&s, "\"a string\"", "unsupported_expression"); // string literal — no production
+    try evalErr(&s, "999999999999999999999999999999", "unsupported_expression"); // u64 overflow → refuse
+
+    // A `(((( … ))))` nest past MAX_EVAL_DEPTH (64) — must hit the cap BEFORE native stack overflow.
+    {
+        var deep: [200]u8 = undefined;
+        var n: usize = 0;
+        var k: usize = 0;
+        while (k < 80) : (k += 1) {
+            deep[n] = '(';
+            n += 1;
+        }
+        deep[n] = '1';
+        n += 1;
+        k = 0;
+        while (k < 80) : (k += 1) {
+            deep[n] = ')';
+            n += 1;
+        }
+        try evalErr(&s, deep[0..n], "unsupported_expression");
+    }
+
+    // An OVER-`DBG_EXPR_CAP` (256-byte) expression is REJECTED, never truncated (P1). Build a
+    // >256-byte `1+1+1+…` expression; the MCP boundary rejects it with -32602 (invalid_params).
+    {
+        var big: [600]u8 = undefined;
+        big[0] = '1';
+        var n: usize = 1;
+        while (n < 400) : (n += 2) {
+            big[n] = '+';
+            big[n + 1] = '1';
+        }
+        var argbuf: [1024]u8 = undefined;
+        const args = try std.fmt.bufPrint(&argbuf, "{{\"expr\":{f}}}", .{std.json.fmt(big[0..n], .{})});
+        const m = try mcpCall(&s, "evaluate", args);
+        try testing.expect(m.is_error); // rejected (invalid_params) — never a truncated, wrong expr
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M-S3 `set_variable` — the DELIBERATE, deterministic write (debug-m3-plan.md §B/§E).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `set_variable` a stopped-frame lvalue and return the parsed RE-RENDERED result (asserting no
+/// error). The returned `SetVar` borrows the session arena — consume it before the next request.
+fn setVarOk(s: *Session, lvalue: []const u8, value: []const u8) !SetVar {
+    return setVarOkF(s, lvalue, value, 0);
+}
+fn setVarOkF(s: *Session, lvalue: []const u8, value: []const u8, frame: u16) !SetVar {
+    var buf: [512]u8 = undefined;
+    const args = try std.fmt.bufPrint(&buf, "{{\"lvalue\":{f},\"value\":{f},\"frame\":{d}}}", .{ std.json.fmt(lvalue, .{}), std.json.fmt(value, .{}), frame });
+    return mcpOk(s, SetVar, "set_variable", args);
+}
+/// `set_variable` and assert it errored with `code` (the honest typed signal — never a wild /
+/// partial / neighbor-clobbering / silently-wrapped write).
+fn setVarErr(s: *Session, lvalue: []const u8, value: []const u8, code: []const u8) !void {
+    return setVarErrF(s, lvalue, value, 0, code);
+}
+fn setVarErrF(s: *Session, lvalue: []const u8, value: []const u8, frame: u16, code: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    const args = try std.fmt.bufPrint(&buf, "{{\"lvalue\":{f},\"value\":{f},\"frame\":{d}}}", .{ std.json.fmt(lvalue, .{}), std.json.fmt(value, .{}), frame });
+    const m = try mcpCall(s, "set_variable", args);
+    if (!m.is_error) {
+        std.debug.print("set_variable '{s}={s}': expected error {s}, got OK: {s}\n", .{ lvalue, value, code, m.text });
+        return error.ExpectedSetVarError;
+    }
+    if (std.mem.indexOf(u8, m.text, code) == null) {
+        std.debug.print("set_variable '{s}={s}': expected {s}, got: {s}\n", .{ lvalue, value, code, m.text });
+        return error.WrongSetVarError;
+    }
+}
+
+test "M-S3 set_variable (BB.EXE): local/register/enum writes + re-read; zero-cycle, no CS:IP move; honest errors; determinism" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var det_body: [4096]u8 = undefined;
+    var det_len: usize = 0;
+    {
+        var s = try spawn(threaded.io());
+        defer s.deinit();
+        _ = try mcpOk(&s, Bp, "set_source_breakpoint", "{\"file\":\"BB.C\",\"line\":9}");
+        const stop = try s.run(null);
+        try testing.expect(stop.stop.breakpoint != null);
+
+        // --- LOCAL int (auto) v=300 → 7. Capture the raw HTTP body for the byte-identity
+        //     determinism compare; it doubles as the write+re-read proof. ---
+        {
+            const r = try s.requestRaw(.POST, "/api/dbg/set-variable?lvalue=v&value=7", null);
+            try testing.expectEqual(std.http.Status.ok, r.status);
+            @memcpy(det_body[0..r.body.len], r.body);
+            det_len = r.body.len;
+        }
+        try testing.expectEqualStrings("7 (0x7)", (try evalOk(&s, "v")).result.value); // re-read landed
+
+        // Zero-cycle / no-CS:IP: a battery of writes advances neither cycles nor CS:IP (§B.5).
+        const cpu_before = try s.cpu();
+
+        // --- S4 cross-signedness fit + reinterpret (never a silent wrap). ---
+        try testing.expectEqualStrings("-1 (0xFFFF)", (try setVarOk(&s, "v", "-1")).result.value); // -1 → 0xFFFF
+        try testing.expectEqualStrings("255 (0xFF)", (try setVarOk(&s, "v", "0xFF")).result.value); // hex literal
+        // --- value-as-EXPRESSION RHS (pure evaluate): v = lo + 5 (lo=BX=0) → 5. ---
+        try testing.expectEqualStrings("5 (0x5)", (try setVarOk(&s, "v", "lo + 5")).result.value);
+
+        // --- REGISTER local (frame 0): hi == CX. Write 42, re-read from the LIVE register. ---
+        {
+            const sv = try setVarOk(&s, "hi", "42");
+            try testing.expect(std.mem.startsWith(u8, sv.result.value, "42 "));
+        }
+        try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "hi")).result.value, "42 "));
+
+        // --- ENUM by NAME (frame 1 = main): m = TEXT / HIRES → re-render shows the enumerator. ---
+        {
+            const sv = try setVarOkF(&s, "m", "TEXT", 1);
+            try testing.expect(std.mem.indexOf(u8, sv.result.value, "TEXT") != null);
+        }
+        {
+            const sv = try setVarOkF(&s, "m", "HIRES", 1);
+            try testing.expect(std.mem.indexOf(u8, sv.result.value, "HIRES") != null);
+        }
+
+        // --- honest write errors (each refused BEFORE any state change). ---
+        try setVarErr(&s, "300", "1", "not_lvalue"); // a literal is not assignable
+        try setVarErr(&s, "&v", "1", "not_lvalue"); // an address-of RESULT is an rvalue
+        try setVarErr(&s, "v", "99999", "type_error"); // out of int range → S4 (no silent wrap)
+        try setVarErrF(&s, "i", "1", 1, "type_error"); // main's `i` is an OUTER-frame register (S5)
+        try setVarErrF(&s, "m", "NOPE", 1, "unresolved"); // unknown enumerator name
+        try setVarErrF(&s, "p", "1", 1, "type_error"); // whole struct Pixel is an aggregate target
+
+        // Neither cycles nor CS:IP moved across ALL the writes above (only data/regs changed).
+        const cpu_after = try s.cpu();
+        try testing.expectEqual(cpu_before.cycles, cpu_after.cycles); // ZERO cycles charged
+        try testing.expectEqual(cpu_before.eip, cpu_after.eip); // CS:IP not advanced
+        try testing.expectEqual(cpu_before.cs_base, cpu_after.cs_base);
+    }
+
+    // Determinism: a SECOND fresh session emits a BYTE-IDENTICAL set-variable body for the
+    // same write (proving the poke is a pure, reproducible function of the stop state).
+    {
+        var s = try spawn(threaded.io());
+        defer s.deinit();
+        _ = try mcpOk(&s, Bp, "set_source_breakpoint", "{\"file\":\"BB.C\",\"line\":9}");
+        _ = try s.run(null);
+        const r = try s.requestRaw(.POST, "/api/dbg/set-variable?lvalue=v&value=7", null);
+        try testing.expectEqual(std.http.Status.ok, r.status);
+        try testing.expectEqualStrings(det_body[0..det_len], r.body);
+    }
+}
+
+test "M-S3 set_variable (BB2.EXE): bitfield RMW (neighbor-intact / AND-clear / signed-mask) + member/pointer + null guard" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var s = try Session.spawn(testing.allocator, threaded.io(), "examples/BB2.EXE");
+    defer s.deinit();
+
+    // Break at BB2.C:54 (frame 0 = main; arr={10,20,30,40}, p=&arr[0], np=0, bits{a=5,b=17,c=200}).
+    _ = try mcpOk(&s, Bp, "set_source_breakpoint", "{\"file\":\"BB2.C\",\"line\":54}");
+    const stop = try s.run(null);
+    try testing.expect(stop.stop.breakpoint != null);
+
+    // Read all three bitfields BEFORE (a=5, b=17, c=200) — the baseline for the neighbor-intact proof.
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "bits.a")).result.value, "5 "));
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "bits.b")).result.value, "17 "));
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "bits.c")).result.value, "200 "));
+
+    // --- NEIGHBOR-INTACT: set bits.b = 3; ONLY b changes, a and c are UNCHANGED (S1a: write back
+    //     exactly `csize` bytes, no clobber of the adjacent members in the storage unit). ---
+    {
+        const sv = try setVarOk(&s, "bits.b", "3");
+        try testing.expect(std.mem.startsWith(u8, sv.result.value, "3 ")); // re-rendered target
+    }
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "bits.a")).result.value, "5 ")); // intact
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "bits.c")).result.value, "200 ")); // intact
+
+    // --- AND-CLEAR: bits.c = 0 (from 200, currently NONZERO) → 0, proving AND-clear-then-OR-insert
+    //     (a naive |= could not write the 0 bits). Neighbors a=5, b=3 still intact. ---
+    {
+        const sv = try setVarOk(&s, "bits.c", "0");
+        try testing.expect(std.mem.startsWith(u8, sv.result.value, "0 "));
+    }
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "bits.a")).result.value, "5 "));
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "bits.b")).result.value, "3 "));
+
+    // --- max value fits the width: bits.a = 7 (3-bit max). ---
+    try testing.expect(std.mem.startsWith(u8, (try setVarOk(&s, "bits.a", "7")).result.value, "7 "));
+    // --- SIGNED-VALUE MASK (S1c): writing -1 to a 5-bit field is ACCEPTED (not range-rejected) and
+    //     masked to `width` bits → 0x1F == 31 (the M-S2 renderer reads a bitfield unsigned). ---
+    try testing.expect(std.mem.startsWith(u8, (try setVarOk(&s, "bits.b", "-1")).result.value, "31 "));
+    // --- bitfield RANGE error: 8 does not fit a:3 (range [-4,7]) → type_error (no silent wrap). ---
+    try setVarErr(&s, "bits.a", "8", "type_error");
+
+    // --- struct/array MEMBER (non-bitfield): arr[2] = 99 → re-read; neighbors arr[1],arr[3] intact. ---
+    try testing.expect(std.mem.startsWith(u8, (try setVarOk(&s, "arr[2]", "99")).result.value, "99 "));
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "arr[1]")).result.value, "20 "));
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "arr[3]")).result.value, "40 "));
+
+    // --- write THROUGH a pointer: *p = 55 → *p re-reads 55, and the aliased arr[0] == 55. ---
+    try testing.expect(std.mem.startsWith(u8, (try setVarOk(&s, "*p", "55")).result.value, "55 "));
+    try testing.expect(std.mem.startsWith(u8, (try evalOk(&s, "arr[0]")).result.value, "55 "));
+
+    // --- POINTER LOCAL write: p = 100 → the near pointer's offset becomes 0x0064. ---
+    try testing.expect(std.mem.indexOf(u8, (try setVarOk(&s, "p", "100")).result.value, "0064") != null);
+
+    // --- S2 null-deref guard: `*np` (np == 0) → type_error, refused at lvalue resolution BEFORE any
+    //     write (a null NEAR pointer decodes to in-slab DS:0000, so the slab guard alone would NOT
+    //     catch it — the terminal refusal is the real guard; NO wild write to DS:0). ---
+    try setVarErr(&s, "*np", "1", "type_error");
+
+    // --- AGGREGATE / array targets: no scalar→aggregate assignment. ---
+    try setVarErr(&s, "bits", "1", "type_error");
+    try setVarErr(&s, "arr", "1", "type_error");
+}
+
+test "M-S3 set_variable (BB2.EXE): no stop_epoch bump — a variables_ref survives a write (D2 / §E16)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var s = try Session.spawn(testing.allocator, threaded.io(), "examples/BB2.EXE");
+    defer s.deinit();
+
+    _ = try mcpOk(&s, Bp, "set_source_breakpoint", "{\"file\":\"BB2.C\",\"line\":54}");
+    _ = try s.run(null);
+
+    // Mint an expansion handle for `arr` (an aggregate array) — pull the u64 out BEFORE any other
+    // request (the arena resets on the next requestRaw).
+    var arr_ref: u64 = 0;
+    {
+        const fv = try getDbg(&s, FrameVars, "/api/dbg/frame-variables?frame=0");
+        arr_ref = varNamed(fv, "arr").?.variables_ref;
+        try testing.expect(arr_ref != 0);
+    }
+
+    // A set_variable does NOT bump the epoch (it is not a resume — no CS:IP advance / cycles), so
+    // the outstanding handle is NOT invalidated.
+    _ = try setVarOk(&s, "arr[1]", "77");
+
+    // Re-expand the SAME ref: it still RESOLVES (no stale_handle) AND reflects the NEW value.
+    {
+        var pbuf: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "/api/dbg/variables?ref={d}", .{arr_ref});
+        const ev = try getDbg(&s, ExpandVars, path);
+        try testing.expectEqual(@as(usize, 4), ev.variables.len); // NOT a stale_handle error
+        try testing.expect(std.mem.startsWith(u8, ev.variables[1].value, "77 ")); // the new value
     }
 }

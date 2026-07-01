@@ -270,6 +270,20 @@ pub const Command = union(enum) {
     /// worker parses it. Anything outside the subset (operators/casts/`&`/`*`/calls) →
     /// `unsupported_expression`; a name that does not resolve → `unresolved`. NOT an evaluator.
     dbg_inspect: DbgInspectReq,
+    /// `evaluate` (debug-m3-plan.md §A) — a READ-ONLY C-expression evaluator: parse + evaluate
+    /// `expr` against the frame's locals/globals + type graph (`core.expr.evaluate`), peek-only,
+    /// zero cycles, NO guest execution. The expression is FLATTENED into `expr`/`expr_len` (T9);
+    /// the worker rejects an over-cap length (never truncates — P1). Full 16-bit C integer
+    /// semantics; an out-of-subset form (call / assignment / `++` / float arith) →
+    /// `unsupported_expression`; a bad operand → `type_error`; `/0` → `divide_by_zero`.
+    dbg_evaluate: DbgEvaluateReq,
+    /// `set_variable` (debug-m3-plan.md §B) — a DELIBERATE, deterministic MUTATION: resolve
+    /// `lvalue` (reusing the evaluator, lvalue-required) + type-directed encode `value`, then a
+    /// committed poke via the SAME guarded path `/api/mem`+`/api/cpu/reg` use (worker-side, D1).
+    /// Does NOT advance CS:IP, charges ZERO cycles, does NOT bump `stop_epoch`. Both strings are
+    /// FLATTENED (T9); an over-cap length is REJECTED at the flatten site (never truncated, P1).
+    /// A non-lvalue → `not_lvalue`; an out-of-range value → `type_error` (never a silent wrap).
+    dbg_set_variable: DbgSetVarReq,
     /// `context` (debug-m2-plan.md §5/R3) — ONE body for the current stop: the frame, its
     /// source window (radius `window`, T16b), the backtrace, and the top-frame locals.
     dbg_context: DbgContextReq,
@@ -295,6 +309,30 @@ pub const DbgInspectReq = struct {
     frame: u16 = 0,
     path_len: u16 = 0,
     path: [DBG_PATH_CAP]u8 = @splat(0),
+};
+
+/// `evaluate` request (pointer-free POD, T9): the C expression FLATTENED into a fixed inline
+/// buffer + length (a `[]const u8` would fail the Command pointer-free gate). The listener
+/// REJECTS an over-`DBG_EXPR_CAP` expression at the flatten site (never `@min`-truncates — a
+/// truncated expression is a different, silently-wrong expression, P1). `frame` selects the
+/// stack frame (0 = innermost). Integers + a fixed array ⇒ passes `expectNoPointerFields`.
+pub const DbgEvaluateReq = struct {
+    frame: u16 = 0,
+    expr_len: u16 = 0,
+    expr: [DBG_EXPR_CAP]u8 = @splat(0),
+};
+
+/// `set_variable` request (pointer-free POD, T9): the `lvalue` and `value` strings FLATTENED
+/// into fixed inline buffers + lengths (a `[]const u8` would fail the Command pointer-free
+/// gate). BOTH flatten sites (MCP + HTTP) REJECT an over-`DBG_EXPR_CAP` `lvalue` /
+/// over-`DBG_VALUE_CAP` `value` (never `@min`-truncated — P1). `frame` selects the stack frame
+/// (0 = innermost). Integers + fixed arrays ⇒ passes `expectNoPointerFields(q.Command)`.
+pub const DbgSetVarReq = struct {
+    frame: u16 = 0,
+    lvalue_len: u16 = 0,
+    value_len: u16 = 0,
+    lvalue: [DBG_EXPR_CAP]u8 = @splat(0),
+    value: [DBG_VALUE_CAP]u8 = @splat(0),
 };
 
 /// `context` request (pointer-free POD, R3). `frame` selects the top frame for the window +
@@ -330,6 +368,12 @@ pub const DbgJsonResult = struct { body_len: u32 = 0 };
 // truncated at the worker copy (display-only; never a borrowed slice on the queue).
 pub const DBG_PATH_CAP = 128;
 pub const DBG_NAME_CAP = 128;
+/// Max `evaluate` expression length (debug-m3-plan.md §C.1). A longer expression is REJECTED
+/// at every flatten site (MCP + HTTP), never `@min`-truncated (P1).
+pub const DBG_EXPR_CAP = 256;
+/// Max `set_variable` value literal length (debug-m3-plan.md §C.1). A longer value is REJECTED
+/// at every flatten site (MCP + HTTP), never `@min`-truncated (P1).
+pub const DBG_VALUE_CAP = 64;
 /// Mirrors `core.MAX_SPECS` — the SourceDebugger spec table size.
 pub const DBG_MAX_SPECS = 64;
 
@@ -551,6 +595,18 @@ pub const ErrCode = enum {
     /// path-addressed peek; use the future evaluator" signal (debug-m2-plan.md §4). → HTTP
     /// 400. NEVER a guessed / partially-evaluated result (CLAUDE.md §2).
     unsupported_expression,
+    // ---- source-level debug M-S3 `evaluate` (debug-m3-plan.md §C.1) ----
+    /// An `evaluate`/`set_variable` operand had the wrong type for the operation (deref of a
+    /// non-pointer, member of a non-aggregate, struct arithmetic, an out-of-bounds index, a
+    /// shift count `<0`/`≥width`, `&bitfield`, an unreadable operand mid-arithmetic, or a
+    /// value out of the target's range). → HTTP 400. NEVER a guessed / silently-wrapped value.
+    type_error,
+    /// Integer division or modulo by zero in `evaluate` — refused host-side, NEVER a guest CPU
+    /// trap. → HTTP 400.
+    divide_by_zero,
+    /// `&` of a non-lvalue (a literal / arithmetic result / a register-resident value), or a
+    /// `set_variable` target that is not an assignable lvalue. → HTTP 400.
+    not_lvalue,
 };
 
 /// The per-session snapshot-slot cap (snapshot-restore-plan §3 / Decision D1; LOCKED).

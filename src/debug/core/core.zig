@@ -222,6 +222,11 @@ pub const MAX_FRAMES: usize = 256;
 /// directed renderer. On the `src/debug` grep gate like the rest of `core/`.
 pub const vars = @import("vars.zig");
 
+/// The M-S3 `evaluate` C-expression evaluator (READ-ONLY). Pure, peek-only, zero-cycle — on
+/// the `src/debug` grep gate + a dedicated guest-exec/write-symbol assertion so it can never
+/// execute the guest or write state.
+pub const expr = @import("expr.zig");
+
 /// The host-side expansion-handle node (minted/validated by `SourceDebugger`); re-exported
 /// so the worker's `variables{ref}` serializer names it without reaching into `debugger.zig`.
 pub const ExpandNode = @import("debugger.zig").ExpandNode;
@@ -271,6 +276,13 @@ pub const Variable = struct {
     /// Bitfield width in bits (0 = not a bitfield) — carried for the member render only.
     bit_width: u8 = 0,
     writable: bool = false,
+    /// A SYNTHESIZED type name (M-S3 `evaluate`): an arithmetic/literal/`sizeof`/`&` result
+    /// has no `type_ref` (so `typeName` would render `"?"`). When non-empty, `writeVariable`
+    /// prefers this borrowed string over streaming `typeName(type_ref)`. Empty ("") for every
+    /// graph-typed result (M-S2 locals/inspect), so their rendering is byte-identical. Like
+    /// `name`/`value_text`, a transient worker-side render view — EXCLUDED from the reflection
+    /// gate (never snapshotted, never a slice on `q.Response`).
+    type_text: []const u8 = "",
 };
 
 /// The per-expand child cap (a struct's member count / an array page). An array larger than

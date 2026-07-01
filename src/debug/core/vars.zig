@@ -153,14 +153,15 @@ pub fn renderChild(sd: *SourceDebugger, node: ExpandNode, index: usize, scratch:
 
 // ─────────────────────────── the value renderer ───────────────────────────
 
-/// Where a value lives.
-const Place = union(enum) {
+/// Where a value lives. `pub` so the M-S3 expression evaluator (`expr.zig`) composes the
+/// same value-location union the M-S2 renderer/resolver use.
+pub const Place = union(enum) {
     mem: u32, // physical linear (bounds-checked against the RAM slab on read)
     reg: u8, // frame-0 x86 register number (format.Reg)
     imm: i64, // a constant/absolute immediate
 };
 
-fn renderValueAt(
+pub fn renderValueAt(
     sd: *SourceDebugger,
     name: []const u8,
     type_ref: u16,
@@ -333,7 +334,7 @@ fn renderAggregateChild(sd: *SourceDebugger, node: ExpandNode, index: usize, scr
 
 /// The starting bit of member `mi` within its bitfield container: the sum of the widths of
 /// the immediately-preceding bitfield members sharing the same `byte_offset`.
-fn bitfieldStart(ms: []const types.MemberInfo, mi: usize) u32 {
+pub fn bitfieldStart(ms: []const types.MemberInfo, mi: usize) u32 {
     var start: u32 = 0;
     var k: usize = mi;
     while (k > 0) {
@@ -351,7 +352,7 @@ fn renderBitfield(sd: *SourceDebugger, name: []const u8, m: types.MemberInfo, li
 /// Extract and render a bitfield of `width` bits starting at `bit_start` from the container
 /// at `linear` (masked from the container's `typeSize` bytes, LE). An out-of-slab container
 /// is HONESTLY `unreadable`. Shared by the member-expansion path and the `inspect` walk.
-fn renderBitfieldAt(sd: *SourceDebugger, name: []const u8, type_ref: u16, linear: u32, addr: Addr, width: u8, bit_start: u32, scratch: []u8) Variable {
+pub fn renderBitfieldAt(sd: *SourceDebugger, name: []const u8, type_ref: u16, linear: u32, addr: Addr, width: u8, bit_start: u32, scratch: []u8) Variable {
     const csize: u16 = @min(typeSize(sd, type_ref), 8);
     var bytes: [8]u8 = @splat(0);
     if (!readMem(sd, linear, bytes[0..csize])) return .{ .name = name, .type_ref = type_ref, .addr = addr, .bit_width = width, .avail = .unreadable };
@@ -368,7 +369,11 @@ fn renderBitfieldAt(sd: *SourceDebugger, name: []const u8, type_ref: u16, linear
 /// the real-mode segment base (far/huge → the stored `seg:off`; a near pointer → the segment
 /// implied by its `PtrKind`). Shared by the deref-minting path and the `inspect` walk so both
 /// compute a pointee target identically.
-fn ptrTarget(sd: *SourceDebugger, kind: types.PtrKind, bytes: []const u8) struct { addr: Addr, is_null: bool } {
+/// A decoded pointer's target: the resolved `addr` (real-mode segment base applied per
+/// `PtrKind`) and whether the stored pointer was null. `pub` so `expr.zig` names the type.
+pub const PtrTarget = struct { addr: Addr, is_null: bool };
+
+pub fn ptrTarget(sd: *SourceDebugger, kind: types.PtrKind, bytes: []const u8) PtrTarget {
     const snap = sd.ctrl.cpuSnapshot();
     if (bytes.len >= 4 and (kind == .far or kind == .huge)) {
         const off = std.mem.readInt(u16, bytes[0..2], .little);
@@ -409,7 +414,7 @@ fn pointeeIsNull(node: ExpandNode) bool {
 /// the RAM slab — else return false (`unreadable`, never `unmapped_fill` as a value). This
 /// is the pure core's own containment guard (worker `inSlab` analog, §3.3) via the public
 /// `Controller.ramSlabSize`, keeping `vars.zig` off any `ctrl.m` internal.
-fn readMem(sd: *SourceDebugger, linear: u32, dst: []u8) bool {
+pub fn readMem(sd: *SourceDebugger, linear: u32, dst: []u8) bool {
     const total = sd.ctrl.ramSlabSize();
     const end = @as(u64, linear) + @as(u64, dst.len);
     if (end > total) return false;
@@ -419,7 +424,7 @@ fn readMem(sd: *SourceDebugger, linear: u32, dst: []u8) bool {
 
 /// Read an x86 register (frame 0) into `dst` (LE), per T7: Reg 0-7 → low 16 of eXX; Reg
 /// 8-11 (al cl dl bl) → low byte; Reg 12-15 (ah ch dh bh) → (eXX>>8)&0xFF.
-fn readReg(sd: *SourceDebugger, r: u8, dst: []u8) void {
+pub fn readReg(sd: *SourceDebugger, r: u8, dst: []u8) void {
     const snap = sd.ctrl.cpuSnapshot();
     const gp = [8]u32{ snap.eax, snap.ecx, snap.edx, snap.ebx, snap.esp, snap.ebp, snap.esi, snap.edi };
     var val: u32 = 0;
@@ -437,7 +442,7 @@ fn readReg(sd: *SourceDebugger, r: u8, dst: []u8) void {
     if (dst.len > n) @memset(dst[n..], 0);
 }
 
-fn leBytes(bytes: []const u8) u64 {
+pub fn leBytes(bytes: []const u8) u64 {
     var v: u64 = 0;
     var i: usize = bytes.len;
     while (i > 0) {
@@ -447,7 +452,7 @@ fn leBytes(bytes: []const u8) u64 {
     return v;
 }
 
-fn signExtend(raw: u64, size: usize) i64 {
+pub fn signExtend(raw: u64, size: usize) i64 {
     if (size == 0 or size >= 8) return @bitCast(raw);
     const bits: u6 = @intCast(size * 8);
     const sign_bit = @as(u64, 1) << (bits - 1);
@@ -458,20 +463,20 @@ fn signExtend(raw: u64, size: usize) i64 {
     return @bitCast(raw);
 }
 
-fn isSigned(id: TypeId) bool {
+pub fn isSigned(id: TypeId) bool {
     return switch (id) {
         .schar, .sint, .slong, .squad, .pchar => true,
         else => false,
     };
 }
 
-fn typeSize(sd: *SourceDebugger, type_ref: u16) u16 {
+pub fn typeSize(sd: *SourceDebugger, type_ref: u16) u16 {
     const s = if (sd.syms) |*sy| sy else return 0;
     const tg = if (s.typegraph) |*g| g else return 0;
     return tg.typeSize(type_ref);
 }
 
-fn tdsName(sd: *SourceDebugger, name_index: u16) []const u8 {
+pub fn tdsName(sd: *SourceDebugger, name_index: u16) []const u8 {
     const s = if (sd.syms) |*sy| sy else return "";
     if (s.tds) |t| return t.name(name_index);
     return "";
@@ -488,7 +493,7 @@ fn tagOrName(sd: *SourceDebugger, type_ref: u16) []const u8 {
     return "";
 }
 
-fn unreadableVar(name: []const u8, type_ref: u16) Variable {
+pub fn unreadableVar(name: []const u8, type_ref: u16) Variable {
     return .{ .name = name, .type_ref = type_ref, .avail = .unreadable };
 }
 
@@ -529,7 +534,7 @@ const Seg = union(enum) { field: []const u8, arrow: []const u8, index: u32 };
 
 /// The current resolution position: a type plus WHERE its value lives, and (when the node is
 /// a bitfield member) the extraction window for the terminal render.
-const Cursor = struct {
+pub const Cursor = struct {
     type_ref: u16,
     place: Place,
     addr: ?Addr,
@@ -538,7 +543,7 @@ const Cursor = struct {
 
 /// One walk step outcome: either a new cursor, or a TERMINAL value that ends the walk (a
 /// `<null>` deref or an `unreadable` address — honest short-circuits, not errors).
-const StepOut = union(enum) { cur: Cursor, terminal: Variable };
+pub const StepOut = union(enum) { cur: Cursor, terminal: Variable };
 
 /// Resolve `path` against `frame`'s locals + the type graph and render the resolved variable
 /// (value + type + an expandable `variables_ref` for an aggregate/array/pointer), exactly like
@@ -646,7 +651,7 @@ fn stepOne(sd: *SourceDebugger, cur: Cursor, seg: Seg, path: []const u8) Inspect
 
 /// `.field` — a struct/class DATA member by name. Non-aggregate / non-memory / method or
 /// missing member → `Unresolved` (a typed refusal, never a wild read).
-fn fieldAccess(sd: *SourceDebugger, cur: Cursor, name: []const u8) InspectError!StepOut {
+pub fn fieldAccess(sd: *SourceDebugger, cur: Cursor, name: []const u8) InspectError!StepOut {
     if (cur.bit != null) return error.Unresolved; // a bitfield scalar has no members
     const addr = cur.addr orelse return error.Unresolved; // a register/immediate aggregate is not addressable
     const ti = typeInfoOf(sd, cur.type_ref) orelse return error.Unresolved;
@@ -669,7 +674,7 @@ fn fieldAccess(sd: *SourceDebugger, cur: Cursor, name: []const u8) InspectError!
 /// Dereference the pointer AT `cur` one level, yielding a cursor at the pointee (an aggregate
 /// base for a following `->field`). A null pointer → a `<null>` terminal; an out-of-slab
 /// pointer read → an `unreadable` terminal (both honest — never a wild read).
-fn derefStep(sd: *SourceDebugger, cur: Cursor, path: []const u8) InspectError!StepOut {
+pub fn derefStep(sd: *SourceDebugger, cur: Cursor, path: []const u8) InspectError!StepOut {
     const ti = typeInfoOf(sd, cur.type_ref) orelse return error.Unresolved;
     if (ti != .pointer) return error.Unresolved;
     const p = ti.pointer;
@@ -688,7 +693,7 @@ fn derefStep(sd: *SourceDebugger, cur: Cursor, path: []const u8) InspectError!St
 /// `[i]` — an array element (bounds-checked against the declared count) or a pointer element
 /// (deref + `i * sizeof(pointee)`). Anything else → `Unresolved`; an out-of-bounds array
 /// index → `Unresolved` (a typed refusal, never a wild read past the array).
-fn indexAccess(sd: *SourceDebugger, cur: Cursor, i: u32, path: []const u8) InspectError!StepOut {
+pub fn indexAccess(sd: *SourceDebugger, cur: Cursor, i: u32, path: []const u8) InspectError!StepOut {
     if (cur.bit != null) return error.Unresolved;
     const ti = typeInfoOf(sd, cur.type_ref) orelse return error.Unresolved;
     switch (ti) {
@@ -719,11 +724,11 @@ fn indexAccess(sd: *SourceDebugger, cur: Cursor, i: u32, path: []const u8) Inspe
     }
 }
 
-fn nullVar(name: []const u8) Variable {
+pub fn nullVar(name: []const u8) Variable {
     return .{ .name = name, .value_text = "<null>", .avail = .ok };
 }
 
-fn typeInfoOf(sd: *SourceDebugger, type_ref: u16) ?types.TypeInfo {
+pub fn typeInfoOf(sd: *SourceDebugger, type_ref: u16) ?types.TypeInfo {
     const s = if (sd.syms) |*sy| sy else return null;
     const tg = if (s.typegraph) |*g| g else return null;
     return tg.typeInfo(type_ref);

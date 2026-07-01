@@ -391,6 +391,41 @@ pub const TypeGraph = struct {
         return .{ .typedef = .{ .name_index = s.name, .aliased = s.type } };
     }
 
+    /// The kind of a tag a cast type-name names (`struct`/`union`/`class`/`enum`).
+    pub const TagKind = enum { struct_, union_, class_, enum_ };
+
+    /// Reverse lookup a `struct`/`union`/`class`/`enum` TAG name → its 1-based type_ref
+    /// (M-S3 cast targets, e.g. `(struct Pixel *)p`). A bounded, table-order scan matching
+    /// both the record `id` and the tag `name` (first match wins — documented deterministic
+    /// resolution for duplicate tags across modules). Null if no such tag exists. Pure,
+    /// integer-only — stays on both determinism gates.
+    pub fn typeRefForTag(self: *const TypeGraph, name: []const u8, kind: TagKind) ?u16 {
+        for (self.tds.types, 0..) |t, i| {
+            const id: TypeId = @enumFromInt(t.id);
+            const ok = switch (kind) {
+                .struct_ => id == .@"struct",
+                .union_ => id == .@"union",
+                .class_ => id == .class,
+                .enum_ => id == .@"enum",
+            };
+            if (!ok) continue;
+            if (std.mem.eql(u8, tagName(self.tds, t.name), name)) return @intCast(i + 1);
+        }
+        return null;
+    }
+
+    /// The 1-based type_ref of the FIRST built-in scalar record whose `TypeId` is `id`
+    /// (M-S3 pointer-to-primitive cast targets, e.g. `(int *)addr`). The predefined
+    /// primitives are materialised as real low-index records (§12 type-reference model), so
+    /// a table-order scan finds the canonical one deterministically. Null if the image
+    /// carries no record of that primitive. Pure, integer-only.
+    pub fn typeRefForPrimitive(self: *const TypeGraph, id: TypeId) ?u16 {
+        for (self.tds.types, 0..) |t, i| {
+            if (@as(TypeId, @enumFromInt(t.id)) == id) return @intCast(i + 1);
+        }
+        return null;
+    }
+
     /// The struct/union members (with byte offsets) of `type_ref`; empty if it is not
     /// an aggregate (§13). The slice is borrowed from the graph.
     pub fn members(self: *const TypeGraph, type_ref: u16) []const MemberInfo {

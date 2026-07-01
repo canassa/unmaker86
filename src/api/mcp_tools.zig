@@ -463,6 +463,20 @@ pub const tools = [_]Tool{
         ,
     },
     .{
+        .name = "evaluate",
+        .description = "Evaluate a C expression in the selected stopped frame and return the resulting value {value, type, addr?, variables_ref}. READ-ONLY: pure peek, zero cycles, NO guest execution — so function calls f(...) are refused (unsupported_expression), as are assignment/++/-- (use set_variable). Full 16-bit C integer semantics: promotion, signedness, pointer arithmetic scaled by pointee size, casts, sizeof, &, *, [], ., ->, ?:, && || (short-circuit). An aggregate/pointer result carries a variables_ref (expand via `variables`). Honest typed errors, never a guessed value: unsupported_expression (out-of-subset / float arithmetic / call), unresolved (unknown name/member), not_lvalue (& of a non-lvalue), type_error (bad operand types / out-of-bounds index / scalar-vs-aggregate), divide_by_zero. Valid only when stopped.",
+        .input_schema =
+        \\{"type":"object","properties":{"expr":{"type":"string","minLength":1,"description":"C expression (e.g. v + lo, *p, &arr[2], p->next->val, sizeof(struct Pixel), (int)c)"},"frame":{"type":"integer","minimum":0,"description":"0-based frame from backtrace (default 0)"}},"required":["expr"],"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "set_variable",
+        .description = "MUTATES guest state: write `value` into the lvalue `lvalue` in the selected stopped frame — a DELIBERATE, deterministic poke (the debugger sibling of write_memory/set_register; does NOT advance the CPU or charge cycles). The lvalue is any assignable target (n, p.x, arr[i], *p, node->next->val, incl. bitfields); a non-lvalue -> not_lvalue. `value` is an integer/char/pointer literal, an enum enumerator NAME, or an expression reducing to a scalar. Out-of-range for the target type -> type_error (never a silent wrap). Writing an outer-frame register -> type_error (callee-clobbered, unmapped). Writing through a null/unreadable pointer -> type_error (no wild write). Returns the RE-RENDERED variable so you can confirm the new value. Valid only when stopped.",
+        .input_schema =
+        \\{"type":"object","properties":{"lvalue":{"type":"string","minLength":1,"description":"assignable target (e.g. n, p.color, arr[2], *p)"},"value":{"type":"string","minLength":1,"description":"integer/char/pointer literal, enum name, or a scalar expression"},"frame":{"type":"integer","minimum":0,"description":"0-based frame (default 0)"}},"required":["lvalue","value"],"additionalProperties":false}
+        ,
+    },
+    .{
         .name = "context",
         .description = "ONE snapshot for the current stop, minimizing round-trips: the current frame {function,file,line,addr}, a numbered source window (`window` lines each side), the full backtrace (innermost first), and the top frame's locals. Prefer this on every stop instead of separate whereami/backtrace/frame_variables calls. Each section degrades honestly (no source line -> \"window\":null; no symbols -> address-only frame + \"locals\":[]). Valid only when stopped.",
         .input_schema =

@@ -64,7 +64,7 @@ const Seg = cpu_mod.Seg;
 const HTTP_HEADER_MAX = 16 * 1024; // also the head-parse buffer; undersize → 413/oversize-head
 const WRITE_BUF = 8 * 1024;
 const MAX_BODY = 64 * 1024; // > MAX_MEM_CHUNK*2 hex + JSON overhead; reject larger with 413
-const RESPONSE_BUF = 48 * 1024; // serialized JSON body (tools/list grew to ~37.6 KiB with the M-S1 debug tools)
+const RESPONSE_BUF = 64 * 1024; // serialized JSON body (tools/list grew past 48 KiB once the M-S3 `evaluate` tool joined the M-S1/M-S2 debug catalog)
 
 /// Worst-case size of a per-`Conn` CAPTURE buffer (Finding 2): the largest raw frame
 /// payload a capture path copies out from under `session.lock` before the unbounded
@@ -1228,6 +1228,50 @@ pub const Conn = struct {
                 }
             }
             return self.submitDebuggerJsonAndRespond(req, .{ .dbg_inspect = cmd });
+        }
+        if (std.mem.eql(u8, path, "/api/dbg/evaluate")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            const fr: u16 = @intCast(@min(self.queryU32(query, "frame") orelse 0, 0xFFFF));
+            const raw = queryValue(query, "expr") orelse
+                return self.respondError(req, .bad_request, "bad_request", "evaluate expects ?expr=<C expression>");
+            var cmd = q.DbgEvaluateReq{ .frame = fr };
+            // P1: percent-decode into a buffer ONE larger than the cap and REJECT an
+            // over-`DBG_EXPR_CAP` expression — NEVER `@min`-truncate (a truncated expression is
+            // a different, silently-wrong expression, CLAUDE.md §2).
+            var dec: [q.DBG_EXPR_CAP + 1]u8 = undefined;
+            const d = percentDecode(dec[0..], raw) orelse
+                return self.respondError(req, .bad_request, "bad_request", "malformed or over-length expression");
+            if (d.len > cmd.expr.len)
+                return self.respondError(req, .bad_request, "bad_request", "expression exceeds DBG_EXPR_CAP");
+            @memcpy(cmd.expr[0..d.len], d);
+            cmd.expr_len = @intCast(d.len);
+            return self.submitDebuggerJsonAndRespond(req, .{ .dbg_evaluate = cmd });
+        }
+        if (std.mem.eql(u8, path, "/api/dbg/set-variable")) {
+            if (method != .POST) return self.methodNotAllowed(req);
+            const fr: u16 = @intCast(@min(self.queryU32(query, "frame") orelse 0, 0xFFFF));
+            const rawlv = queryValue(query, "lvalue") orelse
+                return self.respondError(req, .bad_request, "bad_request", "set-variable expects ?lvalue=<lvalue>&value=<value>");
+            const rawval = queryValue(query, "value") orelse
+                return self.respondError(req, .bad_request, "bad_request", "set-variable expects ?lvalue=<lvalue>&value=<value>");
+            var cmd = q.DbgSetVarReq{ .frame = fr };
+            // P1: percent-decode into buffers ONE larger than the cap and REJECT an over-cap
+            // lvalue/value — NEVER `@min`-truncate (a truncated lvalue/value is a different one).
+            var lvbuf: [q.DBG_EXPR_CAP + 1]u8 = undefined;
+            const lv = percentDecode(lvbuf[0..], rawlv) orelse
+                return self.respondError(req, .bad_request, "bad_request", "malformed or over-length lvalue");
+            if (lv.len > cmd.lvalue.len)
+                return self.respondError(req, .bad_request, "bad_request", "lvalue exceeds DBG_EXPR_CAP");
+            var valbuf: [q.DBG_VALUE_CAP + 1]u8 = undefined;
+            const val = percentDecode(valbuf[0..], rawval) orelse
+                return self.respondError(req, .bad_request, "bad_request", "malformed or over-length value");
+            if (val.len > cmd.value.len)
+                return self.respondError(req, .bad_request, "bad_request", "value exceeds DBG_VALUE_CAP");
+            @memcpy(cmd.lvalue[0..lv.len], lv);
+            cmd.lvalue_len = @intCast(lv.len);
+            @memcpy(cmd.value[0..val.len], val);
+            cmd.value_len = @intCast(val.len);
+            return self.submitDebuggerJsonAndRespond(req, .{ .dbg_set_variable = cmd });
         }
         if (std.mem.eql(u8, path, "/api/dbg/context")) {
             if (method != .GET) return self.methodNotAllowed(req);
@@ -2483,6 +2527,46 @@ pub const Conn = struct {
             return self.submitMcpDebuggerJsonAndRespond(req, id, target, .{ .dbg_inspect = cmd });
         }
 
+        // `evaluate` (M-S3 §A) — a READ-ONLY C-expression evaluator. The `expr` string is
+        // FLATTENED into the pointer-free command POD (T9); the worker parses/evaluates it. A
+        // missing/non-string `expr` is -32602 (fix the call); an OVER-`DBG_EXPR_CAP` expression
+        // is REJECTED here (never `@min`-truncated — a truncated expression is a different,
+        // silently-wrong one, P1). Out-of-subset / bad-operand forms return the honest typed
+        // tool error from the worker (unsupported_expression / type_error / divide_by_zero / …).
+        if (std.mem.eql(u8, name, "evaluate")) {
+            const ev = if (args == .object) args.object.get("expr") else null;
+            if (ev == null or ev.? != .string) return self.respondRpcError(req, id, .invalid_params, "evaluate expects {expr:string, frame?:integer}");
+            const e = ev.?.string;
+            if (e.len > q.DBG_EXPR_CAP) return self.respondRpcError(req, id, .invalid_params, "expression exceeds DBG_EXPR_CAP");
+            var cmd = q.DbgEvaluateReq{ .frame = mcpFrameArg(args) };
+            @memcpy(cmd.expr[0..e.len], e);
+            cmd.expr_len = @intCast(e.len);
+            return self.submitMcpDebuggerJsonAndRespond(req, id, target, .{ .dbg_evaluate = cmd });
+        }
+
+        // `set_variable` (M-S3 §B) — a DELIBERATE MUTATION: write `value` into the lvalue
+        // `lvalue`. Both strings are FLATTENED into the pointer-free command POD (T9); the worker
+        // resolves + encodes + commits the poke. A missing/non-string `lvalue`/`value` is -32602
+        // (fix the call); an OVER-cap `lvalue`/`value` is REJECTED here (never `@min`-truncated —
+        // a truncated lvalue/value is a different one, P1). A non-lvalue / out-of-range value / etc.
+        // returns the honest typed tool error from the worker (not_lvalue / type_error / …).
+        if (std.mem.eql(u8, name, "set_variable")) {
+            const lvj = if (args == .object) args.object.get("lvalue") else null;
+            const vvj = if (args == .object) args.object.get("value") else null;
+            if (lvj == null or lvj.? != .string or vvj == null or vvj.? != .string)
+                return self.respondRpcError(req, id, .invalid_params, "set_variable expects {lvalue:string, value:string, frame?:integer}");
+            const lv = lvj.?.string;
+            const vv = vvj.?.string;
+            if (lv.len > q.DBG_EXPR_CAP) return self.respondRpcError(req, id, .invalid_params, "lvalue exceeds DBG_EXPR_CAP");
+            if (vv.len > q.DBG_VALUE_CAP) return self.respondRpcError(req, id, .invalid_params, "value exceeds DBG_VALUE_CAP");
+            var cmd = q.DbgSetVarReq{ .frame = mcpFrameArg(args) };
+            @memcpy(cmd.lvalue[0..lv.len], lv);
+            cmd.lvalue_len = @intCast(lv.len);
+            @memcpy(cmd.value[0..vv.len], vv);
+            cmd.value_len = @intCast(vv.len);
+            return self.submitMcpDebuggerJsonAndRespond(req, id, target, .{ .dbg_set_variable = cmd });
+        }
+
         // `context` (M-S2 §5/R3) — one snapshot for the current stop. `window` is the source
         // radius (T16b, NOT `context`); `max_frames` bounds the backtrace.
         if (std.mem.eql(u8, name, "context")) {
@@ -3562,6 +3646,13 @@ pub const Conn = struct {
             // An inspect path outside the bounded subset — 400, never a guessed value. The
             // full C-expression evaluator is deferred to M-S3.
             .unsupported_expression => .{ .status = .bad_request, .code = "unsupported_expression", .msg = "path uses an unsupported form (operator/cast/&/*/call); inspect reads member/index paths only" },
+            // ---- source-level debug M-S3 `evaluate` (debug-m3-plan.md §C.1) ----
+            // A bad operand type / out-of-bounds index / out-of-range value — 400, never a guess.
+            .type_error => .{ .status = .bad_request, .code = "type_error", .msg = "operand types are invalid for the operation (deref of non-pointer, member of non-aggregate, out-of-bounds index, bad shift count, or out-of-range value)" },
+            // Integer division / modulo by zero — refused host-side, never a guest trap — 400.
+            .divide_by_zero => .{ .status = .bad_request, .code = "divide_by_zero", .msg = "integer division or modulo by zero" },
+            // `&` of a non-lvalue, or a set_variable target that is not assignable — 400.
+            .not_lvalue => .{ .status = .bad_request, .code = "not_lvalue", .msg = "operand is not an lvalue (cannot take its address / assign to it)" },
         };
     }
 

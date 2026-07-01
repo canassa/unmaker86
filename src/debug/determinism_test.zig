@@ -40,6 +40,12 @@ test "no host time / RNG / thread / env / float / hashmap / atomic in src/debug 
         // clock/RNG/thread/float dependency (a float local renders as RAW HEX BYTES — no
         // x87 — so a byte-identical value falls out of an identical stop).
         @embedFile("core/vars.zig"),
+        // The M-S3 `evaluate` C-expression evaluator (read-only). Pure integer arithmetic over
+        // the type graph + the M-S2 peek path; on the grep gate so it can never grow a host
+        // clock/RNG/thread/FLOAT dependency (float OPERANDS are refused as unsupported_expression,
+        // never computed host-side). A DEDICATED guest-exec/write assertion below enforces its
+        // strictly-peek-only, zero-cycle contract (D1).
+        @embedFile("core/expr.zig"),
     };
     const forbidden = [_][]const u8{
         "std.time",
@@ -75,6 +81,32 @@ test "no host time / RNG / thread / env / float / hashmap / atomic in src/debug 
                 std.debug.print("forbidden pattern '{s}' in a src/debug source\n", .{needle});
                 return error.ForbiddenHostDependence;
             }
+        }
+    }
+}
+
+test "evaluate (expr.zig) is strictly peek-only / zero-cycle (no guest-exec / no write)" {
+    // D1: the M-S3 evaluator NEVER executes the guest or mutates state — the write EFFECT of
+    // set_variable (M3-b) lives on the WORKER, not here. A dedicated grep (NOT the shared
+    // blanket `forbidden`, which is applied to debugger.zig, and debugger.zig legitimately
+    // DEFINES `beginResume`) asserts `expr.zig` carries no guest-exec / side-effect symbol.
+    const src = @embedFile("core/expr.zig");
+    const banned = [_][]const u8{
+        "runUntilEvent",
+        "stepInstruction",
+        "writeMem",
+        "writeMemPhys",
+        "setReg",
+        "bus.write",
+        "portIn",
+        "portOut",
+        "beginResume",
+        "inject",
+    };
+    for (banned) |needle| {
+        if (std.mem.indexOf(u8, src, needle) != null) {
+            std.debug.print("guest-exec/write symbol '{s}' found in expr.zig (must be strictly peek-only)\n", .{needle});
+            return error.EvaluatorNotPeekOnly;
         }
     }
 }
