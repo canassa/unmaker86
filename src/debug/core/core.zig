@@ -21,6 +21,14 @@ const std = @import("std");
 
 pub const SourceDebugger = @import("debugger.zig").SourceDebugger;
 pub const Error = @import("debugger.zig").Error;
+/// CP437→Unicode-scalar transcode for the worker-side JSON emitters (T16c). Re-exported
+/// here so the transport layer reaches it as `core.cp437Scalar`.
+pub const cp437Scalar = @import("debugger.zig").cp437Scalar;
+
+/// The pure real-mode stack-unwinder (M-S2 §2). Kept as a submodule so `debug.core.unwind`
+/// is reachable from the in-process tests; on the `src/debug` grep gate (no host clock/RNG/
+/// float/atomic/thread) like the rest of `core/`.
+pub const unwind = @import("unwind.zig");
 
 // ─────────────────────────── stepping budgets ───────────────────────────
 // FIXED, compile-time constants of the CYCLE COUNTER — never host-derived (no clock,
@@ -130,6 +138,149 @@ pub const SourceWindow = struct {
     root_index: ?u8 = null,
     lines: []const SrcLine,
 };
+
+// ─────────────────────────── backtrace / stack unwind (M-S2 §2) ───────────────────────────
+// The neutral frame DTO produced by `src/debug/core/unwind.zig`. Slice-bearing (borrowed
+// function name / source path), so — like `PcLocation`/`SourceWindow` — it is a worker-side
+// render target, EXCLUDED from the reflection gate and NEVER placed on `q.Response` as a
+// slice (only the serialized `body_len` crosses the queue, §1). No fabrication (CLAUDE.md
+// §2): a frame is either correct or flagged `unreliable`; a case that cannot be unwound
+// faithfully TERMINATES the walk with a typed `BacktraceStop`, it never invents a parent.
+
+/// One unwound call frame, innermost-first (DAP/mcp-debugger convention).
+pub const Frame = struct {
+    /// 0 = innermost (live CS:IP); callers ascend.
+    index: u32,
+    /// Frame 0: the live CS:IP. Callers: the CALL-SITE address (return-addr − 1, §2.5) so
+    /// `source` names the call, not the following statement.
+    pc: Addr,
+    /// Borrowed function name; null ⇒ no symbol covers this pc.
+    function: ?[]const u8 = null,
+    /// file:line of the call site (or the live line for frame 0); null ⇒ no line record.
+    source: ?SourceLoc = null,
+    /// This frame's BP (SS-relative) — the locals base a later `locals` op reads from.
+    frame_base: u16,
+    /// This frame reached its callee (the next-inner frame) by a FAR call — the callee
+    /// pushed a 2-word `CS:IP` return, so unwinding across that edge read `SS:[BP+2]`(IP) +
+    /// `SS:[BP+4]`(CS). Always false for frame 0 (the live frame has no in-trace callee).
+    is_far: bool = false,
+    /// A sanity check rested on an ASSUMPTION (e.g. near/far guessed for a `.map` image, or
+    /// a mid-prologue frame 0 whose BP does not yet frame it). An honest "this frame's
+    /// identity is suspect" flag — set on assumptions, NEVER silently on a hard failure
+    /// (a hard failure terminates the walk instead).
+    unreliable: bool = false,
+};
+
+/// Why the walk stopped — ALWAYS reported so the agent knows the terminating condition was
+/// a real boundary, never a hidden cap or a fabricated parent.
+pub const BacktraceStop = enum {
+    /// The top frame is the whole trace (frame 0 only; no caller could be walked).
+    ok_top,
+    /// Saved BP is 0 — the base of the frame chain (`c0`/`_start`).
+    bp_zero,
+    /// The saved-BP chain stopped strictly ascending, or BP left the stack window / was odd
+    /// — the chain is corrupt or we crossed a non-BP frame; stop rather than mis-walk.
+    bp_not_increasing,
+    /// The reconstructed return address is NOT preceded by a real CALL (the T3
+    /// anti-fabrication check): refuse to emit a parent under zero-init-RAM garbage BP.
+    no_call_site,
+    /// The reconstructed caller maps to no function, and we had NO symbols before it either.
+    no_function,
+    /// The reconstructed caller maps to no function, but we HAD symbols — the C runtime
+    /// startup (C0) / a trampoline; a clean, expected top-of-user-stack boundary.
+    c0_startup,
+    /// The callee we just left is an INTERRUPT handler; the layout above is the CPU-pushed
+    /// `[FLAGS][CS][IP]`, not a BP frame — we cannot BP-walk through it, so stop here.
+    interrupt_boundary,
+    /// Frame 0 is mid-prologue / frame-less: BP does not (yet) frame it, so the saved-BP
+    /// chain is unavailable — emit frame 0 (`unreliable`) only.
+    frameless_callee,
+    /// Hit the caller-supplied `max_frames` cap (or the DTO buffer) — not a boundary.
+    max_frames,
+};
+
+/// The unwound stack: `frames` innermost-first (borrowed slice into the caller's buffer),
+/// plus the always-present `truncated_reason` (never a silent cap).
+pub const Backtrace = struct {
+    frames: []const Frame,
+    truncated_reason: BacktraceStop,
+};
+
+/// The hard cap on unwound frames (bounds the worker's on-stack `Frame` buffer and the
+/// nested-JSON body). A caller's `max_frames` is clamped to this.
+pub const MAX_FRAMES: usize = 256;
+
+// ─────────────────────────── scopes / locals / variable tree (M-S2 §3) ───────────────────────────
+// The neutral DTOs produced by `src/debug/core/vars.zig` (on the grep gate). Slice-bearing
+// (borrowed symbol name / a worker scratch-rendered value), so — like `Frame` — they are
+// worker-side render targets, EXCLUDED from the reflection gate and NEVER placed on
+// `q.Response` as slices (only the serialized `body_len` crosses the queue, §1). No
+// fabrication (CLAUDE.md §2): a value is either correct or HONESTLY flagged
+// (`outer_frame_register` / `unreadable` / `<null>` / `(?)`), never guessed.
+
+/// The lazy-expansion re-export: `debug.core.vars` is the pure `Storage`-dispatch + type-
+/// directed renderer. On the `src/debug` grep gate like the rest of `core/`.
+pub const vars = @import("vars.zig");
+
+/// The host-side expansion-handle node (minted/validated by `SourceDebugger`); re-exported
+/// so the worker's `variables{ref}` serializer names it without reaching into `debugger.zig`.
+pub const ExpandNode = @import("debugger.zig").ExpandNode;
+
+/// One scope-local (the symbol-layer POD); re-exported so the worker gathers a frame's
+/// locals with `core.Local` rather than a deep `symbols/types.zig` path.
+pub const Local = @import("../symbols/types.zig").Local;
+
+/// The DAP scope kinds. M-S2 collapses arguments+locals into ONE `locals` scope (T12 —
+/// `Local` carries no `isParam`), plus the live `registers` scope (frame 0 only).
+pub const ScopeKind = enum { locals, registers, globals };
+
+/// One DAP scope for a frame. `variables_ref` is a lazy handle: pass it to `variables{ref}`
+/// to enumerate the scope's variables (u64 epoch|slot, T11).
+pub const Scope = struct {
+    kind: ScopeKind,
+    frame_index: u32,
+    variables_ref: u64,
+};
+
+/// Whether a variable's value could be read faithfully — the HONEST-degradation axis
+/// (CLAUDE.md §2). `ok` carries a value; every other tag carries an EMPTY `value_text`
+/// and a typed reason the frontend surfaces verbatim (never a fabricated number).
+pub const VarAvail = enum {
+    ok,
+    /// The value lives in a register the callee overwrote; only frame 0's regs are live.
+    outer_frame_register,
+    /// The resolved address is not in mapped RAM (a static in a non-resident segment, or a
+    /// corrupt outer BP / wild pointer target). DISTINCT from a `<null>` pointer.
+    unreadable,
+    /// The symbol's storage class is unmodelled (`Storage.other`) — no value location.
+    no_storage,
+};
+
+/// One rendered variable (a local, a struct member, an array element, or a deref child).
+/// `value_text` is rendered into a WORKER scratch buffer (borrowed); `type_ref` lets the
+/// worker stream `typeName(type_ref)` straight into the JSON (T13 — `typeName` returns void,
+/// so the DTO never carries a borrowed type-name slice). A non-zero `variables_ref` marks an
+/// aggregate/array/pointer that expands ONE level via `variables{ref}` (DAP-lazy).
+pub const Variable = struct {
+    name: []const u8,
+    value_text: []const u8 = "",
+    avail: VarAvail = .ok,
+    addr: ?Addr = null,
+    type_ref: u16 = 0,
+    variables_ref: u64 = 0,
+    /// Bitfield width in bits (0 = not a bitfield) — carried for the member render only.
+    bit_width: u8 = 0,
+    writable: bool = false,
+};
+
+/// The per-expand child cap (a struct's member count / an array page). An array larger than
+/// this is PAGED via `variables{ref,start,count}` (T16a), never silently clipped.
+pub const MAX_CHILDREN: usize = 256;
+
+/// Max distinct locals gathered for one frame (innermost scope + ancestors). A frame with
+/// more visible locals than this is capped (honest — the extras are simply not listed; the
+/// TDS corpus never approaches it).
+pub const MAX_LOCALS: usize = 256;
 
 /// Which kind of source step is in flight (set by `beginStep`).
 pub const StepKind = enum { line, in, out, to_line };

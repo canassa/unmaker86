@@ -252,6 +252,7 @@ pub const SessionRegistry = struct {
             .snapshots = session.snapshots,
             .run_ctl = session.run_control,
             .sd = session.source_debugger,
+            .dbg_json = session.dbg_json,
             .source_roots = &session.source_roots,
             .initial_file_len = session.recipe.file_len,
         };

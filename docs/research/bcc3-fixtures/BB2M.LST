@@ -1,0 +1,186 @@
+Turbo Dump  Version 3.1 Copyright (c) 1988, 1992 Borland International
+                     Display of File BB2M.EXE
+
+DOS File Size                                       1AD8h  (  6872. )
+Load Image Size                                     1090h  (  4240. )
+Relocation Table entry count                        0006h  (     6. )
+Relocation Table address                            003Eh  (    62. )
+Size of header record      (in paragraphs)          0020h  (    32. )
+Minimum Memory Requirement (in paragraphs)          0000h  (     0. )
+Maximum Memory Requirement (in paragraphs)          FFFFh  ( 65535. )
+File load checksum                                  0000h  (     0. )
+Overlay Number                                      0000h  (     0. )
+
+Borland TLINK Version 5.00
+
+Initial Stack Segment  (SS:SP)			  0101:0080
+Program Entry Point    (CS:IP)			  0000:0000
+
+Relocation Locations (6 Entries)
+
+    0000:0001    0000:015B    00CF:00B6    00CF:00B2    00CF:00AE
+    0000:0A77
+
+Borland TLINK Symbol Table Present:
+
+Symbolic Information Version:      3.10
+Debugger Hook Address:             0000:0000
+Case Sensitive Link:               Yes
+Pascal Overlays Present:           No 
+
+Image Size                                        001290h  (  4752. )
+Name Pool Size (in bytes)                         000315h  (   789. )
+Number of Names                                     005Ch  (    92. )
+Number of Type Entries                              001Ch  (    28. )
+Number of Member Entries                            0004h  (     4. )
+Number of Symbols                                   0057h  (    87. )
+Number of Global Symbols                            004Dh  (    77. )
+Number of Source Modules                            0001h  (     1. )
+Number of Local Symbols                             0000h  (     0. )
+Number of Scopes                                    0004h  (     4. )
+Number of Line Number Entries                       0017h  (    23. )
+Number of Include Files                             0001h  (     1. )
+Number of Segments                                  0001h  (     1. )
+Number of Correlation Entries                       0001h  (     1. )
+Basic RTL String Segment Offset                     0000h  (     0. )
+Data Count                                          0000h  (     0. )
+Number of Class Entries                             0000h  (     0. )
+Mumber of Global Classes                            0000h  (     0. )
+Number of Parent Entries                            0000h  (     0. )
+Number of Overload Entries                          0000h  (     0. )
+Number of Scope Class Entries                       0000h  (     0. )
+Number of Module Class Entries                      0000h  (     0. )
+Number of Coverage Analysis Offsets                 0010h  (    16. )
+Number of Browser Entries                           0000h  (     0. )
+Number of Optimized Symbol Entries                  0000h  (     0. )
+Debug Flags                                         0000h  (     0. )
+
+Global Table                      77 Entries (004D)  File Base: 012E0h
+
+  Constant: 000C	  [001] __AHSHIFT            Type: Unknown
+  0000:0163 [002] __cleanup            Type: Unknown
+  0000:0176 [003] __checknull          Type: Unknown
+  0000:019E [004] __terminate          Type: Unknown
+  0000:01F3 [005] __restorezero        Type: Unknown
+  0000:02AD [006] _abort               Type: Unknown
+  0000:02C4 [007] DGROUP@              Type: Unknown
+  0000:02C6 [008] __MMODEL             Type: Unknown
+  0000:02C8 [009] _atexit              Type: Unknown
+  0000:034D [00a] _exit                Type: Unknown
+  0000:035C [00b] __exit               Type: Unknown
+  0000:036E [00c] __cexit              Type: Unknown
+  0000:037C [00d] __c_exit             Type: Unknown
+  0000:0388 [00e] __IOERROR            Type: Unknown
+  0000:03C1 [00f] __DOSERROR           Type: Unknown
+  0000:03D3 [010] _isatty              Type: Unknown
+  0000:03E4 [011] _lseek               Type: Unknown
+  0000:040D [012] __setupio            Type: Unknown
+  0000:04B2 [013] ___brk               Type: Unknown
+  0000:04D4 [014] ___sbrk              Type: Unknown
+  0000:0505 [015] _brk                 Type: Unknown
+  0000:0511 [016] _sbrk                Type: Unknown
+  0000:0521 [017] _free                Type: Unknown
+  0000:05F0 [018] _malloc              Type: Unknown
+  0000:0749 [019] _realloc             Type: Unknown
+  0000:079C [01a] _fflush              Type: Unknown
+  0000:081D [01b] _flushall            Type: Unknown
+  0000:08B4 [01c] _fseek               Type: Unknown
+  0000:091C [01d] _ftell               Type: Unknown
+  0000:09E3 [01e] _setvbuf             Type: Unknown
+  0000:0ABB [01f] ___write             Type: Unknown
+  0000:0BC9 [020] __write              Type: Unknown
+  0000:0C03 [021] __xfflush            Type: Unknown
+  00C2:0006 [022] _fact                Type: function far C returns signed int
+  00C2:0039 [023] _main                Type: function far C returns signed int
+  00CF:0000 [024] DATASEG@             Type: Unknown
+  00CF:0074 [025] __Int0Vector         Type: Unknown
+  00CF:0078 [026] __Int4Vector         Type: Unknown
+  00CF:007C [027] __Int5Vector         Type: Unknown
+  00CF:0080 [028] __Int6Vector         Type: Unknown
+  00CF:0084 [029] __C0argc             Type: Unknown
+  00CF:0086 [02a] __C0argv             Type: Unknown
+  00CF:0088 [02b] __C0environ          Type: Unknown
+  00CF:008A [02c] __envLng             Type: Unknown
+  00CF:008C [02d] __envseg             Type: Unknown
+  00CF:008E [02e] __envSize            Type: Unknown
+  00CF:0090 [02f] __psp                Type: Unknown
+  00CF:0092 [030] __osversion          Type: Unknown
+  00CF:0092 [031] __osmajor            Type: Unknown
+  00CF:0092 [032] __version            Type: Unknown
+  00CF:0093 [033] __osminor            Type: Unknown
+  00CF:0094 [034] _errno               Type: Unknown
+  00CF:0096 [035] __StartTime          Type: Unknown
+  00CF:009A [036] ___heapbase          Type: Unknown
+  00CF:009C [037] ___brklvl            Type: Unknown
+  00CF:009E [038] __heapbase           Type: Unknown
+  00CF:00A2 [039] __brklvl             Type: Unknown
+  00CF:00A6 [03a] __heaptop            Type: Unknown
+  00CF:00AA [03b] __atexitcnt          Type: Unknown
+  00CF:00AC [03c] __exitbuf            Type: Unknown
+  00CF:00B0 [03d] __exitfopen          Type: Unknown
+  00CF:00B4 [03e] __exitopen           Type: Unknown
+  00CF:00B8 [03f] __streams            Type: Unknown
+  00CF:01F8 [040] __nfile              Type: Unknown
+  00CF:01FA [041] __openfd             Type: Unknown
+  00CF:0222 [042] __heaplen            Type: Unknown
+  00CF:0224 [043] __doserrno           Type: Unknown
+  00CF:0226 [044] __dosErrorToSV       Type: Unknown
+  00CF:0280 [045] __stklen             Type: Unknown
+  00CF:0282 [046] __first              Type: Unknown
+  00CF:0284 [047] __last               Type: Unknown
+  00CF:0286 [048] __rover              Type: Unknown
+  00CF:028C [049] __ScanTodVector      Type: Unknown
+  00CF:028C [04a] __RealCvtVector      Type: Unknown
+  00CF:0292 [04b] _g_calls             Type: signed int
+  00CF:0294 [04c] __atexittbl          Type: Unknown
+  Constant: 1000	  [04d] __AHINCR             Type: Unknown
+
+
+Module Table                       1 Entries (0001)  File Base: 015EFh
+
+  Module: [04f] BB2M
+    Language:  C             Underbars: Yes    Memory Model: Medium
+
+    Source Files:
+    [05c] BB2M.C                 Time Stamp: 07/01/126  07:58 am
+
+    Module Type Definitions:
+      [052] Bits                 tag struct 'Bits' 
+          [059] a                    unsigned int: 3h Bits
+          [05a] b                    unsigned int: 5h Bits
+          [05b] c                    unsigned int: 8h Bits
+
+
+    Correlation Records:
+      File Name: BB2M.C
+      Code Base:    00C2:0006	   Code Length: 00C8 bytes
+
+      Parent Scope:  0	
+        Scope Offset:  0006	   Scope Length:  0033 Bytes
+        [BP+6]	   n                    auto signed int
+
+      Parent Scope:  1	
+        Scope Offset:  0010	   Scope Length:  0029 Bytes
+        [BP-2]	   r                    auto signed int
+        SI	   n                    register signed int
+
+      Parent Scope:  0	
+        Scope Offset:  0039	   Scope Length:  0095 Bytes
+
+      Parent Scope:  3	
+        Scope Offset:  0041	   Scope Length:  008D Bytes
+        SI	   sum                  register signed int
+        DI	   i                    register signed int
+        [BP-14]	   bits                 auto struct 'Bits' 
+        [BP-12]	   np                   auto near pointer _DS signed int
+        [BP-10]	   p                    auto near pointer _DS signed int
+        [BP-8]	   arr                  auto c array[4] signed int
+
+      Line Numbers:
+        23:0006h     26:0010h     27:001Ah     28:0028h     29:002Fh
+        30:0034h     32:0039h     41:0041h     42:0046h     43:004Bh
+        44:0050h     45:0055h     46:005Bh     47:0060h     48:0068h
+        49:0070h     50:0078h     51:007Ah     52:007Eh     54:0093h
+        55:00A2h     56:00ABh     57:00C8h
+
+

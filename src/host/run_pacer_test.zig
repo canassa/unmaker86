@@ -81,7 +81,7 @@ fn workerThread(args: WorkerArgs) void {
             args.queue.complete(ctx, .ok);
             return;
         }
-        const resp = api.drainOne(args.ctrl, ctx, .{}, null, null, null, null, null);
+        const resp = api.drainOne(args.ctrl, ctx, .{}, null, null, null, null, null, null);
         args.queue.complete(ctx, resp);
     }
 }
@@ -172,7 +172,10 @@ test "paced run ≡ unpaced run: byte-identical machine state at the actual fina
     // ---- Byte-identical? ----
     try std.testing.expectEqual(final_cycle, cpu1.cycles);
     try std.testing.expectEqual(final_cycle, cpu2.cycles);
-    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&cpu1), std.mem.asBytes(&cpu2));
+    // Field-wise (not asBytes): the POD carries interior/tail alignment padding whose bytes
+    // are undefined, so `expectEqual` — which recurses the fields — is the correct
+    // determinism assertion (padding is not CPU state).
+    try std.testing.expectEqual(cpu1, cpu2);
     try std.testing.expectEqualSlices(u8, ram1, m2.bus.ram);
 }
 
@@ -288,7 +291,9 @@ test "run-to-cycle with the pacer armed disarms it and lands exactly at N" {
 
     const cpu2 = ctrl2.cpuSnapshot();
     try std.testing.expectEqual(target, cpu1.cycles);
-    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&cpu1), std.mem.asBytes(&cpu2));
+    // Field-wise (not asBytes): see the note above — the POD's alignment padding is
+    // undefined, so compare the fields, which is the true "identical CPU state" check.
+    try std.testing.expectEqual(cpu1, cpu2);
     try std.testing.expectEqualSlices(u8, ram1, m2.bus.ram);
 
     pacer.join();

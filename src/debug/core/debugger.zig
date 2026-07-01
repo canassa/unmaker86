@@ -25,6 +25,7 @@ const std = @import("std");
 const core = @import("core.zig");
 const controller = @import("../controller.zig");
 const symbols = @import("../symbols/symbols.zig");
+const types = @import("../symbols/types.zig");
 
 const Controller = controller.Controller;
 const StopReason = controller.StopReason;
@@ -152,6 +153,50 @@ const cp437_high = [128]u21{
 /// The tab stop used when expanding `\t` at cache time (plan §5: expand, do not escape).
 const TAB_STOP = 8;
 
+/// Transcode a single guest CP437 byte to its Unicode scalar (ASCII 0x00..0x7F is identity;
+/// 0x80..0xFF via `cp437_high`). The M-S2 JSON emitters use this (T16c) so a raw high byte
+/// in a symbol name / source path is valid UTF-8 BEFORE it reaches `encodeJsonString` —
+/// never invalid UTF-8 or a panic under `escape_unicode`. Pure, host-clock/RNG/float-free.
+pub fn cp437Scalar(b: u8) u21 {
+    return if (b < 0x80) @as(u21, b) else cp437_high[b - 0x80];
+}
+
+// ─────────────────────────── expansion-handle / stop-epoch (M-S2 §3.5) ───────────────────────────
+// A HOST-SIDE table (never snapshotted, never in `Machine.Snapshot`) that backs the DAP
+// `variablesReference`. A struct/array/pointer var mints a slot; `variables{ref}` re-peeks
+// it AT THE SAME STOP. We must NEVER serve a stale handle (from a prior stop) as a silent
+// wrong read (CLAUDE.md §2) — so the ref packs a strictly-monotonic `stop_epoch`, and
+// validation rejects a prior-epoch handle with `error.StaleHandle`.
+
+/// Max live expansion handles within one Stopped epoch (fits the 16-bit slot field; a
+/// table this deep never occurs in interactive use — an over-full mint degrades to a
+/// non-expandable var, honest, never a wrong slot).
+pub const MAX_HANDLES = 256;
+
+/// What one node the variable being expanded is. The base linear address + type is enough
+/// to re-peek the children at the same stop, so expansion never re-walks the scope path.
+pub const ExpandTarget = enum { locals, aggregate, array, pointee };
+
+/// One expansion node (what a `variables_ref` encodes). Pointer-free integers only.
+pub const ExpandNode = struct {
+    target: ExpandTarget,
+    frame_index: u32 = 0,
+    /// The type to expand (aggregate/array/pointee element type). Unused for `.locals`.
+    type_ref: u16 = 0,
+    /// Where the aggregate/array lives, or the pointer's pointee target (`.pointee`). For
+    /// `.locals` this is the frame's `frame_base` carried in `off` (with `linear`=ss_base+bp).
+    base: Addr = .{ .seg = 0, .off = 0, .linear = 0 },
+    /// For a `.pointee`: which segment base the near/far pointer resolves against.
+    seg_sel: types.PtrKind = .near,
+    /// Array element count (for `.array` paging bounds).
+    elem_count: u32 = 0,
+};
+
+const ExpandTable = struct {
+    nodes: [MAX_HANDLES]ExpandNode = undefined,
+    count: u16 = 0,
+};
+
 pub const SourceDebugger = struct {
     gpa: std.mem.Allocator,
     ctrl: *Controller,
@@ -163,6 +208,15 @@ pub const SourceDebugger = struct {
     specs: [MAX_SPECS]SpecSlot = @splat(.{}),
     step: StepSession = .{},
     state: State = .configuring,
+    /// STRICTLY MONOTONIC for the Session lifetime (T1). Starts at 0 ONLY for a fresh
+    /// `init`; thereafter EVERY resume (`beginResume`/`beginStep`) and `attachOnLoad`/
+    /// `onMachineReverted` only `+%= 1` it — it is NEVER reset to 0. Deliberately placed
+    /// OUTSIDE the `self.step = .{}` reset (below) so the reset reflex cannot zero it: a
+    /// prior-stop handle (`ref` reusing a cleared slot) is then always detectably stale.
+    stop_epoch: u64 = 0,
+    /// The expansion-handle table (host-side, never snapshotted). `count` is cleared on
+    /// every resume; the nodes are rebuilt fresh each Stopped epoch.
+    expand: ExpandTable = .{},
     /// The bounded source-TEXT cache (M-S1.5). Owned host-side bytes, NEVER snapshotted;
     /// freed/rebuilt by `attachOnLoad` (same lifetime as `syms`/`map`).
     sources: [MAX_CACHED_SOURCES]CachedSource = @splat(.{}),
@@ -201,6 +255,10 @@ pub const SourceDebugger = struct {
         self.reresolveBreakpoints();
         self.step = .{};
         self.state = .configuring;
+        // A fresh load may reuse a symbol arena / RAM the prior program used — a prior-stop
+        // handle must not re-validate against a DIFFERENT struct at the reused slot. Bump
+        // the (monotonic) epoch + clear the table; NEVER zero the epoch (T1).
+        self.invalidateHandles();
     }
 
     /// A restore reverted the machine to a prior cycle (load_para unchanged). Only the
@@ -209,6 +267,68 @@ pub const SourceDebugger = struct {
     pub fn onMachineReverted(self: *SourceDebugger) void {
         self.step = .{};
         self.state = .stopped;
+        // A restore rewinds RAM to a prior cycle: a handle minted at the (now-abandoned)
+        // later stop is invalid. Bump the (monotonic) epoch + clear the table; the counter
+        // only climbs, so a coincidental cycle match is still rejected by the epoch (T1).
+        self.invalidateHandles();
+    }
+
+    // ─────────────────────────── stop-epoch / expansion handles (M-S2 §3.5/§6) ───────────────────────────
+
+    /// Clear the expansion table and bump the STRICTLY-MONOTONIC stop epoch (T1). The
+    /// ONLY mutation of `stop_epoch` besides `init` — always `+%= 1`, NEVER a reset. Called
+    /// by every resume and by `attachOnLoad`/`onMachineReverted`, so a prior-epoch handle is
+    /// universally, path-independently detectable as stale.
+    fn invalidateHandles(self: *SourceDebugger) void {
+        self.expand.count = 0;
+        self.stop_epoch +%= 1;
+    }
+
+    /// The T4 resume wrapper: called by the WORKER BEFORE any `drainOne` arm that charges
+    /// cycles, advances CS:IP, or wipes the machine (`run`/`run_slice`/`run_to_*`/`step*`/
+    /// `reset`/input injection). Invalidates every outstanding handle and marks the session
+    /// running so a concurrent inspection is refused with `not_stopped`.
+    pub fn beginResume(self: *SourceDebugger) void {
+        self.invalidateHandles();
+        self.state = .running;
+    }
+
+    /// The T4 stop wrapper: called by the WORKER AFTER a resumed arm stops, whatever
+    /// command drove it. Delegates to `projectStop` (the ONE place `StopReason` is read),
+    /// which sets `state = .stopped/.terminated` and resolves the stop `pc`.
+    pub fn noteStopped(self: *SourceDebugger, reason: StopReason) StopState {
+        return self.projectStop(reason);
+    }
+
+    /// Mark the machine stopped at the current (clean) boundary WITHOUT a `StopReason`
+    /// (a `reset` / a cycle-neutral input inject that returned no stop). Leaves `pc`
+    /// resolution to the on-demand `pcLocation*`; only flips the gate back to Stopped.
+    pub fn noteStoppedNoReason(self: *SourceDebugger) void {
+        self.state = .stopped;
+    }
+
+    /// Mint a `variables_ref` for `node` in the current epoch: `(stop_epoch << 16) |
+    /// (slot+1)` (slot+1 so a valid ref is never 0; the 48-bit epoch stays JSON-number-safe,
+    /// T11). Returns 0 when the table is full (the var renders its summary but cannot be
+    /// expanded — honest degradation, never a wrong slot).
+    pub fn mintHandle(self: *SourceDebugger, node: ExpandNode) u64 {
+        if (self.expand.count >= MAX_HANDLES) return 0;
+        const slot = self.expand.count;
+        self.expand.nodes[slot] = node;
+        self.expand.count += 1;
+        return (@as(u64, self.stop_epoch) << 16) | (@as(u64, slot) + 1);
+    }
+
+    /// Resolve a `variables_ref` back to its node, or `error.StaleHandle` if it is from a
+    /// PRIOR epoch or names an unfilled slot (the no-stale-read guarantee). Because the
+    /// epoch only climbs, a prior-stop handle is always detectably wrong.
+    pub fn resolveHandle(self: *const SourceDebugger, ref: u64) error{StaleHandle}!ExpandNode {
+        const epoch = ref >> 16;
+        const raw = ref & 0xFFFF;
+        if (epoch != self.stop_epoch or raw == 0) return error.StaleHandle;
+        const slot = raw - 1;
+        if (slot >= self.expand.count) return error.StaleHandle;
+        return self.expand.nodes[@intCast(slot)];
     }
 
     fn reresolveBreakpoints(self: *SourceDebugger) void {
@@ -668,6 +788,10 @@ pub const SourceDebugger = struct {
                 self.step.oneshot_id = try self.ctrl.addBreakpoint(.{ .execution_address = .{ .linear = lin } }, true);
             },
         }
+        // T4 (folded, per §6): a source step is a resume — invalidate outstanding handles +
+        // bump the monotonic epoch. Done only AFTER arming succeeds (a failed arm returns an
+        // error above and does not resume, so it must not bump).
+        self.invalidateHandles();
         self.state = .running;
     }
 

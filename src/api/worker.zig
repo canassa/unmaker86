@@ -127,6 +127,22 @@ pub const RenderBuffers = struct {
 /// ~1.2 MiB by more than deflate stored-block + chunk overhead; 1.3 MiB covers it.
 pub const PNG_OUT_CAP: usize = 1300 * 1024;
 
+/// The bounded ceiling for ONE worker-serialized nested-JSON body (debug-m2-plan.md §1.1,
+/// M-S2). The EXPLICIT nested-body cap: a body that would exceed it makes the fixed writer
+/// fail → `response_too_large` (never a truncated JSON, CLAUDE.md §2). Sized to clear the
+/// largest realistic single-level expansion (a deep BaK struct) with margin; the DAP-lazy
+/// contract keeps any one body bounded in practice (narrow `max_frames` / page an array).
+pub const DBG_JSON_CAP: usize = 256 * 1024;
+
+/// The session-owned slab the worker serializes ONE nested-JSON debug body into while
+/// Stopped (mirrors `RenderBuffers`, but for text). Owned by the `Session`, reached by the
+/// worker OFF-Command via a `?*DebugJsonBuffer` field (never carried in the pointer-free
+/// `Command`). The listener copies these OWNED bytes under `session.lock`, then streams.
+pub const DebugJsonBuffer = struct {
+    /// The worker-serialized JSON for one nested op; only `[0..body_len]` is meaningful.
+    body: [DBG_JSON_CAP]u8 = undefined,
+};
+
 /// The addressable guest RAM slab size — the bound for memory containment checks
 /// (§B.5/G3). The bus is host-OOB-safe regardless; this returns a clean
 /// `address_out_of_range` BEFORE the controller call rather than silently reading
@@ -150,7 +166,44 @@ fn inSlab(ctrl: *const Controller, start: u32, len: u32) bool {
 /// Dispatch exactly one command to one `Controller` method. Pure mapping; the only
 /// state it touches is via `ctrl` (the worker owns it) and `ctx.scratch` (the
 /// mem_write bytes, copied in by the handler before submit).
-pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render: ?*RenderBuffers, live: ?*LiveMouseState, snapshots: ?*SnapshotStore, run_ctl: ?*RunControl, sd: ?*SourceDebugger) Response {
+pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render: ?*RenderBuffers, live: ?*LiveMouseState, snapshots: ?*SnapshotStore, run_ctl: ?*RunControl, sd: ?*SourceDebugger, dbg_json: ?*DebugJsonBuffer) Response {
+    // T4 (debug-m2-plan.md §6): the MECHANICAL stop-epoch wrapper. Every command that
+    // charges cycles / advances CS:IP / wipes the machine is a RESUME — BEFORE it runs we
+    // invalidate every outstanding expansion handle + bump the (monotonic) `stop_epoch`
+    // (`beginResume`), and AFTER it stops we re-stamp `sd.state`/`pc` (`noteStopped`),
+    // whatever command drove it. Without this a prior-stop handle would survive a plain
+    // `run`/`reset`/input-inject (which bypass `SourceDebugger`) as a SILENT stale read.
+    // The `dbg_step_*` arms self-manage this via `beginStep`/`projectStop` (excluded here).
+    const is_resume = isResumeCmd(ctx.cmd);
+    if (is_resume) if (sd) |s| s.beginResume();
+    const resp = dispatch(ctrl, ctx, mount, render, live, snapshots, run_ctl, sd, dbg_json);
+    if (is_resume) if (sd) |s| noteResumeStop(s, resp);
+    return resp;
+}
+
+/// The resume classification (T4): every `drainOne` arm that charges cycles, advances
+/// CS:IP, or wipes the machine. `load`/`restore` are EXCLUDED (they invalidate handles via
+/// `attachOnLoad`/`onMachineReverted`); the `dbg_step_*` arms are EXCLUDED (folded into
+/// `beginStep`). `input_mouse_fold` is cycle-neutral (no CS:IP advance) and excluded.
+fn isResumeCmd(cmd: q.Command) bool {
+    return switch (cmd) {
+        .run, .run_slice, .run_to_cycle, .run_to_address, .step, .step_n, .step_over, .reset, .input_key, .input_mouse => true,
+        else => false,
+    };
+}
+
+/// Re-stamp `sd.state`/`pc` after a resumed arm stopped (T4). Uses the arm's `StopReason`
+/// when it carries one (`.stop`/`.step_over`); a `.ok`/`.err` (a `reset`, a cycle-neutral
+/// inject, or a rejected inject) just flips the gate back to Stopped.
+fn noteResumeStop(s: *SourceDebugger, resp: Response) void {
+    switch (resp) {
+        .stop => |reason| _ = s.noteStopped(reason),
+        .step_over => |so| _ = s.noteStopped(so.reason),
+        else => s.noteStoppedNoReason(),
+    }
+}
+
+fn dispatch(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render: ?*RenderBuffers, live: ?*LiveMouseState, snapshots: ?*SnapshotStore, run_ctl: ?*RunControl, sd: ?*SourceDebugger, dbg_json: ?*DebugJsonBuffer) Response {
     return switch (ctx.cmd) {
         // ---- run / step ----------------------------------------------------
         // Every run is PREEMPTIBLE: advanced in bounded bursts so a long/unbounded/wedged
@@ -315,8 +368,393 @@ pub fn drainOne(ctrl: *Controller, ctx: *RequestCtx, mount: MountSource, render:
         .dbg_read_source => |c| dbgReadSource(sd, c),
         .dbg_list_sources => dbgListSources(sd),
 
+        // ---- source-level debug M-S2 nested-JSON seam (M2-a) ----------------
+        // The worker serializes the (variable-length, nested) body into the session-owned
+        // `DebugJsonBuffer` slab while Stopped, and returns only a `DbgJsonResult{body_len}`.
+        .dbg_json_selftest => |c| dbgJsonResp(sd, dbg_json, c, selfTestBody),
+
+        // `backtrace` (M2-b): unwind the call stack (peek-only) + serialize the frame list.
+        // TODO(M2-c): the stop-epoch / `beginResume`/`noteStopped` `drainOne` wiring (plan
+        // §6/T4) is deferred to the locals stage — backtrace emits NO `variables_ref` handles,
+        // so it has no epoch-invalidation dependency; the frame list is a pure function of the
+        // stop cycle. The epoch table lands with the `ExpandTable` it protects (M2-c §3.5).
+        .dbg_backtrace => |c| dbgJsonResp(sd, dbg_json, c, backtraceBody),
+
+        // `scopes` / `frame_variables` / `variables` (M2-c, debug-m2-plan.md §3): per-frame
+        // scope handles, that frame's locals, and one-level handle expansion. Each validates
+        // (frame index / stale handle) BEFORE serializing, so `bad_frame`/`stale_handle`
+        // reach the wire as typed errors rather than the generic `response_too_large`.
+        .dbg_scopes => |c| dbgScopes(sd, dbg_json, c),
+        .dbg_frame_variables => |c| dbgFrameVariables(sd, dbg_json, c),
+        .dbg_variables => |c| dbgVariables(sd, dbg_json, c),
+
+        // `inspect` (M2-d, §4): a bounded path-addressed peek. `context` (M2-d, §5/R3): the
+        // combined one-call-per-stop body (frame + window + backtrace + top-frame locals).
+        .dbg_inspect => |c| dbgInspect(sd, dbg_json, c),
+        .dbg_context => |c| dbgContext(sd, dbg_json, c),
+
         .shutdown_worker => .ok,
     };
+}
+
+/// The M-S2 nested-JSON seam entry point (debug-m2-plan.md §1.3). The worker, while
+/// Stopped, serializes `build(state, writer)` into the session-owned slab as fully-
+/// materialized OWNED bytes and returns only the `body_len` descriptor. It stays clockless
+/// and host-RNG-free: it builds JSON from owned bytes + integer indices + peek reads (no
+/// host clock, no host RNG). Degrades HONESTLY — a null `sd`/slab or a running machine yields a
+/// typed error, never a fake body; an over-`DBG_JSON_CAP` body makes the fixed writer fail
+/// → `response_too_large` (the EXPLICIT overflow, never a truncated JSON).
+fn dbgJsonResp(
+    sd: ?*SourceDebugger,
+    dbg_json: ?*DebugJsonBuffer,
+    args: anytype,
+    comptime build: fn (s: *SourceDebugger, a: @TypeOf(args), w: *std.Io.Writer) std.Io.Writer.Error!void,
+) Response {
+    const s = sd orelse return .{ .err = .no_symbols }; // no debug core wired — honest, never a fake body
+    const buf = dbg_json orelse return .{ .err = .load_failed }; // no slab wired (in-process harness)
+    // §6 gating: the live BP/SP/registers are meaningful only at a clean instruction
+    // boundary. A mid-run peek is refused with a typed error, not a fabricated stop.
+    if (s.state == .running) return .{ .err = .not_stopped };
+    var w = std.Io.Writer.fixed(buf.body[0..]);
+    build(s, args, &w) catch return .{ .err = .response_too_large }; // fixed-writer overrun → explicit 413
+    return .{ .dbg_json = .{ .body_len = @intCast(w.buffered().len) } };
+}
+
+/// The M2-a transport self-test body builder (the plan's "trivial stub body"). Emits a
+/// deterministic `{"selftest":true,"fill":N,"data":"<N × 'x'>"}` document — a pure
+/// function of `fill`, so two runs are byte-identical and HTTP/MCP emit the same bytes. A
+/// large `fill` overruns the fixed slab writer, exercising the `response_too_large` path.
+/// (No machine state is read; the real M2-b..d producers replace this with the backtrace/
+/// locals/context renderers.)
+fn selfTestBody(s: *SourceDebugger, args: q.DbgSelfTestCmd, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    _ = s;
+    try w.print("{{\"selftest\":true,\"fill\":{d},\"data\":\"", .{args.fill});
+    try w.splatByteAll('x', args.fill);
+    try w.writeAll("\"}");
+}
+
+/// The `backtrace` body builder (M2-b, debug-m2-plan.md §2.7). Runs the PURE unwinder
+/// (`core.unwind.backtrace`, peek-only) over the current stop and serializes the frame list
+/// innermost-first: `{index, function, file, line, addr:{seg,off,linear}, frame_base,
+/// is_far, unreliable}` plus the always-present `truncated_reason` (WHY the walk stopped —
+/// never a hidden cap or a fabricated parent). Every guest string is CP437→UTF-8 transcoded
+/// before `encodeJsonString` (T16c). A deterministic function of the stop cycle.
+fn backtraceBody(s: *SourceDebugger, args: q.DbgBacktraceCmd, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    var frames: [core.MAX_FRAMES]core.Frame = undefined;
+    const want = @min(@as(usize, args.max_frames), core.MAX_FRAMES);
+    const bt = core.unwind.backtrace(s, frames[0..], want);
+
+    try w.writeAll("{\"frames\":");
+    try writeFrameList(bt.frames, w);
+    try w.print(",\"truncated_reason\":\"{s}\"}}", .{@tagName(bt.truncated_reason)});
+}
+
+/// Emit a `[...]` array of frames (shared by `backtrace` and `context`, §5 — one renderer, no
+/// divergence). Each frame: `{index, function, file, line, addr, frame_base, is_far, unreliable}`.
+fn writeFrameList(frames: []const core.Frame, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeByte('[');
+    for (frames, 0..) |f, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try w.print("{{\"index\":{d},\"function\":", .{f.index});
+        if (f.function) |name| try writeGuestJsonString(w, name) else try w.writeAll("null");
+        try w.writeAll(",\"file\":");
+        if (f.source) |src| try writeGuestJsonString(w, src.path) else try w.writeAll("null");
+        try w.print(",\"line\":{d},\"addr\":{{\"seg\":{d},\"off\":{d},\"linear\":{d}}},\"frame_base\":{d},\"is_far\":{s},\"unreliable\":{s}}}", .{
+            if (f.source) |src| src.line else 0,
+            f.pc.seg,
+            f.pc.off,
+            f.pc.linear,
+            f.frame_base,
+            if (f.is_far) "true" else "false",
+            if (f.unreliable) "true" else "false",
+        });
+    }
+    try w.writeByte(']');
+}
+
+// ─────────────────────────── scopes / locals / variable tree (M2-c, §3) ───────────────────────────
+
+/// Common preamble for the three §3 handlers: null-check the debug core + slab and enforce
+/// the Stopped gate (§6). Returns the slab pointer, or a typed-error `Response`.
+fn dbgReady(sd: ?*SourceDebugger, dbg_json: ?*DebugJsonBuffer) union(enum) { ok: struct { s: *SourceDebugger, buf: *DebugJsonBuffer }, err: Response } {
+    const s = sd orelse return .{ .err = .{ .err = .no_symbols } };
+    const buf = dbg_json orelse return .{ .err = .{ .err = .load_failed } };
+    if (s.state == .running) return .{ .err = .{ .err = .not_stopped } };
+    return .{ .ok = .{ .s = s, .buf = buf } };
+}
+
+/// Finish a §3 body: seal the fixed writer (an over-`DBG_JSON_CAP` body → `response_too_large`).
+fn sealJson(buf: *DebugJsonBuffer, w: *std.Io.Writer) Response {
+    _ = buf;
+    return .{ .dbg_json = .{ .body_len = @intCast(w.buffered().len) } };
+}
+
+/// Resolve `frame` to its unwound `core.Frame`, or a `bad_frame` error. Fills the caller's
+/// on-stack frame buffer (re-peeked at the current stop — a pure function of the stop cycle).
+fn frameOrBad(s: *SourceDebugger, frame: u16, buf: []core.Frame) ?core.Frame {
+    const bt = core.unwind.backtrace(s, buf, buf.len);
+    if (frame >= bt.frames.len) return null;
+    return bt.frames[frame];
+}
+
+/// `scopes{frame}` (§3.2): the frame's scope handles — one `locals` scope always, plus a
+/// `registers` scope for frame 0 (the live CPU regs). Each carries a lazy `variables_ref`.
+fn dbgScopes(sd: ?*SourceDebugger, dbg_json: ?*DebugJsonBuffer, c: q.DbgScopesReq) Response {
+    const r = switch (dbgReady(sd, dbg_json)) {
+        .err => |e| return e,
+        .ok => |ok| ok,
+    };
+    var fbuf: [core.MAX_FRAMES]core.Frame = undefined;
+    if (frameOrBad(r.s, c.frame, fbuf[0..]) == null) return .{ .err = .bad_frame };
+
+    const locals_ref = r.s.mintHandle(.{ .target = .locals, .frame_index = c.frame });
+    var w = std.Io.Writer.fixed(r.buf.body[0..]);
+    (writeScopes(r.s, c.frame, locals_ref, &w)) catch return .{ .err = .response_too_large };
+    return sealJson(r.buf, &w);
+}
+
+fn writeScopes(s: *SourceDebugger, frame: u16, locals_ref: u64, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    _ = s;
+    try w.print("{{\"scopes\":[{{\"kind\":\"locals\",\"frame_index\":{d},\"variables_ref\":{d}}}", .{ frame, locals_ref });
+    if (frame == 0) try w.writeAll(",{\"kind\":\"registers\",\"frame_index\":0,\"variables_ref\":0}");
+    try w.writeAll("]}");
+}
+
+/// `frame_variables{frame}` (§3.6): the frame's locals rendered inline (scopes + locals in
+/// one body — the one-shot an LLM calls per stop). Aggregates/arrays/pointers carry a
+/// `variables_ref` for `variables{ref}`.
+fn dbgFrameVariables(sd: ?*SourceDebugger, dbg_json: ?*DebugJsonBuffer, c: q.DbgFrameVarsReq) Response {
+    const r = switch (dbgReady(sd, dbg_json)) {
+        .err => |e| return e,
+        .ok => |ok| ok,
+    };
+    var fbuf: [core.MAX_FRAMES]core.Frame = undefined;
+    const frame = frameOrBad(r.s, c.frame, fbuf[0..]) orelse return .{ .err = .bad_frame };
+
+    var w = std.Io.Writer.fixed(r.buf.body[0..]);
+    (writeFrameVariables(r.s, frame, &w)) catch return .{ .err = .response_too_large };
+    return sealJson(r.buf, &w);
+}
+
+fn writeFrameVariables(s: *SourceDebugger, frame: core.Frame, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.print("{{\"frame\":{d},\"variables\":", .{frame.index});
+    try writeLocalsArray(s, frame, w);
+    try w.writeByte('}');
+}
+
+/// Emit a `[...]` array of `frame`'s rendered locals (shared by `frame_variables` and
+/// `context`, §5 — the same renderer, so the two bodies never diverge).
+fn writeLocalsArray(s: *SourceDebugger, frame: core.Frame, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    var locals: [core.MAX_LOCALS]core.Local = undefined;
+    const ls = core.vars.frameLocals(s, frame, locals[0..]);
+    try w.writeByte('[');
+    for (ls, 0..) |l, idx| {
+        if (idx != 0) try w.writeByte(',');
+        var scratch: [256]u8 = undefined;
+        const v = core.vars.renderLocal(s, frame, l, scratch[0..]);
+        try writeVariable(s, v, w);
+    }
+    try w.writeByte(']');
+}
+
+/// `variables{ref,start,count}` (§3.5): expand/page one handle ONE level. A prior-epoch
+/// handle → `stale_handle` (never a silent stale read); a struct ignores `start`/`count`,
+/// an array pages `[start, start+count)`.
+fn dbgVariables(sd: ?*SourceDebugger, dbg_json: ?*DebugJsonBuffer, c: q.DbgVarsReq) Response {
+    const r = switch (dbgReady(sd, dbg_json)) {
+        .err => |e| return e,
+        .ok => |ok| ok,
+    };
+    const node = r.s.resolveHandle(c.ref) catch return .{ .err = .stale_handle };
+
+    var w = std.Io.Writer.fixed(r.buf.body[0..]);
+    (writeVariables(r.s, node, c.start, c.count, &w)) catch return .{ .err = .response_too_large };
+    return sealJson(r.buf, &w);
+}
+
+fn writeVariables(s: *SourceDebugger, node: core.ExpandNode, start: u32, count: u32, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    const total = core.vars.childCount(s, node);
+    // An array pages via [start, start+count); a struct/pointee ignores the window (count==0
+    // ⇒ the whole node). NEVER a silent clip — the emitted `start`/`count` bound the page.
+    const first: usize = @min(@as(usize, start), total);
+    const want: usize = if (count == 0) total else @min(@as(usize, count), total - first);
+    try w.print("{{\"start\":{d},\"count\":{d},\"total\":{d},\"variables\":[", .{ first, want, total });
+    var i: usize = 0;
+    while (i < want) : (i += 1) {
+        if (i != 0) try w.writeByte(',');
+        var scratch: [256]u8 = undefined;
+        const v = core.vars.renderChild(s, node, first + i, scratch[0..]);
+        try writeVariable(s, v, w);
+    }
+    try w.writeAll("]}");
+}
+
+// ─────────────────────────── inspect (M2-d, §4) ───────────────────────────
+
+/// `inspect{frame,path}` (§4): a bounded, path-addressed peek. Resolves `path` against the
+/// frame's locals + type graph (the PURE `core.vars.inspectPath`, reusing the Stage-3 render)
+/// and serializes the resolved `core.Variable`. HONEST typed errors: an out-of-grammar form →
+/// `unsupported_expression` (the anti-eval boundary — never a guessed value); an unresolvable
+/// name/member/index → `unresolved`; a bad frame index → `bad_frame`. A `<null>` deref /
+/// `unreadable` address is a SUCCESSFUL body carrying the honest `avail`/value.
+fn dbgInspect(sd: ?*SourceDebugger, dbg_json: ?*DebugJsonBuffer, c: q.DbgInspectReq) Response {
+    const r = switch (dbgReady(sd, dbg_json)) {
+        .err => |e| return e,
+        .ok => |ok| ok,
+    };
+    var fbuf: [core.MAX_FRAMES]core.Frame = undefined;
+    const frame = frameOrBad(r.s, c.frame, fbuf[0..]) orelse return .{ .err = .bad_frame };
+
+    const path = c.path[0..@min(@as(usize, c.path_len), c.path.len)];
+    var scratch: [512]u8 = undefined;
+    const v = core.vars.inspectPath(r.s, frame, path, scratch[0..]) catch |e| switch (e) {
+        error.Unsupported => return .{ .err = .unsupported_expression },
+        error.Unresolved => return .{ .err = .unresolved },
+    };
+
+    var w = std.Io.Writer.fixed(r.buf.body[0..]);
+    (writeInspect(r.s, path, v, &w)) catch return .{ .err = .response_too_large };
+    return sealJson(r.buf, &w);
+}
+
+fn writeInspect(s: *SourceDebugger, path: []const u8, v: core.Variable, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeAll("{\"path\":");
+    try std.json.Stringify.encodeJsonString(path, .{}, w);
+    try w.writeAll(",\"result\":");
+    try writeVariable(s, v, w);
+    try w.writeByte('}');
+}
+
+// ─────────────────────────── context / R3 (M2-d, §5) ───────────────────────────
+
+/// `context{frame,window,max_frames}` (§5/R3): the combined one-call-per-stop body — the
+/// current frame, its source window (radius `window`, reusing the M-S1.5 `sourceWindow`), the
+/// backtrace (reusing the §2 unwinder), and the top-frame locals (reusing the §3 renderer) —
+/// all in ONE `dbg_json` body via the SHARED frame/window/locals renderers (no divergence).
+fn dbgContext(sd: ?*SourceDebugger, dbg_json: ?*DebugJsonBuffer, c: q.DbgContextReq) Response {
+    const r = switch (dbgReady(sd, dbg_json)) {
+        .err => |e| return e,
+        .ok => |ok| ok,
+    };
+    var w = std.Io.Writer.fixed(r.buf.body[0..]);
+    (writeContext(r.s, c, &w)) catch return .{ .err = .response_too_large };
+    return sealJson(r.buf, &w);
+}
+
+fn writeContext(s: *SourceDebugger, c: q.DbgContextReq, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    var frames: [core.MAX_FRAMES]core.Frame = undefined;
+    const want = @min(@as(usize, c.max_frames), core.MAX_FRAMES);
+    const bt = core.unwind.backtrace(s, frames[0..], want);
+    // The selected top frame (default 0). If the requested frame is out of range, fall back to
+    // frame 0 (always present when Stopped) rather than fail — `context` is the always-on stop
+    // snapshot; the `frame` arg only re-centers the window/locals.
+    const sel: usize = if (c.frame < bt.frames.len) c.frame else 0;
+    const top = bt.frames[sel];
+
+    // 1. frame — the resolved Pc location of the selected frame.
+    try w.writeAll("{\"frame\":{\"index\":");
+    try w.print("{d},\"function\":", .{top.index});
+    if (top.function) |name| try writeGuestJsonString(w, name) else try w.writeAll("null");
+    try w.writeAll(",\"file\":");
+    if (top.source) |src| try writeGuestJsonString(w, src.path) else try w.writeAll("null");
+    try w.print(",\"line\":{d},\"addr\":{{\"seg\":{d},\"off\":{d},\"linear\":{d}}}}}", .{
+        if (top.source) |src| src.line else 0,
+        top.pc.seg,
+        top.pc.off,
+        top.pc.linear,
+    });
+
+    // 2. window — the M-S1.5 source window centered on the selected frame's line (null when the
+    //    frame has no source line, honest).
+    try w.writeAll(",\"window\":");
+    try writeContextWindow(s, top, c.window, w);
+
+    // 3. backtrace — the full frame list (shared renderer).
+    try w.writeAll(",\"backtrace\":");
+    try writeFrameList(bt.frames, w);
+    try w.print(",\"truncated_reason\":\"{s}\"", .{@tagName(bt.truncated_reason)});
+
+    // 4. locals — the selected frame's locals (shared renderer; may carry variables_ref handles
+    //    minted in this stop epoch).
+    try w.writeAll(",\"locals\":");
+    try writeLocalsArray(s, top, w);
+    try w.writeByte('}');
+}
+
+/// Serialize the source window for `frame` (radius `window`) as `{has,...,lines:[...]}` or
+/// `null` when the frame carries no source line / no cached text. Text is already UTF-8 in the
+/// source cache (CP437-transcoded at admission), so it streams straight through `encodeJsonString`.
+fn writeContextWindow(s: *SourceDebugger, frame: core.Frame, window: u16, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    const src = frame.source orelse return w.writeAll("null");
+    var linebuf: [core.MAX_WINDOW_LINES]core.SrcLine = undefined;
+    const win = s.sourceWindow(src.file_id, src.line, window, linebuf[0..]) orelse return w.writeAll("null");
+    try w.print("{{\"has\":true,\"file_id\":{d},\"active_line\":{d},\"clamped\":{s},\"lines\":[", .{
+        win.file_id,
+        win.active_line,
+        if (win.clamped) "true" else "false",
+    });
+    for (win.lines, 0..) |ln, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.print("{{\"number\":{d},\"active\":{s},\"truncated\":{s},\"text\":", .{
+            ln.number,
+            if (ln.active) "true" else "false",
+            if (ln.truncated) "true" else "false",
+        });
+        try std.json.Stringify.encodeJsonString(ln.text, .{}, w);
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}");
+}
+
+/// Emit one `core.Variable` as JSON. Every guest-derived string (`name`, `value_text`, the
+/// streamed type name) is CP437→UTF-8 transcoded (T16c) so a raw high byte never reaches
+/// `encodeJsonString`. `avail != "ok"` carries NO `value_text` — the honest signal.
+fn writeVariable(s: *SourceDebugger, v: core.Variable, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeAll("{\"name\":");
+    try writeGuestJsonString(w, v.name);
+    try w.writeAll(",\"type\":");
+    try writeTypeName(s, v.type_ref, w);
+    try w.print(",\"avail\":\"{s}\"", .{@tagName(v.avail)});
+    if (v.avail == .ok) {
+        try w.writeAll(",\"value\":");
+        try writeGuestJsonString(w, v.value_text);
+    }
+    if (v.addr) |a| try w.print(",\"addr\":{{\"seg\":{d},\"off\":{d},\"linear\":{d}}}", .{ a.seg, a.off, a.linear });
+    if (v.bit_width != 0) try w.print(",\"bit_width\":{d}", .{v.bit_width});
+    try w.print(",\"variables_ref\":{d}}}", .{v.variables_ref});
+}
+
+/// Stream `type_ref`'s C-style type name straight into the JSON as a string value (T13 —
+/// `typeName` returns void). Renders `"?"` when no symbol overlay covers it. Type names are
+/// C identifiers/punctuation (ASCII), emitted via the escaping stringify writer.
+fn writeTypeName(s: *SourceDebugger, type_ref: u16, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    var scratch: [256]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(scratch[0..]);
+    if (s.syms) |*sy| {
+        if (sy.typegraph) |*tg| {
+            tg.typeName(type_ref, &sw) catch {};
+        }
+    }
+    const name = sw.buffered();
+    try writeGuestJsonString(w, if (name.len == 0) "?" else name);
+}
+
+/// Emit `raw` (guest CP437 bytes — a symbol name or source path) as a JSON string value,
+/// transcoding to UTF-8 FIRST (T16c) so a raw high byte can never reach `encodeJsonString`
+/// as invalid UTF-8 / a panic. Bounded scratch; a string longer than it is truncated on a
+/// codepoint boundary (an honest cap, never a smear — names this long do not occur in the
+/// TDS corpus).
+fn writeGuestJsonString(w: *std.Io.Writer, raw: []const u8) std.Io.Writer.Error!void {
+    var scratch: [1024]u8 = undefined;
+    var n: usize = 0;
+    for (raw) |b| {
+        var enc: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(core.cp437Scalar(b), &enc) catch continue;
+        if (n + len > scratch.len) break;
+        @memcpy(scratch[n..][0..len], enc[0..len]);
+        n += len;
+    }
+    try std.json.Stringify.encodeJsonString(scratch[0..n], .{}, w);
 }
 
 // ===========================================================================
@@ -1171,6 +1609,12 @@ pub const Worker = struct {
     /// harness that never wired one (the `dbg_*` commands then fail loud). Set by the
     /// server / registry at the worker-spawn sites, exactly like `render`/`run_ctl`.
     sd: ?*SourceDebugger = null,
+    /// The session-owned nested-JSON slab (M-S2 seam, debug-m2-plan.md §1.1). The worker
+    /// serializes ONE nested debug body into it while Stopped and returns only the
+    /// `body_len`. Null in a test harness that never wired one (a `dbg_json_*` command then
+    /// fails loud with `load_failed`). Set by the server / registry at the worker-spawn
+    /// sites, exactly like `render`/`sd` (missing one regresses provisioned machines).
+    dbg_json: ?*DebugJsonBuffer = null,
     /// The session's configured source-search roots (M-S1.5) — a stable `*const SourceRoots`
     /// the worker borrows for the load-time source-text reads. Null ⇒ no source windows.
     /// Set by the server / registry at the worker-spawn sites, beside `.sd`/`.mount_dir`.
@@ -1204,7 +1648,7 @@ pub const Worker = struct {
                 self.queue.complete(ctx, .ok);
                 return;
             }
-            const resp = drainOne(self.ctrl, ctx, mount, self.render, self.live_mouse, self.snapshots, self.run_ctl, self.sd);
+            const resp = drainOne(self.ctrl, ctx, mount, self.render, self.live_mouse, self.snapshots, self.run_ctl, self.sd, self.dbg_json);
             self.queue.complete(ctx, resp);
             // Stamp the published cycle/mult AFTER each command so `/api/machines` can report
             // this machine's status WITHOUT submitting to (and being blocked by) this worker —

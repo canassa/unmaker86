@@ -52,7 +52,7 @@ fn expectStateEqual(a: cpu_mod.State, b: cpu_mod.State) !void {
 /// thread-agnostic — the threading is exercised separately in queue_test).
 fn drain(ctrl: *Controller, cmd: q.Command) q.Response {
     var ctx: q.RequestCtx = .{ .cmd = cmd };
-    return worker.drainOne(ctrl, &ctx, .{}, null, null, null, null, null);
+    return worker.drainOne(ctrl, &ctx, .{}, null, null, null, null, null, null);
 }
 
 test "#1 queue-drive == direct-call: byte-identical state (CPU + RAM)" {
@@ -71,7 +71,7 @@ test "#1 queue-drive == direct-call: byte-identical state (CPU + RAM)" {
         ctx.scratch[0] = 0xde;
         ctx.scratch[1] = 0xad;
         ctx.scratch[2] = 0xbe;
-        _ = worker.drainOne(&ca, &ctx, .{}, null, null, null, null, null);
+        _ = worker.drainOne(&ca, &ctx, .{}, null, null, null, null, null, null);
     }
     _ = drain(&ca, .{ .mem_peek = .{ .phys = 0x600, .len = 3 } });
 
@@ -279,7 +279,7 @@ test "#5 bounded/retained-capacity: the queue ring + scratch do zero allocations
         _ = drain(&c, .cpu_get);
         _ = drain(&c, .{ .mem_peek = .{ .phys = 0x500, .len = 16 } });
         var ctx: q.RequestCtx = .{ .cmd = .{ .mem_write = .{ .phys = 0x600, .len = 4 } } };
-        _ = worker.drainOne(&c, &ctx, .{}, null, null, null, null, null);
+        _ = worker.drainOne(&c, &ctx, .{}, null, null, null, null, null, null);
         _ = drain(&c, .list_bp);
         _ = drain(&c, .status);
     }
@@ -450,7 +450,7 @@ fn makeSpinMachine(alloc: std.mem.Allocator) !*Machine {
 
 fn drainRc(ctrl: *Controller, rc: *RunControl, cmd: q.Command) q.Response {
     var ctx: q.RequestCtx = .{ .cmd = cmd };
-    return worker.drainOne(ctrl, &ctx, .{}, null, null, null, rc, null);
+    return worker.drainOne(ctrl, &ctx, .{}, null, null, null, rc, null, null);
 }
 
 test "preempt: a control request yields an in-flight (effectively infinite) run promptly" {

@@ -31,6 +31,15 @@ test "no host time / RNG / thread / env / float / hashmap / atomic in src/debug 
         // §1: the worker owns the preempt loop, the pure core only the line predicate).
         @embedFile("core/core.zig"),
         @embedFile("core/debugger.zig"),
+        // The pure real-mode stack unwinder (M-S2 §2). Peek-only (cpuSnapshot/peekMem/
+        // peekMemPhys), never runs the machine; must stay free of host time/RNG/threads/
+        // HashMap/atomics/floats so a backtrace is byte-identical for an identical stop.
+        @embedFile("core/unwind.zig"),
+        // The pure scope/locals/variable-tree renderer (M-S2 §3). Peek-only Storage
+        // dispatch + type-directed rendering; on the gate so it can never grow a host
+        // clock/RNG/thread/float dependency (a float local renders as RAW HEX BYTES — no
+        // x87 — so a byte-identical value falls out of an identical stop).
+        @embedFile("core/vars.zig"),
     };
     const forbidden = [_][]const u8{
         "std.time",

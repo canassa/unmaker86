@@ -88,9 +88,11 @@ test "2: DETERMINISM — two fresh sessions reach byte-identical CPU at the same
 
     // Identical stop cycle...
     try std.testing.expectEqual(stop_a.stop.breakpoint.?.at_cycle, stop_b.stop.breakpoint.?.at_cycle);
-    // ...and BYTE-IDENTICAL CPU snapshot (every register/flag/segment/base/cycle).
-    // This is the core regression: if the API perturbed state, these would differ.
-    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&cpu_a), std.mem.asBytes(&cpu_b));
+    // ...and an IDENTICAL CPU snapshot (every register/flag/segment/base/cycle). Compared
+    // field-wise (not asBytes): the POD carries undefined alignment padding, so `expectEqual`
+    // — which recurses the fields — is the correct check. If the API perturbed state, these
+    // would differ.
+    try std.testing.expectEqual(cpu_a, cpu_b);
 }
 
 test "3: execution-address breakpoint fires at the set linear address" {

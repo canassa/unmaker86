@@ -316,6 +316,14 @@ pub const Session = struct {
     /// `attachOnLoad`. Allocated from the Session `gpa` in `init`, freed in `deinit`.
     source_debugger: ?*debug.SourceDebugger = null,
 
+    /// The session-owned nested-JSON body slab for the M-S2 debug seam (debug-m2-plan.md
+    /// §1.1). Mirrors `render`: the worker serializes ONE nested debug body (backtrace /
+    /// scopes / locals / variables / context) into it while Stopped and returns only the
+    /// `body_len`; the listener copies these OWNED bytes under `self.lock`, then streams.
+    /// Heap-allocated ONCE (stable `?*DebugJsonBuffer` the worker holds, reached like
+    /// `render` — never crosses the pointer-free queue); freed in `deinit`.
+    dbg_json: *worker_mod.DebugJsonBuffer,
+
     /// The configured source-search roots (M-S1.5, debug-source-inlining-plan §A.2). Opened
     /// host `Io.Dir`s, fed ONLY by `load source_path` / `provision_machine source_path` (no
     /// CLI). INLINE (the worker borrows `&session.source_roots`, stable once the Session is at
@@ -362,6 +370,12 @@ pub const Session = struct {
         // dereferences it on the machine-owning thread.
         const sd = try gpa.create(debug.SourceDebugger);
         sd.* = debug.SourceDebugger.init(gpa, ctrl);
+        errdefer {
+            sd.deinit();
+            gpa.destroy(sd);
+        }
+        // The nested-JSON body slab (M-S2 seam). One alloc (256 KiB), stable for the worker.
+        const dbg_json = try gpa.create(worker_mod.DebugJsonBuffer);
         return .{
             .id = id,
             .ctrl = ctrl,
@@ -375,6 +389,7 @@ pub const Session = struct {
             .stream_hub = hub,
             .snapshots = snaps,
             .source_debugger = sd,
+            .dbg_json = dbg_json,
         };
     }
 
@@ -406,5 +421,7 @@ pub const Session = struct {
             sd.deinit();
             gpa.destroy(sd);
         }
+        // The nested-JSON body slab (M-S2 seam) — a plain slab, no inner cleanup.
+        gpa.destroy(self.dbg_json);
     }
 };

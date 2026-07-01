@@ -427,6 +427,48 @@ pub const tools = [_]Tool{
         .description = "List the guest program's source files {file_id, path, cached}. path is the compiler-recorded name (not a host path); cached:true means its TEXT is loaded (a window is available). Pass a file_id to read_source to view any of them.",
         .input_schema = SCHEMA_EMPTY,
     },
+    .{
+        .name = "backtrace",
+        .description = "The call stack, innermost first: each frame's {index, function, file, line of the CALL site, addr:{seg,off,linear}, frame_base, is_far, unreliable}. Valid only when stopped. Real 16-bit BP-chain unwinding over the Borland C frame convention. truncated_reason says WHY the walk stopped (ok_top / c0_startup / no_function / no_call_site / interrupt_boundary / bp_zero / bp_not_increasing / frameless_callee / max_frames) — frames past it are NOT fabricated: a reconstructed caller is refused unless its return address is preceded by a real CALL. A frame's unreliable:true flags an ASSUMPTION (e.g. near/far guessed for a .map image with no type info); a hard failure terminates the walk instead of emitting a doubtful frame.",
+        .input_schema =
+        \\{"type":"object","properties":{"max_frames":{"type":"integer","minimum":1,"description":"max frames to unwind (default 32; clamped to 256)"},"full":{"type":"boolean","default":true,"description":"reserved for DAP parity; the frame list is always complete"}},"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "frame_variables",
+        .description = "The selected stack frame's local variables (arguments + locals collapsed into one list), each {name, type, avail, value?, addr?, bit_width?, variables_ref}. Valid only when stopped. avail is the HONEST-fidelity signal: \"ok\" carries a value; \"outer_frame_register\" means the value lives in a register the callee overwrote and is unrecoverable for a non-top frame; \"unreadable\" means the address is not in mapped RAM; \"no_storage\" is an unmodelled storage class. value is a decimal+hex render (an enum shows its enumerator NAME, or `n (?)` if no enumerator matches; a pointer shows its bits; a float shows raw hex bytes — no x87). A non-zero variables_ref marks a struct/array/pointer — pass it to `variables` to expand ONE level.",
+        .input_schema =
+        \\{"type":"object","properties":{"frame":{"type":"integer","minimum":0,"description":"0-based frame index from backtrace (default 0 = innermost)"}},"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "scopes",
+        .description = "The selected frame's DAP scopes: a \"locals\" scope (always) plus a \"registers\" scope (frame 0 only), each with a variables_ref. Expand a scope's variables_ref via `variables`. Prefer `frame_variables` for the common case (it returns the locals inline). Valid only when stopped.",
+        .input_schema =
+        \\{"type":"object","properties":{"frame":{"type":"integer","minimum":0,"description":"0-based frame index from backtrace (default 0)"}},"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "variables",
+        .description = "Expand a struct / array / pointer ONE level via the variables_ref from frame_variables/scopes/variables. A struct yields its members (with byte offsets; bitfields carry bit_width + the extracted field value); an array yields indexed elements [start,start+count) — pass start/count to PAGE a long array (never silently clipped); a pointer yields its single deref child (a NULL pointer yields a \"<null>\" child, never a wild read; an out-of-RAM target is \"unreadable\"). A ref from a PRIOR stop is rejected with stale_handle — re-fetch after stepping. Valid only when stopped.",
+        .input_schema =
+        \\{"type":"object","properties":{"ref":{"type":"integer","minimum":1,"description":"a variables_ref handle from frame_variables/scopes/variables"},"start":{"type":"integer","minimum":0,"description":"array paging: first element index (default 0)"},"count":{"type":"integer","minimum":1,"description":"array paging: element count (default: the whole node)"}},"required":["ref"],"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "inspect",
+        .description = "Read a variable by a member/index PATH: a bare name (`v`), struct/class members (`p.x`), pointer deref + member (`node->next->value`), and constant array/pointer indices (`arr[2]`). This is NOT a C-expression evaluator: arithmetic / casts / `&` / `*` / function calls / a non-constant index return unsupported_expression (never a guessed value) — use the future `evaluate` for those. The result is one variable {name(=the path), type, avail, value?, addr?, variables_ref} rendered exactly like frame_variables (an aggregate/array/pointer carries a variables_ref to expand). A null pointer along the path yields \"<null>\" (no wild read); an unknown name/member/out-of-bounds index is a typed error. Valid only when stopped.",
+        .input_schema =
+        \\{"type":"object","properties":{"path":{"type":"string","minLength":1,"description":"variable path: identifier + .field / ->field / [const-index] (e.g. p.x, node->next, arr[2])"},"frame":{"type":"integer","minimum":0,"description":"0-based frame index from backtrace (default 0 = innermost)"}},"required":["path"],"additionalProperties":false}
+        ,
+    },
+    .{
+        .name = "context",
+        .description = "ONE snapshot for the current stop, minimizing round-trips: the current frame {function,file,line,addr}, a numbered source window (`window` lines each side), the full backtrace (innermost first), and the top frame's locals. Prefer this on every stop instead of separate whereami/backtrace/frame_variables calls. Each section degrades honestly (no source line -> \"window\":null; no symbols -> address-only frame + \"locals\":[]). Valid only when stopped.",
+        .input_schema =
+        \\{"type":"object","properties":{"frame":{"type":"integer","minimum":0,"description":"0-based frame to center the window+locals on (default 0)"},"window":{"type":"integer","minimum":0,"description":"source lines above/below the active line (default 5)"},"max_frames":{"type":"integer","minimum":1,"description":"max backtrace frames (default 32; clamped to 256)"}},"additionalProperties":false}
+        ,
+    },
     // --- machine lifecycle (machine-AGNOSTIC; server-special, like `load`) ---
     .{
         // Server-special (handled in `server.zig:handleMcpToolCall`, not via `buildCommand`):

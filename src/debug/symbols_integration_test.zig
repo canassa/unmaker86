@@ -277,6 +277,108 @@ test "M-S1 core: attach -> source bp -> cont -> pcLocation -> stepLine -> stepOu
 }
 
 // ===========================================================================
+// M-S2 §2 — the PURE stack unwinder (`core.unwind.backtrace`), driven in-process at
+// the BB.C:9 stop. Proves frame identity + the call-site (ret-1) line mapping + the
+// peek-only (side-effect-free) contract + the T3 anti-fabrication guard, independent of
+// the wire. (debug-m2-plan.md §11 test 1 + 15.)
+// ===========================================================================
+
+const MAIN_CALL_LINE: u32 = 21; // main's `p.x = clamp(300, 0, 319);` — the CALL site
+
+test "M-S2 unwind: BB.EXE backtrace clamp -> main(call site) -> c0 (frame_base + peek-only)" {
+    const alloc = testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+    try writeHostFile(&ctx, "BB.EXE", bb_exe);
+    try m.bootProgram(2, "BB.EXE", "");
+    const psp_seg = m.dos.current_psp;
+
+    var ctrl = Controller.init(m);
+    var sd = SourceDebugger.init(alloc, &ctrl);
+    defer sd.deinit();
+    sd.attachOnLoad(bb_exe, null, psp_seg);
+
+    const rb = try sd.setBreakpoint(.{ .source = .{ .file = "BB.C", .line = CLAMP_LINE } });
+    try testing.expect(rb.verified);
+    _ = sd.projectStop(ctrl.runUntilEvent(50_000_000));
+
+    // Bracket the unwind with a CPU + cycle snapshot: it must be side-effect-free (peek
+    // only) — identical registers/flags and ZERO cycles charged (CLAUDE.md §1).
+    const before = ctrl.cpuSnapshot();
+    const cyc_before = ctrl.currentCycle();
+
+    var frames: [core.MAX_FRAMES]core.Frame = undefined;
+    const bt = core.unwind.backtrace(&sd, frames[0..], 32);
+
+    try testing.expectEqual(before, ctrl.cpuSnapshot()); // no register/flag mutation
+    try testing.expectEqual(cyc_before, ctrl.currentCycle()); // no cycles charged
+
+    // frame 0 = clamp @ BB.C:9 (the live stop), near, reliable.
+    try testing.expectEqual(@as(usize, 2), bt.frames.len);
+    try testing.expectEqualStrings("_clamp", bt.frames[0].function.?);
+    try testing.expectEqual(@as(u32, 9), bt.frames[0].source.?.line);
+    try testing.expect(!bt.frames[0].is_far and !bt.frames[0].unreliable);
+
+    // frame 1 = main @ the clamp CALL SITE (line 21, NOT the following statement 22) — the
+    // ret-1 mapping. Distinct, nonzero, strictly-ascending frame_base.
+    try testing.expectEqualStrings("_main", bt.frames[1].function.?);
+    try testing.expectEqual(MAIN_CALL_LINE, bt.frames[1].source.?.line);
+    try testing.expect(bt.frames[0].frame_base != 0 and bt.frames[1].frame_base != 0);
+    try testing.expect(bt.frames[1].frame_base > bt.frames[0].frame_base);
+
+    // Terminated cleanly at the C runtime startup — never fabricated a parent past main.
+    try testing.expectEqual(core.BacktraceStop.c0_startup, bt.truncated_reason);
+}
+
+test "M-S2 unwind: T3 anti-fabrication — an ascending in-window BP with no CALL at the return is REFUSED" {
+    const alloc = testing.allocator;
+    var ctx = try boot(alloc);
+    defer ctx.deinit();
+    const m = ctx.m;
+    try writeHostFile(&ctx, "BB.EXE", bb_exe);
+    try m.bootProgram(2, "BB.EXE", "");
+    const psp_seg = m.dos.current_psp;
+
+    var ctrl = Controller.init(m);
+    var sd = SourceDebugger.init(alloc, &ctrl);
+    defer sd.deinit();
+    sd.attachOnLoad(bb_exe, null, psp_seg);
+    const rb = try sd.setBreakpoint(.{ .source = .{ .file = "BB.C", .line = CLAMP_LINE } });
+    try testing.expect(rb.verified);
+    _ = sd.projectStop(ctrl.runUntilEvent(50_000_000));
+
+    // Baseline: the REAL (ascending, in-window) BP chain resolves clamp -> main.
+    {
+        var frames: [core.MAX_FRAMES]core.Frame = undefined;
+        const bt = core.unwind.backtrace(&sd, frames[0..], 32);
+        try testing.expectEqual(@as(usize, 2), bt.frames.len);
+        try testing.expectEqualStrings("_main", bt.frames[1].function.?);
+    }
+
+    // Now leave the BP chain EXACTLY as it is (still even / in-window / strictly ascending)
+    // but overwrite the 8 code bytes ENDING at clamp's return address with NOPs, so the
+    // return is no longer preceded by a real CALL (`E8`/`9A`/`FF /2`//`/3`). This is the
+    // zero-init-RAM garbage-BP reality: a plausible chain that never came from a call. The
+    // unwinder must REFUSE to fabricate main and stop with `no_call_site`.
+    const snap = ctrl.cpuSnapshot();
+    const bp: u16 = @truncate(snap.ebp);
+    const ss_base = snap.ss_base;
+    const ret_ip = m.bus.readPhys16(ss_base +% (@as(u32, bp) +% 2));
+    const ret_lin = snap.cs_base +% ret_ip; // clamp is near (small model)
+    var k: u32 = 8;
+    while (k >= 1) : (k -= 1) m.bus.writePhys8(ret_lin - k, 0x90); // NOP over the call site
+
+    var frames: [core.MAX_FRAMES]core.Frame = undefined;
+    const bt = core.unwind.backtrace(&sd, frames[0..], 32);
+    // frame 0 (clamp) is still emitted (its identity is the live CS:IP), but the parent is
+    // REFUSED — no bogus main frame, and the honest boundary reason is surfaced.
+    try testing.expectEqual(@as(usize, 1), bt.frames.len);
+    try testing.expectEqualStrings("_clamp", bt.frames[0].function.?);
+    try testing.expectEqual(core.BacktraceStop.no_call_site, bt.truncated_reason);
+}
+
+// ===========================================================================
 // M-S1.5 — the PURE source-cache + window render (debug-source-inlining-plan §9).
 // Drives `cacheSource`/`sourceWindow` directly (no wire, no machine), proving the
 // render + flags + name lookup independent of the transport.
@@ -398,10 +500,10 @@ test "M-S1.5 core: line truncation + CP437/CRLF/TAB transcode (no silent smear)"
         try testing.expect(w.lines[0].truncated);
         try testing.expectEqual(@as(usize, core.MAX_LINE_BYTES), w.lines[0].text.len);
     }
-    // CP437 high byte (0xC9 → ═ U+2550) + CRLF + a leading TAB: assert valid UTF-8, CR
+    // CP437 high byte (0xCD → ═ U+2550) + CRLF + a leading TAB: assert valid UTF-8, CR
     // stripped, TAB expanded to spaces (the one place "no silent smear" is at risk).
     {
-        const raw = "\tA\xC9B\r\nnext\r\n"; // line 1 = TAB A ═ B (CRLF)
+        const raw = "\tA\xCDB\r\nnext\r\n"; // line 1 = TAB A ═ B (CRLF)
         sd.cacheSource(8, 1, raw);
         var scratch: [core.MAX_WINDOW_LINES]core.SrcLine = undefined;
         const w = sd.sourceWindow(8, 1, 0, &scratch).?;

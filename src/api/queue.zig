@@ -238,9 +238,90 @@ pub const Command = union(enum) {
     /// `list_sources` — enumerate the program's source files (id, path, cached).
     dbg_list_sources: void,
 
+    // ---- source-level debug M-S2 nested-JSON seam (debug-m2-plan.md §1, M2-a) ----
+    /// The M2-a transport SELF-TEST producer (the plan's "trivial stub body" that
+    /// de-risks the nested-JSON seam BEFORE any real nested producer exists). The worker,
+    /// while Stopped, serializes a deterministic body of a requested length into the
+    /// SESSION-owned `DebugJsonBuffer` slab and returns only a `DbgJsonResult{body_len}`
+    /// (pointer-free); the listener copies-under-lock + streams. An oversize `fill`
+    /// overruns the fixed writer → `response_too_large` (proves the explicit overflow
+    /// path). NOT advertised in the MCP `tools/list` catalog — an internal diagnostic the
+    /// real M2-b..d nested producers (`backtrace`/`locals`/`context`) will replace.
+    dbg_json_selftest: DbgSelfTestCmd,
+
+    /// `backtrace` (debug-m2-plan.md §2) — the worker unwinds the call stack (peek-only)
+    /// and serializes the frame list into the session `DebugJsonBuffer`, returning a
+    /// `DbgJsonResult{body_len}`. Pointer-free request POD (integers only).
+    dbg_backtrace: DbgBacktraceCmd,
+
+    /// `scopes` (debug-m2-plan.md §3.2) — the selected frame's scope handles (one `locals`
+    /// scope + a frame-0 `registers` scope); each carries a lazy `variables_ref`.
+    dbg_scopes: DbgScopesReq,
+    /// `frame_variables` (§3.6) — scopes + that frame's locals in one body (the LLM one-shot).
+    dbg_frame_variables: DbgFrameVarsReq,
+    /// `variables` (§3.5) — expand/PAGE one `variables_ref` handle ONE level. `ref` is a u64
+    /// (48-bit epoch | 16-bit slot, T11); a prior-epoch handle → `stale_handle`.
+    dbg_variables: DbgVarsReq,
+
+    /// `inspect` (debug-m2-plan.md §4) — a bounded, PATH-ADDRESSED peek: resolve a variable
+    /// path (`p.x` / `node->next->value` / `arr[2]`) against the frame's locals + type graph
+    /// (reusing `vars.zig`) and serialize the resolved `core.Variable`. The path is FLATTENED
+    /// into `path`/`path_len` (T9 — a slice would fail `expectNoPointerFields(q.Command)`); the
+    /// worker parses it. Anything outside the subset (operators/casts/`&`/`*`/calls) →
+    /// `unsupported_expression`; a name that does not resolve → `unresolved`. NOT an evaluator.
+    dbg_inspect: DbgInspectReq,
+    /// `context` (debug-m2-plan.md §5/R3) — ONE body for the current stop: the frame, its
+    /// source window (radius `window`, T16b), the backtrace, and the top-frame locals.
+    dbg_context: DbgContextReq,
+
     /// The worker-shutdown sentinel: the worker loop exits when it dequeues this.
     shutdown_worker: void,
 };
+
+/// `scopes` / `frame_variables` request (pointer-free): the 0-based frame index (0 =
+/// innermost). Out of range → `bad_frame`.
+pub const DbgScopesReq = struct { frame: u16 = 0 };
+pub const DbgFrameVarsReq = struct { frame: u16 = 0 };
+
+/// `variables` request (pointer-free): the u64 expansion handle plus an explicit array
+/// window (`start`/`count`, T16a — a struct ignores them; `count == 0` ⇒ the whole node).
+pub const DbgVarsReq = struct { ref: u64 = 0, start: u32 = 0, count: u32 = 0 };
+
+/// `inspect` request (pointer-free POD, T9). The variable PATH is FLATTENED into a fixed
+/// inline buffer + length (a `[]const u8` would be a `.pointer` and fail the Command gate);
+/// the worker parses `path[0..path_len]` against the bounded grammar. `frame` selects the
+/// stack frame (0 = innermost).
+pub const DbgInspectReq = struct {
+    frame: u16 = 0,
+    path_len: u16 = 0,
+    path: [DBG_PATH_CAP]u8 = @splat(0),
+};
+
+/// `context` request (pointer-free POD, R3). `frame` selects the top frame for the window +
+/// locals; `window` is the source-window radius (renamed from `context`, T16b — it would
+/// collide with the tool name); `max_frames` bounds the backtrace depth.
+pub const DbgContextReq = struct {
+    frame: u16 = 0,
+    window: u16 = DBG_CONTEXT_DEFAULT,
+    max_frames: u16 = 32,
+};
+
+/// `backtrace` request (pointer-free POD). `max_frames` bounds the unwound depth (clamped
+/// to `core.MAX_FRAMES` on the worker); `full` is advertised for DAP parity and does not
+/// change the emitted shape (the frame list is always innermost-first with the full set).
+pub const DbgBacktraceCmd = struct { full: bool = true, max_frames: u16 = 32 };
+
+/// M2-a transport self-test argument (pointer-free POD): the number of filler bytes the
+/// worker writes into the nested-JSON body, so the test can drive both a small (identical
+/// HTTP/MCP) body and an over-`DBG_JSON_CAP` body (explicit `response_too_large`).
+pub const DbgSelfTestCmd = struct { fill: u32 = 0 };
+
+/// The generic nested-result descriptor (debug-m2-plan.md §1.2). A LENGTH is not a pointer
+/// ⇒ it passes `expectNoPointerFields(q.Response)` unchanged. The BYTES live in the
+/// session-owned `DebugJsonBuffer` slab (reached OFF-Command by the worker, mirroring
+/// `RenderBuffers`); only `body_len` crosses the queue. ONE arm serves every M-S2 nested
+/// body (backtrace/scopes/locals/variables/context) so the wire shape never drifts.
+pub const DbgJsonResult = struct { body_len: u32 = 0 };
 
 // ---- source-level debug core (M-S1) — command/result inline caps -----------
 // A DOS source path is ≤255 chars and a C/Borland symbol name fits comfortably; both
@@ -452,6 +533,24 @@ pub const ErrCode = enum {
     unresolved,
     /// The fixed source-spec breakpoint table (`DBG_MAX_SPECS`) is full.
     spec_table_full,
+    // ---- source-level debug M-S2 nested-JSON seam (debug-m2-plan.md §1.5) ----
+    /// A worker-serialized nested-JSON body would exceed `DBG_JSON_CAP` — the EXPLICIT,
+    /// never-truncated overflow signal (CLAUDE.md §2). → HTTP 413 payload_too_large. The
+    /// agent narrows the request (`max_frames` / expand one handle) and retries.
+    response_too_large,
+    /// A `variables_ref` from a PRIOR Stopped epoch (the handle epoch only climbs, never
+    /// resets — a prior-stop handle is always detectably stale). → HTTP 409. Never a
+    /// silent stale read. (Minted/validated by the M-S2 expansion table; the seam carries
+    /// the typed code now so the wire vocabulary is complete.)
+    stale_handle,
+    /// A frame index outside the unwound backtrace (`scopes`/`locals`/`inspect` frame arg).
+    /// → HTTP 400. (Emitted by the M-S2 backtrace/vars layer; typed here now.)
+    bad_frame,
+    /// An `inspect` path used a form OUTSIDE the bounded subset (an operator / cast / `&` /
+    /// `*` / a function call / a non-constant index) — the honest "this is not the M-S2
+    /// path-addressed peek; use the future evaluator" signal (debug-m2-plan.md §4). → HTTP
+    /// 400. NEVER a guessed / partially-evaluated result (CLAUDE.md §2).
+    unsupported_expression,
 };
 
 /// The per-session snapshot-slot cap (snapshot-restore-plan §3 / Decision D1; LOCKED).
@@ -719,6 +818,13 @@ pub const Response = union(enum) {
     dbg_source: SourceWindow,
     /// `list_sources` — the program's source files (id, path, cached).
     dbg_sources: SourceFilesResult,
+    // ---- source-level debug M-S2 nested-JSON seam (debug-m2-plan.md §1.2) ----
+    /// A nested-JSON body of `body_len` bytes materialized into the session-owned
+    /// `DebugJsonBuffer` slab (the framebuffer-descriptor precedent). The listener copies
+    /// the owned bytes under `session.lock`, then streams them; only the length crosses the
+    /// queue. Never serialized by `writeResponseBody` (streamed separately, like
+    /// `.framebuffer`).
+    dbg_json: DbgJsonResult,
     /// A typed error. The handler maps `code` → HTTP status.
     err: ErrCode,
 };

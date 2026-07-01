@@ -185,6 +185,12 @@ pub const CpuSnapshot = struct {
     gs_base: u32,
     ss_base: u32,
     eip: u32,
+    /// The SS segment limit (`cpu.st.seg_limit[ss]`, real-mode default `0xFFFF`) — the upper
+    /// bound of the stack window. Surfaced ADDITIVELY for the M-S2 stack unwinder's BP-window
+    /// sanity check (debug-m2-plan.md §2.1/§2.2, T14): the pure `unwind.zig` core reads the
+    /// bound off THIS snapshot, never `ctrl.m.cpu.st`. Placed in the u32 block (no interior
+    /// padding) so the POD's byte layout stays stable for existing `asBytes` comparisons.
+    ss_limit: u32,
     cf: bool,
     pf: bool,
     af: bool,
@@ -1511,6 +1517,7 @@ pub const Controller = struct {
             .cycles = st.cycles,
             .halted = st.halted,
             .shutdown = st.shutdown,
+            .ss_limit = st.seg_limit[@intFromEnum(Seg.ss)],
         };
     }
 

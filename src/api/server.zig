@@ -388,7 +388,7 @@ pub const Server = struct {
         // the Server is at its final address.)
         if (self.session) |*s| {
             s.wireStream(self.io);
-            var w: worker_mod.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl, .mount_dir = s.mount_dir, .io = self.io, .render = s.render, .live_mouse = s.live_mouse, .snapshots = s.snapshots, .run_ctl = s.run_control, .sd = s.source_debugger, .source_roots = &s.source_roots, .initial_file_len = s.recipe.file_len };
+            var w: worker_mod.Worker = .{ .queue = &s.queue, .ctrl = s.ctrl, .mount_dir = s.mount_dir, .io = self.io, .render = s.render, .live_mouse = s.live_mouse, .snapshots = s.snapshots, .run_ctl = s.run_control, .sd = s.source_debugger, .dbg_json = s.dbg_json, .source_roots = &s.source_roots, .initial_file_len = s.recipe.file_len };
             @memcpy(w.initial_file[0..s.recipe.file_len], s.recipe.file[0..s.recipe.file_len]);
             s.worker_thread = try std.Thread.spawn(.{}, worker_mod.Worker.run, .{w});
         }
@@ -827,6 +827,15 @@ pub const Conn = struct {
     /// connection. Only capture-active connections pay; the static `Conn` footprint is unchanged.
     capture_buf: ?[]u8 = null,
 
+    /// The Conn-owned copy target for a worker-serialized nested-JSON debug body (M-S2
+    /// seam, debug-m2-plan.md §1.4). The nested-query listener holds `session.lock` only
+    /// across submit → COPY `session.dbg_json.body[0..body_len]` here, then UNLOCKS and
+    /// streams this OWNED copy — so the (possibly slow / large) socket write never holds
+    /// the lock the pacer shares, and a concurrent `run`/`load` on another connection
+    /// cannot re-write the session slab under an in-flight read. `null` until the first
+    /// nested query on this connection; allocated once to `DBG_JSON_CAP`, freed in `deinit`.
+    dbg_copy_buf: ?[]u8 = null,
+
     /// The host-measured throughput (guest cycles/sec) of the session this response serves,
     /// snapshotted just before the CPU-speed body is serialized so `writeCpuSpeed` can emit
     /// the UI-only `sustainable_mult` (the slider cap). The MCP path routes by a `machine`
@@ -848,7 +857,19 @@ pub const Conn = struct {
 
     fn deinit(self: *Conn) void {
         if (self.capture_buf) |buf| self.server.gpa.free(buf);
+        if (self.dbg_copy_buf) |buf| self.server.gpa.free(buf);
         self.arena.deinit();
+    }
+
+    /// Return this connection's nested-JSON copy buffer (M-S2 seam §1.4), allocating it
+    /// once on first use (sized to `worker_mod.DBG_JSON_CAP`, the same ceiling the worker
+    /// slab uses) and reusing it thereafter. `null` only on OOM (an honest error response).
+    /// Freed in `deinit`.
+    fn ensureDbgBuf(self: *Conn) ?[]u8 {
+        if (self.dbg_copy_buf) |buf| return buf;
+        const buf = self.server.gpa.alloc(u8, worker_mod.DBG_JSON_CAP) catch return null;
+        self.dbg_copy_buf = buf;
+        return buf;
     }
 
     /// Return this connection's CAPTURE buffer (Finding 2), allocating it once on first
@@ -1147,6 +1168,73 @@ pub const Conn = struct {
         if (std.mem.eql(u8, path, "/api/step")) {
             if (method != .POST) return self.methodNotAllowed(req);
             return self.submitDebuggerAndRespond(req, .step);
+        }
+
+        // --- source-level debug M-S2 nested-JSON seam self-test (M2-a) ---
+        // An INTERNAL transport diagnostic (not a user-facing feature): it exercises the
+        // whole worker-serialize → copy-under-lock → stream path over HTTP so the seam can
+        // be proven byte-identical to the MCP stream and its overflow path (413) verified.
+        // `?fill=N` sizes the body; a large N overruns `DBG_JSON_CAP` → `response_too_large`.
+        // Replaced by the real M2-b..d nested producers (backtrace/locals/context).
+        if (std.mem.eql(u8, path, "/api/dbg/selftest")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            const fill = self.queryU32(query, "fill") orelse 0;
+            return self.submitDebuggerJsonAndRespond(req, .{ .dbg_json_selftest = .{ .fill = fill } });
+        }
+
+        // --- source-level debug M-S2: backtrace (M2-b, debug-m2-plan.md §2) ---
+        // The HTTP twin of the MCP `backtrace` tool: unwind the call stack (peek-only,
+        // Stopped-gated) and stream the nested-JSON frame list through the same seam.
+        if (std.mem.eql(u8, path, "/api/dbg/backtrace")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            const mf = self.queryU32(query, "max_frames") orelse 32;
+            const mfc: u16 = @intCast(@min(mf, debug.core.MAX_FRAMES));
+            return self.submitDebuggerJsonAndRespond(req, .{ .dbg_backtrace = .{ .max_frames = mfc } });
+        }
+
+        // --- source-level debug M-S2: scopes / frame_variables / variables (M2-c, §3) ---
+        if (std.mem.eql(u8, path, "/api/dbg/scopes")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            const fr: u16 = @intCast(@min(self.queryU32(query, "frame") orelse 0, 0xFFFF));
+            return self.submitDebuggerJsonAndRespond(req, .{ .dbg_scopes = .{ .frame = fr } });
+        }
+        if (std.mem.eql(u8, path, "/api/dbg/frame-variables")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            const fr: u16 = @intCast(@min(self.queryU32(query, "frame") orelse 0, 0xFFFF));
+            return self.submitDebuggerJsonAndRespond(req, .{ .dbg_frame_variables = .{ .frame = fr } });
+        }
+        if (std.mem.eql(u8, path, "/api/dbg/variables")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            const ref = self.queryU64(query, "ref") orelse 0;
+            const start = self.queryU32(query, "start") orelse 0;
+            const count = self.queryU32(query, "count") orelse 0;
+            return self.submitDebuggerJsonAndRespond(req, .{ .dbg_variables = .{ .ref = ref, .start = start, .count = count } });
+        }
+
+        // --- source-level debug M-S2: inspect (M2-d, §4) + context (M2-d, §5/R3) ---
+        // The HTTP twins of the MCP `inspect`/`context` tools, over the same nested-JSON seam.
+        if (std.mem.eql(u8, path, "/api/dbg/inspect")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            const fr: u16 = @intCast(@min(self.queryU32(query, "frame") orelse 0, 0xFFFF));
+            var cmd = q.DbgInspectReq{ .frame = fr };
+            // Percent-decode `?path=` into the flattened inline buffer (T9). An absent/oversize
+            // path leaves it empty → the worker's parser rejects it as unsupported/unresolved.
+            if (queryValue(query, "path")) |raw| {
+                var dec: [q.DBG_PATH_CAP]u8 = undefined;
+                if (percentDecode(dec[0..], raw)) |d| {
+                    const n = @min(d.len, cmd.path.len);
+                    @memcpy(cmd.path[0..n], d[0..n]);
+                    cmd.path_len = @intCast(n);
+                }
+            }
+            return self.submitDebuggerJsonAndRespond(req, .{ .dbg_inspect = cmd });
+        }
+        if (std.mem.eql(u8, path, "/api/dbg/context")) {
+            if (method != .GET) return self.methodNotAllowed(req);
+            const fr: u16 = @intCast(@min(self.queryU32(query, "frame") orelse 0, 0xFFFF));
+            const win: u16 = @intCast(@min(self.queryU32(query, "window") orelse q.DBG_CONTEXT_DEFAULT, debug.core.MAX_WINDOW_LINES));
+            const mf: u16 = @intCast(@min(self.queryU32(query, "max_frames") orelse 32, debug.core.MAX_FRAMES));
+            return self.submitDebuggerJsonAndRespond(req, .{ .dbg_context = .{ .frame = fr, .window = win, .max_frames = mf } });
         }
         if (std.mem.eql(u8, path, "/api/step-n")) {
             if (method != .POST) return self.methodNotAllowed(req);
@@ -1904,10 +1992,25 @@ pub const Conn = struct {
         }
         return null;
     }
+
+    /// The optional `frame` argument of the M-S2 `scopes`/`frame_variables` tools (0-based;
+    /// default 0 = innermost). A negative / out-of-u16 value clamps to 0 (the worker then
+    /// rejects an out-of-backtrace index with `bad_frame`).
+    fn mcpFrameArg(args: std.json.Value) u16 {
+        if (args == .object) if (args.object.get("frame")) |v| {
+            if (v == .integer and v.integer > 0 and v.integer <= 0xFFFF) return @intCast(v.integer);
+        };
+        return 0;
+    }
     fn queryU32(self: *Conn, query: []const u8, key: []const u8) ?u32 {
         _ = self;
         const v = queryValue(query, key) orelse return null;
         return std.fmt.parseInt(u32, v, 10) catch null;
+    }
+    fn queryU64(self: *Conn, query: []const u8, key: []const u8) ?u64 {
+        _ = self;
+        const v = queryValue(query, key) orelse return null;
+        return std.fmt.parseInt(u64, v, 10) catch null;
     }
     fn querySeg(self: *Conn, query: []const u8) ?Seg {
         _ = self;
@@ -2262,6 +2365,23 @@ pub const Conn = struct {
         const name_v = pobj.get("name") orelse return self.respondRpcError(req, id, .invalid_params, "tools/call requires a name");
         if (name_v != .string) return self.respondRpcError(req, id, .invalid_params, "name must be a string");
         const name = name_v.string;
+
+        // M2-a transport self-test (INTERNAL — deliberately NOT in the `tools/list` catalog,
+        // so it is special-cased BEFORE the unknown-tool rejection). Routes the nested-JSON
+        // seam over MCP so it can be proven byte-identical to the HTTP body and its overflow
+        // path (413/isError) verified. Resolves to the header/default session (a transport
+        // diagnostic needs no machine-arg routing).
+        if (std.mem.eql(u8, name, "dbg_selftest")) {
+            const target = session orelse
+                return self.respondMcpToolError(req, id, "no_machine", "no machine; call provision_machine first");
+            const sargs: std.json.Value = pobj.get("arguments") orelse .null;
+            var fill: u32 = 0;
+            if (sargs == .object) if (sargs.object.get("fill")) |fv| {
+                if (fv == .integer and fv.integer >= 0) fill = @intCast(fv.integer);
+            };
+            return self.submitMcpDebuggerJsonAndRespond(req, id, target, .{ .dbg_json_selftest = .{ .fill = fill } });
+        }
+
         if (mcp_tools.find(name) == null) return self.respondRpcError(req, id, .invalid_params, "unknown tool");
         var args: std.json.Value = pobj.get("arguments") orelse .null;
 
@@ -2309,6 +2429,75 @@ pub const Conn = struct {
         // content block the rest of the tools share (mcp-plan.md §7). It takes no
         // arguments (besides the routing `machine`), so it branches before the mapping below.
         if (std.mem.eql(u8, name, "screenshot")) return self.handleMcpScreenshot(req, id, target);
+
+        // `backtrace` (M-S2 §2) is served through the nested-JSON seam, not the flat
+        // `writeResponseBody` path (its `.dbg_json` response is streamed from the session
+        // slab). Parse `max_frames` (clamped to the unwinder's ceiling) and route to the
+        // shared JSON responder so HTTP and MCP emit byte-identical bodies.
+        if (std.mem.eql(u8, name, "backtrace")) {
+            var max_frames: u16 = 32;
+            if (args == .object) if (args.object.get("max_frames")) |v| {
+                if (v == .integer and v.integer > 0)
+                    max_frames = @intCast(@min(v.integer, @as(i64, @intCast(debug.core.MAX_FRAMES))));
+            };
+            return self.submitMcpDebuggerJsonAndRespond(req, id, target, .{ .dbg_backtrace = .{ .max_frames = max_frames } });
+        }
+
+        // `scopes` / `frame_variables` / `variables` (M-S2 §3) — the same nested-JSON seam.
+        if (std.mem.eql(u8, name, "scopes")) {
+            return self.submitMcpDebuggerJsonAndRespond(req, id, target, .{ .dbg_scopes = .{ .frame = mcpFrameArg(args) } });
+        }
+        if (std.mem.eql(u8, name, "frame_variables") or std.mem.eql(u8, name, "locals")) {
+            return self.submitMcpDebuggerJsonAndRespond(req, id, target, .{ .dbg_frame_variables = .{ .frame = mcpFrameArg(args) } });
+        }
+        if (std.mem.eql(u8, name, "variables")) {
+            var ref: u64 = 0;
+            var start: u32 = 0;
+            var count: u32 = 0;
+            if (args == .object) {
+                if (args.object.get("ref")) |v| if (v == .integer and v.integer > 0) {
+                    ref = @intCast(v.integer);
+                };
+                if (args.object.get("start")) |v| if (v == .integer and v.integer >= 0) {
+                    start = @intCast(v.integer);
+                };
+                if (args.object.get("count")) |v| if (v == .integer and v.integer > 0) {
+                    count = @intCast(v.integer);
+                };
+            }
+            return self.submitMcpDebuggerJsonAndRespond(req, id, target, .{ .dbg_variables = .{ .ref = ref, .start = start, .count = count } });
+        }
+
+        // `inspect` (M-S2 §4) — a bounded path-addressed peek. The `path` string is FLATTENED
+        // into the pointer-free command POD (T9); the worker parses it. A missing/non-string
+        // `path` is -32602 (fix the call); an out-of-grammar path returns the honest
+        // `unsupported_expression` tool error from the worker (never a guessed value).
+        if (std.mem.eql(u8, name, "inspect")) {
+            const pv = if (args == .object) args.object.get("path") else null;
+            if (pv == null or pv.? != .string) return self.respondRpcError(req, id, .invalid_params, "inspect expects {path:string, frame?:integer}");
+            var cmd = q.DbgInspectReq{ .frame = mcpFrameArg(args) };
+            const p = pv.?.string;
+            const n = @min(p.len, cmd.path.len);
+            @memcpy(cmd.path[0..n], p[0..n]);
+            cmd.path_len = @intCast(n);
+            return self.submitMcpDebuggerJsonAndRespond(req, id, target, .{ .dbg_inspect = cmd });
+        }
+
+        // `context` (M-S2 §5/R3) — one snapshot for the current stop. `window` is the source
+        // radius (T16b, NOT `context`); `max_frames` bounds the backtrace.
+        if (std.mem.eql(u8, name, "context")) {
+            var win: u16 = q.DBG_CONTEXT_DEFAULT;
+            var mf: u16 = 32;
+            if (args == .object) {
+                if (args.object.get("window")) |v| if (v == .integer and v.integer >= 0) {
+                    win = @intCast(@min(v.integer, @as(i64, @intCast(debug.core.MAX_WINDOW_LINES))));
+                };
+                if (args.object.get("max_frames")) |v| if (v == .integer and v.integer > 0) {
+                    mf = @intCast(@min(v.integer, @as(i64, @intCast(debug.core.MAX_FRAMES))));
+                };
+            }
+            return self.submitMcpDebuggerJsonAndRespond(req, id, target, .{ .dbg_context = .{ .frame = mcpFrameArg(args), .window = win, .max_frames = mf } });
+        }
 
         // Map (name, args) → q.Command (+ debugger flag + RespondOpts). A validation
         // failure is -32602 (fix the CALL). `load` is server-special: its recipe overlay
@@ -2525,6 +2714,110 @@ pub const Conn = struct {
         }) catch return;
         bw.writer.writeAll(prefix) catch return;
         enc.encodeWriter(&bw.writer, png_bytes) catch return;
+        bw.writer.writeAll(suffix) catch return;
+        bw.end() catch return;
+    }
+
+    // ---- source-level debug M-S2 nested-JSON seam (debug-m2-plan.md §1.4) --------
+    // The listener half of the seam, generalizing `submitAndRespondFramebuffer`: the worker
+    // materializes the nested body into the session slab; here we COPY it under
+    // `session.lock` into the Conn-owned `dbg_copy_buf`, UNLOCK, then write the socket over
+    // the owned copy. INVARIANT (T10): every command that writes `session.dbg_json` is
+    // submitted while holding `session.lock` (the CAPTURE span), so two nested queries cannot
+    // interleave their slab writes and the copy reads a single complete body; the finished
+    // OWNED bytes are then immune to a concurrent `run`/`load` on another connection.
+
+    /// The captured nested body (or a typed failure) recorded UNDER the lock, acted on
+    /// after unlock so no socket write happens while the lock is held.
+    const DbgJsonCapture = union(enum) {
+        ok: usize, // body_len; bytes are in the Conn-owned copy buffer
+        err: q.ErrCode, // a typed emulator failure (not_stopped / no_symbols / response_too_large / …)
+        unexpected, // an unexpected response shape (a bug)
+    };
+
+    /// Submit a `dbg_json`-producing command to `session`'s queue UNDER `session.lock` and
+    /// COPY the resulting owned body into `buf` (the Conn copy target). Returns the capture
+    /// verdict; the caller renders the transport (HTTP body / MCP text stream) after unlock.
+    fn captureDbgJson(self: *Conn, session: *Session, cmd: q.Command, buf: []u8) DbgJsonCapture {
+        session.lock.lockUncancelable(self.server.io);
+        defer session.lock.unlock(self.server.io);
+        var ctx: q.RequestCtx = .{ .cmd = cmd };
+        const resp = session.queue.submit(&ctx);
+        switch (resp) {
+            .dbg_json => |d| {
+                @memcpy(buf[0..d.body_len], session.dbg_json.body[0..d.body_len]);
+                return .{ .ok = d.body_len };
+            },
+            .err => |code| return .{ .err = code },
+            else => return .unexpected,
+        }
+    }
+
+    /// HTTP nested-JSON route: submit `cmd`, copy the worker-serialized body under the lock,
+    /// then respond with the OWNED copy as the raw JSON body (the whole `DBG_JSON_CAP`
+    /// ceiling streams straight to the socket). A typed failure → `errInfo` HTTP status
+    /// (`response_too_large` → 413), never a truncated body.
+    fn submitDebuggerJsonAndRespond(self: *Conn, req: *http.Server.Request, cmd: q.Command) void {
+        const buf = self.ensureDbgBuf() orelse
+            return self.respondError(req, .service_unavailable, "internal", "out of memory allocating debug buffer");
+        switch (self.captureDbgJson(self.session.?, cmd, buf)) {
+            .ok => |body_len| self.respondJson(req, .ok, buf[0..body_len]),
+            .err => |code| self.respondErrCode(req, code),
+            .unexpected => self.respondError(req, .service_unavailable, "internal", "unexpected debug response"),
+        }
+    }
+
+    /// MCP nested-JSON path: the SAME captured bytes as the HTTP route (produced once on the
+    /// worker → NO drift), wrapped in the JSON-RPC text-content envelope. T8 — the escaped
+    /// body can ~2× its size, so rather than framing through the 48 KiB `resp_buf` (which
+    /// would make MCP fail earlier than HTTP, diverging the ceiling), we STREAM the escaped
+    /// envelope incrementally to the socket (mirroring `handleMcpScreenshot`'s base64
+    /// stream): prefix → `encodeJsonString(body)` → suffix, so HTTP and MCP share ONE
+    /// `DBG_JSON_CAP` ceiling and emit byte-identical bodies. An emulator ErrCode is an
+    /// `isError` tool result (§6), `response_too_large` included.
+    fn submitMcpDebuggerJsonAndRespond(self: *Conn, req: *http.Server.Request, id: ?mcp.Id, target: *Session, cmd: q.Command) void {
+        const buf = self.ensureDbgBuf() orelse
+            return self.respondMcpToolError(req, id, "internal", "out of memory allocating debug buffer");
+        const body: []const u8 = switch (self.captureDbgJson(target, cmd, buf)) {
+            .ok => |body_len| buf[0..body_len],
+            .err => |code| {
+                const info = errInfo(code);
+                return self.respondMcpToolError(req, id, info.code, info.msg);
+            },
+            .unexpected => return self.respondRpcError(req, id, .internal, "unexpected debug response"),
+        };
+
+        // Build the envelope PREFIX (up to and including the opening of the `text` string
+        // value) into `resp_buf` so we can measure its exact byte length (it embeds the
+        // echoed `id`). `writeTextResult` = prefix + encodeJsonString(body) + suffix, so we
+        // replicate its two ends and stream the escaped body between them.
+        var pw = std.Io.Writer.fixed(self.resp_buf[0..]);
+        const prefix_ok = blk: {
+            mcp.writeResultPrefix(&pw, id) catch break :blk false;
+            pw.writeAll("{\"content\":[{\"type\":\"text\",\"text\":") catch break :blk false;
+            break :blk true;
+        };
+        if (!prefix_ok) return self.respondRpcError(req, id, .internal, "response too large");
+        const prefix = pw.buffered();
+        const suffix = "}],\"isError\":false}}"; // matches writeTextResult(is_error=false) exactly
+
+        // Exact escaped length (incl. the surrounding quotes) via a discarding pass — no 2×
+        // buffer, so the ceiling stays `DBG_JSON_CAP`, not `resp_buf/2`.
+        var counter: std.Io.Writer.Discarding = .init(&.{});
+        std.json.Stringify.encodeJsonString(body, .{}, &counter.writer) catch
+            return self.respondRpcError(req, id, .internal, "failed to escape debug body");
+        const content_length: u64 = @as(u64, prefix.len) + counter.fullCount() + suffix.len;
+
+        const headers = [_]http.Header{
+            .{ .name = "content-type", .value = "application/json; charset=utf-8" },
+        };
+        var stream_buf: [4096]u8 = undefined;
+        var bw = req.respondStreaming(&stream_buf, .{
+            .content_length = content_length,
+            .respond_options = .{ .status = .ok, .keep_alive = false, .extra_headers = &headers },
+        }) catch return;
+        bw.writer.writeAll(prefix) catch return;
+        std.json.Stringify.encodeJsonString(body, .{}, &bw.writer) catch return;
         bw.writer.writeAll(suffix) catch return;
         bw.end() catch return;
     }
@@ -2806,6 +3099,9 @@ pub const Conn = struct {
             // If a framebuffer ever reaches this generic JSON path, report it honestly
             // rather than emitting a wrong body.
             .framebuffer => return self.respondError(req, .service_unavailable, "internal", "framebuffer must be streamed via /api/framebuffer"),
+            // A nested-JSON body is streamed from the session slab by
+            // `submitDebuggerJsonAndRespond`, never through this generic path.
+            .dbg_json => return self.respondError(req, .service_unavailable, "internal", "nested debug body must be streamed via the dbg-json path"),
             else => {},
         }
         var w = std.Io.Writer.fixed(self.resp_buf[0..]);
@@ -2869,7 +3165,8 @@ pub const Conn = struct {
             .dbg_source => |win| try self.writeSourceWindow(w, win),
             .dbg_sources => |sf| try self.writeDbgSources(w, sf),
             // Pre-handled by every caller (see the doc comment). Reaching here is a bug.
-            .err, .framebuffer => unreachable,
+            // `.dbg_json` is streamed from the session slab (submitDebuggerJsonAndRespond).
+            .err, .framebuffer, .dbg_json => unreachable,
         }
     }
 
@@ -3255,6 +3552,16 @@ pub const Conn = struct {
             .unresolved => .{ .status = .not_found, .code = "unresolved", .msg = "file:line or function name resolved to no code address" },
             // All source-spec breakpoint slots are in use — 503 (the breakpoint_table_full idiom).
             .spec_table_full => .{ .status = .service_unavailable, .code = "spec_table_full", .msg = "all source breakpoint slots are in use" },
+            // ---- source-level debug M-S2 nested-JSON seam (debug-m2-plan.md §1.5) ----
+            // The nested body exceeded the slab ceiling: 413 (never a truncated JSON body).
+            .response_too_large => .{ .status = .payload_too_large, .code = "response_too_large", .msg = "nested debug body exceeds the response ceiling; narrow the request" },
+            // A variables_ref from a prior stop (the epoch bumped) — 409, never a stale read.
+            .stale_handle => .{ .status = .conflict, .code = "stale_handle", .msg = "expansion handle is from a prior stop; re-fetch after stepping" },
+            // A frame index outside the unwound backtrace — 400.
+            .bad_frame => .{ .status = .bad_request, .code = "bad_frame", .msg = "frame index outside the current backtrace" },
+            // An inspect path outside the bounded subset — 400, never a guessed value. The
+            // full C-expression evaluator is deferred to M-S3.
+            .unsupported_expression => .{ .status = .bad_request, .code = "unsupported_expression", .msg = "path uses an unsupported form (operator/cast/&/*/call); inspect reads member/index paths only" },
         };
     }
 
